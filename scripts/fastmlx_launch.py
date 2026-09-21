@@ -82,6 +82,20 @@ assert _PROXY_SPEC is not None and _PROXY_SPEC.loader is not None
 fastmlx_proxy = importlib.util.module_from_spec(_PROXY_SPEC)
 _PROXY_SPEC.loader.exec_module(fastmlx_proxy)
 
+# Loaded by file path (not by package import), the same cross-module-reuse
+# pattern fastmlx_safetensors_fit.py itself uses to reach fastmlx_gguf_fit.py's
+# internals (see that file's own "Shared helpers" comment): this lets
+# _pack_has_safetensors below reuse the sizer's OWN countable-file scan
+# (_iter_regular_files) instead of a second, hand-copied traversal that could
+# silently drift out of step with what the sizer actually counts.
+_SAFETENSORS_FIT_PATH = Path(__file__).resolve().parent / "fastmlx_safetensors_fit.py"
+_SAFETENSORS_FIT_SPEC = importlib.util.spec_from_file_location(
+    "_fastmlx_launch_safetensors_fit", _SAFETENSORS_FIT_PATH
+)
+assert _SAFETENSORS_FIT_SPEC is not None and _SAFETENSORS_FIT_SPEC.loader is not None
+_safetensors_fit = importlib.util.module_from_spec(_SAFETENSORS_FIT_SPEC)
+_SAFETENSORS_FIT_SPEC.loader.exec_module(_safetensors_fit)
+
 # The one Swift binary this repository ships that can both answer a
 # ``--fit-check-only`` pre-load question and serve an OpenAI-compatible API,
 # used as the default for both ``--fit-check-bin`` and (absent a custom
@@ -147,6 +161,19 @@ _BUILTIN_FIT_CHECK_FILENAMES = {
 }
 ALLOWED_FIT_CHECK_KEYS = {"bin", "args"}
 
+# The inverse of `_BUILTIN_FIT_CHECK_FILENAMES`, keyed by the RESOLVED
+# argv[0] `_resolve_fit_check_bin_value` produces for each `builtin:` name
+# (a sibling of this file). Used by `_run_serve` to tell whether a fully
+# resolved `fit_check_bin` -- however it got resolved: CLI/env override,
+# an engine profile's own `fitCheck.bin`, or the auto-select fallback --
+# is one of this repository's own built-in pure-Python sizers, without
+# needing to thread a separate "was this a builtin:" flag through every
+# branch that can produce `fit_check_bin`.
+_BUILTIN_FIT_CHECK_BIN_PATHS = {
+    str(Path(__file__).resolve().parent / filename): name
+    for name, filename in _BUILTIN_FIT_CHECK_FILENAMES.items()
+}
+
 # The flags `run_fit_check` itself always supplies; a profile's own
 # `fitCheck.args` must never repeat one of these, since the launcher -- not
 # the profile -- owns the model identity/host/context this fit check runs
@@ -209,6 +236,170 @@ def is_model_dir(path: Path) -> bool:
     if (path / "config.json").is_file():
         return True
     return any(child.is_file() and child.suffix == ".gguf" for child in path.iterdir())
+
+
+# ---------------------------------------------------------------------
+# 0b. Built-in sizer auto-selection: which of this repository's own
+#     pure-Python sizers (fastmlx_safetensors_fit.py / fastmlx_gguf_fit.py)
+#     applies to a given pack, from that pack's own on-disk contents. The
+#     single source of truth for both `fastmlx serve` (the auto-select
+#     fallback in `_run_serve`, below) and `fastmlx recommend` (which
+#     imports this module rather than duplicating this logic).
+# ---------------------------------------------------------------------
+def _pack_has_safetensors(model_path: Path) -> bool:
+    """Whether ``model_path`` looks like a safetensors pack the built-in
+    safetensors sizer (``fastmlx_safetensors_fit.compute_model_bytes``)
+    would actually find at least one countable weight file in.
+
+    This reuses that sizer's OWN countable-file scan
+    (``_iter_regular_files``) rather than a second, hand-copied traversal,
+    so the two can never silently drift apart: a symlink (file or
+    directory) is never followed or counted, a dot-named entry is skipped,
+    and a dot-named directory is never descended into. A top-level
+    ``model.safetensors.index.json`` alone is deliberately NOT treated as
+    "has safetensors" here (unlike the previous version of this check):
+    the sizer itself refuses with "no .safetensors files found" whenever
+    zero countable shard files exist, index.json or not, so a pack with an
+    index but no countable shard would still be a guaranteed sizer
+    failure -- see ``compute_model_bytes``, which raises before it ever
+    reaches its own index-manifest cross-check.
+
+    This only checks for the files' existence via a directory scan; it
+    never opens or parses a file, and it never follows a symlink to see
+    what it points at (see ``_find_uncounted_pattern_entries`` for the
+    separate, permissive diagnostic scan used only to explain a
+    symlinked/dot-hidden miss to the operator, never to size or select
+    anything).
+    """
+    return any(
+        relative.endswith(".safetensors")
+        for relative, _path in _safetensors_fit._iter_regular_files(model_path)
+    )
+
+
+def _pack_has_gguf(model_path: Path) -> bool:
+    """Whether ``model_path`` looks like a GGUF pack: at least one
+    top-level ``*.gguf`` REGULAR FILE -- the same top-level-only scope
+    ``is_model_dir`` and ``fastmlx_gguf_fit.resolve_shards`` itself
+    use.
+
+    Unlike the safetensors sizer, the GGUF sizer's own scan
+    (``resolve_shards``: ``p.is_file() and p.suffix == ".gguf"`` over
+    ``model_path.iterdir()``) does NOT skip a symlink -- ``Path.is_file()``
+    follows symlinks by default, so a symlinked ``*.gguf`` entry (exactly
+    the shape the canonical Hugging Face hub cache layout produces) is
+    already counted by that sizer, and this check (which uses the same
+    ``child.is_file()`` test) already agrees with it. There is therefore no
+    "present but uncounted because it's a symlink" gap here to add a
+    diagnostic for, unlike the safetensors case below: verified by reading
+    ``fastmlx_gguf_fit.resolve_shards`` directly, not assumed to mirror the
+    safetensors sizer's posture.
+    """
+    return any(child.is_file() and child.suffix == ".gguf" for child in model_path.iterdir())
+
+
+def _find_uncounted_pattern_entries(model_path: Path, suffix: str) -> list:
+    """A permissive, best-effort recursive scan for every on-disk entry
+    named ``*<suffix>`` anywhere under ``model_path`` -- deliberately the
+    OPPOSITE of ``_iter_regular_files``: it does not check whether an
+    entry is a symlink, and it does not skip a dot-named entry or avoid
+    descending into a dot-named directory. This exists ONLY to build an
+    honest, actionable diagnostic for the operator when the strict,
+    sizer-matching scan found nothing countable ("this pack DOES have
+    entries shaped like weight files -- they just aren't ones the sizer
+    will count") -- it is never used to size or select a fit-check
+    binary, and finding something here never flips ``_pack_has_safetensors``
+    to ``True``. Returns relative POSIX paths, sorted for deterministic
+    output.
+    """
+    matches = []
+    for dirpath, _dirnames, filenames in os.walk(model_path):
+        for filename in filenames:
+            if filename.endswith(suffix):
+                full = Path(dirpath) / filename
+                matches.append(full.relative_to(model_path).as_posix())
+    return sorted(matches)
+
+
+def _uncounted_safetensors_message(model_path: Path) -> Optional[str]:
+    """``None`` when no ``*.safetensors``-named entry exists anywhere under
+    ``model_path`` at all. Otherwise (this candidate has ``_pack_has_safetensors``
+    ``False`` but at least one raw ``*.safetensors``-named entry exists) an
+    honest, actionable refusal: the entries are present but are symlinks
+    and/or live under a dot-named directory, the built-in sizer
+    deliberately never follows a symlink or descends into a dot-named
+    directory (it only sizes real on-disk bytes it can independently
+    verify -- see ``fastmlx_safetensors_fit._iter_regular_files``), and the
+    remedy is a directory holding the REAL weight files rather than links.
+
+    This is exactly the shape of the canonical Hugging Face hub cache
+    layout (``~/.cache/huggingface/hub/models--<repo>/snapshots/<rev>/``,
+    where every entry is a symlink into ``../../blobs/``), named here as an
+    example, not asserted as the only possible cause.
+    """
+    matches = _find_uncounted_pattern_entries(model_path, ".safetensors")
+    if not matches:
+        return None
+    shown = matches[:3]
+    more_suffix = f" (+{len(matches) - 3} more)" if len(matches) > 3 else ""
+    return (
+        f"{model_path} contains *.safetensors entries "
+        f"({', '.join(shown)}{more_suffix}) but the built-in safetensors "
+        "sizer counted zero of them as weight files: it deliberately never "
+        "follows a symlink (file or directory) and never descends into a "
+        "dot-named directory or counts a dot-named entry -- it only sizes "
+        "real on-disk bytes it can independently verify, which this pack's "
+        "entries are not (this is the shape of the canonical Hugging Face "
+        "hub cache layout, "
+        "~/.cache/huggingface/hub/models--<repo>/snapshots/<rev>/, where "
+        "every entry is a symlink). Point --model-path at a directory "
+        "holding the REAL weight files instead of links -- "
+        "'fastmlx pull <repo>@<revision> --dest <dir>' (this repository's "
+        "own downloader; NOT --adopt, which refuses a symlinked source "
+        "directory outright) writes real, non-symlink files -- or pass "
+        "--fit-check-bin to use a different sizer for this pack."
+    )
+
+
+def _select_builtin_fit_check_bin(model_path: Path) -> tuple:
+    """Auto-select one of this repository's built-in pure-Python sizers by
+    inspecting ``model_path``'s own contents -- used only when neither an
+    explicit ``--fit-check-bin`` nor an engine profile's own ``fitCheck``
+    named one. Returns ``(builtin_name, error_detail)``: exactly one of
+    the two is ``None``. ``builtin_name`` is one of the ``builtin:`` names
+    ``_resolve_fit_check_bin_value`` understands (never a second,
+    hand-copied filename mapping).
+
+    A pack carrying BOTH a safetensors layout and a top-level ``*.gguf``
+    file resolves to ``builtin:safetensors`` -- deliberately: MLX's native
+    weight format is safetensors, and this repository's own
+    ``is_model_dir`` layout check already gives an MLX
+    ``config.json`` layout priority over a co-located ``*.gguf`` file (it
+    is recognized as a model dir regardless of one); auto-selection here
+    must not silently invert that existing precedence. See
+    ``test_pack_with_both_layouts_prefers_safetensors_builtin``.
+
+    A pack with zero countable ``*.safetensors`` files (``_pack_has_safetensors``
+    ``False``) but at least one raw ``*.safetensors``-named entry on disk
+    (a symlink, or one hidden under a dot-named directory) is refused with
+    the honest, actionable diagnostic from ``_uncounted_safetensors_message``
+    instead of falling through to the generic "neither layout" message --
+    the generic message would read as false when the pack visibly contains
+    a file named ``model.safetensors``.
+    """
+    if _pack_has_safetensors(model_path):
+        return "builtin:safetensors", None
+    if _pack_has_gguf(model_path):
+        return "builtin:gguf", None
+    uncounted_message = _uncounted_safetensors_message(model_path)
+    if uncounted_message is not None:
+        return None, uncounted_message
+    return None, (
+        "no --fit-check-bin was given, no engine profile named one, and "
+        f"{model_path} contains neither a *.safetensors layout nor a "
+        "top-level *.gguf file for a built-in sizer to auto-select; pass "
+        "--fit-check-bin"
+    )
 
 
 # ---------------------------------------------------------------------
@@ -1472,10 +1663,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--fit-check-bin",
         default=None,
         help=(
-            "the fit-check binary to run, overriding both "
+            "the fit-check binary to run (an absolute path, or one of "
+            "'builtin:safetensors'/'builtin:gguf'), overriding both "
             "FASTMLX_FIT_CHECK_BIN and the engine profile's own "
             "fitCheck.bin (default: the profile's fitCheck.bin, else the "
-            "built-in engine)"
+            "built-in engine if found on PATH, else a built-in "
+            "pure-Python sizer auto-selected from the pack's own "
+            "contents)"
         ),
     )
     serve.add_argument(
@@ -1483,6 +1677,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="an extra argv token appended to the fit-check invocation (repeatable)",
+    )
+    serve.add_argument(
+        "--kv-reserve-gib",
+        type=float,
+        default=None,
+        help=(
+            "the KV-cache reserve (GiB) forwarded to the fit check as its "
+            "own --kv-reserve-gib; required whenever a built-in sizer "
+            "(builtin:safetensors / builtin:gguf) resolves this launch's "
+            "fit check -- a fit check must never silently assume a zero "
+            "KV-cache reserve; refused if given while a non-built-in "
+            "fit-check binary is in use"
+        ),
     )
     serve.add_argument(
         "--force",
@@ -1716,21 +1923,30 @@ def _run_serve(args, passthrough_args: list) -> int:
 
     # --- fit-check ---------------------------------------------------
     # Precedence: --fit-check-bin (CLI) > FASTMLX_FIT_CHECK_BIN (env) >
-    # the engine profile's own fitCheck.bin > the built-in engine. An
-    # override from the CLI or the environment drops the profile's
-    # fitCheck.args entirely -- those args are sized for the profile's own
-    # sizer, never for whatever binary overrode it -- and is announced on
-    # stderr so an operator does not wonder why a profile's fitCheck.args
-    # were silently ignored.
+    # the engine profile's own fitCheck.bin > the built-in engine (found on
+    # PATH) > a built-in pure-Python sizer auto-selected from the pack's own
+    # contents (see _select_builtin_fit_check_bin) -- the same last-resort
+    # `fastmlx recommend` already uses, so a pack outside the Swift binary's
+    # fixed catalog (or a host with no Swift binary built at all) can still
+    # be fit-checked instead of refusing outright. An override from the CLI
+    # or the environment drops the profile's fitCheck.args entirely -- those
+    # args are sized for the profile's own sizer, never for whatever binary
+    # overrode it -- and is announced on stderr so an operator does not
+    # wonder why a profile's fitCheck.args were silently ignored.
     profile_fit_check = profile.get("fitCheck")
     cli_or_env_fit_check_bin = args.fit_check_bin or os.environ.get("FASTMLX_FIT_CHECK_BIN")
     profile_fit_check_args: list = []
     cli_fit_check_args = list(args.fit_check_arg)
     if cli_or_env_fit_check_bin:
-        fit_check_bin = cli_or_env_fit_check_bin
+        # A `builtin:` name given via --fit-check-bin/FASTMLX_FIT_CHECK_BIN
+        # is resolved the same way an engine profile's own fitCheck.bin is
+        # -- it must never be passed to run_fit_check raw (that would try
+        # to exec a literal path named "builtin:safetensors" and fail with
+        # a confusing "binary not found").
+        override_source = "--fit-check-bin" if args.fit_check_bin else "FASTMLX_FIT_CHECK_BIN"
+        fit_check_bin = _resolve_fit_check_bin_value(cli_or_env_fit_check_bin, override_source)
         fit_check_extra_args = list(cli_fit_check_args)
         if profile_fit_check is not None:
-            override_source = "--fit-check-bin" if args.fit_check_bin else "FASTMLX_FIT_CHECK_BIN"
             print(
                 f"fastmlx serve: {override_source} overrides engine profile "
                 f"{profile['name']!r}'s own fitCheck; its fitCheck.args are not "
@@ -1744,6 +1960,20 @@ def _run_serve(args, passthrough_args: list) -> int:
     else:
         fit_check_bin = shutil.which(_BUILT_IN_ENGINE_BINARY_NAME)
         fit_check_extra_args = list(cli_fit_check_args)
+        if not fit_check_bin:
+            # No CLI/env override, no profile fitCheck, and the built-in
+            # Swift engine binary isn't on PATH (e.g. it was never built,
+            # or this pack is outside its fixed ~19-id catalog): auto-select
+            # one of this repository's own pure-Python sizers from the
+            # pack's own contents instead of refusing outright. Precedence
+            # is unchanged for every existing setup -- this fallback is
+            # only ever reached when shutil.which already returned None.
+            builtin_name, select_error = _select_builtin_fit_check_bin(model_path)
+            if select_error is not None:
+                raise LaunchRefusal(3, f"fit check could not run: {select_error}")
+            fit_check_bin = _resolve_fit_check_bin_value(
+                builtin_name, "<fastmlx serve auto-selected built-in sizer>"
+            )
 
     if not fit_check_bin:
         raise LaunchRefusal(
@@ -1770,6 +2000,45 @@ def _run_serve(args, passthrough_args: list) -> int:
             2,
             f"{source_label} specifies {item!r} ({value_desc}), which differs "
             f"from the launch's own --residency {residency!r}",
+        )
+
+    # Whether the resolved fit_check_bin is one of this repository's own
+    # built-in pure-Python sizers -- true whether it got here via an
+    # explicit builtin: name (CLI/env or engine profile) or the auto-select
+    # fallback above. Those sizers require --kv-reserve-gib (a fit check
+    # must never silently assume a zero KV-cache reserve, mirroring
+    # `fastmlx recommend`'s own requirement -- see build_row); the Swift
+    # built-in engine binary does not accept the flag at all, so it is
+    # never appended outside this branch. Checked after the residency
+    # conflict above so an operator sees the residency conflict's exit 2
+    # first when a launch happens to trip both checks at once.
+    fit_check_is_builtin = fit_check_bin in _BUILTIN_FIT_CHECK_BIN_PATHS
+    kv_reserve_already_in_args = any(
+        item.split("=", 1)[0] == "--kv-reserve-gib" for item in fit_check_extra_args
+    )
+    if fit_check_is_builtin:
+        if args.kv_reserve_gib is None and not kv_reserve_already_in_args:
+            builtin_name = _BUILTIN_FIT_CHECK_BIN_PATHS[fit_check_bin]
+            raise LaunchRefusal(
+                3,
+                f"fit check could not run: a built-in sizer ({builtin_name}) "
+                "is in use, which requires --kv-reserve-gib (a fit check "
+                "must never silently assume a zero KV-cache reserve); pass "
+                "--kv-reserve-gib",
+            )
+        if args.kv_reserve_gib is not None:
+            fit_check_extra_args = fit_check_extra_args + [
+                "--kv-reserve-gib",
+                str(args.kv_reserve_gib),
+            ]
+    elif args.kv_reserve_gib is not None:
+        raise LaunchRefusal(
+            2,
+            f"--kv-reserve-gib was given but the resolved fit-check binary "
+            f"{fit_check_bin} is not one of this repository's built-in "
+            "sizers (builtin:safetensors / builtin:gguf), which do not "
+            "accept it; pass --kv-reserve-gib only when a built-in sizer "
+            "is in use",
         )
 
     fit_result = run_fit_check(

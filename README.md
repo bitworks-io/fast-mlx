@@ -191,7 +191,11 @@ stays bounded.
 OpenAI-compatible engine you serve with. It needs only the Python 3 standard library. The fit check
 itself runs `fastmlx-serve --fit-check-only`, so build that first
 (`swift build -c release --package-path spike --product fastmlx-serve`). Then put
-`spike/.build/release` on `PATH`, or pass `--fit-check-bin`.
+`spike/.build/release` on `PATH`, or pass `--fit-check-bin`. If you do neither, both `serve` and
+`recommend` fall back to one of this repository's own pure-Python sizers, auto-selected from the
+pack's own contents -- so you can fit-check a pack without building any Swift at all. That
+fallback requires `--kv-reserve-gib` (see below); it is never taken when a fit-check binary was
+named or found.
 
 ```sh
 # Pull an exact Hugging Face revision: every file is hash-checked, and an interrupted pull resumes.
@@ -345,14 +349,42 @@ earlier fit or quality problem with this pack.
 
 Precedence when more than one source names a fit-check binary: `--fit-check-bin` (the invocation's
 own flag) beats `FASTMLX_FIT_CHECK_BIN` (environment) beats the profile's own `fitCheck.bin` beats
-the built-in engine. Overriding a profile's `fitCheck.bin` from the CLI or the environment also drops
+the built-in engine, and -- only when every one of those has come up empty, including the built-in
+engine not being on `PATH` -- a built-in pure-Python sizer auto-selected from the pack's own
+contents. That last tier is a last resort, never a preference: it cannot change what any setup
+that already resolved a binary does. It exists so a pack outside the Swift binary's fixed model-id
+catalog, or a host with no Swift build at all, is still fit-checked rather than refused outright,
+which is what makes the quality-card admission gate reachable for such a pack at all. Every tier
+that NAMES a binary -- `--fit-check-bin`, `FASTMLX_FIT_CHECK_BIN`, and a profile's own
+`fitCheck.bin` -- accepts the symbolic names `builtin:safetensors`/`builtin:gguf` and resolves
+them to the same sizers this last tier picks.
+
+Whenever a built-in sizer is what ends up resolved -- however it got there -- `fastmlx serve`
+REQUIRES `--kv-reserve-gib <GiB>` and refuses at exit 3 without it, because a fit check that
+silently assumed a zero KV-cache reserve would report a GREEN that means nothing. The same flag is
+refused at exit 2 if you pass it while a non-built-in binary is resolved: the built-in engine
+binary does not accept it. (Supplying the reserve through `--fit-check-arg` instead satisfies the
+requirement too, in either the two-token `--fit-check-arg=--kv-reserve-gib --fit-check-arg=<GiB>`
+form this README's own examples use or the `=`-joined `--fit-check-arg=--kv-reserve-gib=<GiB>`
+one, and `--kv-reserve-gib` is then not appended a second time.)
+
+A built-in sizer also requires `--context <tokens>`. Those sizers answer only "does this pack fit
+at the KV reserve you named" and emit no context ceiling, where the built-in engine's fit check
+reports one that `fastmlx serve` derives the context from; with no ceiling to derive from, the
+launch refuses at exit 3 with `context could not be determined`. So a launch sized by a built-in
+sizer needs both flags -- `--kv-reserve-gib` and `--context` -- neither of which a launch sized by
+the built-in engine needs.
+
+Overriding a profile's `fitCheck.bin` from the CLI or the environment also drops
 that profile's `fitCheck.args` (they are sized for the profile's own sizer, not whatever overrode
 it), and one stderr line names the override so it is never silent. `fastmlx recommend` accepts the
 same `--engine-profile` flag and reuses only its `fitCheck` (it never execs an engine), so a single
 profile document is the one place a pack's own sizer and args need to be declared for both commands.
 `fastmlx recommend` does NOT read `FASTMLX_FIT_CHECK_BIN`: with that environment variable set,
 `fastmlx serve` and `fastmlx recommend` can end up sizing with different binaries unless both are
-also given the same explicit `--fit-check-bin`.
+also given the same explicit `--fit-check-bin`. That is now the ONLY way the two commands diverge
+on sizer choice: the auto-selection they both fall back to is one shared implementation, not two
+that could drift apart.
 
 A sizer's own args are never automatically residency-aware: an engine profile's `fitCheck.args`
 sizes whatever residency it names (or resident, if none), regardless of the launch's own

@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.tests.test_fastmlx_gguf_fit import build_gguf_bytes
+from scripts.tests.test_fastmlx_safetensors_fit import build_safetensors_bytes, zero_tensor_bytes
 
 
 LAUNCH_PATH = Path(__file__).resolve().parents[1] / "fastmlx_launch.py"
@@ -26,6 +27,7 @@ FASTMLX_LAUNCH = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(FASTMLX_LAUNCH)
 
 GGUF_FIT_CHECK_PATH = Path(__file__).resolve().parents[1] / "fastmlx_gguf_fit.py"
+SAFETENSORS_FIT_CHECK_PATH = Path(__file__).resolve().parents[1] / "fastmlx_safetensors_fit.py"
 
 
 NO_GO_CARD_ID = "fixture-no-go@test"
@@ -3134,6 +3136,347 @@ class GgufFitCheckCallSiteTests(unittest.TestCase):
             (LAUNCH_PATH.parent / "fastmlx_gguf_fit.py").resolve()
         )
         self.assertTrue(GGUF_FIT_CHECK_PATH.samefile(expected_bin))
+
+
+# ---------------------------------------------------------------------
+# 0b/kv-reserve coverage: the "0b. Built-in sizer auto-selection" fallback
+# in _select_builtin_fit_check_bin (reached only when no --fit-check-bin,
+# no FASTMLX_FIT_CHECK_BIN, and no engine profile fitCheck named a sizer,
+# AND the built-in Swift engine (fastmlx-serve) is not on PATH), and the
+# --kv-reserve-gib requirement/forwarding/refusal that comes with any
+# built-in sizer -- whichever way it resolved (auto-select, an explicit
+# builtin: CLI/env value, or an engine profile's own fitCheck.bin). Real
+# safetensors/GGUF packs (via build_safetensors_bytes/build_gguf_bytes,
+# never a stub) drive the auto-select cases through the launcher's real
+# CLI entry point, the same call-site-coverage posture
+# GgufFitCheckCallSiteTests above uses, so a regression that breaks the
+# real sibling sizer's own argument parsing is still caught here.
+# ---------------------------------------------------------------------
+class BuiltinAutoSelectAndKvReserveTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.assertTrue(
+            SAFETENSORS_FIT_CHECK_PATH.is_file(), f"missing {SAFETENSORS_FIT_CHECK_PATH}"
+        )
+        SAFETENSORS_FIT_CHECK_PATH.chmod(
+            SAFETENSORS_FIT_CHECK_PATH.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
+        self.assertTrue(
+            GGUF_FIT_CHECK_PATH.is_file(), f"missing {GGUF_FIT_CHECK_PATH}"
+        )
+        GGUF_FIT_CHECK_PATH.chmod(
+            GGUF_FIT_CHECK_PATH.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
+        )
+
+        # A real, tiny safetensors pack: config.json (so is_model_dir
+        # admits it) plus one countable *.safetensors shard (so
+        # _pack_has_safetensors is True).
+        self.safetensors_dir = self.root / "safetensors-pack"
+        self.safetensors_dir.mkdir()
+        (self.safetensors_dir / "config.json").write_text("{}", encoding="utf-8")
+        blob = build_safetensors_bytes(
+            [("t.a", "I8", [1024], zero_tensor_bytes("I8", [1024]))]
+        )
+        (self.safetensors_dir / "model.safetensors").write_bytes(blob)
+
+        # A real, tiny GGUF pack: one top-level *.gguf file, no config.json
+        # -- is_model_dir admits it on the GGUF arm alone.
+        self.gguf_dir = self.root / "gguf-pack"
+        self.gguf_dir.mkdir()
+        tensors = [
+            {"name": "token_embd.weight", "dims": [4], "type": 0, "offset": 0}  # F32
+        ]
+        gguf_blob = build_gguf_bytes(tensors=tensors, data_section=bytes(16))
+        (self.gguf_dir / "pack.gguf").write_bytes(gguf_blob)
+
+        # A pack with NEITHER layout: config.json alone (admits is_model_dir)
+        # but zero *.safetensors and zero *.gguf entries anywhere -- the
+        # auto-select fallback's own "neither layout" refusal.
+        self.neither_dir = self.root / "neither-pack"
+        self.neither_dir.mkdir()
+        (self.neither_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    @staticmethod
+    def _env_without_stray_fastmlx_vars() -> dict:
+        # See GgufFitCheckCallSiteTests._env_without_stray_fastmlx_vars: the
+        # fit-check subprocess inherits os.environ, and a stray FASTMLX_*
+        # value already present in the test process would make the ceiling
+        # computed below nondeterministic.
+        return {k: v for k, v in os.environ.items() if not k.startswith("FASTMLX_")}
+
+    def _argv(self, model_dir: Path, extra: list, dry_run: bool = True) -> list:
+        # --context is always given explicitly: neither real sizer's own
+        # attestation line carries a fit_context_ceiling field (unlike the
+        # GREEN_FIT_CHECK_BODY stub used elsewhere in this file), so a
+        # GREEN-classified launch with no --context would otherwise refuse
+        # at the separate "context could not be determined" check.
+        argv = [
+            "serve",
+            "--model-path", str(model_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--engine-bin", str(self.fake_engine_bin),
+            "--context", "2048",
+        ] + extra
+        if dry_run:
+            argv.append("--dry-run")
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def _engine_not_on_path(self):
+        # The auto-select fallback is only reached when
+        # shutil.which(_BUILT_IN_ENGINE_BINARY_NAME) already returned None
+        # -- patched directly (rather than mutating PATH) so this can never
+        # be defeated by a real fastmlx-serve binary the host happens to
+        # have built, the same reliability reason the subprocess.run/
+        # shutil.which patches elsewhere in this file exist.
+        return patch.object(FASTMLX_LAUNCH.shutil, "which", return_value=None)
+
+    # ------------------------------------------------------------------
+    # 1/2: auto-select fallback reached, real fit check actually runs.
+    # ------------------------------------------------------------------
+    def test_auto_select_resolves_builtin_safetensors_and_runs_it(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            [
+                "--kv-reserve-gib", "0",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=16384",
+            ],
+        )
+        with self._engine_not_on_path(), patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        expected_bin = str(SAFETENSORS_FIT_CHECK_PATH.resolve())
+        self.assertEqual(called_argv[0], expected_bin)
+        plan = json.loads(stdout.splitlines()[-1])
+        self.assertEqual(plan["fit"]["fields"].get("fit"), "green")
+
+    def test_auto_select_resolves_builtin_gguf_and_runs_it(self):
+        argv = self._argv(
+            self.gguf_dir,
+            [
+                "--kv-reserve-gib", "0",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=16384",
+            ],
+        )
+        with self._engine_not_on_path(), patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        expected_bin = str(GGUF_FIT_CHECK_PATH.resolve())
+        self.assertEqual(called_argv[0], expected_bin)
+        plan = json.loads(stdout.splitlines()[-1])
+        self.assertEqual(plan["fit"]["fields"].get("fit"), "green")
+
+    # ------------------------------------------------------------------
+    # 3: auto-select refusal when neither layout is present.
+    # ------------------------------------------------------------------
+    def test_auto_select_refuses_pack_with_neither_layout(self):
+        argv = self._argv(self.neither_dir, [])
+        with self._engine_not_on_path():
+            code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("fit check could not run", stderr)
+        self.assertIn(
+            "neither a *.safetensors layout nor a top-level *.gguf file", stderr
+        )
+
+    # ------------------------------------------------------------------
+    # 4: auto-select is a LAST resort -- an on-PATH fastmlx-serve still
+    # wins, so a built-in sizer is never auto-selected out from under it.
+    # ------------------------------------------------------------------
+    def test_engine_on_path_wins_over_builtin_auto_select(self):
+        stub_bin = write_script(self.root / "fastmlx-serve-stub.py", GREEN_FIT_CHECK_BODY)
+        argv = self._argv(self.neither_dir, [])
+        with patch.object(
+            FASTMLX_LAUNCH.shutil, "which", return_value=str(stub_bin)
+        ), patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy:
+            code, stdout, stderr = self.run_main(argv)
+        # No --kv-reserve-gib was given: if a built-in sizer had been
+        # auto-selected instead of the on-PATH engine, this would refuse
+        # with exit 3 (see test 5 below). A clean exit 0 here proves the
+        # on-PATH engine -- not a built-in sizer -- was actually used.
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        self.assertEqual(called_argv[0], str(stub_bin))
+        self.assertNotIn(called_argv[0], FASTMLX_LAUNCH._BUILTIN_FIT_CHECK_BIN_PATHS)
+
+    # ------------------------------------------------------------------
+    # 5: --kv-reserve-gib is required once a built-in sizer resolves.
+    # ------------------------------------------------------------------
+    def test_kv_reserve_gib_required_for_auto_selected_builtin(self):
+        argv = self._argv(self.safetensors_dir, [])
+        with self._engine_not_on_path():
+            code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 3)
+        self.assertIn("requires --kv-reserve-gib", stderr)
+        self.assertIn("builtin:safetensors", stderr)
+
+    # ------------------------------------------------------------------
+    # 6: --kv-reserve-gib, once given, is forwarded to the fit check.
+    # ------------------------------------------------------------------
+    def test_kv_reserve_gib_is_forwarded_to_builtin_fit_check_argv(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            [
+                "--kv-reserve-gib", "0",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=16384",
+            ],
+        )
+        with self._engine_not_on_path(), patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        self.assertIn("--kv-reserve-gib", called_argv)
+        idx = called_argv.index("--kv-reserve-gib")
+        self.assertEqual(called_argv[idx + 1], "0.0")
+
+    # ------------------------------------------------------------------
+    # 7: --kv-reserve-gib is refused against a non-built-in fit-check bin.
+    # ------------------------------------------------------------------
+    def test_kv_reserve_gib_refused_for_non_builtin_fit_check_bin(self):
+        green_bin = write_script(self.root / "fit-green-explicit.py", GREEN_FIT_CHECK_BODY)
+        argv = self._argv(
+            self.safetensors_dir,
+            ["--fit-check-bin", str(green_bin), "--kv-reserve-gib", "4"],
+        )
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("is not one of this repository's built-in sizers", stderr)
+
+    # ------------------------------------------------------------------
+    # 8/9: `builtin:` on the serve front door (CLI flag and env var) must
+    # resolve to the real sibling .py sizer, never get exec'd raw.
+    # ------------------------------------------------------------------
+    def test_cli_fit_check_bin_builtin_safetensors_resolves_to_sibling(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            [
+                "--fit-check-bin", "builtin:safetensors",
+                "--kv-reserve-gib", "0",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=16384",
+            ],
+        )
+        with patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertNotIn("fit check binary not found: builtin:safetensors", stderr)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        self.assertEqual(called_argv[0], str(SAFETENSORS_FIT_CHECK_PATH.resolve()))
+
+    def test_env_fit_check_bin_builtin_safetensors_resolves_to_sibling(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            [
+                "--kv-reserve-gib", "0",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=16384",
+            ],
+        )
+        env_patch = dict(self._env_without_stray_fastmlx_vars())
+        env_patch["FASTMLX_FIT_CHECK_BIN"] = "builtin:safetensors"
+        with patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, env_patch, clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertNotIn("fit check binary not found: builtin:safetensors", stderr)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        self.assertEqual(called_argv[0], str(SAFETENSORS_FIT_CHECK_PATH.resolve()))
+
+    # ------------------------------------------------------------------
+    # 10/11: --fit-check-arg can itself satisfy the --kv-reserve-gib
+    # requirement, both the two-token and the "="-joined form.
+    # ------------------------------------------------------------------
+    def test_fit_check_arg_two_token_form_satisfies_kv_reserve_requirement(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            [
+                "--fit-check-arg=--kv-reserve-gib",
+                "--fit-check-arg=8",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=32768",
+            ],
+        )
+        with self._engine_not_on_path(), patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertNotIn("requires --kv-reserve-gib", stderr)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        occurrences = [
+            item for item in called_argv
+            if item == "--kv-reserve-gib" or item.startswith("--kv-reserve-gib=")
+        ]
+        self.assertEqual(len(occurrences), 1)
+
+    def test_fit_check_arg_equals_form_satisfies_kv_reserve_requirement(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            [
+                "--fit-check-arg=--kv-reserve-gib=8",
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg=32768",
+            ],
+        )
+        with self._engine_not_on_path(), patch.object(
+            FASTMLX_LAUNCH.subprocess, "run", wraps=FASTMLX_LAUNCH.subprocess.run
+        ) as spy, patch.dict(os.environ, self._env_without_stray_fastmlx_vars(), clear=True):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertNotIn("requires --kv-reserve-gib", stderr)
+        self.assertEqual(code, 0, stderr)
+        called_argv = spy.call_args.args[0]
+        occurrences = [
+            item for item in called_argv
+            if item == "--kv-reserve-gib" or item.startswith("--kv-reserve-gib=")
+        ]
+        self.assertEqual(len(occurrences), 1)
+
+    # ------------------------------------------------------------------
+    # 12: ordering -- the residency-conflict refusal (exit 2) is reported
+    # BEFORE the kv-reserve requirement (exit 3) when a launch trips both.
+    # ------------------------------------------------------------------
+    def test_residency_conflict_reported_before_kv_reserve_requirement(self):
+        argv = self._argv(
+            self.safetensors_dir,
+            ["--fit-check-arg=--residency=expert-stream"],
+        )
+        # Neither --kv-reserve-gib nor an equivalent --fit-check-arg is
+        # given, so this launch ALSO trips the kv-reserve requirement (see
+        # test 5) -- proving which refusal actually surfaces first.
+        with self._engine_not_on_path():
+            code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("resident", stderr)
+        self.assertIn("expert-stream", stderr)
+        self.assertNotIn("requires --kv-reserve-gib", stderr)
 
 
 # ---------------------------------------------------------------------
