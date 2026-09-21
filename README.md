@@ -370,10 +370,13 @@ one, and `--kv-reserve-gib` is then not appended a second time.)
 
 A built-in sizer also requires `--context <tokens>`. Those sizers answer only "does this pack fit
 at the KV reserve you named" and emit no context ceiling, where the built-in engine's fit check
-reports one that `fastmlx serve` derives the context from; with no ceiling to derive from, the
-launch refuses at exit 3 with `context could not be determined`. So a launch sized by a built-in
-sizer needs both flags -- `--kv-reserve-gib` and `--context` -- neither of which a launch sized by
-the built-in engine needs.
+reports one that `fastmlx serve` derives the context from. So a launch sized by a built-in sizer
+needs both flags -- `--kv-reserve-gib` and `--context` -- neither of which a launch sized by the
+built-in engine needs.
+
+Both are checked together, before the fit check runs, and a single exit-3 refusal names every one
+you are missing rather than one per attempt -- so you do not discover the second requirement only
+after paying for a fit-check run that was always going to be repeated.
 
 Overriding a profile's `fitCheck.bin` from the CLI or the environment also drops
 that profile's `fitCheck.args` (they are sized for the profile's own sizer, not whatever overrode

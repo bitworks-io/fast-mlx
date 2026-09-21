@@ -4299,5 +4299,177 @@ class EngineProfileExampleFilesTests(unittest.TestCase):
                 )
 
 
+# ---------------------------------------------------------------------
+# A launch sized by a built-in sizer needs TWO flags a built-in-engine
+# launch does not: --kv-reserve-gib and --context. Until this class
+# landed, an operator discovered them ONE REFUSAL AT A TIME -- and the
+# --context one only AFTER paying for a full fit-check run, since it was
+# enforced from the fit check's (absent) context ceiling. Both are now
+# collected and reported in a single up-front refusal. See
+# docs/task-inbox/2026-09-21-builtin-sizer-yields-no-context-ceiling.md
+# option (c).
+# ---------------------------------------------------------------------
+class BuiltinSizerCombinedRequirementRefusalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "safetensors-pack"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+        blob = build_safetensors_bytes(
+            [("t.a", "I8", [1024], zero_tensor_bytes("I8", [1024]))]
+        )
+        (self.model_dir / "model.safetensors").write_bytes(blob)
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    def run_main(self, argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def _argv(self, extra):
+        return [
+            "serve",
+            "--model-path", str(self.model_dir),
+            "--quality-cards", str(self.manifest_path),
+            "--engine-bin", str(self.fake_engine_bin),
+            "--fit-check-bin", "builtin:safetensors",
+            "--dry-run",
+        ] + extra
+
+    def test_both_missing_requirements_named_in_one_refusal(self):
+        code, _, stderr = self.run_main(self._argv([]))
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("--kv-reserve-gib", stderr)
+        self.assertIn("--context", stderr)
+        # It must name which sizer, as the reserve-only refusal always did.
+        self.assertIn("builtin:safetensors", stderr)
+
+    def test_missing_context_alone_refuses_before_running_the_fit_check(self):
+        # The reserve IS supplied, so the only thing missing is --context.
+        # This must still refuse UP FRONT rather than after a fit check: a
+        # built-in sizer never emits a ceiling, so running it first only
+        # burns a fit check the operator was always going to have to redo.
+        code, _, stderr = self.run_main(self._argv(["--kv-reserve-gib", "8"]))
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("--context", stderr)
+        # The OLD late check ran only after the fit check and said this;
+        # seeing it would mean the refusal is still the post-fit-check one.
+        self.assertNotIn("context could not be determined", stderr)
+
+    def test_missing_reserve_alone_still_refuses_naming_the_reserve(self):
+        code, _, stderr = self.run_main(self._argv(["--context", "2048"]))
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("--kv-reserve-gib", stderr)
+
+    def test_both_supplied_passes_the_requirement_check(self):
+        # Positive control: with both flags the launch gets PAST this
+        # refusal. Without it, the three tests above would pass even if the
+        # check refused unconditionally.
+        code, _, stderr = self.run_main(
+            self._argv(["--kv-reserve-gib", "8", "--context", "2048"])
+        )
+        self.assertNotIn("which requires", stderr)
+        self.assertNotIn("context could not be determined", stderr)
+
+
+# ---------------------------------------------------------------------
+# ANTI-DRIFT. The up-front --context requirement above rests on a fact
+# about a DIFFERENT program: this repository's built-in sizers answer only
+# "does this pack fit at the KV reserve you named" and emit no context
+# ceiling. If that ever stops being true -- option (b) of the same record
+# proposes exactly that -- the up-front refusal becomes WRONG: it would
+# refuse a launch whose context could in fact have been derived.
+# ---------------------------------------------------------------------
+class BuiltinSizersEmitNoContextCeilingTests(unittest.TestCase):
+    """Pins the assumption the up-front --context refusal depends on.
+
+    If this test fails, a built-in sizer has started emitting a context
+    ceiling. Do NOT adjust this test to match. Remove or rework the
+    up-front --context requirement in scripts/fastmlx_launch.py (search
+    for _builtin_sizer_missing_requirements) so `fastmlx serve` derives
+    the context from the ceiling instead of refusing, and only then
+    update this test.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.safetensors_dir = self.root / "safetensors-pack"
+        self.safetensors_dir.mkdir()
+        (self.safetensors_dir / "config.json").write_text("{}", encoding="utf-8")
+        (self.safetensors_dir / "model.safetensors").write_bytes(
+            build_safetensors_bytes(
+                [("t.a", "I8", [1024], zero_tensor_bytes("I8", [1024]))]
+            )
+        )
+
+        self.gguf_dir = self.root / "gguf-pack"
+        self.gguf_dir.mkdir()
+        (self.gguf_dir / "pack.gguf").write_bytes(
+            build_gguf_bytes(
+                tensors=[
+                    {"name": "token_embd.weight", "dims": [4], "type": 0, "offset": 0}
+                ],
+                data_section=bytes(16),
+            )
+        )
+
+    def _attestation_fields(self, sizer_path, model_dir):
+        # Run the REAL sizer, not a stub: the whole point is to detect
+        # drift in what the actual shipped program emits.
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(sizer_path),
+                "--model-path",
+                str(model_dir),
+                "--kv-reserve-gib",
+                "1",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            f"real sizer {sizer_path.name} did not run: {proc.stderr}",
+        )
+        fields = {}
+        for line in (proc.stdout + proc.stderr).splitlines():
+            for token in line.split():
+                if "=" in token:
+                    key, _, value = token.partition("=")
+                    fields[key] = value
+        return fields, proc
+
+    def test_real_safetensors_sizer_emits_no_context_ceiling(self):
+        fields, proc = self._attestation_fields(
+            SAFETENSORS_FIT_CHECK_PATH, self.safetensors_dir
+        )
+        # Guard against a vacuous pass: the sizer must have emitted SOME
+        # attested fields, or "no ceiling" would be true of empty output.
+        self.assertTrue(
+            fields, f"real sizer emitted no key=value fields at all: {proc.stdout!r}"
+        )
+        self.assertNotIn("fit_context_ceiling", fields)
+
+    def test_real_gguf_sizer_emits_no_context_ceiling(self):
+        fields, proc = self._attestation_fields(GGUF_FIT_CHECK_PATH, self.gguf_dir)
+        self.assertTrue(
+            fields, f"real sizer emitted no key=value fields at all: {proc.stdout!r}"
+        )
+        self.assertNotIn("fit_context_ceiling", fields)
+
+
 if __name__ == "__main__":
     unittest.main()

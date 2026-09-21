@@ -361,6 +361,56 @@ def _uncounted_safetensors_message(model_path: Path) -> Optional[str]:
     )
 
 
+# The two flags a launch sized by one of this repository's built-in
+# pure-Python sizers needs, and which a launch sized by the built-in engine
+# does not. Both are collected and reported TOGETHER: before this existed an
+# operator met them one refusal at a time, and the --context one only after
+# paying for a full fit-check run, because it was enforced downstream from
+# the fit check's (absent) context ceiling. See
+# docs/task-inbox/2026-09-21-builtin-sizer-yields-no-context-ceiling.md
+# option (c).
+_BUILTIN_REQUIREMENT_REASONS = {
+    "--kv-reserve-gib": (
+        "a fit check must never silently assume a zero KV-cache reserve"
+    ),
+    "--context": (
+        "these sizers answer only whether the pack fits at the reserve you "
+        "named and emit no context ceiling to derive one from"
+    ),
+}
+
+
+def _join_flag_list(flags) -> str:
+    """``['--a']`` -> ``'--a'``; ``['--a', '--b']`` -> ``'--a and --b'``."""
+    flags = list(flags)
+    if len(flags) == 1:
+        return flags[0]
+    return " and ".join(flags)
+
+
+def _builtin_sizer_missing_requirements(
+    *, kv_reserve_gib, kv_reserve_already_in_args: bool, context
+) -> list:
+    """Every requirement a built-in sizer launch is missing, in the order
+    they are reported -- never just the first one found.
+
+    ``--context`` is required UP FRONT, even when the reserve was supplied,
+    rather than downstream from the fit check's missing context ceiling. A
+    built-in sizer never emits a ceiling (pinned by
+    ``BuiltinSizersEmitNoContextCeilingTests``), so letting the fit check run
+    first would only burn a fit check the operator was always going to have
+    to run again. The separate downstream "context could not be determined"
+    check stays exactly as it was, for a NON-built-in binary that happens to
+    omit the field.
+    """
+    missing = []
+    if kv_reserve_gib is None and not kv_reserve_already_in_args:
+        missing.append("--kv-reserve-gib")
+    if context is None:
+        missing.append("--context")
+    return missing
+
+
 def _select_builtin_fit_check_bin(model_path: Path) -> tuple:
     """Auto-select one of this repository's built-in pure-Python sizers by
     inspecting ``model_path``'s own contents -- used only when neither an
@@ -2017,14 +2067,19 @@ def _run_serve(args, passthrough_args: list) -> int:
         item.split("=", 1)[0] == "--kv-reserve-gib" for item in fit_check_extra_args
     )
     if fit_check_is_builtin:
-        if args.kv_reserve_gib is None and not kv_reserve_already_in_args:
+        missing = _builtin_sizer_missing_requirements(
+            kv_reserve_gib=args.kv_reserve_gib,
+            kv_reserve_already_in_args=kv_reserve_already_in_args,
+            context=args.context,
+        )
+        if missing:
             builtin_name = _BUILTIN_FIT_CHECK_BIN_PATHS[fit_check_bin]
             raise LaunchRefusal(
                 3,
                 f"fit check could not run: a built-in sizer ({builtin_name}) "
-                "is in use, which requires --kv-reserve-gib (a fit check "
-                "must never silently assume a zero KV-cache reserve); pass "
-                "--kv-reserve-gib",
+                f"is in use, which requires {_join_flag_list(missing)}; "
+                + "; ".join(_BUILTIN_REQUIREMENT_REASONS[flag] for flag in missing)
+                + f"; pass {_join_flag_list(missing)}",
             )
         if args.kv_reserve_gib is not None:
             fit_check_extra_args = fit_check_extra_args + [
