@@ -4427,6 +4427,17 @@ class BuiltinSizersEmitNoContextCeilingTests(unittest.TestCase):
     def _attestation_fields(self, sizer_path, model_dir):
         # Run the REAL sizer, not a stub: the whole point is to detect
         # drift in what the actual shipped program emits.
+        #
+        # --wired-limit-mib is passed explicitly because these tests must
+        # run on the Linux CI runner as well as on macOS. Left to itself a
+        # sizer derives the ceiling from iogpu.wired_limit_mb / hw.memsize,
+        # neither of which exists on Linux, and it then refuses (exit 1)
+        # with "could not determine a wired memory ceiling" -- a refusal
+        # about the HOST, not about the pack. Naming the ceiling removes
+        # the host dependency without weakening what is asserted below:
+        # the sizer still runs for real against a real pack, and a context
+        # ceiling would still show up in its attested fields if it ever
+        # emitted one.
         proc = subprocess.run(
             [
                 sys.executable,
@@ -4435,6 +4446,8 @@ class BuiltinSizersEmitNoContextCeilingTests(unittest.TestCase):
                 str(model_dir),
                 "--kv-reserve-gib",
                 "1",
+                "--wired-limit-mib",
+                "16384",
             ],
             capture_output=True,
             text=True,
