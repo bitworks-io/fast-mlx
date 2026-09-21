@@ -1,14 +1,17 @@
+import argparse
 import contextlib
 import importlib.util
 import io
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+from scripts.tests.test_fastmlx_gguf_fit import build_gguf_bytes
 from scripts.tests.test_fastmlx_launch import (
     CAPTURING_FIT_CHECK_BODY,
     GREEN_ATTESTATION_WITH_RESIDENCY_BODY,
@@ -17,6 +20,7 @@ from scripts.tests.test_fastmlx_launch import (
     SYNTHETIC_CARD_REVISION,
     write_expert_stream_card_manifest,
 )
+from scripts.tests.test_fastmlx_safetensors_fit import build_safetensors_bytes, zero_tensor_bytes
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1376,6 +1380,419 @@ class EngineBuildRecommendTestCase(unittest.TestCase):
         row = doc["rows"][0]
         self.assertEqual(row["engineBuild"]["status"], "match")
         self.assertIsNone(row["engineBuild"]["message"])
+
+
+# ---------------------------------------------------------------------
+# AC1/AC2: built-in pure-Python sizer auto-selected from a candidate
+# pack's own contents when neither --fit-check-bin nor an engine-profile
+# fitCheck named one -- recommend must be able to answer with Python
+# alone, never falling back to searching PATH for the Swift engine binary.
+#
+# A standalone TestCase (NOT a subclass of FastmlxRecommendTestCase, which
+# already carries 40+ of its own test_ methods) -- inheriting it here
+# would silently re-run its entire suite under this class's name too,
+# following this file's own established convention (see
+# RecommendResidencyTestCase below, which duplicates its own small setUp
+# rather than subclassing for the same reason).
+# ---------------------------------------------------------------------
+class BuiltinSizerAutoSelectionTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+
+    def make_model_dir(self, name: str, repo: str = None, revision: str = None) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        if repo is not None or revision is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision=revision or ("e" * 40))
+        return model_dir
+
+    def base_argv(self, model_paths, **overrides) -> list:
+        argv = ["recommend", "--quality-cards", str(self.manifest_path)]
+        for path in model_paths:
+            argv += ["--model-path", str(path)]
+        args = {"--fit-check-bin": str(self.green_fit_bin)}
+        args.update(overrides)
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def run_json(self, argv: list):
+        code, stdout, stderr = self.run_main(argv + ["--json"])
+        return code, json.loads(stdout), stderr
+
+    def _safetensors_model_dir(
+        self, name: str = "auto-safetensors-model", repo: str = None
+    ) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        blob = build_safetensors_bytes(
+            [("t.a", "F32", [4], zero_tensor_bytes("F32", [4]))]
+        )
+        (model_dir / "model.safetensors").write_bytes(blob)
+        if repo is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision="e" * 40)
+        return model_dir
+
+    def _write_gguf_file(self, model_dir: Path, name: str = "model.gguf") -> Path:
+        tensors = [{"name": "t.f32", "dims": [4], "type": 0, "offset": 0}]
+        blob = build_gguf_bytes(tensors=tensors, data_section=bytes(16))
+        path = model_dir / name
+        path.write_bytes(blob)
+        return path
+
+    def _gguf_model_dir(self, name: str = "auto-gguf-model") -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        self._write_gguf_file(model_dir)
+        return model_dir
+
+    # ------------------------------------------------------------------
+    # AC1: selection by pack contents.
+    # ------------------------------------------------------------------
+    def test_safetensors_pack_auto_selects_builtin_safetensors_sizer(self):
+        model_dir = self._safetensors_model_dir()
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("builtin:safetensors", row["message"])
+        self.assertIn("--kv-reserve-gib", row["message"])
+
+    def test_gguf_pack_auto_selects_builtin_gguf_sizer(self):
+        model_dir = self._gguf_model_dir()
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("builtin:gguf", row["message"])
+        self.assertIn("--kv-reserve-gib", row["message"])
+
+    def test_pack_with_neither_layout_refuses_naming_what_it_looked_for_and_the_remedy(self):
+        model_dir = self.make_model_dir("bare-config-only", repo=PASS_REPO)
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("*.safetensors", row["message"])
+        self.assertIn("*.gguf", row["message"])
+        self.assertIn("--fit-check-bin", row["message"])
+        # Never a silent fall-back to naming the Swift engine binary.
+        self.assertNotIn("fastmlx-serve", row["message"])
+
+    def test_pack_with_both_layouts_prefers_safetensors_builtin(self):
+        model_dir = self._safetensors_model_dir("both-layouts-model")
+        self._write_gguf_file(model_dir, name="also-present.gguf")
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertIn("builtin:safetensors", row["message"])
+        self.assertNotIn("builtin:gguf", row["message"])
+
+    # ------------------------------------------------------------------
+    # AC1 (this cycle): pack-has-safetensors detection must count only
+    # entries the safetensors sizer's OWN scan (_iter_regular_files) would
+    # actually count -- never a symlink, never anything under (or named
+    # with) a dot-prefixed path component. Fixtures below reproduce the
+    # REAL defect shape: a real blob file plus a *symlink* named
+    # `model.safetensors` pointing at it, exactly the canonical Hugging
+    # Face hub cache layout
+    # (~/.cache/huggingface/hub/models--<repo>/snapshots/<rev>/).
+    # ------------------------------------------------------------------
+    def _symlinked_safetensors_model_dir(
+        # Deliberately does NOT contain the substring "symlink" -- an
+        # earlier draft of this fixture used a name containing it, which
+        # made `self.assertIn("symlink", message)` pass for the wrong
+        # reason (the directory's OWN path was embedded in even the
+        # generic, unrelated fallback message) rather than because the
+        # refusal text itself explained the symlink. See the mutation
+        # check in the cycle report for how this was caught.
+        self, name: str = "hf-cache-style-model", repo: str = None
+    ) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        blob_dir = self.root / f"{name}-blobs"
+        blob_dir.mkdir(exist_ok=True)
+        blob = build_safetensors_bytes(
+            [("t.a", "F32", [4], zero_tensor_bytes("F32", [4]))]
+        )
+        real_blob = blob_dir / "deadbeef0123456789"
+        real_blob.write_bytes(blob)
+        (model_dir / "model.safetensors").symlink_to(real_blob)
+        if repo is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision="e" * 40)
+        return model_dir
+
+    def _dot_hidden_safetensors_model_dir(
+        self, name: str = "dot-hidden-safetensors-model", repo: str = None
+    ) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        hidden_dir = model_dir / ".cache"
+        hidden_dir.mkdir()
+        blob = build_safetensors_bytes(
+            [("t.a", "F32", [4], zero_tensor_bytes("F32", [4]))]
+        )
+        # A REAL, non-symlink regular file -- the miss here is purely the
+        # dot-named directory it lives under, isolating that half of AC1
+        # from the symlink half exercised by
+        # _symlinked_safetensors_model_dir.
+        (hidden_dir / "model.safetensors").write_bytes(blob)
+        if repo is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision="e" * 40)
+        return model_dir
+
+    def test_pack_has_safetensors_is_false_for_symlink_only_pack(self):
+        # Direct unit-level pin on the detection function itself: a
+        # symlinked model.safetensors must never register as "has
+        # safetensors" -- that is exactly what routed the sizer at a
+        # guaranteed "no .safetensors files found" refusal before this fix.
+        model_dir = self._symlinked_safetensors_model_dir()
+        self.assertFalse(FASTMLX_RECOMMEND._pack_has_safetensors(model_dir))
+
+    def test_pack_has_safetensors_is_false_for_dot_hidden_only_pack(self):
+        model_dir = self._dot_hidden_safetensors_model_dir()
+        self.assertFalse(FASTMLX_RECOMMEND._pack_has_safetensors(model_dir))
+
+    def test_pack_has_safetensors_is_true_for_a_real_regular_file(self):
+        # The happy path AC1 must not break: a normal pack of REAL,
+        # non-symlink files still registers as "has safetensors".
+        model_dir = self._safetensors_model_dir("plain-real-file-model")
+        self.assertTrue(FASTMLX_RECOMMEND._pack_has_safetensors(model_dir))
+
+    def test_symlinked_only_pack_still_selects_builtin_safetensors_through_build_row(self):
+        # Reachability through the real CLI entry point (build_row), not
+        # just the bare detection function: a symlink-only pack must not
+        # silently fall through to "neither layout" either -- it is
+        # recognized as a safetensors pack that failed for a SPECIFIC,
+        # honest reason (see the next test for the message contents).
+        model_dir = self._symlinked_safetensors_model_dir()
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertNotIn("--kv-reserve-gib", row["message"])
+        self.assertNotIn("neither a *.safetensors layout", row["message"])
+
+    def test_symlinked_only_pack_refusal_names_symlink_and_a_verified_remedy(self):
+        model_dir = self._symlinked_safetensors_model_dir()
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        message = doc["rows"][0]["message"]
+        # The OLD, misleading message a bare rglob() match used to route
+        # the sizer into (see fastmlx_safetensors_fit.compute_model_bytes)
+        # must be gone: the pack visibly contains model.safetensors, and
+        # this message must never assert its absence.
+        self.assertNotIn("no .safetensors files found", message)
+        self.assertIn("model.safetensors", message)
+        self.assertIn("symlink", message)
+        # The verified remedy: this repository's OWN downloader writes
+        # real, non-symlink files (see hf_pinned_snapshot_download.py); a
+        # bare `--adopt` is explicitly NOT offered as the remedy since it
+        # refuses a symlinked source directory outright
+        # (fastmlx_pull.py's own adopt() verification walk).
+        self.assertIn("fastmlx pull", message)
+        self.assertIn("--adopt", message)
+
+    def test_symlinked_only_pack_with_kv_reserve_never_reaches_sizers_own_no_files_message(self):
+        # The EXACT reported repro: --kv-reserve-gib IS supplied (so the
+        # old code's earlier "requires --kv-reserve-gib" gate cannot mask
+        # anything), and the OLD detection would still route to the real
+        # safetensors sizer subprocess, which refuses with "no
+        # .safetensors files found under <dir>" even though the directory
+        # visibly contains model.safetensors. This pins the whole
+        # end-to-end path: with the fix, this candidate must never reach
+        # that sizer subprocess at all.
+        model_dir = self._symlinked_safetensors_model_dir()
+        argv = self.base_argv(
+            [model_dir], **{"--fit-check-bin": None, "--kv-reserve-gib": "1"}
+        )
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        message = doc["rows"][0]["message"]
+        self.assertNotIn("no .safetensors files found", message)
+        self.assertIn("symlink", message)
+
+    def test_dot_hidden_only_pack_refusal_names_dot_directory_and_a_remedy(self):
+        model_dir = self._dot_hidden_safetensors_model_dir()
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        message = doc["rows"][0]["message"]
+        self.assertNotIn("no .safetensors files found", message)
+        self.assertIn(".cache/model.safetensors", message)
+        self.assertIn("dot-named", message)
+
+    # ------------------------------------------------------------------
+    # AC2: --kv-reserve-gib forwarding, and the acceptance-level case this
+    # whole cycle exists for: recommend answers a real safetensors pack
+    # with NO fastmlx-serve on PATH at all.
+    # ------------------------------------------------------------------
+    def test_kv_reserve_gib_forwarded_to_auto_selected_builtin_and_fit_check_succeeds(self):
+        # This is the exact user story this cycle exists for: a real
+        # safetensors pack, no fastmlx-serve on PATH anywhere in this
+        # process, and recommend still answers "recommended" with Python
+        # alone (see the manual repro in scripts/fastmlx_recommend.py's
+        # module docstring / cycle's acceptance criteria).
+        model_dir = self._safetensors_model_dir(repo=PASS_REPO)
+        argv = (
+            self.base_argv(
+                [model_dir],
+                **{"--fit-check-bin": None, "--kv-reserve-gib": "0.5"},
+            )
+            + [
+                # `=` form: a flag-shaped value token (e.g. `--wired-limit-mib`)
+                # passed as a separate argv entry would make argparse treat it
+                # as a NEW option rather than this --fit-check-arg's value
+                # (see the sibling pattern in test_fastmlx_launch.py's
+                # "--fit-check-arg=--mmap-side-file" usage).
+                "--fit-check-arg=--wired-limit-mib",
+                "--fit-check-arg",
+                "4096",
+                "--fit-check-arg=--wired-margin-gib",
+                "--fit-check-arg",
+                "2",
+            ]
+        )
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 0, doc)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "recommended")
+        self.assertEqual(row["fit"]["verdict"], "GREEN")
+
+    def test_kv_reserve_gib_forwarded_to_explicit_fit_check_bin(self):
+        model_dir = self.make_model_dir("pass-model-explicit", repo=PASS_REPO)
+        capture_path = self.root / "captured-fit-argv.json"
+        capturing_bin = write_script(self.root / "fit-capture.py", CAPTURING_FIT_CHECK_BODY)
+        os.environ["FIT_CHECK_CAPTURE_PATH"] = str(capture_path)
+        try:
+            argv = self.base_argv(
+                [model_dir],
+                **{"--fit-check-bin": str(capturing_bin), "--kv-reserve-gib": "1.5"},
+            )
+            code, doc, _ = self.run_json(argv)
+        finally:
+            del os.environ["FIT_CHECK_CAPTURE_PATH"]
+        self.assertEqual(code, 0, doc)
+        captured_argv = json.loads(capture_path.read_text(encoding="utf-8"))
+        self.assertIn("--kv-reserve-gib", captured_argv)
+        self.assertIn("1.5", captured_argv)
+
+
+# ---------------------------------------------------------------------
+# AC3: the no-model-identity hint must never name a flag `recommend`
+# itself does not accept (unlike the shared launch.NO_MODEL_IDENTITY_HINT,
+# which names --model-revision -- a `fastmlx serve`-only flag). The
+# accepted-flag set is derived from recommend's OWN parser, never
+# hand-copied, so this test cannot rot independently of the real CLI.
+#
+# A standalone TestCase, not a subclass of FastmlxRecommendTestCase --
+# see the comment on BuiltinSizerAutoSelectionTestCase above for why.
+# ---------------------------------------------------------------------
+class RecommendNoIdentityHintFlagsTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+
+    def base_argv(self, model_paths, **overrides) -> list:
+        argv = ["recommend", "--quality-cards", str(self.manifest_path)]
+        for path in model_paths:
+            argv += ["--model-path", str(path)]
+        args = {"--fit-check-bin": str(self.green_fit_bin)}
+        args.update(overrides)
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def _recommend_subparser():
+        parser = FASTMLX_RECOMMEND.build_arg_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action.choices["recommend"]
+        raise AssertionError("fastmlx_recommend's parser has no 'recommend' subparser")
+
+    @classmethod
+    def _recommend_accepted_flags(cls) -> set:
+        flags = set()
+        for action in cls._recommend_subparser()._actions:
+            flags.update(action.option_strings)
+        return flags
+
+    def _no_identity_model_dir(self, name: str) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        return model_dir
+
+    def test_no_identity_hint_names_no_flag_recommend_does_not_accept(self):
+        model_dir = self._no_identity_model_dir("no-identity-flag-check")
+        argv = self.base_argv([model_dir])
+        _, _, stderr = self.run_main(argv)
+        accepted = self._recommend_accepted_flags()
+        # Strip any single-quoted example command (e.g. a suggested
+        # `fastmlx pull ...` invocation for a DIFFERENT command) before
+        # scanning for flag-looking tokens -- a flag that legitimately
+        # belongs to a different named command inside a quoted example is
+        # never a claim about THIS command's own flags.
+        without_examples = re.sub(r"'[^']*'", "", stderr)
+        claimed_flags = set(re.findall(r"--[A-Za-z][A-Za-z-]*", without_examples))
+        unaccepted = claimed_flags - accepted
+        self.assertEqual(
+            unaccepted,
+            set(),
+            msg=(
+                f"no-identity hint claims flag(s) recommend does not accept: "
+                f"{unaccepted} (stderr={stderr!r})"
+            ),
+        )
+
+    def test_no_identity_hint_no_longer_mentions_model_revision(self):
+        model_dir = self._no_identity_model_dir("no-identity-model-revision-check")
+        argv = self.base_argv([model_dir])
+        _, _, stderr = self.run_main(argv)
+        self.assertNotIn("--model-revision", stderr)
+        self.assertIn("no model identity", stderr)
+        self.assertIn("fastmlx pull", stderr)
+        self.assertIn("--adopt", stderr)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-18T22:45:00Z",
+  "generatedAt": "2026-09-21T00:16:00Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -123,7 +123,7 @@
         "headline": "Qwen3.8-Flash-Next, 3.3-bit pack: about 1 next word in 15 differs from an 8-bit conversion of the official weights.",
         "nextWordDrift": {
           "oneInK": 15,
-          "top1AgreementPct": 93.50
+          "top1AgreementPct": 93.5
         },
         "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows the mixed 4/8-bit pack is closer to this reference (p = 2.2e-14); an earlier peer-vs-peer comparison (this pack vs. the mixed 4/8-bit pack directly, not vs. this 8-bit reference) found 6.2% (150/2432) disagreement, superseded by this reference-based measurement",
         "example": {
@@ -147,7 +147,7 @@
         ],
         "tvLowerBoundMedian": 0.0164,
         "tvLowerBoundP95": 0.2443,
-        "klLowerBoundMedianNats": 0.0060,
+        "klLowerBoundMedianNats": 0.006,
         "klLowerBoundP95Nats": 0.1754,
         "boundsWeakenedPositions": "1526/2432 = 62.7%",
         "logprobTopK": 20,
@@ -450,6 +450,86 @@
         "unmeasured": [
           "decode throughput (speedX)",
           "tool-call quality"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-0p6b-4bit@m5",
+      "model": {
+        "family": "Qwen3-0.6B",
+        "repo": "mlx-community/Qwen3-0.6B-4bit",
+        "hfPin": "73e3e38d"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m5",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 13.91% top-1 disagreement (86.09% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 7 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 7,
+          "top1AgreementPct": 86.0938
+        },
+        "regressionFocus": "open-ended enumerative and advisory writing (17-25% next-word drift); canonical technical explanations drift least (5-9%)",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract a real disagreement from the peer-divergence cell's raw observations corresponding to peer-divergence-qwen3-0p6b-4bit-vs-8bit-2026-09-20.json"
+        },
+        "benefit": {
+          "fit": "0.33 GB on disk - fits a 24 GB Mac with room to spare",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 2560,
+        "disagreements": 356,
+        "disagreement_rate": 0.1390625,
+        "tier": "SIGNIFICANT",
+        "wilson_lo": 0.12619890966069058,
+        "wilson_hi": 0.1530076911834834,
+        "tv_lower_bound_median": 0.048132136250098045,
+        "tv_lower_bound_p95": 0.450021616743724,
+        "tv_lower_bound_raw_min": -1.0222757298450347e-06,
+        "kl_lower_bound_median_nats": 0.024091585796186296,
+        "kl_lower_bound_p95_nats": 0.5774919564632153
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M5 / 24 GiB / macOS 26.6.2",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-v1",
+        "sourceVerdict": "peer-divergence-qwen3-0p6b-4bit-vs-8bit-2026-09-20.json",
+        "measuredAt": "2026-09-21T00:16:00Z",
+        "engineBuild": {
+          "commit": "21af3abd339a0752319ba6b4abe3b3880b16da3b"
+        }
+      },
+      "boundary": {
+        "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
         ]
       }
     }

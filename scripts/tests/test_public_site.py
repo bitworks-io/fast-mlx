@@ -4941,9 +4941,23 @@ class PublicSiteTests(unittest.TestCase):
             any("duplicates another card" in f for f in failures), failures
         )
 
-    def test_real_manifest_flash_next_cards_carry_expected_engine_build_sha(self) -> None:
+    # The Flash Next cards were measured on a third-party serving engine
+    # (fa76a4b5); the consumer-class 0.6B card was measured on fast-mlx's
+    # own fastmlx-serve release build. provenance.engineBuild is OPTIONAL
+    # on ANY card (docs/quality-card-schema-v1.md:362) -- what this test
+    # pins is that no card acquires one by ACCIDENT, which is the live
+    # hazard: emit_quality_card.py --engine-commit stamps every card that
+    # run emits (scripts/emit_quality_card.py:946).
+    EXPECTED_ENGINE_BUILD_BY_CARD_ID = {
+        "qwen38-flash-next-mixed-4-8bit@m3ultra": ENGINE_BUILD_VALID_COMMIT,
+        "qwen38-flash-next-iq-3p3bpw@m3ultra": ENGINE_BUILD_VALID_COMMIT,
+        "qwen3-0p6b-4bit@m5": "21af3abd339a0752319ba6b4abe3b3880b16da3b",
+    }
+
+    def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:
         loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
         self.assertIsNotNone(loaded)
+        # (1) unchanged: every Flash Next card carries the build it was measured on.
         flash_next_cards = [
             card for card in loaded["cards"] if card["model"]["family"] == "Qwen3.8-Flash-Next"
         ]
@@ -4954,12 +4968,21 @@ class PublicSiteTests(unittest.TestCase):
                 {"commit": self.ENGINE_BUILD_VALID_COMMIT},
                 card["id"],
             )
-        other_family_cards = [
-            card for card in loaded["cards"] if card["model"]["family"] != "Qwen3.8-Flash-Next"
-        ]
-        self.assertTrue(other_family_cards, "expected at least one non-Flash-Next card")
-        for card in other_family_cards:
-            self.assertNotIn("engineBuild", card["provenance"], card["id"])
+        # (2) every recorded build, on every card, is the expected one -- a new
+        # card, a dropped field, or a wrongly-stamped sha all fail here.
+        self.assertEqual(
+            {
+                card["id"]: card["provenance"]["engineBuild"]["commit"]
+                for card in loaded["cards"]
+                if "engineBuild" in card["provenance"]
+            },
+            self.EXPECTED_ENGINE_BUILD_BY_CARD_ID,
+        )
+        # (3) "absent means unrecorded" stays exercised by a real card.
+        self.assertTrue(
+            [card for card in loaded["cards"] if "engineBuild" not in card["provenance"]],
+            "expected at least one card with no recorded engine build",
+        )
 
 
 class ArgparseUsageErrorExitCodeTests(unittest.TestCase):
