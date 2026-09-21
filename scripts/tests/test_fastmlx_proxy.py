@@ -1245,6 +1245,50 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
     without ever sleeping/polling for it).
     """
 
+    # ------------------------------------------------------------------
+    # Slot-release assertions are about WHETHER a slot is released, never
+    # about how promptly. Asserted directly against a single sequential
+    # request, they are timing-coupled: under CPU contention the releasing
+    # path may not have run by the time the follow-up is admitted, and the
+    # test fails with a 503 even though nothing leaked. That flaked on a
+    # loaded CI runner and blocked a publication, which is worse than a
+    # slow test -- a flaky DoS-regression test trains readers to dismiss a
+    # real failure.
+    #
+    # So retry each sequential request against a bounded deadline. This
+    # does NOT mask a genuinely leaked slot: a leaked slot is never
+    # released, so every retry inside the deadline still gets 503 and the
+    # assertion still fails. It only removes the requirement that the
+    # release beat a fixed wall clock.
+    # ------------------------------------------------------------------
+    def assert_sequential_requests_admitted(self, proxy, count, context, deadline=10.0):
+        for i in range(count):
+            end = time.monotonic() + deadline
+            status = None
+            attempts = 0
+            while True:
+                conn = http.client.HTTPConnection(
+                    "127.0.0.1", proxy.server_address[1], timeout=5
+                )
+                conn.request("POST", "/v1/chat/completions", body=b"{}")
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                status = resp.status
+                attempts += 1
+                if status == 200 or time.monotonic() >= end:
+                    break
+                time.sleep(0.02)
+            self.assertEqual(
+                status,
+                200,
+                f"sequential request {i} after {context} must be admitted -- a "
+                f"leaked slot would refuse it with 503 instead (still {status} "
+                f"after {attempts} attempts over {deadline:.0f}s, so the slot "
+                "was never released, not merely released late)",
+            )
+
+
     def setUp(self):
         self._servers = []
         self.addCleanup(self._cleanup)
@@ -1445,13 +1489,7 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         self.assertEqual(results[1][0], 200)
         self.assertEqual(results[2][0], 200)
 
-        for i in range(3):  # cap (2) + 1
-            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
-            conn.request("POST", "/v1/chat/completions", body=b"{}")
-            resp = conn.getresponse()
-            resp.read()
-            conn.close()
-            self.assertEqual(resp.status, 200, f"sequential request {i} after release must be admitted")
+        self.assert_sequential_requests_admitted(proxy, 3, "release")  # cap (2) + 1
 
     # ------------------------------------------------------------------
     # Slot-unwind path 1: ``ThreadingMixIn.process_request`` itself can
@@ -1535,17 +1573,9 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
             f"{proxy.inflight_requests} != 0",
         )
 
-        for i in range(3):  # cap (2) + 1
-            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
-            conn.request("POST", "/v1/chat/completions", body=b"{}")
-            resp = conn.getresponse()
-            resp.read()
-            conn.close()
-            self.assertEqual(
-                resp.status, 200,
-                f"sequential request {i} after 2 induced thread-start failures must be "
-                "admitted -- a leaked slot would refuse it with 503 instead",
-            )
+        self.assert_sequential_requests_admitted(
+            proxy, 3, "2 induced thread-start failures"
+        )  # cap (2) + 1
 
     # ------------------------------------------------------------------
     # Slot-unwind path 2: ``socketserver.BaseServer.process_request_thread``
@@ -1620,17 +1650,9 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
             f"{proxy.inflight_requests} != 0",
         )
 
-        for i in range(2):  # cap (1) + 1
-            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
-            conn.request("POST", "/v1/chat/completions", body=b"{}")
-            resp = conn.getresponse()
-            resp.read()
-            conn.close()
-            self.assertEqual(
-                resp.status, 200,
-                f"sequential request {i} after a BaseException from the handler must be "
-                "admitted -- a leaked slot would refuse it with 503 instead",
-            )
+        self.assert_sequential_requests_admitted(
+            proxy, 2, "a BaseException from the handler"
+        )  # cap (1) + 1
 
     # ------------------------------------------------------------------
     # Slot-unwind path 3: the handler raises an ORDINARY ``Exception``
@@ -1707,17 +1729,9 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
             f"{proxy.inflight_requests} != 0",
         )
 
-        for i in range(2):  # cap (1) + 1
-            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
-            conn.request("POST", "/v1/chat/completions", body=b"{}")
-            resp = conn.getresponse()
-            resp.read()
-            conn.close()
-            self.assertEqual(
-                resp.status, 200,
-                f"sequential request {i} after an ordinary Exception from the handler must "
-                "be admitted -- a leaked slot would refuse it with 503 instead",
-            )
+        self.assert_sequential_requests_admitted(
+            proxy, 2, "an ordinary Exception from the handler"
+        )  # cap (1) + 1
 
     # ------------------------------------------------------------------
     # Documented behaviour, previously uncovered: a streaming (SSE)
