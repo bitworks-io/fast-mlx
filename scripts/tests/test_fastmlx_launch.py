@@ -4145,25 +4145,44 @@ class HostHardwareClassTestCase(unittest.TestCase):
     raised exception.
     """
 
+    # The normalization contract, stated ONCE and shared by both tests below.
+    # These are the exact strings the published cards carry, so this table is the
+    # contract itself rather than a convenience fixture.
+    REPRESENTATIVE_CHIPS = {
+        "Apple M3 Ultra": "apple-m3-ultra",
+        "Apple M5": "apple-m5",
+    }
+
     @staticmethod
     def _import_emit_quality_card():
+        """The emitter module, or ``None`` when it is not importable.
+
+        ``scripts/emit_quality_card.py`` is NOT part of the sanitized public
+        projection, so the PROJECTED copy of this test file runs in a tree where
+        the module genuinely does not exist. Returning ``None`` (rather than
+        letting ``ModuleNotFoundError`` escape) is what lets the agreement test
+        below skip only on that tree, while the contract test still asserts real
+        behavior everywhere. See
+        ``docs/task-inbox/2026-09-22-projected-test-imported-an-unprojected-module.md``.
+        """
         scripts_dir = str(LAUNCH_PATH.parent)
         inserted = scripts_dir not in sys.path
         if inserted:
             sys.path.insert(0, scripts_dir)
         try:
             import emit_quality_card
+        except ModuleNotFoundError:
+            return None
         finally:
             if inserted:
                 sys.path.remove(scripts_dir)
         return emit_quality_card
 
-    # Criterion 6: pinned by IMPORTING the emitter's own function, not by
-    # copying its literal output, so the two copies cannot drift unnoticed.
-    def test_normalization_matches_emitter_for_representative_chips(self):
-        emit_quality_card = self._import_emit_quality_card()
-        for chip in ("Apple M3 Ultra", "Apple M5"):
-            expected = emit_quality_card._hardware_class(chip)
+    # Criterion 6, half one: the normalization contract itself. Runs on EVERY
+    # tree, including the projected public one -- never skipped, so this can
+    # never silently vanish.
+    def test_normalization_matches_representative_chips(self):
+        for chip, expected in self.REPRESENTATIVE_CHIPS.items():
 
             def fake_run(argv, chip=chip, **kwargs):
                 return subprocess.CompletedProcess(argv, 0, stdout=chip + "\n", stderr="")
@@ -4171,6 +4190,26 @@ class HostHardwareClassTestCase(unittest.TestCase):
             with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
                 actual = FASTMLX_LAUNCH.host_hardware_class()
             self.assertEqual(actual, expected)
+
+    # Criterion 6, half two: the ANTI-DRIFT pin. `host_hardware_class` is a
+    # deliberate second copy of `emit_quality_card._hardware_class`'s rule, so
+    # the two must agree -- pinned against the SAME table above, which is what
+    # makes this a real pin rather than a tautology (asserting the emitter
+    # against itself would pass however either side drifted).
+    def test_emitter_normalization_agrees_with_the_same_contract(self):
+        emit_quality_card = self._import_emit_quality_card()
+        if emit_quality_card is None:
+            self.skipTest(
+                "emit_quality_card is not in the sanitized public projection; "
+                "the contract itself is asserted by "
+                "test_normalization_matches_representative_chips, which never skips"
+            )
+        for chip, expected in self.REPRESENTATIVE_CHIPS.items():
+            self.assertEqual(
+                emit_quality_card._hardware_class(chip),
+                expected,
+                "the emitter's normalization drifted from host_hardware_class's contract",
+            )
 
     def test_nonzero_returncode_fails_closed_to_none(self):
         def fake_run(argv, **kwargs):
