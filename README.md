@@ -410,9 +410,10 @@ recommending it.
 An engine profile also accepts an OPTIONAL `engineBuild` object naming the build THIS profile
 launches: `{"commit": "<40-hex git sha>", "binarySha256": "<64-hex sha256>"}`, both sub-keys
 optional. `commit` is operator-asserted only — never checked against anything, just compared
-against a quality card's own `provenance.engineBuild.commit` (see
-`docs/quality-card-schema-v1.md` "Engine build") so `serve`/`recommend` can tell you when a card's
-measurement and this launch's engine build differ. `binarySha256`, when given, IS verified:
+against a quality card's own `provenance.engineBuild.commit`, so `serve`/`recommend` can tell you
+when a card's measurement and this launch's engine build differ. Engine build is used only to
+report that difference and to pick between two cards for the same pack; it never filters a card out
+of admission. `binarySha256`, when given, IS verified:
 `fastmlx serve` hashes the resolved engine binary before exec'ing it and refuses (exit 3, not
 overridable by `--force`) on a mismatch. The example profiles under `examples/engine-profiles/`
 intentionally omit `engineBuild` — an asserted commit there would be false for every operator's

@@ -720,6 +720,64 @@ def card_engine_build_commit(card: Optional[dict]) -> Optional[str]:
     return commit if isinstance(commit, str) else None
 
 
+def card_hardware_class(card: Optional[dict]) -> Optional[str]:
+    """The hardware class ``card`` was measured on (``config.hardwareClass``),
+    or ``None`` when the card carries no ``config``, no ``hardwareClass``, or
+    an empty/non-string one -- fails open to "unrecorded" rather than
+    raising, the same way ``card_engine_build_commit`` fails open to
+    "unrecorded": this field is OPTIONAL, and a card predating it (or a
+    hand-added fixture) is never required to carry it.
+
+    ``resolve_card`` uses this ONLY to disambiguate a multi-candidate match
+    (see its docstring) -- exactly like ``card_engine_build_commit``, and
+    unlike ``card_residency``, this never filters the candidate list.
+    """
+    if card is None:
+        return None
+    config = card.get("config")
+    if not isinstance(config, dict):
+        return None
+    hardware_class = config.get("hardwareClass")
+    return hardware_class if isinstance(hardware_class, str) and hardware_class else None
+
+
+def host_hardware_class() -> Optional[str]:
+    """This host's hardware class, normalized to the SAME string the
+    published quality cards carry (e.g. ``"apple-m3-ultra"``, ``"apple-m5"``).
+
+    Composes two sibling implementations this MUST stay byte-consistent
+    with (a dedicated test pins the normalization against the second one):
+
+    - ``fastmlx_bench._chip_identity()``: ``sysctl -n
+      machdep.cpu.brand_string`` -> e.g. ``"Apple M3 Ultra"``.
+    - ``emit_quality_card._hardware_class(chip)``: ``chip.lower().replace("
+      ", "-")`` -> e.g. ``"apple-m3-ultra"``.
+
+    This is a deliberate separate copy, not an import of either module --
+    see the "Deliberately OUT of scope" note in
+    ``docs/task-inbox/2026-09-22-PREDECLARATION-hardwareclass-joins-identity-never-filters.md``.
+
+    Fails closed to ``None`` -- never a guess, never a hostname -- on ANY
+    failure: non-macOS (no ``sysctl`` on PATH), a nonzero return code, a
+    timeout, empty stdout, or any other subprocess error. Never raises.
+    """
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "machdep.cpu.brand_string"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    brand = result.stdout.strip()
+    if not brand:
+        return None
+    return brand.lower().replace(" ", "-")
+
+
 def engine_build_status(card_commit: Optional[str], launch_commit: Optional[str]) -> str:
     """Classify a card's measured engine build against a launch's own, per
     ``docs/quality-card-schema-v1.md`` "Engine build":
@@ -897,6 +955,7 @@ def resolve_card(
     model_revision: Optional[str],
     residency: str = "resident",
     engine_build_commit: Optional[str] = None,
+    host_hardware_class=host_hardware_class,
 ) -> Optional[dict]:
     """The implicit (no ``--card-id``) lookup: a repo match (Swift semantics)
     OR an hfPin-prefix match against the model's pinned revision. If both
@@ -908,12 +967,27 @@ def resolve_card(
     Cards are filtered to ``residency`` (``card_residency(card) ==
     residency``) BEFORE either lookup and before the ambiguity check: a
     card measured for the other residency is invisible to this lookup, the
-    same way a card for a different model is.
+    same way a card for a different model is. ``hardwareClass`` NEVER
+    filters this way -- see below.
 
     A repo or pin match can now name MORE THAN ONE card -- the same pack
-    measured on more than one engine build. When it does, the single card
-    whose ``provenance.engineBuild.commit`` equals ``engine_build_commit``
-    (this launch's own engine build) is selected. An undeclared launch
+    measured on more than one hardware class and/or engine build. When it
+    does, ``hardwareClass`` is tried FIRST: if the candidates do not all
+    share one hardware class, and exactly one candidate's
+    ``card_hardware_class`` equals this host's (``host_hardware_class()``),
+    that one is selected. An unknown host class, or zero/more-than-one
+    matching candidates, narrows nothing -- it falls through unchanged to
+    the existing engine-build tiebreak below. Like
+    ``engineBuild.commit``, ``hardwareClass`` is used ONLY to disambiguate
+    an otherwise-tied identity match; it is never used to FILTER the
+    candidate list the way ``residency`` does. An Ultra card measured on an
+    Ultra host is not "for the wrong hardware" on an M5 host -- it is
+    weaker, still-valid evidence, and stays reachable as the sole candidate
+    whenever it is the only match for the pack.
+
+    If hardware class does not narrow to one, the single card whose
+    ``provenance.engineBuild.commit`` equals ``engine_build_commit`` (this
+    launch's own engine build) is selected next. An undeclared launch
     (``None``) selects none of them, not even an unrecorded card; anything else (no exact match, or more than one) refuses
     (exit 3) rather than silently picking one -- engine build is never used
     to FILTER a card the way residency does, only to disambiguate an
@@ -944,6 +1018,21 @@ def resolve_card(
     if len(candidates) == 1:
         return candidates[0]
 
+    # hardwareClass disambiguates a multi-candidate tie exactly like
+    # engineBuild.commit does below -- NEVER a filter. Only consult the host
+    # (and only narrow) when the candidates actually disagree on class; an
+    # unknown host class, or zero/more-than-one matching candidates, changes
+    # nothing and falls through untouched.
+    candidate_classes = {card_hardware_class(card) for card in candidates}
+    if len(candidate_classes) > 1:
+        host_class = host_hardware_class()
+        if host_class is not None:
+            class_matches = [
+                card for card in candidates if card_hardware_class(card) == host_class
+            ]
+            if len(class_matches) == 1:
+                return class_matches[0]
+
     # An undeclared launch never picks among several cards, not even the one
     # whose build is also unrecorded: that would let an unrecorded card
     # silently shadow a measured one.
@@ -956,7 +1045,9 @@ def resolve_card(
     if len(exact_matches) == 1:
         return exact_matches[0]
     build_labels = sorted(
-        (card_engine_build_commit(card) or "undeclared")[:12] for card in candidates
+        f"{card_hardware_class(card) or 'unrecorded'}@"
+        f"{(card_engine_build_commit(card) or 'undeclared')[:12]}"
+        for card in candidates
     )
     raise LaunchRefusal(
         3,

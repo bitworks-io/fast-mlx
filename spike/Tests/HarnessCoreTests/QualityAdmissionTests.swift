@@ -12,14 +12,19 @@ final class QualityAdmissionTests: XCTestCase {
     private func card(
         id: String = "qwen38-27b-optiq-4bit@m3ultra", repo: String = "mlx-community/Qwen3.8-27B-OptiQ-4bit",
         verdict: QualityVerdict, admissionDefault: Bool = false, optIn: Bool = true,
-        tier: String = "Noticeable", headline: String = "About 1 word in 6 differs."
+        tier: String = "Noticeable", headline: String = "About 1 word in 6 differs.",
+        hardwareClass: String? = nil, residency: String? = nil
     ) -> QualityCard {
-        QualityCard(
+        let config: QualityCard.Config? =
+            (hardwareClass != nil || residency != nil)
+            ? .init(residency: residency, hardwareClass: hardwareClass) : nil
+        return QualityCard(
             id: id,
             model: .init(repo: repo, hfPin: "b04599de"),
             verdict: verdict,
             admission: .init(default: admissionDefault, optIn: optIn, reason: "test fixture"),
-            legible: .init(tier: tier, headline: headline))
+            legible: .init(tier: tier, headline: headline),
+            config: config)
     }
 
     // MARK: - discriminator truth table (docs/quality-card-schema-v1.md)
@@ -318,6 +323,141 @@ final class QualityAdmissionTests: XCTestCase {
         let data = Data(explicit.utf8)
         let c = QualityCardStore.card(forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: data)
         XCTAssertEqual(c?.id, "qwen38-27b-optiq-4bit-explicit@m3ultra")
+    }
+
+    // MARK: - hardwareClass identity/tiebreak (docs/task-inbox/2026-09-22-PREDECLARATION-…): two
+    // same-repo, same-residency cards differing only in `config.hardwareClass` are NOT duplicates —
+    // the uniqueness key widens to admit them — but `hostHardwareClass` must never FILTER admission,
+    // only break a tie deterministically, and only when there IS a tie.
+
+    /// Criterion 7 — THE ORDER TEST. Two same-repo resident cards, different hardwareClass, one PASS
+    /// one NO_GO. With no host hint (`hostHardwareClass: nil`), selection must never let manifest
+    /// array order decide: both orderings must resolve to the SAME card, and it must be the NO_GO
+    /// one (a broken quantization keeps refusing on hardware it was never measured on).
+    func testHardwareClassOrderInsensitiveSelectsNoGoRegardlessOfArrayOrder() {
+        let passCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m5", verdict: .pass, hardwareClass: "apple-m5")
+        let noGoCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .noGo, hardwareClass: "apple-m3-ultra")
+
+        let forwardOrder = [passCard, noGoCard]
+        let reverseOrder = [noGoCard, passCard]
+
+        let forward = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: forwardOrder)
+        let reverse = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: reverseOrder)
+
+        XCTAssertEqual(forward?.id, noGoCard.id, "NO_GO must win regardless of manifest order")
+        XCTAssertEqual(reverse?.id, noGoCard.id, "NO_GO must win regardless of manifest order")
+        XCTAssertEqual(forward?.id, reverse?.id, "selection must be identical under both orderings")
+
+        // And the end-to-end outcome must actually refuse, not merely "pick a card".
+        XCTAssertEqual(
+            QualityAdmission.decide(card: forward, optIn: false),
+            .refuseQualityFlagged(
+                "Noticeable: About 1 word in 6 differs. re-run with --accept-quality \(noGoCard.id) to elect it."
+            ))
+    }
+
+    /// Criterion 4 — the non-filter invariant. A SINGLE card measured on a different hardware class
+    /// than the host must still resolve — hardwareClass never FILTERS, only tiebreaks when there is
+    /// more than one candidate.
+    func testSingleCardOnDifferentHardwareClassStillResolves() {
+        let onlyCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .pass, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: "apple-m5",
+            in: [onlyCard])
+        XCTAssertEqual(resolved?.id, onlyCard.id, "a single card must resolve regardless of host class")
+    }
+
+    /// The NO_GO form of the non-filter invariant: an Ultra NO_GO card must still refuse on an M5
+    /// host — filtering by hardwareClass here would silently disarm the refusal.
+    func testSingleNoGoCardOnDifferentHardwareClassStillRefuses() {
+        let onlyCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .noGo, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: "apple-m5",
+            in: [onlyCard])
+        XCTAssertEqual(resolved?.id, onlyCard.id)
+        guard case .refuseQualityFlagged = QualityAdmission.decide(card: resolved, optIn: false) else {
+            return XCTFail(
+                "an Ultra NO_GO card must still refuse on a non-matching host, not be silently disarmed")
+        }
+    }
+
+    /// Host-match tiebreak: two candidates, `hostHardwareClass` matches exactly one -> that one wins,
+    /// even though it is not the NO_GO card — an exact host match is a stronger signal than the
+    /// NO_GO-prefers-safety fallback, which only applies when there is no unique host match.
+    func testHostHardwareClassMatchesExactlyOneCandidateSelectsThatOne() {
+        let m5Card = card(id: "qwen38-27b-optiq-4bit@apple-m5", verdict: .pass, hardwareClass: "apple-m5")
+        let ultraCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .pass, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: "apple-m5",
+            in: [ultraCard, m5Card])
+        XCTAssertEqual(resolved?.id, m5Card.id)
+    }
+
+    /// A card whose `config` is absent entirely (older card, predates `hardwareClass`) must still
+    /// participate safely: nil-safe, never a decode/selection crash, and still order-insensitive
+    /// against a card that DOES carry hardwareClass.
+    func testCardWithNoConfigAtAllParticipatesSafelyInHardwareClassTiebreak() {
+        let noConfigCard = card(id: "qwen38-27b-optiq-4bit@legacy", verdict: .pass)
+        XCTAssertNil(noConfigCard.config?.hardwareClass)
+        let ultraNoGo = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .noGo, hardwareClass: "apple-m3-ultra")
+
+        let forward = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: [noConfigCard, ultraNoGo])
+        let reverse = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", in: [ultraNoGo, noConfigCard])
+        XCTAssertEqual(forward?.id, ultraNoGo.id)
+        XCTAssertEqual(reverse?.id, ultraNoGo.id)
+    }
+
+    /// `config.hardwareClass` decodes leniently exactly like `residency`: absent or explicit null ->
+    /// nil, never a decode failure.
+    func testHardwareClassDecodesLenientlyAbsentOrNull() throws {
+        let absent = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "config": { "residency": "resident" },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Near-lossless", "headline": "h" }
+            }
+            """)
+        XCTAssertNil(absent.config?.hardwareClass)
+
+        let explicitNull = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "config": { "residency": "resident", "hardwareClass": null },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Near-lossless", "headline": "h" }
+            }
+            """)
+        XCTAssertNil(explicitNull.config?.hardwareClass)
+
+        let present = try decodeCard(
+            """
+            {
+              "id": "x@m3ultra",
+              "model": { "repo": "mlx-community/x", "hfPin": "abc" },
+              "config": { "residency": "resident", "hardwareClass": "apple-m3-ultra" },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "t" },
+              "legible": { "tier": "Near-lossless", "headline": "h" }
+            }
+            """)
+        XCTAssertEqual(present.config?.hardwareClass, "apple-m3-ultra")
     }
 
     // MARK: - QualityCard.matchesResidentLaunch / effectiveResidency (decode-level, independent of

@@ -4941,6 +4941,79 @@ class PublicSiteTests(unittest.TestCase):
             any("duplicates another card" in f for f in failures), failures
         )
 
+    # ------------------------------------------------------------------
+    # config.hardwareClass joins the uniqueness key as a fourth component
+    # (docs/quality-card-schema-v1.md "Uniqueness"): an Ultra card and an M5
+    # card for the same identity/residency/engineBuild are two measurements
+    # of two different facts, not duplicates. It must NEVER become a filter
+    # (docs/task-inbox/2026-09-22-PREDECLARATION-hardwareclass-joins-identity-never-filters.md).
+    # ------------------------------------------------------------------
+
+    def test_hardware_class_variant_of_a_duplicate_card_is_accepted_by_both_validators(
+        self,
+    ) -> None:
+        manifest = self.quality_guide_manifest()
+        variant = json.loads(json.dumps(manifest["cards"][0]))
+        variant["id"] = "qwen38-27b-optiq-4bit@m5"
+        variant["config"]["hardwareClass"] = "apple-m5"
+        manifest["cards"].append(variant)
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 5)
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(failures, [])
+
+    def test_duplicate_including_hardware_class_is_still_rejected_by_both_validators(
+        self,
+    ) -> None:
+        # Control: the card `id` already embeds an `@<hardwareClass>` suffix,
+        # so an implementation that keys uniqueness on `id` (instead of the
+        # (identity, residency, hardwareClass, engineBuild) tuple) would pass
+        # the accept-test above while having silently deleted the whole
+        # uniqueness rule. Give the duplicate a DISTINCT id so this test is
+        # about the key, not the id.
+        manifest = self.quality_guide_manifest()
+        duplicate = json.loads(json.dumps(manifest["cards"][0]))
+        duplicate["id"] = "qwen38-27b-optiq-4bit-hw-dup@m3ultra"
+        manifest["cards"].append(duplicate)
+        with self.assertRaises(SystemExit):
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("duplicates another card" in f for f in failures), failures
+        )
+
+    def test_hardware_class_duplicate_check_agrees_between_both_validators(self) -> None:
+        # Nothing else cross-checks the two implementations; a change to one
+        # alone must not go unnoticed. Runs the SAME fixture pair through
+        # both validators for the accept case and the refuse case.
+        cases = {
+            "different-hardware-class-accepts": "apple-m5",
+            "same-hardware-class-refuses": "apple-m3-ultra",
+        }
+        for label, hardware_class in cases.items():
+            with self.subTest(label=label):
+                manifest = self.quality_guide_manifest()
+                variant = json.loads(json.dumps(manifest["cards"][0]))
+                variant["id"] = "qwen38-27b-optiq-4bit-crosscheck@variant"
+                variant["config"]["hardwareClass"] = hardware_class
+                manifest["cards"].append(variant)
+
+                build_refused = False
+                try:
+                    build_public_site.validate_quality_card_document(manifest, "test manifest")
+                except SystemExit:
+                    build_refused = True
+
+                failures = validate_public_site.validate_quality_guide_manifest(manifest)
+                validate_refused = bool(failures)
+
+                self.assertEqual(
+                    build_refused,
+                    validate_refused,
+                    f"{label}: build_public_site refused={build_refused} "
+                    f"validate_public_site refused={validate_refused} failures={failures}",
+                )
+
     # The Flash Next cards were measured on a third-party serving engine
     # (fa76a4b5); the consumer-class 0.6B card was measured on fast-mlx's
     # own fastmlx-serve release build. provenance.engineBuild is OPTIONAL

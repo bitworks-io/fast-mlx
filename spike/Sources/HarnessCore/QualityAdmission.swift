@@ -62,16 +62,23 @@ public struct QualityCard: Sendable, Decodable, Equatable {
         }
     }
 
-    /// The slice of `config` this gate consults: `residency`, the only field that changes whether a
-    /// card is even ELIGIBLE to gate a resident Swift launch. Decoded leniently — a missing or `null`
-    /// `residency` is `nil` here (→ "resident" via `QualityCard.effectiveResidency`), and any other
-    /// emitter-side `config` field (`quant`, `enhancement`, `hardwareClass`, …) is ignored, never
+    /// The slice of `config` this gate consults: `residency` (the only field that changes whether a
+    /// card is even ELIGIBLE to gate a resident Swift launch) and `hardwareClass` (a uniqueness-key /
+    /// tiebreak input — see `QualityCardStore.card(forRepo:hostHardwareClass:in:)` — never an
+    /// eligibility filter). Both decode leniently: a missing or `null` value is `nil`, never a decode
+    /// failure. Any other emitter-side `config` field (`quant`, `enhancement`, …) is ignored, never
     /// failing this decode.
     public struct Config: Sendable, Decodable, Equatable {
         public let residency: String?
+        /// The hardware class this card was MEASURED on (e.g. `"apple-m3-ultra"`), or `nil` for a
+        /// card that predates this field. A host property, not a launch parameter: it is a
+        /// uniqueness-key component and a multi-candidate tiebreak, and it must NEVER filter
+        /// admission — see the doc comment on `QualityCardStore.card(forRepo:hostHardwareClass:in:)`.
+        public let hardwareClass: String?
 
-        public init(residency: String? = nil) {
+        public init(residency: String? = nil, hardwareClass: String? = nil) {
             self.residency = residency
+            self.hardwareClass = hardwareClass
         }
     }
 
@@ -176,26 +183,66 @@ public enum QualityCardStore {
     /// string) must never match here, however it is ordered in the manifest: it is treated exactly
     /// like "no card for this repo", i.e. `.admitUnmeasured`, never as a resident admission input.
     /// `nil` on an unknown repo, a repo with only non-resident cards, or a decode failure.
-    public static func card(forRepo repoID: String, in manifestData: Data) -> QualityCard? {
+    public static func card(
+        forRepo repoID: String, hostHardwareClass: String? = nil, in manifestData: Data
+    ) -> QualityCard? {
         guard let manifest = try? JSONDecoder().decode(QualityCardManifest.self, from: manifestData)
         else {
             return nil
         }
-        return card(forRepo: repoID, in: manifest.cards)
+        return card(forRepo: repoID, hostHardwareClass: hostHardwareClass, in: manifest.cards)
     }
 
-    /// The single card-selection rule over already-decoded cards: the first card for `repoID` that
-    /// was measured resident. Every Swift call site that picks a card by identity goes through here,
-    /// so the residency filter cannot be bypassed by a caller that loaded the manifest itself.
-    public static func card(forRepo repoID: String, in cards: [QualityCard]) -> QualityCard? {
-        cards.first { $0.model.repo == repoID && $0.matchesResidentLaunch }
+    /// The single card-selection rule over already-decoded cards. Every Swift call site that picks a
+    /// card by identity goes through here, so the residency filter cannot be bypassed by a caller
+    /// that loaded the manifest itself.
+    ///
+    /// Filters to `model.repo == repoID && matchesResidentLaunch`, then:
+    /// 1. 0 or 1 match — return it. This is TODAY'S BEHAVIOR, byte-for-byte identical to
+    ///    `cards.first { ... }`, and must stay exactly that: it is what preserves every existing
+    ///    user's resolution. (An Ultra card and an M5 card for the same pack are legitimately
+    ///    distinct measurements, not duplicates — see
+    ///    `docs/task-inbox/2026-09-22-PREDECLARATION-hardwareclass-joins-identity-never-filters.md`
+    ///    — so reaching >1 match here is an expected, supported case, not an error.)
+    /// 2. More than one match: if `hostHardwareClass` is non-nil and exactly one candidate's
+    ///    `config?.hardwareClass` equals it, return that one. An exact host match is the strongest
+    ///    available signal — this card is evidence gathered on the box that is about to serve.
+    /// 3. Otherwise, manifest array order must NEVER decide the outcome (order is emitter-determined
+    ///    and not stable under re-emission). If any remaining candidate's `verdict == .noGo`, the
+    ///    selection prefers one of those: `QualityAdmission.decide` refuses ONLY on `.noGo`
+    ///    (`:141-163`), so a broken quantization must keep refusing even on hardware it was never
+    ///    measured on — a card measured on other hardware is WEAKER evidence, not VOID evidence, and
+    ///    hardwareClass must never act as an eligibility filter (that would silently disarm every
+    ///    published NO_GO card on every non-matching host, converting a fail-closed gate into a
+    ///    fail-open one). If no candidate is `.noGo`, every remaining candidate admits, so the choice
+    ///    cannot change the outcome. Either way, pick deterministically by the lexicographically
+    ///    smallest card `id`, so the `--accept-quality <id>` refusal message is stable across
+    ///    manifest re-emissions.
+    public static func card(
+        forRepo repoID: String, hostHardwareClass: String? = nil, in cards: [QualityCard]
+    ) -> QualityCard? {
+        let matches = cards.filter { $0.model.repo == repoID && $0.matchesResidentLaunch }
+        if matches.count <= 1 {
+            return matches.first
+        }
+        if let hostHardwareClass {
+            let hostMatches = matches.filter { $0.config?.hardwareClass == hostHardwareClass }
+            if hostMatches.count == 1 {
+                return hostMatches[0]
+            }
+        }
+        let noGoMatches = matches.filter { $0.verdict == .noGo }
+        let tiePool = noGoMatches.isEmpty ? matches : noGoMatches
+        return tiePool.min { $0.id < $1.id }
     }
 
     /// Convenience: read `manifestURL` and decode it. Returns `nil` (never throws) when the file is
     /// missing or unreadable — the no-manifest-today behavior is unchanged.
-    public static func card(forRepo repoID: String, manifestURL: URL) -> QualityCard? {
+    public static func card(
+        forRepo repoID: String, hostHardwareClass: String? = nil, manifestURL: URL
+    ) -> QualityCard? {
         guard let data = try? Data(contentsOf: manifestURL) else { return nil }
-        return card(forRepo: repoID, in: data)
+        return card(forRepo: repoID, hostHardwareClass: hostHardwareClass, in: data)
     }
 
     /// Strict decode: throws `QualityCardsManifestUndecodable` on an unreadable file or a payload

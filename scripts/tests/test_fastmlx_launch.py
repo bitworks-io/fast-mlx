@@ -3951,6 +3951,257 @@ class EngineBuildTestCase(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# hardwareClass: docs/task-inbox/2026-09-22-PREDECLARATION-hardwareclass-
+# joins-identity-never-filters.md. hardwareClass JOINS the multi-candidate
+# tiebreak (like engineBuild.commit) but must NEVER filter admission (like
+# residency does NOT apply here) -- an Ultra card is still the sole,
+# reachable, resolved card on an M5 host whenever it is the only candidate
+# for the pack. host_hardware_class is an injectable seam (default the
+# real function), exactly like _run_front_mode/_wait_for_lifeline_signal's
+# ``popen=subprocess.Popen`` seam -- tests always pass it explicitly rather
+# than monkeypatching the module attribute, since a keyword default is
+# bound once at function-definition time.
+# ---------------------------------------------------------------------
+SAFETY_ULTRA_REPO = "example/SafetyUltraModel"
+SAFETY_ULTRA_CARD_ID = "safety-ultra@test"
+
+
+def single_ultra_card(verdict: str = "PASS", opt_in: bool = False, default: bool = True) -> dict:
+    return {
+        "id": SAFETY_ULTRA_CARD_ID,
+        "model": {"repo": SAFETY_ULTRA_REPO, "hfPin": "cccccccc"},
+        "verdict": verdict,
+        "config": {"hardwareClass": "apple-m3-ultra"},
+        "admission": {"default": default, "optIn": opt_in, "reason": "measured on Ultra"},
+        "legible": {"tier": "Reference" if verdict == "PASS" else "Unquantified",
+                    "headline": "Ultra card."},
+    }
+
+
+HWC_REPO = "example/HwClassModel"
+HWC_CARD_ULTRA_ID = "hwc-ultra@test"
+HWC_CARD_M5_ID = "hwc-m5@test"
+
+
+def hardware_class_card_manifest() -> dict:
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": HWC_CARD_ULTRA_ID,
+                "model": {"repo": HWC_REPO, "hfPin": "aaaaaaaa"},
+                "verdict": "PASS",
+                "config": {"hardwareClass": "apple-m3-ultra"},
+                "admission": {"default": True, "optIn": False, "reason": "pass ultra"},
+                "legible": {"tier": "Reference", "headline": "Ultra pass."},
+            },
+            {
+                "id": HWC_CARD_M5_ID,
+                "model": {"repo": HWC_REPO, "hfPin": "bbbbbbbb"},
+                "verdict": "PASS",
+                "config": {"hardwareClass": "apple-m5"},
+                "admission": {"default": True, "optIn": False, "reason": "pass m5"},
+                "legible": {"tier": "Reference", "headline": "M5 pass."},
+            },
+        ],
+    }
+
+
+class HardwareClassTieBreakTestCase(unittest.TestCase):
+    # Criterion 4 -- THE SAFETY TEST. A single card is the only candidate,
+    # so resolve_card must return it UNCHANGED regardless of the host's
+    # class: hardwareClass never filters. Asserted on the returned card's
+    # id, not merely "no exception", so the mutation this guards against
+    # (turning this into a filter) is provably reached.
+    def test_single_ultra_card_resolves_unchanged_on_m5_host(self):
+        cards = [single_ultra_card()]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, SAFETY_ULTRA_REPO, None, host_hardware_class=lambda: "apple-m5"
+        )
+        self.assertEqual(card["id"], SAFETY_ULTRA_CARD_ID)
+
+    # The refusal that would be silently lost if hardwareClass filtered: a
+    # NO_GO Ultra card must still be the card resolve_card hands back on an
+    # M5 host, so the caller's admission gate still sees it and still
+    # refuses it.
+    def test_single_no_go_ultra_card_still_resolves_on_m5_host(self):
+        cards = [single_ultra_card(verdict="NO_GO", opt_in=True, default=False)]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, SAFETY_ULTRA_REPO, None, host_hardware_class=lambda: "apple-m5"
+        )
+        self.assertEqual(card["id"], SAFETY_ULTRA_CARD_ID)
+        self.assertEqual(card["verdict"], "NO_GO")
+
+    # Structural: the non-filter property isn't incidental -- the
+    # single-candidate path never even calls the host-class seam.
+    def test_single_candidate_path_never_consults_host_hardware_class(self):
+        cards = [single_ultra_card()]
+        calls = []
+
+        def spy():
+            calls.append(True)
+            return "apple-m5"
+
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, SAFETY_ULTRA_REPO, None, host_hardware_class=spy
+        )
+        self.assertEqual(card["id"], SAFETY_ULTRA_CARD_ID)
+        self.assertEqual(calls, [])
+
+    # Criterion 5a: two candidates differ ONLY in hardwareClass; the host
+    # matches exactly one -> that one is selected.
+    def test_two_candidates_differ_only_in_hardware_class_host_match_selects_one(self):
+        cards = hardware_class_card_manifest()["cards"]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, HWC_REPO, None, host_hardware_class=lambda: "apple-m5"
+        )
+        self.assertEqual(card["id"], HWC_CARD_M5_ID)
+
+    def test_two_candidates_differ_only_in_hardware_class_host_match_selects_the_other(self):
+        cards = hardware_class_card_manifest()["cards"]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, HWC_REPO, None, host_hardware_class=lambda: "apple-m3-ultra"
+        )
+        self.assertEqual(card["id"], HWC_CARD_ULTRA_ID)
+
+    # Criterion 5b: an unknown host class (None) never narrows -- falls
+    # through to the existing exit-3 refusal, whose message names the
+    # hardware classes so the refusal is diagnosable.
+    def test_two_candidates_differ_only_in_hardware_class_unknown_host_refuses(self):
+        cards = hardware_class_card_manifest()["cards"]
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                cards, HWC_REPO, None, host_hardware_class=lambda: None
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("apple-m3-ultra", ctx.exception.message)
+        self.assertIn("apple-m5", ctx.exception.message)
+
+    # Same refusal when the host class matches NEITHER candidate.
+    def test_two_candidates_differ_only_in_hardware_class_host_matches_neither_refuses(self):
+        cards = hardware_class_card_manifest()["cards"]
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                cards, HWC_REPO, None, host_hardware_class=lambda: "apple-m1"
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("apple-m3-ultra", ctx.exception.message)
+        self.assertIn("apple-m5", ctx.exception.message)
+
+    # When candidates all share one class (or all carry none), the host
+    # seam is never consulted at all -- the existing engine-build tiebreak
+    # (dual_engine_build_card_manifest, both cards carrying no
+    # hardwareClass) is untouched by this change.
+    def test_candidates_sharing_one_hardware_class_never_consult_host(self):
+        cards = dual_engine_build_card_manifest()["cards"]
+        calls = []
+
+        def spy():
+            calls.append(True)
+            return "apple-m5"
+
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards,
+            DUAL_BUILD_REPO,
+            None,
+            engine_build_commit=DUAL_BUILD_COMMIT_B,
+            host_hardware_class=spy,
+        )
+        self.assertEqual(card["id"], DUAL_BUILD_CARD_B_ID)
+        self.assertEqual(calls, [])
+
+
+class CardHardwareClassTestCase(unittest.TestCase):
+    def test_returns_config_hardware_class(self):
+        card = {"config": {"hardwareClass": "apple-m5"}}
+        self.assertEqual(FASTMLX_LAUNCH.card_hardware_class(card), "apple-m5")
+
+    def test_none_when_card_is_none(self):
+        self.assertIsNone(FASTMLX_LAUNCH.card_hardware_class(None))
+
+    def test_none_when_no_config(self):
+        self.assertIsNone(FASTMLX_LAUNCH.card_hardware_class({"id": "x"}))
+
+    def test_none_when_config_not_a_dict(self):
+        self.assertIsNone(FASTMLX_LAUNCH.card_hardware_class({"config": "nope"}))
+
+    def test_none_when_empty_string(self):
+        self.assertIsNone(
+            FASTMLX_LAUNCH.card_hardware_class({"config": {"hardwareClass": ""}})
+        )
+
+    def test_none_when_non_string(self):
+        self.assertIsNone(
+            FASTMLX_LAUNCH.card_hardware_class({"config": {"hardwareClass": 5}})
+        )
+
+
+class HostHardwareClassTestCase(unittest.TestCase):
+    """``host_hardware_class`` composes ``sysctl -n
+    machdep.cpu.brand_string`` with the SAME normalization
+    ``emit_quality_card._hardware_class`` applies, and fails closed to
+    ``None`` on any failure -- never a guess, never a hostname, never a
+    raised exception.
+    """
+
+    @staticmethod
+    def _import_emit_quality_card():
+        scripts_dir = str(LAUNCH_PATH.parent)
+        inserted = scripts_dir not in sys.path
+        if inserted:
+            sys.path.insert(0, scripts_dir)
+        try:
+            import emit_quality_card
+        finally:
+            if inserted:
+                sys.path.remove(scripts_dir)
+        return emit_quality_card
+
+    # Criterion 6: pinned by IMPORTING the emitter's own function, not by
+    # copying its literal output, so the two copies cannot drift unnoticed.
+    def test_normalization_matches_emitter_for_representative_chips(self):
+        emit_quality_card = self._import_emit_quality_card()
+        for chip in ("Apple M3 Ultra", "Apple M5"):
+            expected = emit_quality_card._hardware_class(chip)
+
+            def fake_run(argv, chip=chip, **kwargs):
+                return subprocess.CompletedProcess(argv, 0, stdout=chip + "\n", stderr="")
+
+            with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+                actual = FASTMLX_LAUNCH.host_hardware_class()
+            self.assertEqual(actual, expected)
+
+    def test_nonzero_returncode_fails_closed_to_none(self):
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no sysctl")
+
+        with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(FASTMLX_LAUNCH.host_hardware_class())
+
+    def test_empty_stdout_fails_closed_to_none(self):
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, stdout="   \n", stderr="")
+
+        with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(FASTMLX_LAUNCH.host_hardware_class())
+
+    def test_missing_sysctl_fails_closed_to_none_never_raises(self):
+        def fake_run(argv, **kwargs):
+            raise FileNotFoundError("sysctl not found")
+
+        with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(FASTMLX_LAUNCH.host_hardware_class())
+
+    def test_timeout_fails_closed_to_none_never_raises(self):
+        def fake_run(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=5)
+
+        with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+            self.assertIsNone(FASTMLX_LAUNCH.host_hardware_class())
+
+
+# ---------------------------------------------------------------------
 # Engine build DERIVATION from a release tree's own provenance.json, with
 # NO operator-written --engine-profile engineBuild.commit at all -- see
 # `derive_engine_build_from_release`. A release-layout engine binary lives

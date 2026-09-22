@@ -785,12 +785,18 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
     if not isinstance(cards, list) or not cards:
         fail(f"{label} must contain at least one card")
     seen_ids: set[str] = set()
-    # Identity for the (identity, residency, engineBuild) duplicate check
-    # below: (model.repo if non-null else model.hfPin, normalized residency,
-    # provenance.engineBuild.commit or None). Two cards sharing all three
-    # would be indistinguishable to fastmlx_launch.resolve_card's
-    # engine-build disambiguation (see docs/quality-card-schema-v1.md
-    # "Engine build") -- refused here instead of silently tying at runtime.
+    # Identity for the (identity, residency, hardwareClass, engineBuild)
+    # duplicate check below: (model.repo if non-null else model.hfPin,
+    # normalized residency, config.hardwareClass, provenance.engineBuild.commit
+    # or None). Two cards sharing all four would be indistinguishable to
+    # fastmlx_launch.resolve_card's engine-build disambiguation (see
+    # docs/quality-card-schema-v1.md "Engine build") -- refused here instead
+    # of silently tying at runtime. hardwareClass is included because an
+    # Ultra card and an M5 card for the same pack are two measurements of two
+    # different facts, not duplicates (docs/quality-card-schema-v1.md:31) --
+    # but it is NEVER used to FILTER card admission (see "Engine build" in
+    # that doc, which states the same never-filters contract); it only
+    # disambiguates the key.
     seen_identity_engine_builds: set[tuple] = set()
     validated_cards: List[Dict[str, object]] = []
     for index, raw_card in enumerate(cards):
@@ -1033,11 +1039,17 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
         repo_value = model.get("repo")
         identity = repo_value if repo_value is not None else model.get("hfPin")
         residency_value = config.get("residency") if isinstance(config, dict) else None
-        identity_key = (identity, residency_value or "resident", engine_build_commit)
+        hardware_class_value = config.get("hardwareClass") if isinstance(config, dict) else None
+        identity_key = (
+            identity,
+            residency_value or "resident",
+            hardware_class_value,
+            engine_build_commit,
+        )
         if identity_key in seen_identity_engine_builds:
             fail(
                 f"{card_label} duplicates another card's (identity, residency, "
-                f"engineBuild) combination {identity_key!r}"
+                f"hardwareClass, engineBuild) combination {identity_key!r}"
             )
         seen_identity_engine_builds.add(identity_key)
 

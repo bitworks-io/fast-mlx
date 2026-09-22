@@ -5020,11 +5020,17 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
             model.get("hfPin") if isinstance(model, dict) else None
         )
         residency_value = config.get("residency") if isinstance(config, dict) else None
-        identity_key = (identity, residency_value or "resident", engine_build_commit)
+        hardware_class_value = config.get("hardwareClass") if isinstance(config, dict) else None
+        identity_key = (
+            identity,
+            residency_value or "resident",
+            hardware_class_value,
+            engine_build_commit,
+        )
         if identity_key in seen_identity_engine_builds:
             failures.append(
-                f"{label} duplicates another card's (identity, residency, engineBuild) "
-                f"combination {identity_key!r}"
+                f"{label} duplicates another card's (identity, residency, hardwareClass, "
+                f"engineBuild) combination {identity_key!r}"
             )
         else:
             seen_identity_engine_builds.add(identity_key)
