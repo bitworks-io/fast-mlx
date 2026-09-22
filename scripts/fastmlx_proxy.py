@@ -239,6 +239,40 @@ _REFUSAL_DRAIN_DEADLINE_SECONDS = 0.05
 # remove.
 _REFUSAL_LOG_MIN_INTERVAL_SECONDS = 1.0
 
+# Fixed count of held slots a ``saturation_snapshot`` line names explicitly
+# (the K OLDEST -- see ``ProvenanceProxyServer._maybe_emit_saturation_
+# snapshot``). Fixed, never derived from ``max_concurrent_requests``, so
+# the line's byte size is O(1) regardless of how high an operator sets the
+# concurrency cap -- a full per-slot dump was REJECTED on exactly this
+# ground (see the task predeclaration this increment implements,
+# ``docs/task-inbox/2026-09-21-PREDECLARATION-proxy-saturation-snapshot-
+# who-holds-the-slots.md``): an operator-settable cap makes an
+# O(max_concurrent) line an attacker-triggered log-amplification vector.
+_SATURATION_SNAPSHOT_TOP_K = 8
+
+# Minimum spacing, in monotonic seconds, between ``saturation_snapshot``
+# stderr lines -- a DEDICATED interval and a DEDICATED piece of rate-limit
+# state (``ProvenanceProxyServer._saturation_last_emitted_monotonic``),
+# never ``_REFUSAL_LOG_MIN_INTERVAL_SECONDS``/``_refusal_log_lock`` above.
+# The two rate limits protect different emitters with different trigger
+# conditions (a FAILED semaphore acquire vs. CROSSING a saturation mark);
+# sharing their state would let one feature's burst silently consume the
+# other's budget, or vice versa.
+_SATURATION_SNAPSHOT_MIN_INTERVAL_SECONDS = 1.0
+
+
+def _saturation_threshold(max_concurrent_requests: int) -> int:
+    """``ceil(0.8 * max_concurrent_requests)``, floored at 1 -- the mark
+    ``inflight`` must reach or cross for a ``saturation_snapshot`` to be
+    considered (still subject to the rate limit above once it is).
+    Computed in exact integer arithmetic, never ``0.8 * n`` in floating
+    point, so the threshold cannot drift with float rounding: ``ceil(a /
+    b)`` for positive integers is ``-(-a // b)``, since Python's ``//``
+    floors -- negating both operands turns that floor into the ceiling of
+    the original division.
+    """
+    return max(1, -(-4 * max_concurrent_requests // 5))
+
 
 def _sanitize_header_value(value: object) -> str:
     return _NON_PRINTABLE_ASCII.sub("", str(value))
@@ -1245,6 +1279,54 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         # be added to ``build_provenance_body`` or the 503 body itself).
         self._refusals_total = 0
 
+        # -- Saturation snapshot: WHO holds the concurrency slots --------
+        # See ``docs/task-inbox/2026-09-21-PREDECLARATION-proxy-
+        # saturation-snapshot-who-holds-the-slots.md``. A monotonic slot
+        # id, allocated under ``_inflight_lock`` in the SAME critical
+        # section that already adjusts ``inflight_requests`` (see
+        # ``process_request``/``process_request_thread`` below), maps to
+        # the peer host and acquire time of the slot it names. NEVER
+        # keyed on ``client_address``, ``id(request)``, or ``fileno()``:
+        # all three are reused across a live server's lifetime (a closed
+        # socket's fileno is handed to the next accepted connection; an
+        # ``id()`` can be reused once its object is collected), so a
+        # stale deregister keyed on any of them could delete a different,
+        # still-live slot's entry.
+        self._slot_registry: dict = {}
+        self._next_slot_id = 0
+        # A TRANSIENT correlation from the live ``request`` socket object
+        # to the slot id ``process_request`` allocated for it. This is
+        # needed only because ``process_request_thread``'s call signature
+        # is fixed by ``socketserver.ThreadingMixIn.process_request``
+        # (which starts it as ``Thread(target=self.process_request_thread,
+        # args=(request, client_address))`` -- exactly two positional
+        # args, no room for a third) and because this module's own test
+        # suite patches/wraps ``process_request_thread`` directly at the
+        # class level and must keep working unmodified. Every insertion
+        # here is matched by exactly one removal on EVERY code path (the
+        # normal ``finally`` in ``process_request_thread`` and the
+        # thread-start-failure ``except`` branch in ``process_request``),
+        # always while the very same ``request`` object is still a live,
+        # referenced local in that call frame -- unlike the slot registry
+        # itself (consulted later, asynchronously, by the saturation-
+        # reporter thread), this map is never read after the request it
+        # describes could have closed, so it does not carry the "reused
+        # after close" hazard a persisted ``fileno()``/``id()`` key would.
+        self._pending_slot_by_request: dict = {}
+        self._saturation_threshold = _saturation_threshold(max_concurrent_requests)
+        self._saturation_event = threading.Event()
+        self._saturation_stop_event = threading.Event()
+        self._saturation_reporter_thread: Optional[threading.Thread] = None
+        self._saturation_reporter_lock = threading.Lock()
+        # Dedicated rate-limit state for ``saturation_snapshot`` lines --
+        # see ``_SATURATION_SNAPSHOT_MIN_INTERVAL_SECONDS`` above for why
+        # this is never shared with ``_refusal_log_lock``/
+        # ``_refusal_log_last_emitted_monotonic``. Owned exclusively by
+        # the single saturation-reporter thread once started (see
+        # ``serve_forever`` below) -- no lock needed around reads/writes
+        # of this timestamp, since no other thread ever touches it.
+        self._saturation_last_emitted_monotonic: Optional[float] = None
+
     def process_request(self, request, client_address) -> None:
         """Non-blocking admission gate in front of ``ThreadingMixIn``'s own
         ``process_request``: a ``BoundedSemaphore`` slot must be acquired
@@ -1284,6 +1366,23 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
             self.inflight_requests += 1
             if self.inflight_requests > self.peak_inflight_requests:
                 self.peak_inflight_requests = self.inflight_requests
+            # Registry site 1 of 3 (see ``__init__``'s own comment on
+            # ``_slot_registry``): allocated in the SAME critical section
+            # that increments ``inflight_requests`` above, so a slot is
+            # considered HELD from the instant admission succeeds, not
+            # from whenever a handler thread happens to start running.
+            slot_id = self._next_slot_id
+            self._next_slot_id += 1
+            self._slot_registry[slot_id] = (client_address[0], time.monotonic())
+            self._pending_slot_by_request[request] = slot_id
+            inflight_now = self.inflight_requests
+        # Outside the lock (see its own invariant comment above): a single
+        # int compare and a non-blocking ``Event.set()`` -- never a format
+        # or a ``stderr`` write on this, the single accept thread. See
+        # ``_saturation_reporter_loop`` below for the one thread that does
+        # both, entirely off this thread.
+        if inflight_now >= self._saturation_threshold:
+            self._saturation_event.set()
         try:
             super().process_request(request, client_address)
         except BaseException:
@@ -1306,6 +1405,18 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
             self._slots.release()
             with self._inflight_lock:
                 self.inflight_requests -= 1
+                # Registry site 2 of 3: the thread that would otherwise
+                # deregister this slot (``process_request_thread``'s own
+                # ``finally``, below) never started at all, and this
+                # ``except`` is the ONLY place left that can. Missing
+                # this leaves a phantom entry in ``_slot_registry``
+                # forever -- telemetry that manufactures a permanent
+                # false attack signal (a slot that reads as held, by an
+                # ever-aging peer, though nothing is actually holding
+                # it).
+                pending_slot_id = self._pending_slot_by_request.pop(request, None)
+                if pending_slot_id is not None:
+                    self._slot_registry.pop(pending_slot_id, None)
             self.shutdown_request(request)
             raise
 
@@ -1315,7 +1426,136 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         finally:
             with self._inflight_lock:
                 self.inflight_requests -= 1
+                # Registry site 3 of 3: the ordinary release path. Never
+                # "repaired" against ``inflight_requests`` here or
+                # anywhere else -- a divergence between
+                # ``len(_slot_registry)`` and ``inflight_requests`` is the
+                # visible symptom of the very bug class this feature
+                # exists to surface (a leaked slot, or a double release),
+                # exactly like the never-clamped negative ``inflight`` at
+                # ``_log_capacity_refusal``'s own comment. Clamping or
+                # auto-resyncing it here would restore the silence.
+                slot_id = self._pending_slot_by_request.pop(request, None)
+                if slot_id is not None:
+                    self._slot_registry.pop(slot_id, None)
             self._slots.release()
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        """Starts the saturation-reporter thread (see
+        ``_saturation_reporter_loop`` below) lazily, HERE rather than in
+        ``__init__`` -- this module's own test suite constructs servers
+        via ``create_server``/``ProvenanceProxyServer(...)`` that are
+        sometimes never run at all (bind-only construction) and are not
+        uniformly closed the instant a test ends, so an ``__init__``-
+        started thread would leak one per such instance for the whole
+        test process's life. ``daemon=True`` (see ``_start_saturation_
+        reporter``) means it is never a barrier to process exit on its
+        own regardless, but starting it lazily still keeps a server that
+        never serves from ever spinning it up.
+        """
+        self._start_saturation_reporter()
+        super().serve_forever(poll_interval)
+
+    def server_close(self) -> None:
+        """Stops the saturation-reporter thread cleanly: sets the stop
+        flag, then wakes the reporter via the SAME ``Event`` the accept
+        thread uses to signal it (the reporter may currently be blocked
+        in ``Event.wait()`` with nothing else left to wake it), then joins
+        it after the socket itself is closed.
+        """
+        self._saturation_stop_event.set()
+        self._saturation_event.set()
+        thread = self._saturation_reporter_thread
+        super().server_close()
+        if thread is not None:
+            thread.join(timeout=5)
+
+    def _start_saturation_reporter(self) -> None:
+        with self._saturation_reporter_lock:
+            if self._saturation_reporter_thread is not None:
+                return
+            thread = threading.Thread(
+                target=self._saturation_reporter_loop,
+                name="fastmlx-proxy-saturation-reporter",
+                daemon=True,
+            )
+            self._saturation_reporter_thread = thread
+            thread.start()
+
+    def _saturation_reporter_loop(self) -> None:
+        """The ONLY thread that ever formats or writes a
+        ``saturation_snapshot`` line. The accept thread's only job (see
+        ``process_request`` above) is waking this one up with a non-
+        blocking ``Event.set()`` -- never a format, never I/O, on the
+        accept thread itself.
+        """
+        while True:
+            self._saturation_event.wait()
+            self._saturation_event.clear()
+            if self._saturation_stop_event.is_set():
+                return
+            self._maybe_emit_saturation_snapshot()
+
+    def _maybe_emit_saturation_snapshot(self) -> None:
+        now_monotonic = time.monotonic()
+        last = self._saturation_last_emitted_monotonic
+        if (
+            last is not None
+            and (now_monotonic - last) < _SATURATION_SNAPSHOT_MIN_INTERVAL_SECONDS
+        ):
+            return
+        self._saturation_last_emitted_monotonic = now_monotonic
+
+        # COPY under the lock -- never iterate ``_slot_registry`` live
+        # here. The accept thread mutates it on every accepted
+        # connection (see ``process_request`` above), and this method
+        # runs on a SEPARATE thread from that one, so an unlocked
+        # iteration here could both race a concurrent mutation and raise
+        # ``RuntimeError: dictionary changed size during iteration``.
+        # ``json.dumps`` and the ``stderr`` write happen OUTSIDE the
+        # lock, below -- the lock's own invariant comment (see
+        # ``__init__``) is about the ACCEPT thread never blocking under
+        # it, which copying (not formatting or writing) satisfies.
+        with self._inflight_lock:
+            slots = list(self._slot_registry.values())
+            inflight = self.inflight_requests
+
+        # A slot present in this copy may have already been released by
+        # the time this line actually reaches ``stderr`` below -- the
+        # snapshot is a point-in-time copy, not a live view, and that is
+        # benign: it is documented behavior, not a bug to "fix" by
+        # re-checking membership against the live registry.
+        now = time.monotonic()
+        ages = [(peer, max(0.0, now - acquired)) for peer, acquired in slots]
+        # The whole point of this field (see the module docstring
+        # reference above): counts DISTINCT HOSTS holding a slot, never
+        # connections -- one host holding 40 slots reads ``1`` here, not
+        # 40. Computed over ALL held slots, not merely the K reported in
+        # ``top_slots`` below.
+        distinct_peer_hosts = len({peer for peer, _ in ages})
+        max_age_s = round(max((age for _, age in ages), default=0.0), 3)
+        oldest_first = sorted(ages, key=lambda pair: pair[1], reverse=True)
+        top_slots = [
+            {"peer": peer, "age_s": round(age, 3)}
+            for peer, age in oldest_first[:_SATURATION_SNAPSHOT_TOP_K]
+        ]
+
+        entry = {
+            "ts": time.time(),
+            "event": "saturation_snapshot",
+            "inflight": inflight,
+            "max_concurrent": self.max_concurrent_requests,
+            "distinct_peer_hosts": distinct_peer_hosts,
+            "max_age_s": max_age_s,
+            "slots_reported": len(top_slots),
+            "top_slots": top_slots,
+            "trigger": "threshold",
+        }
+        line = json.dumps(entry)
+        sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+        if self.log_hook is not None:
+            self.log_hook(entry)
 
     def _refuse_over_capacity(
         self, request, client_address, inflight_at_refusal: int, peak_at_refusal: int

@@ -236,6 +236,13 @@ very same row. `recommend --json` carries the same two facts under two different
 (`null` when the card has none) -- never merged into one `fit` key, and a `--json` consumer that only
 reads `fit` misses the card's own claim.
 
+A row carries its card **whatever the fit check decides**. A pack that does not fit this host, and a
+pack whose fit check could not run at all, both still report the card that was resolved for them --
+the `does-not-fit` case is exactly where the card matters most, since the measured quality of a pack
+you cannot run is what tells you whether to go looking for a smaller one. The card never changes a
+row's status: `does-not-fit` stays `does-not-fit` and is never recommended, no matter what its card
+says.
+
 A pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
 a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
@@ -622,6 +629,37 @@ Behaviour to know:
     whole life, counted for every refusal even when its own stderr line is suppressed by the
     once-per-second rate limit above -- it is the field that can recover the true refusal count if a
     stderr line is ever lost or rotated, which `suppressed_since_last_log` alone cannot do.
+- Above, `inflight` says HOW MANY slots are held; it says nothing about the *shape* of who holds
+  them, and a 300-second-held slot emits nothing for the whole hold if nothing else changes. A
+  `saturation_snapshot` line closes that gap: once `inflight` reaches or crosses
+  `max(1, ceil(0.8 * max_concurrent))`, the proxy emits (rate-limited to at most one line per
+  second, using its own dedicated interval and rate-limit state, never the refusal line's) a JSONL
+  line shaped `{ts, event: "saturation_snapshot", inflight, max_concurrent, distinct_peer_hosts,
+  max_age_s, slots_reported, top_slots: [{peer, age_s}, ...], trigger: "threshold"}`.
+  `distinct_peer_hosts` counts the UNIQUE peer hosts across *every* held slot (not merely the ones
+  named in `top_slots`); `max_age_s` is the age of the single oldest held slot, over every slot;
+  `top_slots` names at most 8 slots (a fixed count, never derived from `max_concurrent`, so the
+  line's size never grows with an operator-raised cap) -- specifically the 8 OLDEST, each as
+  `{peer, age_s}` where `peer` is the client's HOST only (never `host:port`). `slots_reported` is
+  simply `len(top_slots)`. Like every other field on this page, this line is **stderr-only
+  telemetry: it is never added to `GET /fastmlx/provenance`'s body, the 503 refusal body/headers, or
+  the ordinary per-request log line** -- a peer list reaching an unauthenticated remote client would
+  be cross-client disclosure of third parties' IP addresses, categorically worse than the
+  already-excluded saturation counters. Because a peer host is retained here (if only for the
+  in-process life of the snapshot line before it reaches an operator's own log storage), operators
+  handling this stream take on the same PII retention obligations as any other log of client IP
+  addresses -- rotate/redact it under the same policy already applied to access logs, and do not
+  forward it to a destination without that policy.
+  Three things read as correct but are easy to misread:
+  - A slot named in `top_slots` may have **already released** by the time the line reaches
+    `stderr` -- the snapshot is a point-in-time copy, not a live view, and that gap is normal, not a
+    bug to "fix" by re-checking membership.
+  - `distinct_peer_hosts` counts **hosts, not connections** -- one host holding 40 slots reads `1`
+    here, not 40.
+  - A NAT or reverse proxy in front of this proxy collapses many real clients down to one peer host
+    on the wire, which reads as concentration here. The field measures what this proxy can see on
+    its own accepted sockets, not ground truth about how many distinct clients are actually behind
+    that host.
 - There is no read timeout toward the engine, so a long prefill or a long non-streamed completion is
   not cut off. Connecting to the engine times out after 10 s, and an unreachable engine gets a 502
   JSON error that still carries the headers.

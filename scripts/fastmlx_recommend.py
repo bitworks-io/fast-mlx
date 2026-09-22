@@ -392,10 +392,12 @@ def build_row(
         builtin_name, select_error = _select_builtin_fit_check_bin(model_path)
         if select_error is not None:
             row["status"] = STATUS_ERROR
+            row["card"] = _card_summary(card)
             row["message"] = f"fit check could not run: {select_error}"
             return row
         if kv_reserve_gib is None:
             row["status"] = STATUS_ERROR
+            row["card"] = _card_summary(card)
             row["message"] = (
                 "fit check could not run: a built-in sizer "
                 f"({builtin_name}) was auto-selected for this pack, which "
@@ -426,6 +428,7 @@ def build_row(
 
     if fit_result.kind == "error":
         row["status"] = STATUS_ERROR
+        row["card"] = _card_summary(card)
         row["message"] = f"fit check could not run: {fit_result.detail}"
         return row
 
@@ -433,6 +436,7 @@ def build_row(
         row["status"] = STATUS_DOES_NOT_FIT
         detail = (fit_result.stderr or "").strip() or "fit check verdict RED"
         row["fit"] = {"verdict": "RED", "context": context}
+        row["card"] = _card_summary(card)
         row["message"] = detail
         return row
 
@@ -450,6 +454,7 @@ def build_row(
     attested_residency = fields.get("residency")
     if attested_residency is not None and attested_residency != residency:
         row["status"] = STATUS_ERROR
+        row["card"] = _card_summary(card)
         row["message"] = (
             f"fit check attested residency={attested_residency!r}, which "
             f"differs from the requested --residency {residency!r}"

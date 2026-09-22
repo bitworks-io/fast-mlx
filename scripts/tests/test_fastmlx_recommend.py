@@ -650,6 +650,102 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertIn("requested context exceeds", row["message"])
 
     # ------------------------------------------------------------------
+    # The RED-fit defect this cycle's tests pin: `build_row` resolves the
+    # pack's quality card long before the fit check runs (see
+    # `launch.resolve_card` above), but a live RED verdict used to return
+    # before `row["card"]` was ever set -- the ONE resolved fact `build_row`
+    # threw away on this path (`engineBuild`/`mtp` already survive it). A
+    # does-not-fit pack is exactly the case where the discarded card
+    # (headline/tier/verdict) matters most: it is the artifact that would
+    # tell the operator what this pack costs in quality and point them at a
+    # different one. Two arms, same pack/host, differing ONLY in whether
+    # the quality-card manifest has a matching card -- proving the carry is
+    # conditioned on a REAL resolved card, not just always-None turning
+    # into some other unconditional placeholder.
+    # ------------------------------------------------------------------
+    def test_does_not_fit_row_carries_resolved_card_when_one_resolves(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        code, doc, _ = self.run_json(
+            self.base_argv([model_dir], **{"--fit-check-bin": str(self.red_fit_bin)})
+        )
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "does-not-fit")
+        card = row["card"]
+        self.assertIsNotNone(card, msg="does-not-fit row dropped its resolved card")
+        self.assertEqual(card["id"], PASS_CARD_ID)
+        self.assertEqual(card["verdict"], "PASS")
+        self.assertEqual(card["tier"], "Reference")
+        self.assertEqual(card["headline"], "Matches the reference closely.")
+
+    def test_does_not_fit_row_card_is_none_when_no_card_resolves(self):
+        # The discrimination arm: same pack shape, same host, same RED fit
+        # check -- only the manifest lookup differs (this repo has no
+        # matching card at all). Without this arm, a test asserting only
+        # the carded case above would pass equally well against a bug that
+        # always sets `row["card"] = {}` or similar.
+        model_dir = self.make_model_dir("uncarded-pack", repo=UNCARDED_REPO)
+        code, doc, _ = self.run_json(
+            self.base_argv([model_dir], **{"--fit-check-bin": str(self.red_fit_bin)})
+        )
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "does-not-fit")
+        self.assertIsNone(row["card"])
+
+    def test_does_not_fit_text_rendering_keeps_live_fit_and_card_fit_in_order(self):
+        # Integration-level (through the real CLI/build_row, not a
+        # hand-built row dict): the head line must still show the LIVE
+        # fit-check verdict this host measured, and the card's own fit
+        # sentence must render under the existing "card fit: " label
+        # (never a bare "fit:") -- _format_row_text is unchanged, this only
+        # proves it already covers a does-not-fit row with a card attached.
+        manifest_path = self.write_manifest_with_card_fit(PASS_CARD_ID, PASS_FIT_TEXT)
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        _, stdout, _ = self.run_main(
+            self.base_argv(
+                [model_dir],
+                **{
+                    "--fit-check-bin": str(self.red_fit_bin),
+                    "--quality-cards": str(manifest_path),
+                },
+            )
+        )
+        self.assertIn("fit=RED", stdout)
+        self.assertIn("card fit:", stdout)
+        self.assertIn(f"card fit: {PASS_FIT_TEXT}", stdout)
+        # Order: the live verdict is in the head line; the card's sentence
+        # is on a later line under its own label.
+        self.assertLess(stdout.index("fit=RED"), stdout.index("card fit:"))
+
+    def test_does_not_fit_status_and_ranking_unchanged_by_the_card_carry(self):
+        # No behavioral change to classification, ranking, or exit code:
+        # a does-not-fit row with a now-carried card must still rank
+        # exactly like it did before (ahead of error, behind everything
+        # recommendable) and must never itself become admitted.
+        pass_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        missing_dir = self.root / "missing"
+        argv = self.base_argv(
+            [pass_dir, missing_dir], **{"--fit-check-bin": str(self.red_fit_bin)}
+        )
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        rows = doc["rows"]
+        self.assertEqual([row["status"] for row in rows], ["does-not-fit", "error"])
+        does_not_fit_row = rows[0]
+        self.assertEqual(does_not_fit_row["status"], FASTMLX_RECOMMEND.STATUS_DOES_NOT_FIT)
+        self.assertIsNotNone(does_not_fit_row["card"])
+        # Direct unit-level pin on the ranking/exit-code helpers themselves,
+        # confirming a resolved card on a does-not-fit row cannot promote it
+        # (rank_rows keys does-not-fit purely on status; exit_code_for never
+        # treats does-not-fit as recommendable).
+        ranked = FASTMLX_RECOMMEND.rank_rows(list(reversed(rows)))
+        self.assertEqual(
+            [row["status"] for row in ranked], ["does-not-fit", "error"]
+        )
+        self.assertEqual(FASTMLX_RECOMMEND.exit_code_for(rows), 2)
+
+    # ------------------------------------------------------------------
     # error: an unrunnable fit check never crashes, becomes an error row.
     # ------------------------------------------------------------------
     def test_unrunnable_fit_check_is_an_error_row_not_a_crash(self):
@@ -1476,6 +1572,25 @@ class BuiltinSizerAutoSelectionTestCase(unittest.TestCase):
         self.assertEqual(row["status"], "error")
         self.assertIn("builtin:safetensors", row["message"])
         self.assertIn("--kv-reserve-gib", row["message"])
+
+    # ------------------------------------------------------------------
+    # Same defect class as the RED-fit does-not-fit row (see
+    # FastmlxRecommendTestCase.test_does_not_fit_row_carries_resolved_card_when_one_resolves):
+    # the --kv-reserve-gib-missing error row is a DIFFERENT early return in
+    # build_row (the auto-selected-builtin-sizer branch, before the fit
+    # check even runs) that resolves a card first and must carry it too.
+    # ------------------------------------------------------------------
+    def test_kv_reserve_gib_missing_error_row_carries_resolved_card(self):
+        model_dir = self._safetensors_model_dir(repo=PASS_REPO)
+        argv = self.base_argv([model_dir], **{"--fit-check-bin": None})
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("--kv-reserve-gib", row["message"])
+        card = row["card"]
+        self.assertIsNotNone(card, msg="kv-reserve-gib error row dropped its resolved card")
+        self.assertEqual(card["id"], PASS_CARD_ID)
 
     def test_gguf_pack_auto_selects_builtin_gguf_sizer(self):
         model_dir = self._gguf_model_dir()

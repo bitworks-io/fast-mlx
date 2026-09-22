@@ -13,6 +13,7 @@ import contextlib
 import http.client
 import importlib.util
 import io
+import itertools
 import json
 import os
 import socket
@@ -2213,6 +2214,8 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         logged_event = threading.Event()
 
         def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                return  # a separate, unrelated feature's line; see its own tests
             logged.append(entry)
             logged_event.set()
 
@@ -2579,6 +2582,8 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         logged_event = threading.Event()
 
         def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                return  # a separate, unrelated feature's line; see its own tests
             logged.append(entry)
             logged_event.set()
 
@@ -2665,6 +2670,8 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         logged_lock = threading.Lock()
 
         def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                return  # a separate, unrelated feature's line; see its own tests
             with logged_lock:
                 logged.append(entry)
 
@@ -3249,6 +3256,8 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         logged_lock = threading.Lock()
 
         def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                return  # a separate, unrelated feature's line; see its own tests
             with logged_lock:
                 logged.append(entry)
 
@@ -3336,6 +3345,8 @@ class ProxyConcurrencyLimitTests(unittest.TestCase):
         logged_event = threading.Event()
 
         def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                return  # a separate, unrelated feature's line; see its own tests
             logged.append(entry)
             logged_event.set()
 
@@ -3712,6 +3723,449 @@ class ProxyLogAtomicityTests(unittest.TestCase):
         self.assertTrue(calls[0].endswith("\n"))
         entry = json.loads(calls[0])
         self.assertEqual(entry["request_id"], "req-1")
+
+
+class ProxySaturationSnapshotTests(unittest.TestCase):
+    """``saturation_snapshot`` JSONL lines on the operator-only ``stderr``
+    channel: the leading indicator of WHO holds the proxy's concurrency
+    slots, not merely how many (see ``docs/task-inbox/2026-09-21-
+    PREDECLARATION-proxy-saturation-snapshot-who-holds-the-slots.md``).
+
+    ``log_hook`` carries these entries on the SAME channel ordinary
+    ``_log``/``_log_capacity_refusal`` entries use -- every assertion below
+    selects entries by ``entry.get("event") == "saturation_snapshot"``,
+    NEVER by list position, exactly per that predeclaration's own warning.
+    """
+
+    def setUp(self):
+        self._servers = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+            server._test_thread.join(timeout=5)
+
+    def _start_gated_upstream(self, expected_arrivals: int):
+        """Same shape as ``ProxyConcurrencyLimitTests``' own helper (see
+        its docstring there): every request blocks on a shared ``gate``
+        until released, and ``arrived[n - 1]`` fires the instant the n-th
+        request reaches upstream -- the barrier this class uses to prove
+        N slots are provably held concurrently without any sleep-based
+        polling.
+        """
+        requests = []
+        lock = threading.Lock()
+        gate = threading.Event()
+        arrived = [threading.Event() for _ in range(expected_arrivals)]
+
+        def responder(handler):
+            with lock:
+                requests.append(handler.path)
+                n = len(requests)
+            if 0 < n <= expected_arrivals:
+                arrived[n - 1].set()
+            self.assertTrue(gate.wait(timeout=10), "test never released the gate")
+            payload = b"{}"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        return upstream, gate, arrived
+
+    def _start_proxy(self, upstream, **kwargs):
+        server = start_proxy(FIXTURE_PLAN, "127.0.0.1", upstream.server_address[1], **kwargs)
+        self._servers.append(server)
+        return server
+
+    def _drive_request(self, port: int) -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+        conn.request("POST", "/v1/chat/completions", body=b"{}")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+    def _send_and_read(self, port: int, raw_request: bytes, timeout: float = 5) -> bytes:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        sock.sendall(raw_request)
+        sock.settimeout(timeout)
+        response = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        except socket.timeout:
+            pass
+        sock.close()
+        return response
+
+    @staticmethod
+    def _patched_get_request(hosts):
+        """Context manager: for its duration, every connection THIS
+        process's proxy servers accept reports a ``client_address`` host
+        drawn from ``hosts`` (cycled) instead of the real loopback source
+        address every real test connection actually shares -- the
+        source-side seam this class uses to fabricate identical or
+        distinct peer hosts deterministically, without any reliance on
+        real routing or multiple source machines.
+        """
+        real_get_request = FASTMLX_PROXY.ProvenanceProxyServer.get_request
+        hosts_iter = itertools.cycle(hosts)
+
+        def fake_get_request(self_server):
+            request, real_client_address = real_get_request(self_server)
+            host = next(hosts_iter)
+            return request, (host, real_client_address[1])
+
+        return unittest.mock.patch.object(
+            FASTMLX_PROXY.ProvenanceProxyServer, "get_request", new=fake_get_request
+        )
+
+    def _hold_n_slots_sequentially_and_capture_first_snapshot(self, n: int, hosts):
+        """Admits ``n`` connections ONE AT A TIME -- starting connection
+        ``i + 1`` only after ``arrived[i]`` fires -- so the accept order
+        (and therefore which ``hosts[i]`` each slot is tagged with) is
+        deterministic, then waits for a ``saturation_snapshot`` line and
+        returns it (plus cleanup handles) while every slot is still held.
+        """
+        upstream, gate, arrived = self._start_gated_upstream(expected_arrivals=n)
+
+        snapshots = []
+        snapshot_seen = threading.Event()
+
+        def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                snapshots.append(entry)
+                snapshot_seen.set()
+
+        proxy = self._start_proxy(upstream, max_concurrent_requests=n, log_hook=log_hook)
+
+        threads = []
+        with self._patched_get_request(hosts):
+            for i in range(n):
+                t = threading.Thread(target=self._drive_request, args=(proxy.server_address[1],))
+                t.start()
+                threads.append(t)
+                self.assertTrue(arrived[i].wait(timeout=5), f"request {i} never reached upstream")
+
+            self.assertTrue(
+                snapshot_seen.wait(timeout=5),
+                "no saturation_snapshot line was emitted while the cap was held",
+            )
+
+        return snapshots[0], gate, threads
+
+    # ------------------------------------------------------------------
+    # Criterion 1 (the anti-vacuity bar): at IDENTICAL ``inflight``, arm A
+    # (N slots, ONE peer host) must report ``distinct_peer_hosts == 1``
+    # and arm B (N slots, N distinct hosts) must report ``== N``. Merely
+    # asserting the field's PRESENCE is refused by the task predeclaration
+    # as vacuous -- this is the two-arm discrimination it requires
+    # instead.
+    # ------------------------------------------------------------------
+    def test_distinct_peer_hosts_discriminates_one_host_from_many_at_identical_inflight(self):
+        n = 4
+
+        entry_a, gate_a, threads_a = self._hold_n_slots_sequentially_and_capture_first_snapshot(
+            n, ["10.0.0.1"]
+        )
+        self.assertEqual(entry_a["inflight"], n)
+        self.assertEqual(
+            entry_a["distinct_peer_hosts"], 1,
+            "N slots from ONE peer host must report distinct_peer_hosts == 1",
+        )
+        gate_a.set()
+        for t in threads_a:
+            t.join(timeout=5)
+
+        entry_b, gate_b, threads_b = self._hold_n_slots_sequentially_and_capture_first_snapshot(
+            n, [f"10.0.0.{i}" for i in range(1, n + 1)]
+        )
+        self.assertEqual(entry_b["inflight"], n)
+        self.assertEqual(
+            entry_b["distinct_peer_hosts"], n,
+            "N slots from N distinct peer hosts must report distinct_peer_hosts == N",
+        )
+        gate_b.set()
+        for t in threads_b:
+            t.join(timeout=5)
+
+        # The point of the field: identical `inflight`, different shape,
+        # different reading.
+        self.assertEqual(entry_a["inflight"], entry_b["inflight"])
+        self.assertNotEqual(entry_a["distinct_peer_hosts"], entry_b["distinct_peer_hosts"])
+
+    # ------------------------------------------------------------------
+    # Criterion 2: an intentionally-aged slot reports ``age_s >= hold`` in
+    # the SAME snapshot where a just-acquired slot reports ``age_s <
+    # hold``. A real (bounded, generous-margin) wall-clock gap between the
+    # two admissions -- the same idiom this suite already uses elsewhere
+    # (e.g. ``time.sleep(1.5)`` against a scaled-down deadline constant)
+    # -- rather than patching ``time.monotonic`` globally, which this
+    # module also calls from unrelated request-timeout/deadline code paths
+    # a global patch would silently perturb.
+    # ------------------------------------------------------------------
+    def test_age_discriminates_an_aged_slot_from_a_fresh_one_in_the_same_snapshot(self):
+        hold = 0.05
+        upstream, gate, arrived = self._start_gated_upstream(expected_arrivals=2)
+
+        snapshots = []
+        snapshot_seen = threading.Event()
+
+        def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                snapshots.append(entry)
+                snapshot_seen.set()
+
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2, log_hook=log_hook)
+
+        with self._patched_get_request(["10.9.0.1"]):
+            t1 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1],))
+            t1.start()
+            self.assertTrue(arrived[0].wait(timeout=5), "the aged request never reached upstream")
+
+        time.sleep(hold * 4)  # generous margin past `hold`
+
+        with self._patched_get_request(["10.9.0.2"]):
+            t2 = threading.Thread(target=self._drive_request, args=(proxy.server_address[1],))
+            t2.start()
+            self.assertTrue(arrived[1].wait(timeout=5), "the fresh request never reached upstream")
+
+        self.assertTrue(
+            snapshot_seen.wait(timeout=5), "no saturation_snapshot line was emitted"
+        )
+
+        entry = snapshots[0]
+        by_peer = {slot["peer"]: slot["age_s"] for slot in entry["top_slots"]}
+        self.assertGreaterEqual(
+            by_peer["10.9.0.1"], hold, "the aged slot must report age_s >= hold"
+        )
+        self.assertLess(
+            by_peer["10.9.0.2"], hold, "the just-acquired slot must report age_s < hold"
+        )
+
+        gate.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+    # ------------------------------------------------------------------
+    # Criterion 3: with the cap at K + 20 and every slot held,
+    # ``len(top_slots) <= K`` and the reported slots are the K OLDEST, not
+    # merely any K -- proving both the O(1) bound and that "oldest" (not
+    # "newest" or "arbitrary") is what survives the cut (kills mutation
+    # M2: selecting the K NEWEST instead).
+    # ------------------------------------------------------------------
+    def test_top_k_bound_holds_regardless_of_the_configured_cap_and_reports_the_oldest(self):
+        k = FASTMLX_PROXY._SATURATION_SNAPSHOT_TOP_K
+        n = k + 20
+        upstream, gate, arrived = self._start_gated_upstream(expected_arrivals=n)
+
+        lock = threading.Lock()
+        snapshots = []
+
+        def log_hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                with lock:
+                    snapshots.append(entry)
+
+        proxy = self._start_proxy(upstream, max_concurrent_requests=n, log_hook=log_hook)
+
+        hosts = [f"10.7.0.{i}" for i in range(1, n + 1)]
+        threads = []
+        with unittest.mock.patch.object(
+            FASTMLX_PROXY, "_SATURATION_SNAPSHOT_MIN_INTERVAL_SECONDS", 0.0
+        ), self._patched_get_request(hosts):
+            for i in range(n):
+                t = threading.Thread(target=self._drive_request, args=(proxy.server_address[1],))
+                t.start()
+                threads.append(t)
+                self.assertTrue(arrived[i].wait(timeout=5), f"request {i} never reached upstream")
+
+            deadline = time.monotonic() + 5
+            full_snapshot = None
+            while full_snapshot is None and time.monotonic() < deadline:
+                with lock:
+                    for entry in snapshots:
+                        if entry["inflight"] == n:
+                            full_snapshot = entry
+                            break
+                if full_snapshot is None:
+                    time.sleep(0.02)
+
+        self.assertIsNotNone(
+            full_snapshot, f"never observed a saturation_snapshot with inflight == {n}"
+        )
+        self.assertLessEqual(len(full_snapshot["top_slots"]), k)
+        self.assertEqual(full_snapshot["slots_reported"], len(full_snapshot["top_slots"]))
+
+        reported_peers = {slot["peer"] for slot in full_snapshot["top_slots"]}
+        # Connections were admitted strictly one at a time (each started
+        # only after the PREVIOUS one's arrival fired -- see the loop
+        # above), so ``hosts[0]`` is the OLDEST slot and ``hosts[:k]`` are
+        # exactly the K oldest.
+        oldest_expected = set(hosts[:k])
+        self.assertEqual(
+            reported_peers, oldest_expected,
+            "top_slots must report the K OLDEST slots, not any K of them",
+        )
+
+        gate.set()
+        for t in threads:
+            t.join(timeout=5)
+
+    # ------------------------------------------------------------------
+    # Criterion 5: after a forced thread-start failure (the third
+    # registry site -- see ``process_request``'s own ``except
+    # BaseException`` unwind), the registry must be EMPTY and
+    # ``len(registry) == inflight_requests`` -- no phantom entry. Reuses
+    # the same induction technique as ``ProxyConcurrencyLimitTests.
+    # test_failed_handler_thread_start_does_not_leak_its_slot``.
+    # ------------------------------------------------------------------
+    def test_registry_has_no_phantom_entry_after_a_forced_thread_start_failure(self):
+        def responder(handler):
+            payload = b"{}"
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=2)
+
+        handled = threading.Event()
+
+        def record_handle_error(request, client_address):
+            handled.set()
+
+        proxy.handle_error = record_handle_error
+
+        def flaky_process_request(self_server, request, client_address):
+            raise RuntimeError("can't start new thread")
+
+        with unittest.mock.patch.object(
+            socketserver.ThreadingMixIn, "process_request", new=flaky_process_request
+        ):
+            conn = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+            self.assertTrue(
+                handled.wait(timeout=5),
+                "the induced thread-start failure never reached handle_error",
+            )
+            conn.close()
+
+        self.assertEqual(
+            proxy.inflight_requests, 0,
+            "inflight counter leaked after the induced thread-start failure",
+        )
+        self.assertEqual(
+            len(proxy._slot_registry), 0,
+            "a phantom slot-registry entry survived the induced thread-start failure",
+        )
+        self.assertEqual(len(proxy._slot_registry), proxy.inflight_requests)
+        self.assertEqual(
+            len(proxy._pending_slot_by_request), 0,
+            "the transient request-to-slot correlation map was not cleaned up",
+        )
+
+    # ------------------------------------------------------------------
+    # Criterion 9 / M4: driving many accepts inside one rate-limit
+    # interval must yield AT MOST ONE ``saturation_snapshot`` line -- a
+    # mutation that emits on every threshold-crossing accept instead of
+    # respecting the rate limit turns this RED.
+    # ------------------------------------------------------------------
+    def test_rate_limit_allows_at_most_one_line_per_interval(self):
+        n = 6
+        with unittest.mock.patch.object(
+            FASTMLX_PROXY, "_SATURATION_SNAPSHOT_MIN_INTERVAL_SECONDS", 10.0
+        ):
+            upstream, gate, arrived = self._start_gated_upstream(expected_arrivals=n)
+            emitted = []
+            lock = threading.Lock()
+
+            def log_hook(entry):
+                if entry.get("event") == "saturation_snapshot":
+                    with lock:
+                        emitted.append(entry)
+
+            proxy = self._start_proxy(upstream, max_concurrent_requests=n, log_hook=log_hook)
+
+            threads = []
+            for _ in range(n):
+                t = threading.Thread(target=self._drive_request, args=(proxy.server_address[1],))
+                t.start()
+                threads.append(t)
+            for i in range(n):
+                self.assertTrue(arrived[i].wait(timeout=5), f"request {i} never reached upstream")
+
+            # Bounded window for the reporter thread to process every
+            # trigger the accept thread could possibly have queued while
+            # all ``n`` connections were being admitted.
+            time.sleep(0.3)
+
+            gate.set()
+            for t in threads:
+                t.join(timeout=5)
+
+        with lock:
+            count = len(emitted)
+        self.assertLessEqual(
+            count, 1,
+            f"expected at most one saturation_snapshot line inside the rate-limit "
+            f"interval, got {count}",
+        )
+
+    # ------------------------------------------------------------------
+    # Criterion 4/14: no peer, age, slot, or counter field from this
+    # feature may reach an unauthenticated client -- neither the
+    # provenance body nor the 503 refusal body/headers gain any new key.
+    # ------------------------------------------------------------------
+    def test_client_visible_surfaces_carry_no_new_saturation_fields(self):
+        upstream, gate, arrived = self._start_gated_upstream(expected_arrivals=1)
+        proxy = self._start_proxy(upstream, max_concurrent_requests=1)
+
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("GET", "/fastmlx/provenance")
+        resp = conn.getresponse()
+        body_bytes = resp.read()
+        conn.close()
+        body = json.loads(body_bytes)
+        self.assertEqual(
+            set(body.keys()),
+            {"fit", "card", "admission", "residency", "engineBuild", "mtp", "front"},
+            "the provenance body's key set must stay byte-unchanged by this increment",
+        )
+        for forbidden in (
+            "peer", "top_slots", "distinct_peer_hosts", "slots_reported",
+            "max_age_s", "saturation_snapshot",
+        ):
+            self.assertNotIn(forbidden, body_bytes.decode("utf-8"))
+
+        holder = threading.Thread(target=self._drive_request, args=(proxy.server_address[1],))
+        holder.start()
+        self.assertTrue(arrived[0].wait(timeout=5), "the holder request never reached upstream")
+
+        raw_request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}"
+        response = self._send_and_read(proxy.server_address[1], raw_request)
+        self.assertIn(b" 503 ", response)
+        header_bytes, _, body_bytes = response.partition(b"\r\n\r\n")
+        body_json = json.loads(body_bytes)
+        self.assertEqual(set(body_json.keys()), {"error"})
+        self.assertEqual(set(body_json["error"].keys()), {"type", "message"})
+        for forbidden in (
+            b"peer", b"top_slots", b"distinct_peer_hosts", b"slots_reported", b"max_age_s",
+        ):
+            self.assertNotIn(forbidden, response)
+
+        gate.set()
+        holder.join(timeout=5)
 
 
 if __name__ == "__main__":
