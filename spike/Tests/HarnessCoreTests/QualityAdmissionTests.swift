@@ -460,6 +460,75 @@ final class QualityAdmissionTests: XCTestCase {
         XCTAssertEqual(present.config?.hardwareClass, "apple-m3-ultra")
     }
 
+    // MARK: - fail-closed-before-tiebreak (the host-class narrowing step must never outrank a
+    // published NO_GO by returning a host-matching PASS card before the NO_GO pool is even
+    // consulted; host class may only tiebreak WITHIN whichever verdict pool survives).
+
+    /// T1 — the flip must be unreachable: a host-matching PASS card and a NO_GO measured on other
+    /// hardware collide; the OLD ordering returned `hostMatches[0]` (the PASS card) before ever
+    /// looking at `.noGo`, so `decide` silently admitted. Pins both the SELECTION and the resulting
+    /// ADMISSION outcome, so a resolver-only assertion could not hide a still-broken `decide`.
+    func testHostMatchDoesNotOverrideNoGoAcrossDifferentHardware() {
+        let passCard = card(id: "qwen38-27b-optiq-4bit@apple-m5", verdict: .pass, hardwareClass: "apple-m5")
+        let noGoCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .noGo, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: "apple-m5",
+            in: [passCard, noGoCard])
+        XCTAssertEqual(
+            resolved?.id, noGoCard.id,
+            "fail-closed NO_GO preference must win over an exact host match on a different card")
+        guard case .refuseQualityFlagged = QualityAdmission.decide(card: resolved, optIn: false) else {
+            return XCTFail(
+                "the resolved card must actually refuse -- a selection-only assertion would miss a still-broken decide()"
+            )
+        }
+    }
+
+    /// T2 — anti-vacuity arm: with NO candidate NO_GO, host-class narrowing must still discriminate on
+    /// its own. Without this arm, simply deleting the host-class branch entirely would still pass T1
+    /// (both cards land in the same NO_GO-only pool there) and the suite would measure nothing about
+    /// host-class selection itself.
+    func testHostClassStillSelectsAmongAllPassCandidates() {
+        let m5Card = card(id: "qwen38-27b-optiq-4bit@apple-m5", verdict: .pass, hardwareClass: "apple-m5")
+        let ultraCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .pass, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: "apple-m5",
+            in: [ultraCard, m5Card])
+        XCTAssertEqual(
+            resolved?.id, m5Card.id, "host class must still discriminate when no candidate is NO_GO")
+    }
+
+    /// T3 — host class disambiguates WITHIN the NO_GO pool, not just across it: when every remaining
+    /// candidate is already NO_GO, the host match still picks the most relevant one so the
+    /// `--accept-quality <id>` refusal names a card actually measured on this box, proving the branch
+    /// was subordinated to the fail-closed filter rather than bypassed by it.
+    func testHostClassDisambiguatesWithinNoGoPool() {
+        let m5NoGo = card(id: "qwen38-27b-optiq-4bit@apple-m5", verdict: .noGo, hardwareClass: "apple-m5")
+        let ultraNoGo = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .noGo, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: "apple-m5",
+            in: [ultraNoGo, m5NoGo])
+        XCTAssertEqual(
+            resolved?.id, m5NoGo.id,
+            "host class must pick the most relevant NO_GO card, not merely any NO_GO card")
+    }
+
+    /// T4 — nil host is unchanged: the same collision as T1 with no host hint at all must still
+    /// resolve to the NO_GO card exactly as before this fix, so a caller that never passes
+    /// hostHardwareClass sees no behavior change from this fix.
+    func testNilHostHardwareClassStillSelectsNoGo() {
+        let passCard = card(id: "qwen38-27b-optiq-4bit@apple-m5", verdict: .pass, hardwareClass: "apple-m5")
+        let noGoCard = card(
+            id: "qwen38-27b-optiq-4bit@apple-m3-ultra", verdict: .noGo, hardwareClass: "apple-m3-ultra")
+        let resolved = QualityCardStore.card(
+            forRepo: "mlx-community/Qwen3.8-27B-OptiQ-4bit", hostHardwareClass: nil,
+            in: [passCard, noGoCard])
+        XCTAssertEqual(resolved?.id, noGoCard.id)
+    }
+
     // MARK: - QualityCard.matchesResidentLaunch / effectiveResidency (decode-level, independent of
     // QualityCardStore, to isolate decode leniency from the store's filtering).
 

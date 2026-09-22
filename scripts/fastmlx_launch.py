@@ -971,8 +971,17 @@ def resolve_card(
     filters this way -- see below.
 
     A repo or pin match can now name MORE THAN ONE card -- the same pack
-    measured on more than one hardware class and/or engine build. When it
-    does, ``hardwareClass`` is tried FIRST: if the candidates do not all
+    measured on more than one hardware class and/or engine build. When
+    ANY of those candidates carries a ``NO_GO`` verdict, the pool is
+    narrowed to just the ``NO_GO`` candidate(s) FIRST, before any other
+    tiebreak runs: a ``NO_GO`` is authoritative evidence against the
+    launch, never merely weaker evidence than a same-pack
+    PASS/REFERENCE/EXACT sibling, so an exact hardwareClass or
+    engineBuild match on a non-``NO_GO`` sibling must never silently
+    outrank it. The tiebreaks below then run identically inside that
+    narrowed pool (or the full pool, when no candidate is ``NO_GO``).
+
+    Within whichever pool is in play, ``hardwareClass`` is tried FIRST: if the candidates do not all
     share one hardware class, and exactly one candidate's
     ``card_hardware_class`` equals this host's (``host_hardware_class()``),
     that one is selected. An unknown host class, or zero/more-than-one
@@ -1015,6 +1024,23 @@ def resolve_card(
     candidates = repo_cards if repo_cards else pin_cards
     if not candidates:
         return None
+
+    # Fail-closed FIRST, before any tiebreak: a NO_GO verdict is
+    # authoritative evidence against the launch, never merely weaker
+    # evidence than a same-pack PASS/REFERENCE/EXACT sibling. When ANY
+    # candidate is NO_GO, narrow the pool to just the NO_GO candidate(s)
+    # and run the SAME disambiguation chain below (hardwareClass, then
+    # engineBuild.commit, then the exit-3 refusal) inside that narrower
+    # pool. hardwareClass is a tiebreak WITHIN a verdict class, never
+    # across one -- a card measured on other hardware is weaker evidence,
+    # not void evidence, so an exact host-class match on a PASS sibling
+    # must never silently outrank a published NO_GO for the same pack.
+    no_go_candidates = [
+        card for card in candidates if card.get("verdict") == "NO_GO"
+    ]
+    if no_go_candidates:
+        candidates = no_go_candidates
+
     if len(candidates) == 1:
         return candidates[0]
 

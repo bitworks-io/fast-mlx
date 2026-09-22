@@ -4112,6 +4112,105 @@ class HardwareClassTieBreakTestCase(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+# ---------------------------------------------------------------------
+# NO_GO fail-closed tiebreak: an exact host-class match must NEVER convert
+# a NO_GO refusal into an admission. hardwareClass is a tiebreak WITHIN a
+# verdict class (see resolve_card's docstring), never across one -- a
+# same-pack PASS measured on THIS host is not "better evidence" than a
+# NO_GO also on record for this pack; it is simply evidence about a
+# DIFFERENT configuration the launch is not using. docs/task-inbox/
+# 2026-09-22-PREDECLARATION-hardwareclass-joins-identity-never-filters.md.
+# ---------------------------------------------------------------------
+MIXED_VERDICT_REPO = "example/MixedVerdictModel"
+MIXED_VERDICT_PASS_M5_ID = "mixed-pass-m5@test"
+MIXED_VERDICT_NOGO_ULTRA_ID = "mixed-nogo-ultra@test"
+MIXED_VERDICT_NOGO_M5_ID = "mixed-nogo-m5@test"
+
+
+def mixed_verdict_card(card_id: str, hardware_class: str, verdict: str) -> dict:
+    return {
+        "id": card_id,
+        "model": {"repo": MIXED_VERDICT_REPO, "hfPin": card_id},
+        "verdict": verdict,
+        "config": {"hardwareClass": hardware_class},
+        "admission": {
+            "default": verdict != "NO_GO",
+            "optIn": verdict == "NO_GO",
+            "reason": f"{verdict.lower()} on {hardware_class}",
+        },
+        "legible": {
+            "tier": "Reference" if verdict == "PASS" else "Unquantified",
+            "headline": f"{verdict} on {hardware_class}.",
+        },
+    }
+
+
+def mixed_pass_m5_no_go_ultra_cards() -> list:
+    # PASS@apple-m5, NO_GO@apple-m3-ultra -- the exact shape from the
+    # defect report: an apple-m5 host has an exact hardwareClass match
+    # against the PASS card, which must NOT outrank the NO_GO sibling.
+    return [
+        mixed_verdict_card(MIXED_VERDICT_PASS_M5_ID, "apple-m5", "PASS"),
+        mixed_verdict_card(MIXED_VERDICT_NOGO_ULTRA_ID, "apple-m3-ultra", "NO_GO"),
+    ]
+
+
+class NoGoFailClosedTieBreakTestCase(unittest.TestCase):
+    # T1: the flip is unreachable. Without the fix, an apple-m5 host's
+    # exact hardwareClass match against the PASS card silently disarms the
+    # published NO_GO. With the fix, NO_GO candidates are narrowed to
+    # FIRST, so the single remaining NO_GO candidate is returned outright
+    # and the caller's admission gate still refuses the launch.
+    def test_no_go_outranks_exact_host_class_match_on_pass_sibling(self):
+        cards = mixed_pass_m5_no_go_ultra_cards()
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, MIXED_VERDICT_REPO, None, host_hardware_class=lambda: "apple-m5"
+        )
+        self.assertEqual(card["id"], MIXED_VERDICT_NOGO_ULTRA_ID)
+        self.assertEqual(card["verdict"], "NO_GO")
+        outcome, _message = FASTMLX_LAUNCH.decide_admission(card, opted_in=False)
+        self.assertEqual(outcome, "refuse_quality_flagged")
+
+    # T2: two-arm discrimination -- host class still works when no
+    # candidate is NO_GO. MANDATORY alongside T1: deleting the host-class
+    # branch entirely would still pass T1 for free (the NO_GO pool narrows
+    # to one candidate without ever consulting host class), so this test
+    # is what actually proves the tiebreak logic, not just the narrowing,
+    # survived the fix.
+    def test_host_class_still_selects_between_two_pass_candidates(self):
+        cards = hardware_class_card_manifest()["cards"]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, HWC_REPO, None, host_hardware_class=lambda: "apple-m5"
+        )
+        self.assertEqual(card["id"], HWC_CARD_M5_ID)
+
+    # T3: host class still disambiguates WITHIN the NO_GO pool -- proves
+    # subordination (host class demoted to a within-verdict tiebreak), not
+    # a bypass of the tiebreak altogether.
+    def test_host_class_disambiguates_within_the_no_go_pool(self):
+        cards = [
+            mixed_verdict_card(MIXED_VERDICT_NOGO_M5_ID, "apple-m5", "NO_GO"),
+            mixed_verdict_card(MIXED_VERDICT_NOGO_ULTRA_ID, "apple-m3-ultra", "NO_GO"),
+        ]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, MIXED_VERDICT_REPO, None, host_hardware_class=lambda: "apple-m5"
+        )
+        self.assertEqual(card["id"], MIXED_VERDICT_NOGO_M5_ID)
+        self.assertEqual(card["verdict"], "NO_GO")
+
+    # T4: an unknown host class (None) is unchanged by the fix. The NO_GO
+    # pool here narrows to a single candidate BEFORE hardwareClass is ever
+    # consulted (same as the single-candidate short circuit above it), so
+    # the outcome does not depend on whether the host is known.
+    def test_unknown_host_class_still_returns_the_sole_no_go_candidate(self):
+        cards = mixed_pass_m5_no_go_ultra_cards()
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, MIXED_VERDICT_REPO, None, host_hardware_class=lambda: None
+        )
+        self.assertEqual(card["id"], MIXED_VERDICT_NOGO_ULTRA_ID)
+        self.assertEqual(card["verdict"], "NO_GO")
+
+
 class CardHardwareClassTestCase(unittest.TestCase):
     def test_returns_config_hardware_class(self):
         card = {"config": {"hardwareClass": "apple-m5"}}

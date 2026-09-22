@@ -204,20 +204,24 @@ public enum QualityCardStore {
     ///    distinct measurements, not duplicates — see
     ///    `docs/task-inbox/2026-09-22-PREDECLARATION-hardwareclass-joins-identity-never-filters.md`
     ///    — so reaching >1 match here is an expected, supported case, not an error.)
-    /// 2. More than one match: if `hostHardwareClass` is non-nil and exactly one candidate's
-    ///    `config?.hardwareClass` equals it, return that one. An exact host match is the strongest
-    ///    available signal — this card is evidence gathered on the box that is about to serve.
-    /// 3. Otherwise, manifest array order must NEVER decide the outcome (order is emitter-determined
-    ///    and not stable under re-emission). If any remaining candidate's `verdict == .noGo`, the
-    ///    selection prefers one of those: `QualityAdmission.decide` refuses ONLY on `.noGo`
-    ///    (`:141-163`), so a broken quantization must keep refusing even on hardware it was never
-    ///    measured on — a card measured on other hardware is WEAKER evidence, not VOID evidence, and
-    ///    hardwareClass must never act as an eligibility filter (that would silently disarm every
+    /// 2. More than one match: manifest array order must NEVER decide the outcome (order is
+    ///    emitter-determined and not stable under re-emission). Fail-closed FIRST — if any candidate's
+    ///    `verdict == .noGo`, narrow the pool to just those: `QualityAdmission.decide` refuses ONLY on
+    ///    `.noGo` (`:141-163`), so a broken quantization must keep refusing even on hardware it was
+    ///    never measured on — a card measured on other hardware is WEAKER evidence, not VOID evidence,
+    ///    and hardwareClass must never act as an eligibility filter (that would silently disarm every
     ///    published NO_GO card on every non-matching host, converting a fail-closed gate into a
-    ///    fail-open one). If no candidate is `.noGo`, every remaining candidate admits, so the choice
-    ///    cannot change the outcome. Either way, pick deterministically by the lexicographically
-    ///    smallest card `id`, so the `--accept-quality <id>` refusal message is stable across
-    ///    manifest re-emissions.
+    ///    fail-open one). If no candidate is `.noGo`, the pool stays every remaining candidate — none
+    ///    of them can change the outcome, since they all admit.
+    /// 3. Host class is a TIEBREAK WITHIN that pool only, never a filter and never a way to escape the
+    ///    pool chosen in step 2: if `hostHardwareClass` is non-nil and exactly one of the pool's
+    ///    candidates has `config?.hardwareClass` equal to it, return that one. An exact host match is
+    ///    the strongest available signal for choosing WHICH card of the surviving pool is most
+    ///    relevant — but it must never reach across pools to prefer an admitting card over a NO_GO one;
+    ///    doing so would defeat step 2's fail-closed preference by ordering, not by filtering.
+    /// 4. Otherwise (no unique host match, or no host hint), pick deterministically by the
+    ///    lexicographically smallest card `id` within the pool, so the `--accept-quality <id>` refusal
+    ///    message is stable across manifest re-emissions.
     public static func card(
         forRepo repoID: String, hostHardwareClass: String? = nil, in cards: [QualityCard]
     ) -> QualityCard? {
@@ -225,14 +229,14 @@ public enum QualityCardStore {
         if matches.count <= 1 {
             return matches.first
         }
+        let noGoMatches = matches.filter { $0.verdict == .noGo }
+        let tiePool = noGoMatches.isEmpty ? matches : noGoMatches
         if let hostHardwareClass {
-            let hostMatches = matches.filter { $0.config?.hardwareClass == hostHardwareClass }
+            let hostMatches = tiePool.filter { $0.config?.hardwareClass == hostHardwareClass }
             if hostMatches.count == 1 {
                 return hostMatches[0]
             }
         }
-        let noGoMatches = matches.filter { $0.verdict == .noGo }
-        let tiePool = noGoMatches.isEmpty ? matches : noGoMatches
         return tiePool.min { $0.id < $1.id }
     }
 
