@@ -5014,6 +5014,181 @@ class PublicSiteTests(unittest.TestCase):
                     f"validate_public_site refused={validate_refused} failures={failures}",
                 )
 
+    # ------------------------------------------------------------------
+    # config.hardwareClass must be canonical: `^[a-z0-9]+(-[a-z0-9]+)*$`,
+    # exactly the shape `fastmlx_launch.host_hardware_class()` produces. A
+    # value outside this shape can never host-match by construction (see
+    # that function's docstring), so it is a SILENT no-op at serve time
+    # rather than an error -- which is why the shape pin is refused here,
+    # not merely style
+    # (docs/task-inbox/2026-09-22-PREDECLARATION-hardware-class-must-be-canonical.md).
+    # ------------------------------------------------------------------
+
+    HARDWARE_CLASS_CANONICAL_VALUES = ("apple-m3-ultra", "apple-m5")
+    HARDWARE_CLASS_NONCANONICAL_VALUES = ("Apple M5", "apple_m5", "APPLE-M5", "apple--m5")
+
+    def test_hardware_class_canonical_values_are_accepted_by_both_validators(self) -> None:
+        for hardware_class in self.HARDWARE_CLASS_CANONICAL_VALUES:
+            with self.subTest(hardware_class=hardware_class):
+                manifest = self.quality_guide_manifest()
+                manifest["cards"][0]["config"]["hardwareClass"] = hardware_class
+                validated = build_public_site.validate_quality_card_document(
+                    manifest, "test manifest"
+                )
+                self.assertEqual(
+                    validated["cards"][0]["config"]["hardwareClass"], hardware_class
+                )
+                failures = validate_public_site.validate_quality_guide_manifest(manifest)
+                self.assertEqual(failures, [])
+
+    def test_hardware_class_noncanonical_values_are_refused_naming_field_and_value(
+        self,
+    ) -> None:
+        for hardware_class in self.HARDWARE_CLASS_NONCANONICAL_VALUES:
+            with self.subTest(hardware_class=hardware_class):
+                manifest = self.quality_guide_manifest()
+                manifest["cards"][0]["config"]["hardwareClass"] = hardware_class
+
+                with self.assertRaises(SystemExit) as build_ctx:
+                    build_public_site.validate_quality_card_document(manifest, "test manifest")
+                build_message = str(build_ctx.exception)
+                self.assertIn("hardwareClass", build_message)
+                self.assertIn(repr(hardware_class), build_message)
+
+                failures = validate_public_site.validate_quality_guide_manifest(manifest)
+                matching = [
+                    f for f in failures if "hardwareClass" in f and repr(hardware_class) in f
+                ]
+                self.assertTrue(matching, failures)
+
+    # Three hand-maintained copies of the hardwareClass shape/sentinel rule
+    # exist by design (the projection split): build_public_site.py,
+    # validate_public_site.py, and emit_quality_card.py each own a separate
+    # constant rather than importing a shared one. Nothing else cross-checks
+    # the two PROJECTED copies against drift, so pin their regex source and
+    # flags, and their sentinel constants, directly against each other --
+    # an added `re.IGNORECASE` (or similar) on only one copy would otherwise
+    # drift silently past every other test in this file.
+    def test_hardware_class_shape_and_sentinel_constants_agree_between_both_validators(
+        self,
+    ) -> None:
+        self.assertEqual(
+            build_public_site.QUALITY_CARD_HARDWARE_CLASS.pattern,
+            validate_public_site.QUALITY_CARD_HARDWARE_CLASS.pattern,
+        )
+        self.assertEqual(
+            build_public_site.QUALITY_CARD_HARDWARE_CLASS.flags,
+            validate_public_site.QUALITY_CARD_HARDWARE_CLASS.flags,
+        )
+        self.assertEqual(
+            build_public_site.QUALITY_CARD_HARDWARE_CLASS_SENTINEL,
+            validate_public_site.QUALITY_CARD_HARDWARE_CLASS_SENTINEL,
+        )
+
+    # ------------------------------------------------------------------
+    # config.hardwareClass must not carry the chip-probe-failed sentinel
+    # "unknown": `ProvenanceCLI.chipBrand()`
+    # (spike/Sources/fastmlx-harness/Provenance+CLI.swift:102,105) and
+    # `fastmlx_bench._chip_identity` (three sites) return that literal
+    # string when chip identification fails, and it feeds
+    # `emit_quality_card`'s `context["hardware"]["chip"]` unrefused. It is
+    # lowercase alphanumeric, so it PASSES the canonical shape check above
+    # -- yet `fastmlx_launch.host_hardware_class()` (the detector) fails
+    # closed to `None` and can NEVER return "unknown", so a card carrying
+    # it can never host-match: a silent no-op, exactly what this gate
+    # exists to refuse. This is a SEPARATE check from the shape check (the
+    # shape is fine; the meaning is "the chip probe failed"), with its OWN
+    # distinct message.
+    # ------------------------------------------------------------------
+
+    HARDWARE_CLASS_SENTINEL_VALUES = ("unknown", "UNKNOWN", "Unknown")
+
+    def test_hardware_class_sentinel_is_refused_by_both_validators_with_sentinel_message(
+        self,
+    ) -> None:
+        for hardware_class in self.HARDWARE_CLASS_SENTINEL_VALUES:
+            with self.subTest(hardware_class=hardware_class):
+                manifest = self.quality_guide_manifest()
+                manifest["cards"][0]["config"]["hardwareClass"] = hardware_class
+
+                with self.assertRaises(SystemExit) as build_ctx:
+                    build_public_site.validate_quality_card_document(manifest, "test manifest")
+                build_message = str(build_ctx.exception)
+                self.assertIn("hardwareClass", build_message)
+                # Distinguishing text: the sentinel message, not the generic
+                # shape message -- a test that only checked "some failure
+                # occurred" would pass on the wrong branch.
+                self.assertIn("chip-probe-failed sentinel value", build_message)
+                self.assertNotIn("is not a canonical", build_message)
+
+                failures = validate_public_site.validate_quality_guide_manifest(manifest)
+                sentinel_failures = [
+                    f
+                    for f in failures
+                    if "hardwareClass" in f and "chip-probe-failed sentinel value" in f
+                ]
+                self.assertTrue(sentinel_failures, failures)
+                self.assertFalse(
+                    any(
+                        "hardwareClass" in f and "is not a canonical" in f
+                        for f in failures
+                    ),
+                    f"sentinel value must be refused with the sentinel message, not the "
+                    f"generic shape message: {failures}",
+                )
+
+    def test_hardware_class_casing_variant_is_refused_for_shape_never_admitted_as_identity(
+        self,
+    ) -> None:
+        # Two otherwise-identical cards sharing the SAME non-canonical
+        # hardwareClass casing must be refused for the SHAPE, so a casing
+        # variant can never be silently admitted as a second (identity,
+        # residency, hardwareClass, engineBuild) identity -- that is
+        # precisely F1 in the predeclaration: a casing variant
+        # manufacturing a tie the duplicate gate exists to prevent.
+        #
+        # Measured collect-vs-raise asymmetry (do not mistake either half
+        # for a bug): `build_public_site.fail()` raises on the FIRST
+        # non-canonical card it sees, so for that validator the shape
+        # refusal provably happens before the duplicate check ever runs --
+        # it never reaches the second card, let alone the duplicate check.
+        # `validate_public_site` is collect-style and does NOT
+        # short-circuit: it still constructs the identity key from the raw
+        # (non-canonical) value for BOTH cards, so with two IDENTICAL
+        # non-canonical values the raw strings tie and it ALSO reports
+        # "duplicates another card" alongside the two shape failures
+        # (measured: 3 failures total). That is not a second bug -- the
+        # shape failures already refuse the manifest either way -- but a
+        # test must not claim the duplicate branch never fires here.
+        manifest = self.quality_guide_manifest()
+        manifest["cards"][0]["config"]["hardwareClass"] = "Apple M3 Ultra"
+        variant = json.loads(json.dumps(manifest["cards"][0]))
+        variant["id"] = "qwen38-27b-optiq-4bit-casing@variant"
+        manifest["cards"].append(variant)
+
+        with self.assertRaises(SystemExit) as build_ctx:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        build_message = str(build_ctx.exception)
+        self.assertIn("hardwareClass", build_message)
+        self.assertNotIn("duplicates another card", build_message)
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(failures, "casing-variant manifest must be refused")
+        shape_failures = [
+            f for f in failures if "hardwareClass" in f and "is not a canonical" in f
+        ]
+        # Both card 0 and the appended variant carry the non-canonical
+        # value, so the validate-side collect list carries a shape failure
+        # for each -- it never short-circuits after the first.
+        variant_index = len(manifest["cards"]) - 1
+        self.assertTrue(
+            any("quality card entry 0 " in f for f in shape_failures), shape_failures
+        )
+        self.assertTrue(
+            any(f"quality card entry {variant_index} " in f for f in shape_failures),
+            shape_failures,
+        )
+
     # The Flash Next cards were measured on a third-party serving engine
     # (fa76a4b5); the consumer-class 0.6B card was measured on fast-mlx's
     # own fastmlx-serve release build. provenance.engineBuild is OPTIONAL

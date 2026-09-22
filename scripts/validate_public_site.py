@@ -57,6 +57,34 @@ QUALITY_CARD_PROVENANCE_REQUIRED_KEYS = {
 QUALITY_CARD_PROVENANCE_ALLOWED_KEYS = QUALITY_CARD_PROVENANCE_REQUIRED_KEYS | {"engineBuild"}
 QUALITY_CARD_ENGINE_BUILD_COMMIT = re.compile(r"[0-9a-f]{40}")
 QUALITY_CARD_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*@[a-z0-9]+(?:-[a-z0-9]+)*")
+# config.hardwareClass: the SAME string `fastmlx_launch.host_hardware_class()`
+# produces (e.g. "apple-m3-ultra") -- lowercase alphanumeric segments joined
+# by single hyphens. A value outside this shape can never host-match by
+# construction (see `fastmlx_launch.host_hardware_class()`'s docstring), so
+# it is refused here rather than silently never firing at serve time.
+#
+# This is a deliberate separate copy, not an import of either sibling --
+# see the "projection split" note in
+# docs/task-inbox/2026-09-22-PREDECLARATION-hardware-class-must-be-canonical.md.
+# Must stay byte-consistent with the copy in `build_public_site.py` and
+# with `emit_quality_card.validate_hardware_class` / the argparse-validated
+# `--hardware-class` in `emit_quality_card_cell.py`.
+QUALITY_CARD_HARDWARE_CLASS = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+# The producer-side fail-closed sentinel: `ProvenanceCLI.chipBrand()`
+# (spike/Sources/fastmlx-harness/Provenance+CLI.swift:102,105) and
+# `fastmlx_bench._chip_identity` (three call sites) both return the literal
+# string "unknown" when chip identification fails, and that value can flow
+# unrefused into `emit_quality_card`'s `context["hardware"]["chip"]`. It is
+# lowercase alphanumeric, so it PASSES QUALITY_CARD_HARDWARE_CLASS above --
+# but the detector, `fastmlx_launch.host_hardware_class()`, fails closed to
+# `None` and can NEVER return "unknown". A card carrying "unknown" can
+# therefore never host-match: a silent no-op, exactly what this gate exists
+# to refuse. This is a separate check from the shape check above (the shape
+# is fine; the meaning is "the chip probe failed"), and is compared against
+# the case-normalized value so "UNKNOWN" / "Unknown" are refused too, with
+# this dedicated message rather than the generic shape message.
+# Must stay byte-consistent with the copy in `build_public_site.py`.
+QUALITY_CARD_HARDWARE_CLASS_SENTINEL = "unknown"
 QUALITY_GUIDE_PUBLIC_FILE = "quality/index.html"
 CAPABILITY_STATUS_LABELS = {
     "implemented": "Implemented",
@@ -4823,7 +4851,25 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                     _flag_transfer_failures(config.get("flagTransfer"), label)
                 )
             require_str(config, "enhancement", f"{label} config", failures)
-            require_str(config, "hardwareClass", f"{label} config", failures)
+            hardware_class = require_str(config, "hardwareClass", f"{label} config", failures)
+            if (
+                hardware_class is not None
+                and hardware_class.strip().lower() == QUALITY_CARD_HARDWARE_CLASS_SENTINEL
+            ):
+                failures.append(
+                    f"{label} config.hardwareClass {hardware_class!r} is the "
+                    "chip-probe-failed sentinel value ('unknown'); chip identification "
+                    "failed when this card was measured, so the card must not claim a "
+                    "hardware class it could not measure"
+                )
+            elif hardware_class is not None and not QUALITY_CARD_HARDWARE_CLASS.fullmatch(
+                hardware_class
+            ):
+                failures.append(
+                    f"{label} config.hardwareClass {hardware_class!r} is not a canonical "
+                    "hardware class (expected lowercase alphanumeric segments joined by single "
+                    "hyphens, e.g. 'apple-m3-ultra')"
+                )
 
         verdict = require_str(card, "verdict", label, failures)
         if verdict is not None and verdict not in QUALITY_VERDICTS:
