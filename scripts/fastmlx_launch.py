@@ -1185,6 +1185,42 @@ def card_fit_line(card: Optional[dict]) -> Optional[str]:
     return str(fit) if fit is not None else None
 
 
+def announce_verdict(card: Optional[dict]) -> str:
+    """The decoded ``verdict=`` token for the ``fastmlx_launch=admitted``
+    startup line -- mirrors the Swift ``QualityAdmission.announceFragment``
+    precedent (``spike/Sources/HarnessCore/QualityAdmission.swift``) and
+    this file's own ``decide_admission`` immediately below: an operator
+    must be able to SEE which quality verdict admitted a launch from this
+    one line, never merely infer it from a bare ``card=`` id.
+
+    Unlike ``announceFragment``, this token is never OMITTED for an
+    uncarded launch -- it is fixed at exactly ``"none"``, never absent.
+    ``fastmlx_launch=admitted`` is a fixed-arity key=value record whose
+    every field is always present with an explicit sentinel (``card=none``,
+    ``engine_build=<status>``, ``mtp=<status>``), specifically so a
+    supervisor line-parser (launchd, nohup, a log shipper) can split the
+    line on whitespace and index a fixed field position without a
+    conditional grammar. ``announceFragment``'s Swift fragment, by
+    contrast, is a 1-or-2-token fragment with no such contract, so it is
+    free to drop the token entirely when there is no card.
+
+    Fails closed exactly like the Swift ``QualityVerdict`` decoder and like
+    ``decide_admission`` below: a missing ``verdict`` key, an explicit
+    ``UNMEASURED``, or any string ``decide_admission`` does not recognize
+    as PASS/REFERENCE/EXACT/NO_GO all render as ``"UNMEASURED"`` here too
+    -- this line must never echo back a raw verdict string that the
+    admission logic itself did not believe. The return value can never
+    contain whitespace or ``/``: it is always one of ``none``, ``PASS``,
+    ``REFERENCE``, ``EXACT``, ``NO_GO``, or ``UNMEASURED``.
+    """
+    if card is None:
+        return "none"
+    verdict = card.get("verdict")
+    if verdict in ("PASS", "REFERENCE", "EXACT", "NO_GO"):
+        return verdict
+    return "UNMEASURED"
+
+
 def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
     """Mirror ``QualityAdmission.decide`` exactly.
 
@@ -2733,6 +2769,7 @@ def _run_serve(args, passthrough_args: list) -> int:
     admitted_line = (
         "fastmlx_launch=admitted "
         f"engine={profile['name']} card={card.get('id') if card else 'none'} "
+        f"verdict={announce_verdict(card)} "
         f"fit={fit_label} context={context} residency={residency} "
         f"engine_build={build_status} mtp={mtp_status}"
     )

@@ -1399,6 +1399,79 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         self.assertEqual(captured_argv[captured_argv.index("--context") + 1], "2048")
 
     # ------------------------------------------------------------------
+    # The admitted line's `verdict=` token: an operator must be able to SEE
+    # which quality verdict admitted a launch from this ONE line, never
+    # merely infer it from `card=` -- the defect this closes. A real exec
+    # (not --dry-run) is required here, same as
+    # test_admitted_run_actually_execs_the_engine above: the admitted line
+    # is only ever printed on the real-launch path.
+    # ------------------------------------------------------------------
+    def test_admitted_line_carries_verdict_adjacent_to_an_opted_in_no_go_card(self):
+        env = dict(os.environ)
+        env["FAKE_ENGINE_CAPTURE_PATH"] = str(self.root / "captured-argv.json")
+        argv = [
+            sys.executable,
+            str(LAUNCH_PATH),
+        ] + self.base_args(
+            **{
+                "--context": "2048",
+                "--model-repo": NO_GO_REPO,
+                "--accept-quality": NO_GO_CARD_ID,
+            }
+        )
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Asserted as ONE adjacent literal, not two separate assertIns --
+        # a regression that put the verdict token somewhere else in the
+        # line (or dropped it) must fail this even if both substrings
+        # happen to appear elsewhere.
+        self.assertIn(f"card={NO_GO_CARD_ID} verdict=NO_GO", result.stderr)
+
+    def test_admitted_line_carries_none_verdict_when_uncarded(self):
+        env = dict(os.environ)
+        env["FAKE_ENGINE_CAPTURE_PATH"] = str(self.root / "captured-argv.json")
+        # No --model-repo and no pull receipt: the model has no resolved
+        # identity, so no card can ever match (same setup as
+        # test_in_dir_pull_receipt_alone_no_longer_identifies_model's
+        # admit_unmeasured case, run here as a real exec instead of
+        # --dry-run so the admitted line is actually printed).
+        argv = [
+            sys.executable,
+            str(LAUNCH_PATH),
+        ] + self.base_args(**{"--context": "2048"})
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("card=none verdict=none", result.stderr)
+
+    def test_admitted_line_is_unchanged_except_for_the_inserted_verdict_token(self):
+        # Non-regression: every OTHER token of the admitted line must stay
+        # byte-identical. This is the exact pre-change line captured from
+        # this same PASS-card scenario (model-repo=PASS_REPO, context=2048)
+        # before the `verdict=` token existed; the only permitted delta is
+        # " verdict=PASS" inserted immediately after the `card=` token.
+        pre_change_line = (
+            "fastmlx_launch=admitted engine=fastmlx-serve "
+            "card=fixture-pass@test fit=GREEN context=2048 residency=resident "
+            "engine_build=unrecorded mtp=off"
+        )
+        expected_line = pre_change_line.replace(
+            "card=fixture-pass@test ", "card=fixture-pass@test verdict=PASS "
+        )
+        env = dict(os.environ)
+        env["FAKE_ENGINE_CAPTURE_PATH"] = str(self.root / "captured-argv.json")
+        argv = [
+            sys.executable,
+            str(LAUNCH_PATH),
+        ] + self.base_args(**{"--context": "2048", "--model-repo": PASS_REPO})
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        admitted_lines = [
+            line for line in result.stderr.splitlines() if line.startswith("fastmlx_launch=admitted")
+        ]
+        self.assertEqual(len(admitted_lines), 1, result.stderr)
+        self.assertEqual(admitted_lines[0], expected_line)
+
+    # ------------------------------------------------------------------
     # A public card with model.repo == null, identified only by an hfPin
     # prefix of the model's pinned revision.
     # ------------------------------------------------------------------
@@ -5222,6 +5295,55 @@ class BuiltinSizersEmitNoContextCeilingTests(unittest.TestCase):
             fields, f"real sizer emitted no key=value fields at all: {proc.stdout!r}"
         )
         self.assertNotIn("fit_context_ceiling", fields)
+
+
+class AnnounceVerdictTestCase(unittest.TestCase):
+    """Unit arms over ``announce_verdict``, isolated from any launch --
+    the pure-function contract stated in its docstring.
+    """
+
+    def test_no_card_is_none(self):
+        self.assertEqual(FASTMLX_LAUNCH.announce_verdict(None), "none")
+
+    def test_pass_verdict_passes_through(self):
+        self.assertEqual(FASTMLX_LAUNCH.announce_verdict({"verdict": "PASS"}), "PASS")
+
+    def test_reference_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_LAUNCH.announce_verdict({"verdict": "REFERENCE"}), "REFERENCE"
+        )
+
+    def test_exact_verdict_passes_through(self):
+        self.assertEqual(FASTMLX_LAUNCH.announce_verdict({"verdict": "EXACT"}), "EXACT")
+
+    def test_no_go_verdict_passes_through(self):
+        self.assertEqual(FASTMLX_LAUNCH.announce_verdict({"verdict": "NO_GO"}), "NO_GO")
+
+    def test_unmeasured_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_LAUNCH.announce_verdict({"verdict": "UNMEASURED"}), "UNMEASURED"
+        )
+
+    def test_unrecognized_verdict_string_fails_closed_to_unmeasured(self):
+        # decide_admission treats any string it does not recognize as
+        # admit_unmeasured -- this line must never echo back "MAYBE" as if
+        # it were a verdict the admission logic actually believed.
+        self.assertEqual(FASTMLX_LAUNCH.announce_verdict({"verdict": "MAYBE"}), "UNMEASURED")
+
+    def test_card_with_no_verdict_key_fails_closed_to_unmeasured(self):
+        self.assertEqual(FASTMLX_LAUNCH.announce_verdict({"id": "x"}), "UNMEASURED")
+
+    # Differ control: a constant-returning implementation (e.g. always
+    # "UNMEASURED", or always the card id) must not pass this file's other
+    # arms. Stated directly here too, so it fails even if every other arm
+    # were deleted: PASS and an opted-in NO_GO must render DIFFERENT,
+    # non-empty tokens.
+    def test_pass_and_no_go_render_different_nonempty_tokens(self):
+        pass_verdict = FASTMLX_LAUNCH.announce_verdict({"verdict": "PASS"})
+        no_go_verdict = FASTMLX_LAUNCH.announce_verdict({"verdict": "NO_GO"})
+        self.assertTrue(pass_verdict)
+        self.assertTrue(no_go_verdict)
+        self.assertNotEqual(pass_verdict, no_go_verdict)
 
 
 if __name__ == "__main__":
