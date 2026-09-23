@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-08-29",
+  "updatedAt": "2026-09-22",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,86 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-3",
+      "title": "Publish v0.1.3: the engine no longer outlives its launcher",
+      "publishedAt": "2026-09-19T21:17:52Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.3 arm64 macOS distribution, in which the fastmlx serve --front-port launcher no longer leaves its engine running: the engine is stopped when the launcher or its guard is killed, a requested stop exits 143, and a busy engine port is refused rather than adopted.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "f418b8e47b35ff030485bd2878ad5dad63be31fd",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
+      "id": "tagged-distribution-v0-1-2",
+      "title": "Publish v0.1.2: provenance on every response",
+      "publishedAt": "2026-09-19T17:00:14Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.2 arm64 macOS distribution, adding fastmlx serve --front-port provenance headers on every response, and card provenance that states when a launch's engine build or its --mtp setting differs from the one the quality card was checked with.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "9bb06501a38684c08293d900fcc6e804e59b11e4",
+      "publicLinks": [
+        {
+          "label": "Inspect the published capabilities",
+          "path": "capabilities/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
+      "id": "tagged-distribution-v0-1-1",
+      "title": "Publish v0.1.1: fit checks that name their own refusal",
+      "publishedAt": "2026-09-19T11:02:36Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.1 arm64 macOS distribution, adding header-only GGUF and safetensors fit checks with both fit sizers, residency-aware quality-card admission that matches a streaming launch only to a streaming card, and an explicit stated reason when a fit check cannot run.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "8aab34b45b8dbd39163f8c507343105b55de123f",
+      "publicLinks": [
+        {
+          "label": "Inspect the published capabilities",
+          "path": "capabilities/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
+      "id": "tagged-distribution-v0-1-0",
+      "title": "Publish v0.1.0: the first tagged distribution",
+      "publishedAt": "2026-09-18T22:24:54Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the first tagged fast-mlx distribution: a reviewed release packaging script, operator install instructions, and an arm64 macOS archive published alongside the SHA-256 checksum a downloader can verify it against.",
+      "scope": "Tagged public distribution, its packaging script, and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "9671a8b39541990201b510c0da2843528e822395",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "model-aware-context-completion-budgets",
       "title": "Publish model-aware context and completion budgets",

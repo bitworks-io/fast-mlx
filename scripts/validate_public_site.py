@@ -232,9 +232,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_495
+REVIEWED_HOME_PAGE_BYTES = 10_640
 REVIEWED_HOME_PAGE_SHA256 = (
-    "0a9a65e598f903233174979fadf0b438738388bc75d80d3f1cf1ca5846445cba"
+    "c5bdbcec29e8e5657c5447e50a7a1f1249468e77b81662fc04377d70b6825d7a"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -258,9 +258,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_822
+REVIEWED_STATUS_PAGE_BYTES = 22_967
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "46d4a1e2f3d4d24c936082789ae07cc67d90407d43237dcc175bb5811ffd99df"
+    "712ac1777888801c41e5a08503f05746c872e9877f97bc81155d8878a12b4d10"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -436,8 +436,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/model-aware-context-completion-budgets/",
-    "https://github.com/bitworks-io/fast-mlx/commit/940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
+    "../releases/tagged-distribution-v0-1-3/",
+    "https://github.com/bitworks-io/fast-mlx/commit/f418b8e47b35ff030485bd2878ad5dad63be31fd",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -449,7 +449,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "32 published research notes",
-    "22 reviewed release records",
+    "26 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -610,11 +610,27 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 23_025
+REVIEWED_RELEASE_INDEX_BYTES = 27_872
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "e1d5ccae648b66108562fb3c85b2628c82d926a9e8f8238f12ab64ee3b9eb23f"
+    "28dffb77385d5da65a18593b84e9a6f3d7d07cef25521494ae7541822543dc33"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "tagged-distribution-v0-1-3",
+        "Publish v0.1.3: the engine no longer outlives its launcher",
+    ),
+    (
+        "tagged-distribution-v0-1-2",
+        "Publish v0.1.2: provenance on every response",
+    ),
+    (
+        "tagged-distribution-v0-1-1",
+        "Publish v0.1.1: fit checks that name their own refusal",
+    ),
+    (
+        "tagged-distribution-v0-1-0",
+        "Publish v0.1.0: the first tagged distribution",
+    ),
     (
         "model-aware-context-completion-budgets",
         "Publish model-aware context and completion budgets",
@@ -666,6 +682,22 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "tagged-distribution-v0-1-3": (
+        4_884,
+        "1e53801b1dd9adf262f61a159ba321cd00d9fef3d65158cf67fd55a496d6cc46",
+    ),
+    "tagged-distribution-v0-1-2": (
+        4_826,
+        "f79714a52faff962e93c8b646cbfea2d6e9e91023afa524c9d8dd6dcb909147a",
+    ),
+    "tagged-distribution-v0-1-1": (
+        4_870,
+        "84770a0ad3023e24b8c81af1216231033f3853d8aa8649fa9eb4f09bf95f3d28",
+    ),
+    "tagged-distribution-v0-1-0": (
+        4_810,
+        "d9eee85da210a2fd402c9a26758d381a02160bf77966585e1d8400a3223c4c88",
+    ),
     "model-aware-context-completion-budgets": (
         4_852,
         "6e307e05e3e2eb1b806c8dd7e86fa2ecdfd27eda541e6a8bad304652b6df972a",
@@ -3471,7 +3503,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "model-aware-context-completion-budgets",
+        "data-latest-release-id": "tagged-distribution-v0-1-3",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }

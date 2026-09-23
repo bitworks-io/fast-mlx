@@ -298,33 +298,33 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "model-aware-context-completion-budgets",
-                "title": "Publish model-aware context and completion budgets",
-                "publishedAt": "2026-08-29T21:36:35Z",
-                "category": "product",
+                "id": "tagged-distribution-v0-1-3",
+                "title": "Publish v0.1.3: the engine no longer outlives its launcher",
+                "publishedAt": "2026-09-19T21:17:52Z",
+                "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes model- and host-fit-aware context and completion budgets "
-                    "with authenticated discovery and exact prompt, transport, and "
-                    "response enforcement across supported serving routes."
+                    "Publishes the v0.1.3 arm64 macOS distribution, in which the "
+                    "fastmlx serve --front-port launcher no longer leaves its engine "
+                    "running: the engine is stopped when the launcher or its guard is "
+                    "killed, a requested stop exits 143, and a busy engine port is "
+                    "refused rather than adopted."
                 ),
                 "scope": (
-                    "Reviewed source and regression tests for supported fast-mlx routes; "
-                    "no universal model-family support, long-context quality, throughput, "
-                    "GLM runtime, deployment, or production promotion claim."
+                    "Tagged public distribution and the arm64 macOS archive published "
+                    "with its SHA-256 checksum only; the binaries are unsigned and not "
+                    "notarized, and no performance, quality, model-support, "
+                    "host-qualification, deployment, or production-promotion claim "
+                    "follows."
                 ),
-                "publicCommit": "940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
+                "publicCommit": "f418b8e47b35ff030485bd2878ad5dad63be31fd",
                 "publicLinks": [
                     {
-                        "label": "Inspect the serving capability",
-                        "path": "capabilities/openai-http-sse-serving/",
+                        "label": "Start with the operator quickstart",
+                        "path": "quickstart/",
                     },
                     {
-                        "label": "Read the implementation note",
-                        "path": "research/the-4k-limit-was-not-the-model-limit/",
-                    },
-                    {
-                        "label": "Read the release JSON",
+                        "label": "Read the release ledger",
                         "path": "releases/index.json",
                     },
                 ],
@@ -334,6 +334,10 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "f418b8e47b35ff030485bd2878ad5dad63be31fd",
+                "9bb06501a38684c08293d900fcc6e804e59b11e4",
+                "8aab34b45b8dbd39163f8c507343105b55de123f",
+                "9671a8b39541990201b510c0da2843528e822395",
                 "940e247ff62fb66d76adb3f48167a1d58d5e3dd1",
                 "b62e0ccd69e6456ad5a824e1a3177b1a4580ad1b",
                 "6a44732e6834788c12b569a8dc5fe1d3b1376455",
@@ -1237,9 +1241,14 @@ class PublicSiteTests(unittest.TestCase):
                 self.assertIn(
                     f'data-public-commit="{release["publicCommit"]}"', page
                 )
-                self.assertIn(release["title"], page)
-                self.assertIn(release["summary"], page)
-                self.assertIn(release["scope"], page)
+                # The page renders these three through html.escape(str(x)) --
+                # quote=True -- so compare against the escaped form. For a field
+                # with no special character the two are identical, so this is the
+                # same assertion; it differs only for a field that genuinely has
+                # to be escaped, where the raw form is the WRONG expectation.
+                self.assertIn(html.escape(release["title"]), page)
+                self.assertIn(html.escape(release["summary"]), page)
+                self.assertIn(html.escape(release["scope"]), page)
                 self.assertIn(
                     "https://github.com/bitworks-io/fast-mlx/commit/"
                     + release["publicCommit"],
