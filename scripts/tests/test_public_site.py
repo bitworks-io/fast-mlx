@@ -4552,6 +4552,110 @@ class PublicSiteTests(unittest.TestCase):
                 failures,
             )
 
+    def render_card_fragment_with_example(self, example: dict[str, object]) -> tuple[str, str]:
+        """Render card 0 from the sample manifest with its `legible.example`
+        replaced, and return (isolated fragment, card id)."""
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][0]
+        card["legible"]["example"] = example
+        card_id = str(card["id"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            loaded = build_public_site.load_quality_guides(root)
+        page = build_public_site.render_quality_guide(loaded["cards"])
+        return self.quality_card_fragment(page, card_id), card_id
+
+    def test_quality_example_measured_renders_side_by_side(self) -> None:
+        """Acceptance criterion 1: a `measured` example renders its context,
+        both outputs, and its note -- the "visceral side-by-side" the schema
+        requires and the renderer was silently dropping."""
+        example = {
+            "status": "measured",
+            "prompt": "fixture-context: the reasoning preamble text",
+            "referenceOutput": "fixture-reference-output: the peer pack picked so",
+            "configOutput": "fixture-config-output: this pack picked let",
+            "note": "fixture-note: first disagreement, prompt 0 position 4",
+        }
+        fragment, _ = self.render_card_fragment_with_example(example)
+        self.assertIn(example["prompt"], fragment)
+        self.assertIn(example["referenceOutput"], fragment)
+        self.assertIn(example["configOutput"], fragment)
+        self.assertIn(example["note"], fragment)
+
+    def test_quality_example_pending_renders_explicit_not_yet_extracted_line(self) -> None:
+        """Acceptance criterion 2: a `pending` example must not render as
+        silence -- silence reads as "nothing differs" -- mirroring the
+        Unquantified branch's reasoning at :2380-2386."""
+        example = {
+            "status": "pending",
+            "prompt": None,
+            "referenceOutput": None,
+            "configOutput": None,
+            "note": "fixture: extract from task-evidence jsonl",
+        }
+        fragment, _ = self.render_card_fragment_with_example(example)
+        self.assertIn("no side-by-side", fragment.lower())
+        # None of the measured-only labels leak through when there is
+        # nothing to show for prompt/referenceOutput/configOutput.
+        self.assertNotIn("Other arm said", fragment)
+        self.assertNotIn("This pack said", fragment)
+        self.assertNotIn("Context:", fragment)
+
+    def test_quality_example_measured_and_pending_fragments_differ_and_are_nonempty(
+        self,
+    ) -> None:
+        """Differ control: a renderer that emits a constant, or emits nothing
+        in both arms, must fail this."""
+        measured_example = {
+            "status": "measured",
+            "prompt": "fixture-context: differ-control prompt",
+            "referenceOutput": "fixture-reference-output: differ-control reference",
+            "configOutput": "fixture-config-output: differ-control config",
+            "note": "fixture-note: differ-control note",
+        }
+        pending_example = {
+            "status": "pending",
+            "prompt": None,
+            "referenceOutput": None,
+            "configOutput": None,
+            "note": "fixture: differ-control pending note",
+        }
+        measured_fragment, _ = self.render_card_fragment_with_example(measured_example)
+        pending_fragment, _ = self.render_card_fragment_with_example(pending_example)
+        self.assertTrue(measured_fragment.strip())
+        self.assertTrue(pending_fragment.strip())
+        self.assertNotEqual(measured_fragment, pending_fragment)
+
+    def test_quality_example_illustrative_is_labeled_unmistakably_not_measured(self) -> None:
+        """Acceptance criterion 3: `illustrative` renders, but labeled so a
+        reader can never mistake it for a measured case."""
+        example = {
+            "status": "illustrative",
+            "prompt": None,
+            "referenceOutput": None,
+            "configOutput": None,
+            "note": "fixture: illustrative placeholder note",
+        }
+        fragment, _ = self.render_card_fragment_with_example(example)
+        self.assertIn(example["note"], fragment)
+        self.assertIn("illustrative", fragment.lower())
+        self.assertIn("not a measured case", fragment.lower())
+
+    def test_quality_example_measured_prompt_is_html_escaped(self) -> None:
+        """A real card's context begins with a literal `<think>` token; an
+        unescaped render path would inject a tag into the public page."""
+        example = {
+            "status": "measured",
+            "prompt": "<think> Okay,",
+            "referenceOutput": "fixture-reference-output: escaping-control reference",
+            "configOutput": "fixture-config-output: escaping-control config",
+            "note": "fixture-note: escaping-control note",
+        }
+        fragment, _ = self.render_card_fragment_with_example(example)
+        self.assertIn("&lt;think&gt;", fragment)
+        self.assertNotIn("<think>", fragment)
+
     def test_quality_guide_reference_and_exact_cards_render_null_safely(self) -> None:
         """REFERENCE (null drift/regression) and EXACT/MTP (mostly-null card) render
         with no leaked "None" and the documented null-specific copy."""

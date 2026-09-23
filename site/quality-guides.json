@@ -486,11 +486,11 @@
         },
         "regressionFocus": "open-ended enumerative and advisory writing (17-25% next-word drift); canonical technical explanations drift least (5-9%)",
         "example": {
-          "status": "pending",
-          "prompt": null,
-          "referenceOutput": null,
-          "configOutput": null,
-          "note": "extract a real disagreement from the peer-divergence cell's raw observations corresponding to peer-divergence-qwen3-0p6b-4bit-vs-8bit-2026-09-20.json"
+          "status": "measured",
+          "prompt": "<think> Okay,",
+          "referenceOutput": " so",
+          "configOutput": " let",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026<think> Okay,', the peer pack picks ' so' and this pack picks ' let'."
         },
         "benefit": {
           "fit": "0.33 GB on disk - fits a 24 GB Mac with room to spare",
@@ -566,11 +566,11 @@
         },
         "regressionFocus": "open-ended enumerative, procedural and advisory writing (19-25% next-word drift); canonical technical explanations drift least (4.7-9.4%)",
         "example": {
-          "status": "pending",
-          "prompt": null,
-          "referenceOutput": null,
-          "configOutput": null,
-          "note": "extract a real disagreement from the peer-divergence cell's raw observations corresponding to peer-divergence-qwen3-0p6b-4bit-vs-8bit-m3ultra-2026-09-23.json"
+          "status": "measured",
+          "prompt": "<think> Okay,",
+          "referenceOutput": " so",
+          "configOutput": " let",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026<think> Okay,', the peer pack picks ' so' and this pack picks ' let'."
         },
         "benefit": {
           "fit": "0.33 GB on disk - negligible against a 256 GB Mac",

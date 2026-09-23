@@ -2399,6 +2399,56 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
             body.append(
                 f'<p class="quality-regression"><strong>Regression focus:</strong> {html.escape(str(regression_focus))}</p>'
             )
+        # legible.example is "the visceral side-by-side" (schema v1): the one
+        # real instance of the measured difference, not just its percentage.
+        # A "pending" status must render an explicit line rather than
+        # silence -- silence would read as "nothing differs", the same
+        # failure mode the Unquantified drift branch above exists to avoid.
+        example = legible.get("example")
+        if example is not None:
+            example_status = str(example.get("status"))
+            if example_status == "pending":
+                body.append(
+                    '<div class="quality-example quality-example-pending">'
+                    '<p class="quality-example-label"><strong>Example:</strong> '
+                    'No side-by-side has been extracted for this card yet.</p>'
+                    '</div>'
+                )
+            else:
+                example_prompt = example.get("prompt")
+                example_reference_output = example.get("referenceOutput")
+                example_config_output = example.get("configOutput")
+                example_note = example.get("note")
+                if example_status == "illustrative":
+                    example_label = "Illustrative example — not a measured case"
+                else:
+                    example_label = "Measured example"
+                example_parts = [
+                    f'<div class="quality-example quality-example-{html.escape(example_status, quote=True)}">',
+                    f'<p class="quality-example-label"><strong>{html.escape(example_label)}</strong></p>',
+                ]
+                if example_prompt is not None:
+                    example_parts.append(
+                        '<p class="quality-example-context"><strong>Context:</strong> '
+                        f'{html.escape(str(example_prompt))}</p>'
+                    )
+                if example_reference_output is not None:
+                    example_parts.append(
+                        '<p class="quality-example-reference"><strong>Other arm said:</strong> '
+                        f'{html.escape(str(example_reference_output))}</p>'
+                    )
+                if example_config_output is not None:
+                    example_parts.append(
+                        '<p class="quality-example-config"><strong>This pack said:</strong> '
+                        f'{html.escape(str(example_config_output))}</p>'
+                    )
+                if example_note:
+                    example_parts.append(
+                        '<p class="quality-example-note"><strong>Note:</strong> '
+                        f'{html.escape(str(example_note))}</p>'
+                    )
+                example_parts.append('</div>')
+                body.extend(example_parts)
         body.extend(
             [
                 f'<p class="quality-admission"><strong>{html.escape(verdict_label)}:</strong> '
