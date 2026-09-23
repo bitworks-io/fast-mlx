@@ -4469,6 +4469,26 @@ class PublicSiteTests(unittest.TestCase):
 
         self.assertIn(reference_card["legible"]["headline"], page)
 
+    def test_quality_guide_renders_every_boundary_unmeasured_entry(self) -> None:
+        """boundary.unmeasured is required and validated (build_public_site.py
+        ~:1070-1078) but render_quality_guide never emitted it: a reader could
+        not tell what a card does NOT cover. Render the real shipped manifest
+        and require every unmeasured entry to appear in its own card."""
+        loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
+        self.assertIsNotNone(loaded)
+        cards = loaded["cards"]
+        page = build_public_site.render_quality_guide(cards)
+        for card in cards:
+            card_id = str(card["id"])
+            fragment = self.quality_card_fragment(page, card_id)
+            for entry in card["boundary"]["unmeasured"]:
+                self.assertIn(
+                    entry,
+                    fragment,
+                    f"quality card {card_id!r} does not render boundary.unmeasured "
+                    f"entry {entry!r}",
+                )
+
     def test_quality_speed_line_below_one_never_says_faster(self) -> None:
         """A measured speedX below 1.0 is a slowdown. Rendering it with the
         word "faster" would publish a falsehood — the reader would read a
@@ -4758,6 +4778,67 @@ class PublicSiteTests(unittest.TestCase):
             self.assertTrue(
                 any("does not render its provenance method" in f for f in failures), failures
             )
+
+    def test_validator_rejects_quality_page_hiding_its_unmeasured_list(self) -> None:
+        """Mirrors test_validator_rejects_quality_page_missing_family_or_method:
+        a regression that stops the renderer emitting a card's
+        boundary.unmeasured entries must be caught by the fail-closed page
+        validator, not just eyeballed."""
+
+        manifest = self.quality_guide_manifest()
+        original_render_quality_guide = build_public_site.render_quality_guide
+
+        def render_without_unmeasured(cards: object) -> str:
+            page = original_render_quality_guide(cards)  # type: ignore[arg-type]
+            page = re.sub(
+                r'<p class="scope-note quality-unmeasured-label">.*?</ul>',
+                "",
+                page,
+                flags=re.S,
+            )
+            return page
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            output.mkdir()
+            with mock.patch.object(
+                build_public_site, "load_quality_guides", return_value=manifest
+            ), mock.patch.object(
+                build_public_site,
+                "render_quality_guide",
+                side_effect=render_without_unmeasured,
+            ):
+                build_public_site.build_site(REPOSITORY_ROOT, output)
+
+            failures = validate_public_site.validate_quality_guide_page(output)
+            for card in manifest["cards"]:
+                card_id = str(card["id"])
+                for entry in card["boundary"]["unmeasured"]:
+                    self.assertTrue(
+                        any(
+                            f"quality card {card_id!r}" in f
+                            and "does not render its boundary.unmeasured entry" in f
+                            and entry in f
+                            for f in failures
+                        ),
+                        (card_id, entry, failures),
+                    )
+
+    def test_quality_card_with_empty_unmeasured_list_is_refused(self) -> None:
+        """boundary.unmeasured = [] passes the existing type check (`any(...)`
+        over an empty list is False), so a card claiming nothing is unmeasured
+        would publish silently. The loader must refuse it and the refusal
+        reason must name the card and boundary.unmeasured, not just raise."""
+        manifest = self.quality_guide_manifest()
+        manifest["cards"][0]["boundary"]["unmeasured"] = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_quality_guide_manifest(root, manifest)
+            with self.assertRaisesRegex(
+                SystemExit,
+                r"card entry 0 boundary\.unmeasured must not be empty",
+            ):
+                build_public_site.load_quality_guides(root)
 
     def test_validator_rejects_unknown_quality_verdict_and_provenance_source(self) -> None:
         base_manifest = self.quality_guide_manifest()

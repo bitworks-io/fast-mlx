@@ -5219,6 +5219,12 @@ def validate_quality_guide_page(site: Path) -> List[str]:
             )
         if str(card["boundary"]["scope"]) not in text:
             failures.append(f"quality card {card_id!r} does not render its boundary scope")
+        for entry in card["boundary"]["unmeasured"]:
+            if str(entry) not in text:
+                failures.append(
+                    f"quality card {card_id!r} does not render its "
+                    f"boundary.unmeasured entry {entry!r}"
+                )
         if re.search(r"\bNone\b", text):
             failures.append(
                 f"quality card {card_id!r} leaks a null field as literal text \"None\""

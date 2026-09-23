@@ -1076,6 +1076,11 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
             not isinstance(item, str) or not item.strip() for item in unmeasured
         ):
             fail(f"{card_label} boundary.unmeasured must be a list of non-empty strings")
+        if not unmeasured:
+            # A card claiming nothing is unmeasured is a claim of completeness
+            # no measurement in this schema actually makes; the empty-list case
+            # slips past the check above (`any(...)` over `[]` is False).
+            fail(f"{card_label} boundary.unmeasured must not be empty")
 
         repo_value = model.get("repo")
         identity = repo_value if repo_value is not None else model.get("hfPin")
@@ -2473,6 +2478,17 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
             )
         body.append(
             f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(boundary["scope"]))}</p>'
+        )
+        body.extend(
+            [
+                '<p class="scope-note quality-unmeasured-label"><strong>Not measured:</strong></p>',
+                '<ul class="quality-unmeasured-list">',
+                *[
+                    f'<li>{html.escape(str(entry))}</li>'
+                    for entry in boundary["unmeasured"]
+                ],
+                '</ul>',
+            ]
         )
         body.extend(
             [
