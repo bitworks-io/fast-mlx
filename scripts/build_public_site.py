@@ -927,6 +927,41 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
         if not isinstance(admission.get("optIn"), bool):
             fail(f"{card_label} admission.optIn is not a bool")
         require_text(admission, "reason", f"{card_label} admission")
+        # Claim-integrity gate (NOT an admission gate: the Swift + Python serve
+        # gates key on `verdict` alone -- see "Admission discriminator rules" in
+        # docs/quality-card-schema-v1.md). admission.{default,optIn} are
+        # validated-for-agreement CLAIMS about verdict that the public renderer
+        # surfaces (quality_admission_framing reads admission.reason); a card
+        # publishing a NO_GO verdict alongside admission.default=True would
+        # render "safe silent default" for a pack the serve gate refuses.
+        # R1: a NO_GO card can never be the silent production default.
+        # R2: a NO_GO card must stay electable, because the refusal message
+        #     tells the operator to elect it with --accept-quality.
+        #
+        # Deliberately ONE-SIDED. `verdict != "NO_GO"` must NOT imply
+        # default=True: "may this be the SILENT production default?" is a
+        # rollout/trust question that a passing MEASUREMENT does not settle,
+        # and scripts/tests/fixtures/quality-guides.sample.json ships two
+        # passing cards that say so -- a PASS card whose quality is
+        # vendor-reported rather than independently gated, and an EXACT card
+        # whose reason is "opt-in pending broader rollout". A biconditional
+        # here would reject both, so it would be a rule about what makes the
+        # shipped manifest pass rather than a rule about the claim.
+        #
+        # UNMEASURED is exempt: no UNMEASURED card has ever been emitted or
+        # shipped, so a rule for it would be an unreachable branch.
+        # admission.optIn on a non-NO_GO verdict is deliberately left
+        # unconstrained: the repo currently carries two contradictory
+        # conventions for that case, and picking a winner is a separate
+        # increment.
+        if verdict == "NO_GO":
+            if admission["default"] is not False:
+                fail(
+                    f"{card_label} admission.default {admission['default']!r} disagrees "
+                    f"with verdict 'NO_GO' (a NO_GO pack is never a silent default)"
+                )
+            if admission["optIn"] is not True:
+                fail(f"{card_label} admission.optIn must be true when verdict is 'NO_GO'")
 
         legible = require_exact_keys(
             card.get("legible"),

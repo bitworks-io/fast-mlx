@@ -5076,6 +5076,166 @@ class PublicSiteTests(unittest.TestCase):
             failures,
         )
 
+    # ------------------------------------------------------------------
+    # admission/verdict claim-integrity gate (docs/quality-card-schema-v1.md
+    # "Admission discriminator rules"). Deliberately ONE-SIDED: it only
+    # constrains a NO_GO card (R1: admission.default must be False, R2:
+    # admission.optIn must be True). It must NOT become a biconditional --
+    # a non-NO_GO card is free to carry default=False, because "may this be
+    # the SILENT production default?" is a rollout/trust question a passing
+    # MEASUREMENT does not settle. Both validators (build_public_site.py
+    # raises SystemExit; validate_public_site.py accumulates a failure
+    # list) must agree.
+    # ------------------------------------------------------------------
+    def test_no_go_card_with_default_true_is_rejected_by_both_validators(self) -> None:
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        self.assertEqual(no_go_card["verdict"], "NO_GO")
+        no_go_card["admission"]["default"] = True
+
+        with self.assertRaises(SystemExit) as build_ctx:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        build_message = str(build_ctx.exception)
+        self.assertIn("admission.default", build_message)
+        self.assertIn("NO_GO", build_message)
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("admission.default" in f and "NO_GO" in f for f in failures), failures
+        )
+
+    def test_no_go_card_with_opt_in_false_is_rejected_by_both_validators(self) -> None:
+        manifest = self.quality_guide_manifest()
+        no_go_card = manifest["cards"][0]
+        self.assertEqual(no_go_card["verdict"], "NO_GO")
+        no_go_card["admission"]["optIn"] = False
+
+        with self.assertRaises(SystemExit) as build_ctx:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        build_message = str(build_ctx.exception)
+        self.assertIn("admission.optIn", build_message)
+        self.assertIn("NO_GO", build_message)
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("admission.optIn" in f and "NO_GO" in f for f in failures), failures
+        )
+
+    def test_verdict_flipped_to_no_go_with_untouched_default_true_is_rejected(self) -> None:
+        # Positive control: the REFERENCE card already carries
+        # admission.default=True (it IS the production default). Leave
+        # `admission` completely untouched and flip only `verdict` to
+        # NO_GO. If this test passed for any reason OTHER than the R1
+        # check -- e.g. a gate that always rejected default=True, or one
+        # that keyed on a fixed card index -- it would prove the gate was
+        # not actually reading the (verdict, default) pair. Asserting the
+        # SAME R1 message as the direct-mutation test above proves the gate
+        # keys on the pair, not on a constant.
+        manifest = self.quality_guide_manifest()
+        reference_card = manifest["cards"][1]
+        self.assertEqual(reference_card["verdict"], "REFERENCE")
+        self.assertIs(reference_card["admission"]["default"], True)
+        reference_card["verdict"] = "NO_GO"
+
+        with self.assertRaises(SystemExit) as build_ctx:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        build_message = str(build_ctx.exception)
+        self.assertIn("admission.default", build_message)
+        self.assertIn("NO_GO", build_message)
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("admission.default" in f and "NO_GO" in f for f in failures), failures
+        )
+
+    def test_secondary_validator_rejects_non_bool_admission_default(self) -> None:
+        # This type check is newly added to validate_public_site.py only,
+        # closing a pre-existing gap where it type-checked admission.reason
+        # but never the two bools; build_public_site.py already carried the
+        # equivalent isinstance check. It is verdict-independent (the string
+        # "false" is truthy-adjacent but not a bool), so a non-NO_GO card is
+        # enough to isolate it from the R1/R2 checks above.
+        manifest = self.quality_guide_manifest()
+        pass_card = manifest["cards"][2]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        pass_card["admission"]["default"] = "false"
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("admission.default is not a bool" in f for f in failures), failures
+        )
+
+    def test_secondary_validator_rejects_non_bool_admission_opt_in(self) -> None:
+        manifest = self.quality_guide_manifest()
+        pass_card = manifest["cards"][2]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        pass_card["admission"]["optIn"] = "yes"
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any("admission.optIn is not a bool" in f for f in failures), failures
+        )
+
+    def test_pass_card_with_default_false_is_accepted_by_both_validators(self) -> None:
+        # A PASS verdict is a passing MEASUREMENT, not a rollout decision;
+        # default=False on a PASS card is legitimate (the fixture's own
+        # reason: "vendor-reported quality only; not independently gated by
+        # fast-mlx"). If the gate were a biconditional instead of one-sided,
+        # this accept case would wrongly become a reject case.
+        manifest = self.quality_guide_manifest()
+        pass_card = manifest["cards"][2]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        pass_card["admission"]["default"] = False
+
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 4)
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(failures, [])
+
+    def test_exact_card_with_default_false_is_accepted_by_both_validators(self) -> None:
+        # An EXACT (token-for-token identical) verdict is also a passing
+        # MEASUREMENT; the fixture's reason is explicit that default=False
+        # here reflects a rollout choice ("opt-in pending broader rollout"),
+        # not a quality problem. A biconditional gate would reject this too.
+        manifest = self.quality_guide_manifest()
+        exact_card = manifest["cards"][3]
+        self.assertEqual(exact_card["verdict"], "EXACT")
+        exact_card["admission"]["default"] = False
+
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 4)
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(failures, [])
+
+    def test_non_no_go_card_with_opt_in_false_is_accepted_by_both_validators(self) -> None:
+        # admission.optIn on a non-NO_GO verdict is deliberately left
+        # unconstrained (docs/quality-card-schema-v1.md notes the repo
+        # currently carries two contradictory conventions for that case).
+        # R2 only fires when verdict == "NO_GO".
+        manifest = self.quality_guide_manifest()
+        pass_card = manifest["cards"][2]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        pass_card["admission"]["optIn"] = False
+
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 4)
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(failures, [])
+
+    def test_unmodified_sample_fixture_is_accepted_by_both_validators(self) -> None:
+        # scripts/tests/fixtures/quality-guides.sample.json ships two
+        # passing, non-default cards (the PASS card at index 2 and the
+        # EXACT card at index 3) alongside the NO_GO card at index 0. This
+        # fixture is the control that falsified an earlier biconditional
+        # draft of this rule -- a biconditional would have rejected both
+        # passing cards. It must load and validate with zero failures,
+        # unmodified.
+        manifest = self.quality_guide_manifest()
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 4)
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(failures, [])
+
     def test_secondary_validator_accepts_real_quality_guide_manifest(self) -> None:
         loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
         self.assertIsNotNone(loaded)
