@@ -197,13 +197,18 @@ ENGINE_BINARY_SHA256="$(shasum -a 256 "$STAGE_ROOT/bin/fastmlx-serve" | awk '{pr
 CAPACITY_BINARY_SHA256="$(shasum -a 256 "$STAGE_ROOT/bin/fastmlx-capacity" | awk '{print $1}')"
 
 # The `fastmlx` tooling: a thin Python dispatcher (fastmlx.py) plus the sibling modules it loads
-# by file path (pull/launch/recommend/bench/the front-mode proxy/the HF downloader/the two fit
-# sizers). All nine must stay siblings in the same directory -- fastmlx_launch.py loads
-# fastmlx_pull.py and fastmlx_proxy.py, fastmlx_recommend.py loads fastmlx_launch.py,
-# fastmlx_pull.py loads hf_pinned_snapshot_download.py, and fastmlx_safetensors_fit.py loads
-# fastmlx_gguf_fit.py (via importlib, resolving Path(__file__).resolve().parent), each resolving
-# the sibling path relative to its own __file__.
-for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_proxy fastmlx_recommend fastmlx_bench hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
+# by file path (pull/launch/recommend/bench/the front-mode proxy/the HF downloader/the release
+# publishability validator/the two fit sizers). All ten must stay siblings in the same
+# directory -- fastmlx_launch.py loads fastmlx_pull.py and fastmlx_proxy.py, fastmlx_recommend.py
+# loads fastmlx_launch.py, fastmlx_pull.py loads hf_pinned_snapshot_download.py,
+# fastmlx_bench.py loads validate_public_repository.py (its sole source for PRIVATE_MARKERS,
+# THIRD_PARTY_ENGINE_MARKERS, and OWN_BINARY_NAME -- see fastmlx_bench.py's
+# _load_marker_source; a staged tree missing this sibling fail-closed refuses every bench row
+# with "refused_sweep_unavailable" rather than reporting a clean sweep), and
+# fastmlx_safetensors_fit.py loads fastmlx_gguf_fit.py (via importlib, resolving
+# Path(__file__).resolve().parent), each resolving the sibling path relative to its own
+# __file__.
+for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_proxy fastmlx_recommend fastmlx_bench validate_public_repository hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
   cp -f "$REPO_ROOT/scripts/${name}.py" "$STAGE_ROOT/libexec/scripts/${name}.py"
 done
 # The two fit sizers are exec'd directly (fastmlx_launch.py's --fit-check-bin), unlike the other
@@ -362,6 +367,7 @@ class Fastmlx < Formula
     (libexec/"scripts").install "scripts/fastmlx_proxy.py"
     (libexec/"scripts").install "scripts/fastmlx_recommend.py"
     (libexec/"scripts").install "scripts/fastmlx_bench.py"
+    (libexec/"scripts").install "scripts/validate_public_repository.py"
     (libexec/"scripts").install "scripts/hf_pinned_snapshot_download.py"
     (libexec/"scripts").install "scripts/fastmlx_gguf_fit.py"
     (libexec/"scripts").install "scripts/fastmlx_safetensors_fit.py"

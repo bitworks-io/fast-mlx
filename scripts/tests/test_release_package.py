@@ -30,6 +30,7 @@ _TOOLING_SCRIPT_NAMES = (
     "fastmlx_proxy.py",
     "fastmlx_recommend.py",
     "fastmlx_bench.py",
+    "validate_public_repository.py",
     "hf_pinned_snapshot_download.py",
     "fastmlx_gguf_fit.py",
     "fastmlx_safetensors_fit.py",
@@ -80,6 +81,74 @@ REQUIRES_MACOS_RELEASE_PACKAGING = unittest.skipUnless(
     sys.platform == "darwin",
     "package-release.sh's packaged output (shasum, an arm64-macos tarball) is exercised on macOS only",
 )
+
+
+# --- sibling-load dependency closure: scanned from source, never a second hardcoded list -------
+# The tooling loads its siblings by file path at CALL time (importlib.util.spec_from_file_
+# location, resolved through Path(__file__).resolve().parent / "<name>.py" -- see
+# fastmlx_bench.py's _load_marker_source, fastmlx_pull.py's _DOWNLOADER_SPEC, fastmlx_launch.py's
+# _PULL_SPEC/_PROXY_SPEC/_SAFETENSORS_FIT_SPEC, fastmlx_recommend.py's _LAUNCH_SPEC, and
+# fastmlx_safetensors_fit.py's _GGUF_FIT_SPEC). package-release.sh must stage every script this
+# graph transitively reaches into BOTH the tarball's libexec/scripts AND the emitted formula's
+# install block, or the staged copy 500s/refuses at a sibling-load call site the repo checkout
+# never exercises. This is computed by scanning source below -- asserting a hardcoded name list
+# against another hardcoded name list would just be two copies of the same guess.
+_SIBLING_LOAD_RE = re.compile(r'\.parent\s*/\s*"([^"/]+\.py)"')
+
+
+def _sibling_load_targets(script_path: Path) -> "set[str]":
+    """The sibling ``.py`` filenames `script_path` loads by file path, per the
+    ``Path(__file__).resolve().parent / "<name>.py"`` pattern every load site in this codebase
+    uses (see the module comment above). A regex over the source, not an AST walk or an import
+    analysis -- every load site is written this one way, so this is a faithful stand-in."""
+    text = script_path.read_text(encoding="utf-8")
+    return set(_SIBLING_LOAD_RE.findall(text))
+
+
+def _transitive_sibling_load_closure(seed_names: "list[str]", scripts_dir: Path) -> "set[str]":
+    """Starting from `seed_names` (already-staged tooling scripts), transitively follows every
+    sibling-file load discovered in each script's own source until no new name appears. This is
+    the actual dependency graph the tooling exercises at CALL time, not a hand-maintained list --
+    a script that starts loading a new sibling is caught here automatically the next time this
+    runs, with no edit required to this test file."""
+    closure = set(seed_names)
+    frontier = set(seed_names)
+    while frontier:
+        next_frontier: "set[str]" = set()
+        for name in frontier:
+            script_path = scripts_dir / name
+            if not script_path.is_file():
+                continue
+            for target in _sibling_load_targets(script_path):
+                if target not in closure:
+                    closure.add(target)
+                    next_frontier.add(target)
+        frontier = next_frontier
+    return closure
+
+
+def _parse_staging_script_names(package_script_text: str) -> "list[str]":
+    """Parses package-release.sh's own tooling-staging ``for name in ...; do`` loop's bash word
+    list -- never hardcoded here -- so a future change to that loop is reflected immediately in
+    what the closure check below tests against."""
+    match = re.search(r"for name in ([^;]+); do", package_script_text)
+    if not match:
+        raise AssertionError(
+            "could not find package-release.sh's tooling-staging 'for name in ...; do' loop -- "
+            "has it been rewritten to no longer use a bash word-list loop?"
+        )
+    return [f"{word}.py" for word in match.group(1).split()]
+
+
+def _parse_formula_install_block_names(package_script_text: str) -> "list[str]":
+    """Parses the emitted formula's ``(libexec/"scripts").install "scripts/<name>.py"`` lines
+    directly out of package-release.sh's own emitter heredoc -- never hardcoded here. These lines
+    carry no bash variable substitution (the heredoc is unquoted only for $VERSION and the
+    profile-install block), so they appear byte-identical in package-release.sh's own source
+    text and in whatever it emits."""
+    return re.findall(
+        r'\(libexec/"scripts"\)\.install "scripts/([^"]+\.py)"', package_script_text
+    )
 
 
 def _run_git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
@@ -293,6 +362,7 @@ class ReleasePackageTests(unittest.TestCase):
                     "libexec/scripts/fastmlx_proxy.py",
                     "libexec/scripts/fastmlx_recommend.py",
                     "libexec/scripts/fastmlx_bench.py",
+                    "libexec/scripts/validate_public_repository.py",
                     "libexec/scripts/hf_pinned_snapshot_download.py",
                     "libexec/scripts/fastmlx_gguf_fit.py",
                     "libexec/scripts/fastmlx_safetensors_fit.py",
@@ -641,6 +711,66 @@ class ReleasePackageTests(unittest.TestCase):
             for argv in ([str(link), "--help"], [str(link), "capacity", "--help"]):
                 linked_result = subprocess.run(argv, capture_output=True, text=True)
                 self.assertEqual(linked_result.returncode, 0, linked_result.stderr)
+
+    def test_staged_bench_module_reports_publishable_not_refused_sweep_unavailable(
+        self,
+    ) -> None:
+        # Acceptance (the actual user outcome, not list membership): fastmlx_bench.py's
+        # publishability_control loads its marker source (PRIVATE_MARKERS,
+        # THIRD_PARTY_ENGINE_MARKERS, OWN_BINARY_NAME) from the sibling
+        # scripts/validate_public_repository.py by file path at CALL time -- see
+        # _load_marker_source. If that sibling is not staged alongside fastmlx_bench.py, EVERY
+        # `fastmlx bench` row in a shipped tarball is fail-closed refused
+        # ("refused_sweep_unavailable"), never "publishable", even for a row with no marker in
+        # it at all. This loads the module from the STAGED tarball (not this repo's own
+        # checkout copy) and proves the staged tree is internally self-consistent.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage_dir = root / "stage"
+            out_dir = root / "out"
+            self.run_package_script(stage_dir, out_dir)
+            tarball, _ = self._tarball_paths(out_dir)
+
+            extract_dir = root / "extracted"
+            extract_dir.mkdir()
+            with tarfile.open(tarball, "r:gz") as tar:
+                tar.extractall(extract_dir, filter="data")
+
+            staged_bench = (
+                extract_dir
+                / "fastmlx-testver-arm64-macos"
+                / "libexec"
+                / "scripts"
+                / "fastmlx_bench.py"
+            )
+            self.assertTrue(staged_bench.is_file())
+
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import importlib.util, json, sys\n"
+                        "spec = importlib.util.spec_from_file_location('fastmlx_bench', sys.argv[1])\n"
+                        "module = importlib.util.module_from_spec(spec)\n"
+                        "spec.loader.exec_module(module)\n"
+                        "row = {'model': 'demo-model', 'quantization': 'q4'}\n"
+                        "print(json.dumps(module.publishability_control(row)))\n"
+                    ),
+                    str(staged_bench),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+            verdict = json.loads(probe.stdout.strip())
+            self.assertNotEqual(
+                verdict["status"],
+                "refused_sweep_unavailable",
+                f"staged fastmlx_bench.py could not load its marker source and fail-closed "
+                f"refused a row with no marker in it: {verdict!r}",
+            )
+            self.assertEqual(verdict["status"], "publishable", verdict)
 
     # --- formula generation (opt-in, only with --emit-formula) --------------------------------
 
@@ -1295,6 +1425,67 @@ class ReleasePackageScriptTextTests(unittest.TestCase):
                 text,
                 f"scripts/package-release.sh must not reference {forbidden!r}",
             )
+
+    def test_sibling_load_closure_is_covered_by_both_install_lists(self) -> None:
+        # Acceptance: every script transitively reachable by a sibling-file load, starting from
+        # the tooling scripts package-release.sh currently stages, must appear in BOTH install
+        # lists it maintains for that tooling -- the tarball staging loop (`for name in ...; do`)
+        # and the formula's emitted `(libexec/"scripts").install` block. Both the seed list and
+        # the closure itself are parsed/computed from source, never pinned against a second
+        # hardcoded name list (that would just be this test asserting a list against a copy of
+        # itself -- see _TOOLING_SCRIPT_NAMES's own comment above, which does exactly that and is
+        # NOT relied on here). Two independently failable assertions (A1, A2) so a defect that
+        # hits only one of the two install lists is still caught and named.
+        text = PACKAGE_SCRIPT.read_text(encoding="utf-8")
+        staged_names = _parse_staging_script_names(text)
+        formula_names = _parse_formula_install_block_names(text)
+        closure = _transitive_sibling_load_closure(staged_names, PACKAGE_SCRIPT.parent)
+
+        missing_from_staging = closure - set(staged_names)
+        self.assertEqual(
+            missing_from_staging,
+            set(),
+            "package-release.sh's tarball staging loop ('for name in ...; do') omits "
+            f"sibling-load target(s) {sorted(missing_from_staging)} -- a staged tarball would "
+            "fail to load them at CALL time even though the script that needs them is staged",
+        )
+        missing_from_formula = closure - set(formula_names)
+        self.assertEqual(
+            missing_from_formula,
+            set(),
+            "package-release.sh's emitted formula install block omits sibling-load target(s) "
+            f"{sorted(missing_from_formula)} -- a brew install would fail to load them at CALL "
+            "time even though the script that needs them is installed",
+        )
+
+    def test_closure_check_fires_when_a_real_dependency_is_missing(self) -> None:
+        # Anti-vacuity control for the closure gate above: proves the gate can actually fail --
+        # and fails by NAMING the missing module, not merely "it raised" -- without mutating
+        # package-release.sh on disk. Removes hf_pinned_snapshot_download.py (fastmlx_pull.py's
+        # own sibling-load target) from an in-memory copy of the parsed staging list only.
+        text = PACKAGE_SCRIPT.read_text(encoding="utf-8")
+        staged_names = _parse_staging_script_names(text)
+        self.assertIn(
+            "hf_pinned_snapshot_download.py",
+            staged_names,
+            "fixture assumption broken: hf_pinned_snapshot_download.py is no longer in "
+            "package-release.sh's staging list, so removing it in-memory would not be a "
+            "discriminating mutation for this control",
+        )
+        mutated_staged_names = [
+            name for name in staged_names if name != "hf_pinned_snapshot_download.py"
+        ]
+
+        closure = _transitive_sibling_load_closure(mutated_staged_names, PACKAGE_SCRIPT.parent)
+        missing = closure - set(mutated_staged_names)
+
+        self.assertIn(
+            "hf_pinned_snapshot_download.py",
+            missing,
+            "removing hf_pinned_snapshot_download.py from the staged-name list must make the "
+            f"closure check name it as missing -- got missing={sorted(missing)} instead, which "
+            "means the gate is not actually reachable through fastmlx_pull.py's sibling load",
+        )
 
 
 if __name__ == "__main__":
