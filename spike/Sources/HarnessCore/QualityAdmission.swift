@@ -191,11 +191,66 @@ public enum QualityAdmission {
     }
 }
 
+/// A single element of the manifest's `cards` array, decoded leniently: `card` is `nil` when this
+/// element fails to decode as a `QualityCard` for ANY reason (a missing required field such as
+/// `admission.optIn`, a malformed value, or a non-object element) rather than throwing out of the
+/// surrounding array decode. `init(from:)` here must NEVER throw -- CRITICAL, do not "fix" this by
+/// removing the `try?` below.
+///
+/// `UnkeyedDecodingContainer.decode(_:)` does NOT advance `currentIndex` when the element decode
+/// throws (probed directly on Apple Swift 6.4). A naive
+/// `while !container.isAtEnd { _ = try? container.decode(QualityCard.self) }` would therefore
+/// INFINITE-LOOP on the first malformed element: the failed decode never consumes it, so `isAtEnd`
+/// never becomes true. Wrapping the fallible decode INSIDE this always-succeeding `Decodable`
+/// conformance is what makes `[LenientQualityCard]`'s own array decode -- which DOES always advance,
+/// because `LenientQualityCard.init(from:)` never throws -- skip a malformed element exactly once,
+/// the same way it advances past a well-formed one.
+private struct LenientQualityCard: Decodable {
+    let card: QualityCard?
+    init(from decoder: Decoder) throws { card = try? QualityCard(from: decoder) }
+}
+
 /// The top-level `site/quality-guides.json` manifest envelope
 /// (`docs/quality-card-schema-v1.md`'s "Top-level manifest"). Decoded leniently — `schema` and
 /// `generatedAt` are carried but not asserted here; only `cards` is consulted.
+///
+/// `cards` itself is decoded per-element leniently via `LenientQualityCard`: one malformed card
+/// (e.g. missing `admission.optIn`) is dropped and counted in `droppedCardCount`, never thrown out of
+/// the whole manifest decode -- closing the defect where one bad card silently disarmed every other
+/// card's admission gate. The ENVELOPE stays strict: `cards` must still decode as a JSON array (the
+/// keyed `container.decode([LenientQualityCard].self, forKey: .cards)` call below still throws on a
+/// structurally corrupt envelope, e.g. `cards` as an object) -- leniency must never turn a corrupt
+/// manifest into "0 cards, gate armed, everything silently admits".
 struct QualityCardManifest: Decodable {
     let cards: [QualityCard]
+    /// Count of `cards` array elements that failed to decode as a `QualityCard` and were dropped.
+    /// `0` for a fully well-formed manifest (including every manifest decoded before this type
+    /// gained per-element leniency).
+    let droppedCardCount: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case cards
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let lenientCards = try container.decode([LenientQualityCard].self, forKey: .cards)
+        cards = lenientCards.compactMap(\.card)
+        droppedCardCount = lenientCards.count - cards.count
+    }
+}
+
+/// The public result of `QualityCardStore.loadManifestDetailed(contentsOf:)`: the cards that
+/// survived per-element decode, plus how many did not. `droppedCardCount == 0` for a fully
+/// well-formed manifest — including every manifest that predates per-card leniency.
+public struct QualityCardManifestLoadResult: Sendable, Equatable {
+    public let cards: [QualityCard]
+    public let droppedCardCount: Int
+
+    public init(cards: [QualityCard], droppedCardCount: Int) {
+        self.cards = cards
+        self.droppedCardCount = droppedCardCount
+    }
 }
 
 /// Loads a `QualityCard` for a resolved repo out of a `fast-mlx-quality-card-v1` manifest. Fails
@@ -405,17 +460,36 @@ public enum QualityCardStore {
     }
 
     /// Strict decode: throws `QualityCardsManifestUndecodable` on an unreadable file or a payload
-    /// that fails `fast-mlx-quality-card-v1` decoding, instead of `card(forRepo:manifestURL:)`'s
-    /// silent nil. Used only for an EXPLICITLY supplied `--quality-cards` path — see
-    /// `QualityCardsManifestResolver`'s doc comment for why the conventional default keeps the
-    /// silent fail-open behavior via the convenience method above instead.
-    public static func loadManifest(contentsOf url: URL) throws -> [QualityCard] {
+    /// whose ENVELOPE fails `fast-mlx-quality-card-v1` decoding, instead of
+    /// `card(forRepo:manifestURL:)`'s silent nil. Used only for an EXPLICITLY supplied
+    /// `--quality-cards` path — see `QualityCardsManifestResolver`'s doc comment for why the
+    /// conventional default keeps the silent fail-open behavior via the convenience method above
+    /// instead.
+    ///
+    /// A malformed INDIVIDUAL card no longer throws here (see `QualityCardManifest`'s per-element
+    /// leniency) -- it is silently dropped, exactly like `loadManifest(contentsOf:)` below, which is
+    /// why that entry point's four existing call sites need no change. A caller that must react to a
+    /// dropped card (the D2 explicit-path-refuses decision — see `FastMLXServe.applyQualityAdmissionGate`)
+    /// needs `droppedCardCount`, which `loadManifest`'s `[QualityCard]`-only return type cannot carry;
+    /// this is the entry point that exposes it.
+    public static func loadManifestDetailed(contentsOf url: URL) throws -> QualityCardManifestLoadResult
+    {
         guard let data = try? Data(contentsOf: url),
             let manifest = try? JSONDecoder().decode(QualityCardManifest.self, from: data)
         else {
             throw QualityCardsManifestUndecodable(path: url.path)
         }
-        return manifest.cards
+        return QualityCardManifestLoadResult(
+            cards: manifest.cards, droppedCardCount: manifest.droppedCardCount)
+    }
+
+    /// `loadManifestDetailed(contentsOf:)`'s `.cards` only, for the four call sites that never needed
+    /// `droppedCardCount` and predate it. Behavior is byte-identical to before per-card leniency
+    /// existed: a fully well-formed manifest returns every card; the ENVELOPE throw behavior
+    /// (missing file, corrupt JSON, corrupt `cards` shape) is unchanged; a malformed individual card
+    /// is now dropped rather than throwing (this entry point simply does not expose the count).
+    public static func loadManifest(contentsOf url: URL) throws -> [QualityCard] {
+        try loadManifestDetailed(contentsOf: url).cards
     }
 
     /// The implicit (no `--card-id`) lookup: a repo match (`card(forRepo:hostHardwareClass:in:)`'s

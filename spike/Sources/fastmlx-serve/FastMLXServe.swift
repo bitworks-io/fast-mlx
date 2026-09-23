@@ -622,6 +622,21 @@ private func modelRevisionArgument(rawArguments: [String]) -> String? {
 /// decode ALSO exits non-zero (never fails open); the conventional default keeps today's
 /// fail-open behavior on the same two conditions.
 ///
+/// Per-card leniency (`QualityCardStore.loadManifestDetailed`, docs/task-inbox/2026-09-23-
+/// PREDECLARATION-one-malformed-card-disarms-the-whole-gate.md): one malformed card in an otherwise
+/// decodable manifest no longer throws out the WHOLE manifest -- it is dropped and counted. Four
+/// announce states result, and the happy path (0 dropped) stays byte-identical to before this
+/// change: no manifest active -> `quality_cards=none`; active, 0 dropped -> today's string
+/// unchanged; active, n>=1 dropped -> today's string plus ` quality_cards_dropped=<n>` (never `=0`);
+/// active, envelope undecodable on the DEFAULT path only -> `quality_cards=<path>
+/// quality_cards_status=unreadable` (keeps the path token so an operator can tell "wrong CWD", which
+/// still says `quality_cards=none`, from "right CWD, broken file"). An EXPLICIT `--quality-cards`
+/// path whose envelope is undecodable still refuses exactly as before. An EXPLICIT path with one or
+/// more DROPPED cards is a NEW refusal (D2): leniency deleted the throw that used to make a
+/// malformed card refuse startup on the explicit path, so this gate re-adds that strictness
+/// explicitly rather than silently starting to serve with a dropped card on the one path an operator
+/// asked to be strict about.
+///
 /// Card lookup goes through `QualityCardStore.resolve(repo:revision:hostHardwareClass:in:)` — a
 /// repo match (`model`) or an hfPin-prefix match against an explicit `--model-revision` value (read
 /// off `rawArguments` exactly like `--accept-quality`). `.none` behaves exactly like today's `nil`
@@ -648,8 +663,11 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     }
 
     let cards: [QualityCard]
+    let droppedCardCount: Int
     do {
-        cards = try QualityCardStore.loadManifest(contentsOf: manifestURL)
+        let loaded = try QualityCardStore.loadManifestDetailed(contentsOf: manifestURL)
+        cards = loaded.cards
+        droppedCardCount = loaded.droppedCardCount
     } catch {
         guard !explicit else {
             FileHandle.standardError.write(
@@ -658,9 +676,29 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
                         .utf8))
             exit(2)
         }
-        // The conventional default keeps today's fail-open behavior: a broken/unreadable default
-        // manifest behaves exactly like no manifest at all -- every model admits unmeasured.
-        return "quality_cards=none"
+        // The conventional default keeps today's fail-open behavior for an UNDECODABLE envelope: a
+        // broken/unreadable default manifest never blocks serving -- every model admits unmeasured.
+        // Unlike the pre-leniency `quality_cards=none` return here, this keeps the manifest PATH in
+        // the token (`quality_cards=<path> quality_cards_status=unreadable`) rather than collapsing
+        // to the same string a genuinely absent manifest prints, so an operator can tell "wrong CWD"
+        // (no manifest was even found) from "right CWD, but the file there is broken".
+        return "quality_cards=\(manifestURL.path) quality_cards_status=unreadable"
+    }
+
+    // D2: an EXPLICITLY supplied `--quality-cards` manifest with one or more dropped cards refuses
+    // startup rather than silently serving with a card missing from the gate -- leniency (above)
+    // deleted the throw that used to make this refuse before per-card decoding existed; this restores
+    // strictness on the one path an operator explicitly asked to be strict about. The conventional
+    // default never refuses here: it drops, counts, announces (`quality_cards_dropped=<n>` below),
+    // and keeps serving.
+    if explicit, droppedCardCount > 0 {
+        FileHandle.standardError.write(
+            Data(
+                """
+                fastmlx-serve configuration=refused reason=quality_cards_dropped detail=\
+                \(droppedCardCount) card(s) in \(manifestURL.path) failed to decode\n
+                """.utf8))
+        exit(2)
     }
 
     let revision = modelRevisionArgument(rawArguments: rawArguments)
@@ -695,7 +733,11 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         FileHandle.standardError.write(Data((message + "\n").utf8))
         exit(2)
     }
-    return "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))"
+    // Never emit `quality_cards_dropped=0` -- that would break the byte-identical happy-path
+    // announce for every existing launch of a fully well-formed manifest.
+    let droppedFragment = droppedCardCount > 0 ? " quality_cards_dropped=\(droppedCardCount)" : ""
+    return
+        "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))\(droppedFragment)"
 }
 
 /// Resolve the `--tier` serve dial into a `ServingPolicy`, composing any explicit `--kv-quant`

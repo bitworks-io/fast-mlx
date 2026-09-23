@@ -1,5 +1,6 @@
 import CryptoKit
 import Darwin
+import Dispatch
 import Foundation
 import XCTest
 
@@ -23,6 +24,53 @@ func fixtureBackendConfiguration() -> ScalarServingBackendConfiguration {
         maximumQueuedRequests: 2,
         queueRetryAfterSeconds: 1,
         mailboxCapacity: .init(maxDeltas: 8, maxBytes: 4_096))
+}
+
+/// Lock-protected accumulator for `MLXScalarServingTests.runLongLivedServeAndCaptureLine`'s
+/// `Pipe.fileHandleForReading.readabilityHandler` closure: that closure runs on a GCD-managed
+/// background queue, so its mutable state cannot live in captured `var` locals under Swift 6 strict
+/// concurrency (`readabilityHandler`'s parameter is not `@Sendable`-checked the way a plain closure
+/// capturing local `var`s would be). `@unchecked Sendable` is justified here because every access to
+/// `buffer`/`matchedLine` is serialized through `lock`.
+private final class LineWatcher: @unchecked Sendable {
+    private let lock = NSLock()
+    private let marker: String
+    private var buffer = ""
+    private var matchedLine: String?
+    private let matchedSemaphore = DispatchSemaphore(value: 0)
+
+    init(marker: String) {
+        self.marker = marker
+    }
+
+    /// Appends newly-read stdout bytes and, the FIRST time a complete line containing `marker`
+    /// appears in the accumulated buffer, records it and signals `matchedSemaphore` exactly once.
+    func append(_ data: Data) {
+        lock.lock()
+        let wasAlreadyMatched = matchedLine != nil
+        buffer += String(decoding: data, as: UTF8.self)
+        if !wasAlreadyMatched,
+            let line = buffer.split(separator: "\n", omittingEmptySubsequences: false)
+                .first(where: { $0.contains(marker) })
+        {
+            matchedLine = String(line)
+        }
+        let justMatched = !wasAlreadyMatched && matchedLine != nil
+        lock.unlock()
+        if justMatched {
+            matchedSemaphore.signal()
+        }
+    }
+
+    /// Blocks up to `timeout` seconds for `append` to find a matching line. Returns the matched line
+    /// (`nil` on timeout) alongside whatever stdout was captured so far, so a caller can render a
+    /// useful timeout failure message.
+    func waitForMatch(timeout: TimeInterval) -> (line: String?, capturedSoFar: String) {
+        let result = matchedSemaphore.wait(timeout: .now() + timeout)
+        lock.lock()
+        defer { lock.unlock() }
+        return (result == .success ? matchedLine : nil, buffer)
+    }
 }
 
 final class MLXScalarServingTests: XCTestCase {
@@ -1826,6 +1874,161 @@ final class MLXScalarServingTests: XCTestCase {
                 chatTemplateOverrideURL: overrideURL))
 
         XCTAssertEqual(validated.chatTemplateOverrideURL, overrideURL)
+    }
+
+    // MARK: - Black-box CLI coverage: quality-card manifest per-card leniency (docs/task-inbox/
+    // 2026-09-23-PREDECLARATION-one-malformed-card-disarms-the-whole-gate.md) —
+    // `applyQualityAdmissionGate` is a `private func` in the `fastmlx-serve` EXECUTABLE target; no
+    // test target can call it directly, so a fully green `HarnessCoreTests` suite alone would prove
+    // only that a new HarnessCore API (`QualityCardStore.loadManifestDetailed`) returns a count,
+    // never that the real serve path calls it or emits it into the startup line. This is the
+    // REQUIRED black-box arm that closes that gap, plus one bonus arm for the D2 explicit-path
+    // refusal decision.
+
+    /// A `site/quality-guides.json`-shaped manifest with exactly one malformed card — present
+    /// `admission` object, but missing `optIn` — the same malformed shape
+    /// `QualityAdmissionTests`'s HarnessCore-level fixture uses (reproduced here rather than shared
+    /// across targets, since HarnessCoreTests fixtures are private to that target).
+    private func writeQualityGuidesManifestWithOneMalformedCard(at url: URL) throws {
+        let json = #"""
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-23T00:00:00Z",
+              "cards": [
+                {
+                  "id": "cli-fixture-malformed@m3ultra",
+                  "model": { "repo": "mlx-community/cli-fixture-malformed" },
+                  "verdict": "NO_GO",
+                  "admission": { "default": false, "reason": "missing optIn" },
+                  "legible": { "tier": "Noticeable", "headline": "h" }
+                }
+              ]
+            }
+            """#
+        try Data(json.utf8).write(to: url)
+    }
+
+    /// Runs `fastmlx-serve` as a LONG-LIVED server (it never exits on its own once past startup)
+    /// with `currentDirectory` as the process's working directory, reads stdout INCREMENTALLY with
+    /// an explicit timeout until a complete line containing `marker` appears, then terminates the
+    /// process by its own PID. Deliberately does NOT reuse `runServe` above: that harness calls
+    /// `readDataToEndOfFile()` then `waitUntilExit()`, both of which block forever against a server
+    /// that never exits on its own. `process.executableURL` is the real binary directly (no shell
+    /// wrapper), so `process.terminate()` signals the actual server PID, never a wrapper's. State is
+    /// held on `LineWatcher` (a lock-protected reference type) rather than captured `var` locals: the
+    /// `readabilityHandler` closure runs on a GCD-managed background queue, and Swift 6 strict
+    /// concurrency correctly refuses to let it mutate a plain captured `var` from this function.
+    private func runLongLivedServeAndCaptureLine(
+        arguments: [String], currentDirectory: URL, containing marker: String,
+        timeout: TimeInterval = 20
+    ) throws -> String {
+        let binary = Self.serveURL
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: binary.path),
+            "fastmlx-serve binary missing at \(binary.path); "
+                + "SpikeServingAdaptersTests must depend on the executable target")
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = arguments
+        process.currentDirectoryURL = currentDirectory
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        let watcher = LineWatcher(marker: marker)
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            watcher.append(data)
+        }
+
+        try process.run()
+        defer {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            if process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+        }
+
+        let (resolvedLine, capturedSoFar) = watcher.waitForMatch(timeout: timeout)
+        guard let resolvedLine else {
+            XCTFail(
+                "timed out after \(timeout)s waiting for a stdout line containing \(marker); "
+                    + "captured stdout so far: \(capturedSoFar)")
+            return ""
+        }
+        return resolvedLine
+    }
+
+    /// THE REQUIRED BLACK-BOX ARM. A conventional-default `site/quality-guides.json` (no
+    /// `--quality-cards` flag — `QualityCardsManifestResolver`'s CWD-relative default) containing
+    /// exactly one malformed card must make it through the REAL `run()` and actually surface
+    /// `quality_cards_dropped=1` in the real printed startup line — proving the executable's
+    /// `applyQualityAdmissionGate` genuinely calls `QualityCardStore.loadManifestDetailed` and
+    /// genuinely emits its count, not merely that the HarnessCore API returns one in isolation.
+    /// `--scripted` needs no checkpoint/tokenizer (`prepareBackend`'s `.scripted` case); `--port 0`
+    /// asks the OS for an ephemeral port so this test cannot collide with any other fixed-port CLI
+    /// test in this file.
+    func testServeCLIDefaultManifestOneMalformedCardAnnouncesDroppedCountInStartupLine() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "quality-cards-dropped-cli-\(UUID().uuidString)", isDirectory: true)
+        let siteDirectory = directory.appendingPathComponent("site", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: siteDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeQualityGuidesManifestWithOneMalformedCard(
+            at: siteDirectory.appendingPathComponent("quality-guides.json"))
+
+        let line = try runLongLivedServeAndCaptureLine(
+            arguments: ["--scripted", "--host", "127.0.0.1", "--port", "0"],
+            currentDirectory: directory, containing: "quality_cards_dropped=1")
+
+        XCTAssertTrue(
+            line.contains("quality_cards_dropped=1"),
+            "expected quality_cards_dropped=1 in the real startup line, got: \(line)")
+        XCTAssertTrue(
+            line.contains(siteDirectory.appendingPathComponent("quality-guides.json").path),
+            "the quality_cards= path token must still name the conventional default manifest: \(line)"
+        )
+    }
+
+    /// Bonus arm covering decision D2: an EXPLICITLY supplied `--quality-cards <path>` manifest with
+    /// one dropped card must REFUSE startup (exit 2) rather than silently serve with a card missing
+    /// from the gate. Per-card leniency deleted the pre-existing throw that used to make this
+    /// refuse; this is the guard that restores it on the one path an operator explicitly asked to be
+    /// strict about. Unlike the default-path arm above, this process exits on its own well before
+    /// binding a listener, so the ordinary fast-exit `runServe` harness (`readDataToEndOfFile` +
+    /// `waitUntilExit`) is safe here — no long-lived-server hang risk.
+    func testServeCLIExplicitManifestOneMalformedCardRefusesStartupWithExitTwo() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "quality-cards-explicit-dropped-cli-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifestURL = directory.appendingPathComponent("explicit-quality-guides.json")
+        try writeQualityGuidesManifestWithOneMalformedCard(at: manifestURL)
+
+        let result = try runServe(arguments: [
+            "--scripted",
+            "--quality-cards", manifestURL.path,
+            "--host", "127.0.0.1",
+            "--port", "58736",
+        ])
+
+        XCTAssertEqual(result.exitStatus, 2)
+        XCTAssertTrue(
+            result.stderr.contains("configuration=refused"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("reason=quality_cards_dropped"),
+            "unexpected stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("1 card"),
+            "expected the drop count named in the refusal: \(result.stderr)")
     }
 }
 

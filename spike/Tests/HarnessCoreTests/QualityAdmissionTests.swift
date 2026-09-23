@@ -786,6 +786,141 @@ final class QualityAdmissionTests: XCTestCase {
         XCTAssertTrue(cards.contains { $0.id == "qwen38-27b-optiq-4bit@m3ultra" })
     }
 
+    // MARK: - Per-card lenient decode (docs/task-inbox/2026-09-23-PREDECLARATION-one-malformed-
+    // card-disarms-the-whole-gate.md) — one malformed card in `cards` must be dropped and counted,
+    // never thrown out of the whole manifest decode; a corrupt ENVELOPE must still throw.
+
+    /// The one malformed element used by both `testMalformedCardFixtureReachabilityControl...`
+    /// (standalone) and `eightCardManifestWithOneMissingOptInJSON` (embedded) — present `admission`
+    /// object, but missing exactly the `optIn` field `QualityCard.Admission`'s synthesized decode
+    /// requires. Factored into one property so the two tests can never silently drift apart.
+    private var malformedCardMissingOptInJSON: String {
+        """
+        {
+          "id": "sixth-card@fixture",
+          "model": { "repo": "mlx-community/sixth-card-repo" },
+          "verdict": "NO_GO",
+          "admission": { "default": false, "reason": "missing optIn" },
+          "legible": { "tier": "Noticeable", "headline": "h" }
+        }
+        """
+    }
+
+    /// Mandatory reachability control (predeclaration, "Arms and mutations"): before trusting any
+    /// outcome asserted against `malformedCardMissingOptInJSON` below, prove the fixture is malformed
+    /// on exactly the intended key by decoding it STANDALONE with a strict decoder. Without this, a
+    /// fixture typo could leave the element well-formed, every "dropped" assertion downstream would
+    /// read `droppedCardCount == 0` for the wrong reason, and the whole increment would pass vacuously.
+    func testMalformedCardFixtureReachabilityControlThrowsKeyNotFoundOnOptIn() {
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(QualityCard.self, from: Data(malformedCardMissingOptInJSON.utf8))
+        ) { error in
+            guard case DecodingError.keyNotFound(let key, _) = error else {
+                return XCTFail("expected DecodingError.keyNotFound, got \(error)")
+            }
+            XCTAssertEqual(
+                key.stringValue, "optIn",
+                "fixture must be malformed on exactly the intended key; got missing key "
+                    + key.stringValue)
+        }
+    }
+
+    /// 8 cards, exactly one (`sixth-card@fixture`) malformed — the shape the predeclaration
+    /// mandates. `third-card@fixture` is a well-formed NO_GO card so the "a surviving NO_GO card
+    /// still refuses" assertion is not vacuous.
+    private var eightCardManifestWithOneMissingOptInJSON: String {
+        func wellFormedCard(id: String, verdict: String) -> String {
+            """
+            {
+              "id": "\(id)",
+              "model": { "repo": "mlx-community/\(id)-repo" },
+              "verdict": "\(verdict)",
+              "admission": { "default": false, "optIn": true, "reason": "fixture" },
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+            """
+        }
+        let cards = [
+            wellFormedCard(id: "first-card@fixture", verdict: "PASS"),
+            wellFormedCard(id: "second-card@fixture", verdict: "PASS"),
+            wellFormedCard(id: "third-card@fixture", verdict: "NO_GO"),
+            wellFormedCard(id: "fourth-card@fixture", verdict: "PASS"),
+            wellFormedCard(id: "fifth-card@fixture", verdict: "REFERENCE"),
+            malformedCardMissingOptInJSON,
+            wellFormedCard(id: "seventh-card@fixture", verdict: "EXACT"),
+            wellFormedCard(id: "eighth-card@fixture", verdict: "UNMEASURED"),
+        ]
+        return """
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-23T00:00:00Z",
+              "cards": [\(cards.joined(separator: ","))]
+            }
+            """
+    }
+
+    /// The decisive acceptance case: 7 of 8 cards survive, `droppedCardCount == 1`, the malformed
+    /// card's own id is absent from the survivors (catches an M3-style "dropped the wrong card"
+    /// defect — a count-only assertion would stay green even if `.dropFirst()` silently removed
+    /// `first-card@fixture` instead), and the untouched NO_GO card still refuses after the drop
+    /// (catches an M2-style "the count lies" defect from the other direction: proves dropping is a
+    /// real, independent effect on `cards`, not just on a reported number).
+    func testLenientManifestDecodeDropsExactlyOneMalformedCardAmongEightAndSurvivingNoGoStillRefuses()
+        throws
+    {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-one-malformed-\(UUID().uuidString).json")
+        try Data(eightCardManifestWithOneMissingOptInJSON.utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(result.cards.count, 7, "exactly 7 of 8 cards must survive the decode")
+        XCTAssertEqual(result.droppedCardCount, 1, "exactly 1 dropped card must be counted")
+        XCTAssertFalse(
+            result.cards.contains { $0.id == "sixth-card@fixture" },
+            "the malformed card itself must not appear among the survivors")
+
+        guard let survivingNoGo = result.cards.first(where: { $0.id == "third-card@fixture" }) else {
+            return XCTFail("the well-formed NO_GO card must survive the drop of an unrelated card")
+        }
+        XCTAssertEqual(survivingNoGo.verdict, .noGo)
+        let outcome = QualityAdmission.decide(card: survivingNoGo, optIn: false)
+        guard case .refuseQualityFlagged = outcome else {
+            return XCTFail(
+                "a surviving NO_GO card must still refuse after an unrelated card is dropped, got \(outcome)"
+            )
+        }
+    }
+
+    /// `loadManifest(contentsOf:)` (the `.cards`-only wrapper every existing call site uses) must
+    /// inherit the same per-card leniency, not just `loadManifestDetailed`.
+    func testLoadManifestClassicWrapperAlsoDropsMalformedCardsWithoutThrowing() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-one-malformed-wrapper-\(UUID().uuidString).json")
+        try Data(eightCardManifestWithOneMissingOptInJSON.utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let cards = try QualityCardStore.loadManifest(contentsOf: url)
+        XCTAssertEqual(cards.count, 7)
+    }
+
+    /// The REQUIRED property: envelope corruption stays FATAL. `cards` as an object (not an array)
+    /// must still THROW `QualityCardsManifestUndecodable` — leniency must never degrade a corrupt
+    /// envelope into "0 cards, gate armed, everything admits".
+    func testLoadManifestDetailedThrowsOnCorruptCardsEnvelopeNotJustAMalformedElement() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-corrupt-envelope-\(UUID().uuidString).json")
+        try Data(#"{"cards": {}}"#.utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertThrowsError(
+            try QualityCardStore.loadManifestDetailed(contentsOf: url),
+            "a corrupt cards ENVELOPE (not an array) must still throw"
+        ) { error in
+            XCTAssertTrue(
+                error is QualityCardsManifestUndecodable,
+                "expected QualityCardsManifestUndecodable, got \(error)")
+        }
+    }
+
     // MARK: - QualityCardStore.canonicalHardwareClass (docs/task-inbox/2026-09-22-PREDECLARATION-
     // swift-serve-never-learns-its-host-class.md, criteria 1–4) — pure, mirrors
     // `fastmlx_launch.host_hardware_class()`'s normalization generalized the way
@@ -1135,6 +1270,40 @@ final class QualityAdmissionTests: XCTestCase {
         let resolution = QualityCardStore.resolve(
             repo: "Qwen3.8-Flash-Next-MLX-oQ4-MTP", revision: nil, in: cards)
         XCTAssertEqual(resolution, .none)
+    }
+
+    /// MANDATORY UNMUTATED CONTROL (predeclaration, "Arms and mutations"): the REAL shipped
+    /// `site/quality-guides.json` must decode with `droppedCardCount == 0`, and every
+    /// repo-identified NO_GO card it carries must still resolve by its own repo and still refuse
+    /// without opt-in. If this is RED on first run, the INSTRUMENT is wrong — do not "fix" it by
+    /// editing the shipped manifest; report it instead.
+    func testRealShippedManifestHasNoDroppedCardsAndEveryRepoIdentifiedNoGoCardStillRefuses() throws {
+        guard let url = locateSiteQualityGuidesJSON() else {
+            XCTFail("could not locate site/quality-guides.json by walking up from #filePath")
+            return
+        }
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(
+            result.droppedCardCount, 0,
+            "the real shipped manifest must be fully well-formed today; a nonzero drop here means "
+                + "the manifest (or this instrument) is wrong, not that leniency is proven")
+
+        let repoIdentifiedNoGoCards = result.cards.filter { $0.verdict == .noGo && $0.model.repo != nil }
+        XCTAssertFalse(
+            repoIdentifiedNoGoCards.isEmpty,
+            "sanity: the real manifest must carry at least one repo-identified NO_GO card")
+        for c in repoIdentifiedNoGoCards {
+            let resolution = QualityCardStore.resolve(repo: c.model.repo, revision: nil, in: result.cards)
+            guard case .resolved(let resolved) = resolution else {
+                XCTFail("expected \(c.id) to resolve by its own repo \(c.model.repo ?? "nil"), got \(resolution)")
+                continue
+            }
+            let outcome = QualityAdmission.decide(card: resolved, optIn: false)
+            guard case .refuseQualityFlagged = outcome else {
+                XCTFail("expected \(resolved.id) to refuse without opt-in, got \(outcome)")
+                continue
+            }
+        }
     }
 
     // MARK: - QualityAdmission.announceFragment(card:) — closes the other half of the "operator can
