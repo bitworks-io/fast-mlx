@@ -4942,19 +4942,30 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
             #
             # UNMEASURED is exempt: no UNMEASURED card has ever been emitted
             # or shipped, so a rule for it would be an unreachable branch.
-            # admission.optIn on a non-NO_GO verdict is deliberately left
-            # unconstrained: the repo currently carries two contradictory
-            # conventions for that case, and picking a winner is a separate
-            # increment.
+            #
+            # admission.optIn is a FROZEN CONSTANT true on every verdict, not
+            # conditioned on NO_GO like R1/R2 above. It is derivable from
+            # nothing and carries no per-card information, but the field is
+            # retained in the wire format because released fastmlx-serve
+            # binaries decode it non-optionally: a missing field fails OPEN
+            # (the whole manifest fails to decode and serve announces
+            # `quality_cards=none`). Resolved: this used to be left
+            # unconstrained on non-NO_GO verdicts pending a decision between
+            # two contradictory conventions in the repo; that question is
+            # now closed to redefinition. Unlike `default`'s one-sidedness
+            # (which is PERMANENT -- two honest passing cards in
+            # scripts/tests/fixtures/quality-guides.sample.json carry
+            # `default: false`), this exemption was TEMPORARY.
+            if isinstance(opt_in, bool) and opt_in is not True:
+                failures.append(
+                    f"{label} admission.optIn must be true "
+                    f"(every card is electable via --accept-quality)"
+                )
             if verdict == "NO_GO":
                 if isinstance(default, bool) and default is not False:
                     failures.append(
                         f"{label} admission.default {default!r} disagrees with "
                         f"verdict 'NO_GO' (a NO_GO pack is never a silent default)"
-                    )
-                if isinstance(opt_in, bool) and opt_in is not True:
-                    failures.append(
-                        f"{label} admission.optIn must be true when verdict is 'NO_GO'"
                     )
 
         legible = card.get("legible")

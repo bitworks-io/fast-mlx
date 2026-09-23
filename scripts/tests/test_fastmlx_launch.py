@@ -112,7 +112,7 @@ def fixture_manifest() -> dict:
                 "verdict": "PASS",
                 "admission": {
                     "default": True,
-                    "optIn": False,
+                    "optIn": True,
                     "reason": "measured pass",
                 },
                 "legible": {"tier": "Reference", "headline": "Matches the reference closely."},
@@ -123,7 +123,7 @@ def fixture_manifest() -> dict:
                 "verdict": "EXACT",
                 "admission": {
                     "default": True,
-                    "optIn": False,
+                    "optIn": True,
                     "reason": "token-exact",
                 },
                 "legible": {"tier": "Exact", "headline": "Token-exact with the reference."},
@@ -174,7 +174,7 @@ def fixture_manifest() -> dict:
                 "verdict": "PASS",
                 "admission": {
                     "default": True,
-                    "optIn": False,
+                    "optIn": True,
                     "reason": "measured pass (pin-identified pack, no repo)",
                 },
                 "legible": {
@@ -3688,7 +3688,7 @@ def engine_build_card_manifest() -> dict:
                 "id": EB_PASS_CARD_ID,
                 "model": {"repo": EB_PASS_REPO, "hfPin": "cafebab1"},
                 "verdict": "PASS",
-                "admission": {"default": True, "optIn": False, "reason": "measured pass"},
+                "admission": {"default": True, "optIn": True, "reason": "measured pass"},
                 "legible": {"tier": "Reference", "headline": "eb pass headline"},
                 "provenance": {"engineBuild": {"commit": EB_CARD_COMMIT}},
             },
@@ -3696,7 +3696,7 @@ def engine_build_card_manifest() -> dict:
                 "id": EB_UNRECORDED_CARD_ID,
                 "model": {"repo": EB_UNRECORDED_REPO, "hfPin": "0badc0d1"},
                 "verdict": "PASS",
-                "admission": {"default": True, "optIn": False, "reason": "measured pass"},
+                "admission": {"default": True, "optIn": True, "reason": "measured pass"},
                 "legible": {"tier": "Reference", "headline": "eb unrecorded headline"},
                 # No provenance at all: engine build "unrecorded".
             },
@@ -3726,7 +3726,7 @@ def dual_engine_build_card_manifest() -> dict:
                 "id": DUAL_BUILD_CARD_A_ID,
                 "model": {"repo": DUAL_BUILD_REPO, "hfPin": "aaaaaaaa"},
                 "verdict": "PASS",
-                "admission": {"default": True, "optIn": False, "reason": "pass build A"},
+                "admission": {"default": True, "optIn": True, "reason": "pass build A"},
                 "legible": {"tier": "Reference", "headline": "Build A pass."},
                 "provenance": {"engineBuild": {"commit": DUAL_BUILD_COMMIT_A}},
             },
@@ -3734,7 +3734,7 @@ def dual_engine_build_card_manifest() -> dict:
                 "id": DUAL_BUILD_CARD_B_ID,
                 "model": {"repo": DUAL_BUILD_REPO, "hfPin": "bbbbbbbb"},
                 "verdict": "PASS",
-                "admission": {"default": True, "optIn": False, "reason": "pass build B"},
+                "admission": {"default": True, "optIn": True, "reason": "pass build B"},
                 "legible": {"tier": "Reference", "headline": "Build B pass."},
                 "provenance": {"engineBuild": {"commit": DUAL_BUILD_COMMIT_B}},
             },
@@ -4039,13 +4039,13 @@ SAFETY_ULTRA_REPO = "example/SafetyUltraModel"
 SAFETY_ULTRA_CARD_ID = "safety-ultra@test"
 
 
-def single_ultra_card(verdict: str = "PASS", opt_in: bool = False, default: bool = True) -> dict:
+def single_ultra_card(verdict: str = "PASS", default: bool = True) -> dict:
     return {
         "id": SAFETY_ULTRA_CARD_ID,
         "model": {"repo": SAFETY_ULTRA_REPO, "hfPin": "cccccccc"},
         "verdict": verdict,
         "config": {"hardwareClass": "apple-m3-ultra"},
-        "admission": {"default": default, "optIn": opt_in, "reason": "measured on Ultra"},
+        "admission": {"default": default, "optIn": True, "reason": "measured on Ultra"},
         "legible": {"tier": "Reference" if verdict == "PASS" else "Unquantified",
                     "headline": "Ultra card."},
     }
@@ -4066,7 +4066,7 @@ def hardware_class_card_manifest() -> dict:
                 "model": {"repo": HWC_REPO, "hfPin": "aaaaaaaa"},
                 "verdict": "PASS",
                 "config": {"hardwareClass": "apple-m3-ultra"},
-                "admission": {"default": True, "optIn": False, "reason": "pass ultra"},
+                "admission": {"default": True, "optIn": True, "reason": "pass ultra"},
                 "legible": {"tier": "Reference", "headline": "Ultra pass."},
             },
             {
@@ -4074,7 +4074,7 @@ def hardware_class_card_manifest() -> dict:
                 "model": {"repo": HWC_REPO, "hfPin": "bbbbbbbb"},
                 "verdict": "PASS",
                 "config": {"hardwareClass": "apple-m5"},
-                "admission": {"default": True, "optIn": False, "reason": "pass m5"},
+                "admission": {"default": True, "optIn": True, "reason": "pass m5"},
                 "legible": {"tier": "Reference", "headline": "M5 pass."},
             },
         ],
@@ -4099,7 +4099,7 @@ class HardwareClassTieBreakTestCase(unittest.TestCase):
     # M5 host, so the caller's admission gate still sees it and still
     # refuses it.
     def test_single_no_go_ultra_card_still_resolves_on_m5_host(self):
-        cards = [single_ultra_card(verdict="NO_GO", opt_in=True, default=False)]
+        cards = [single_ultra_card(verdict="NO_GO", default=False)]
         card = FASTMLX_LAUNCH.resolve_card(
             cards, SAFETY_ULTRA_REPO, None, host_hardware_class=lambda: "apple-m5"
         )
@@ -4208,7 +4208,7 @@ def mixed_verdict_card(card_id: str, hardware_class: str, verdict: str) -> dict:
         "config": {"hardwareClass": hardware_class},
         "admission": {
             "default": verdict != "NO_GO",
-            "optIn": verdict == "NO_GO",
+            "optIn": True,
             "reason": f"{verdict.lower()} on {hardware_class}",
         },
         "legible": {
@@ -4901,7 +4901,7 @@ class ResidencyTestCase(unittest.TestCase):
                     "config": {"residency": "resident"},
                     "admission": {
                         "default": True,
-                        "optIn": False,
+                        "optIn": True,
                         "reason": "measured pass",
                     },
                     "legible": {"tier": "Reference", "headline": "Resident pass."},

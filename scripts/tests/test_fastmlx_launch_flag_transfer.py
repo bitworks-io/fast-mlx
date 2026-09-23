@@ -78,7 +78,7 @@ def _pass_card(card_id: str, repo: str, flag_transfer: dict | None) -> dict:
         "id": card_id,
         "model": {"repo": repo, "hfPin": "deadbeef"},
         "verdict": "PASS",
-        "admission": {"default": True, "optIn": False, "reason": "measured pass"},
+        "admission": {"default": True, "optIn": True, "reason": "measured pass"},
         "legible": {"tier": "Reference", "headline": f"{card_id} headline"},
         "provenance": {"engineBuild": {"commit": MTP_CARD_COMMIT}},
     }

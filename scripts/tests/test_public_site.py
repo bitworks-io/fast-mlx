@@ -5105,6 +5105,13 @@ class PublicSiteTests(unittest.TestCase):
         )
 
     def test_no_go_card_with_opt_in_false_is_rejected_by_both_validators(self) -> None:
+        # admission.optIn is now checked unconditionally on every verdict
+        # (see the comment above the optIn check in both validators), so
+        # the rejection message this NO_GO card hits is the same
+        # unconditional message a non-NO_GO card would hit -- it no longer
+        # mentions "NO_GO" by name. This test still proves a NO_GO card
+        # with optIn=False is rejected by both validators; it no longer
+        # proves the (now-removed) NO_GO-specific message text.
         manifest = self.quality_guide_manifest()
         no_go_card = manifest["cards"][0]
         self.assertEqual(no_go_card["verdict"], "NO_GO")
@@ -5114,11 +5121,10 @@ class PublicSiteTests(unittest.TestCase):
             build_public_site.validate_quality_card_document(manifest, "test manifest")
         build_message = str(build_ctx.exception)
         self.assertIn("admission.optIn", build_message)
-        self.assertIn("NO_GO", build_message)
 
         failures = validate_public_site.validate_quality_guide_manifest(manifest)
         self.assertTrue(
-            any("admission.optIn" in f and "NO_GO" in f for f in failures), failures
+            any("admission.optIn" in f for f in failures), failures
         )
 
     def test_verdict_flipped_to_no_go_with_untouched_default_true_is_rejected(self) -> None:
@@ -5207,20 +5213,37 @@ class PublicSiteTests(unittest.TestCase):
         failures = validate_public_site.validate_quality_guide_manifest(manifest)
         self.assertEqual(failures, [])
 
-    def test_non_no_go_card_with_opt_in_false_is_accepted_by_both_validators(self) -> None:
-        # admission.optIn on a non-NO_GO verdict is deliberately left
-        # unconstrained (docs/quality-card-schema-v1.md notes the repo
-        # currently carries two contradictory conventions for that case).
-        # R2 only fires when verdict == "NO_GO".
+    def test_non_no_go_card_with_opt_in_false_is_rejected_by_both_validators(self) -> None:
+        # admission.optIn is a FROZEN CONSTANT true on every verdict (see
+        # docs/quality-card-schema-v1.md "Admission invariant rules" R2 and
+        # the comment above the optIn check in both validators): the serve
+        # gate admits this PASS card unconditionally, so `optIn: false`
+        # would publish a false claim that a user may not elect it. Leave
+        # verdict and admission.default untouched -- only optIn is mutated.
         manifest = self.quality_guide_manifest()
         pass_card = manifest["cards"][2]
         self.assertEqual(pass_card["verdict"], "PASS")
+        self.assertIs(pass_card["admission"]["default"], False)
         pass_card["admission"]["optIn"] = False
 
-        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
-        self.assertEqual(len(validated["cards"]), 4)
+        with self.assertRaises(SystemExit) as build_ctx:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        build_message = str(build_ctx.exception)
+        self.assertIn("admission.optIn", build_message)
+        self.assertIn("card entry 2", build_message)
+        # Distinguishes "the new unconditional rule fired" from "the
+        # pre-existing NO_GO-only rule (R2) fired": this card's verdict is
+        # PASS, so if the failure text ever mentions NO_GO, the wrong rule
+        # (or a rule keyed on the wrong condition) fired.
+        self.assertNotIn("NO_GO", build_message)
+
         failures = validate_public_site.validate_quality_guide_manifest(manifest)
-        self.assertEqual(failures, [])
+        # Exactly one failure proves the rule is per-card and the mutation
+        # was reached -- not a blanket check that floods every entry.
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("admission.optIn", failures[0])
+        self.assertIn("card entry 2", failures[0])
+        self.assertNotIn("NO_GO", failures[0])
 
     def test_unmodified_sample_fixture_is_accepted_by_both_validators(self) -> None:
         # scripts/tests/fixtures/quality-guides.sample.json ships two
