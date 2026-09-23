@@ -713,6 +713,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="path to an engine-profile JSON file (default: the built-in engine profile)",
     )
     recommend.add_argument(
+        "--engine-bin",
+        default=None,
+        help=(
+            "the engine binary named for engine-build derivation ONLY "
+            "(this command never execs it, unlike fastmlx serve's own "
+            "--engine-bin) -- default: the built-in profile's own binary "
+            "name, resolved on PATH, when no --engine-profile is given"
+        ),
+    )
+    recommend.add_argument(
         "--json",
         action="store_true",
         help="print the ranked rows as a JSON object instead of formatted text",
@@ -731,15 +741,41 @@ def _run_recommend(args) -> int:
         return 2
 
     try:
-        profile, _ = launch.load_engine_profile(args.engine_profile)
+        profile, is_built_in_profile = launch.load_engine_profile(args.engine_profile)
     except launch.LaunchRefusal as refusal:
         print(f"fastmlx recommend: {refusal.message}", file=sys.stderr)
         return refusal.exit_code
 
     # Read only for engine-build status/notice (see build_row); this script
     # never execs anything, so a profile's engineBuild.binarySha256 is never
-    # verified here.
+    # verified here. An operator-declared commit ALWAYS wins over a
+    # derived one; derivation only fills the gap when the profile declares
+    # none at all (including the built-in profile, whose engineBuild is
+    # always None) -- see fastmlx_launch._run_serve's identical wiring,
+    # which this reuses rather than forks.
+    #
+    # This script never execs anything, so a derived commit describes
+    # ONLY the binary the operator NAMED via --engine-bin (or the
+    # built-in profile's own binary name on PATH) -- never a binary this
+    # command will run. That is why --engine-bin must be explicit here,
+    # and why the built-in-profile PATH fallback is inherited from
+    # fastmlx serve's own guarded helper
+    # (`_guarded_engine_bin_abs_for_engine_build_derivation`) rather than
+    # reinvented: a copied rule would let the two commands disagree about
+    # the same binary. Derivation never refuses and never changes this
+    # command's exit code -- no candidate means no derived commit, and
+    # the launch simply stays "undeclared", exactly as before.
     engine_build_commit = (profile.get("engineBuild") or {}).get("commit")
+    if engine_build_commit is None:
+        candidate_engine_bin_abs = launch._guarded_engine_bin_abs_for_engine_build_derivation(
+            args, is_built_in_profile
+        )
+        if candidate_engine_bin_abs is not None:
+            derived_engine_build = launch.derive_engine_build_from_release(
+                candidate_engine_bin_abs
+            )
+            if derived_engine_build is not None:
+                engine_build_commit = derived_engine_build["commit"]
     # Whether this run's engine profile carries the exact token `--mtp` --
     # recommend never execs anything and has no passthrough concept, so
     # this only ever scans the profile's own (and, for --residency

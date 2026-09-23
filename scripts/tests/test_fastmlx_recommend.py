@@ -19,6 +19,8 @@ from scripts.tests.test_fastmlx_launch import (
     SYNTHETIC_CARD_REPO,
     SYNTHETIC_CARD_REVISION,
     write_expert_stream_card_manifest,
+    write_release_engine_binary,
+    write_release_provenance,
 )
 from scripts.tests.test_fastmlx_safetensors_fit import build_safetensors_bytes, zero_tensor_bytes
 
@@ -1476,6 +1478,285 @@ class EngineBuildRecommendTestCase(unittest.TestCase):
         row = doc["rows"][0]
         self.assertEqual(row["engineBuild"]["status"], "match")
         self.assertIsNone(row["engineBuild"]["message"])
+
+
+# ---------------------------------------------------------------------
+# engineBuild DERIVATION: no operator-written --engine-profile
+# engineBuild.commit at all, resolved instead from a release layout's own
+# provenance.json -- the SAME two launch helpers fastmlx serve already
+# calls (derive_engine_build_from_release,
+# _guarded_engine_bin_abs_for_engine_build_derivation), reused unchanged
+# here via --engine-bin. recommend still execs nothing: --engine-bin only
+# NAMES the binary these rows describe, it is never run.
+# ---------------------------------------------------------------------
+class EngineBuildDerivationRecommendTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "eb-derive-quality-guides.json"
+        self.manifest_path.write_text(
+            json.dumps(engine_build_manifest_for_recommend()), encoding="utf-8"
+        )
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+
+    def make_model_dir(self, name: str, repo: str = None) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        if repo is not None:
+            write_pull_receipt(model_dir, repo_id=repo, revision="e" * 40)
+        return model_dir
+
+    def base_argv(self, model_dir: Path, engine_bin: Path, **overrides) -> list:
+        args = {
+            "--quality-cards": str(self.manifest_path),
+            "--model-path": str(model_dir),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(engine_bin),
+        }
+        args.update(overrides)
+        argv = ["recommend"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv + ["--json"]
+
+    def _write_profile(self, commit: str = None) -> Path:
+        document = {
+            "schema": "fastmlx-engine-profile-v1",
+            "name": "eb-derive-profile",
+            "argv": ["{engine_bin}"],
+        }
+        if commit is not None:
+            document["engineBuild"] = {"commit": commit}
+        path = self.root / "eb-derive-profile.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    # (1) The headline case: release layout + matching commit + matching
+    # binary sha, no profile commit at all -- match, reachable with NO
+    # operator-written engineBuild.commit.
+    def test_release_layout_derives_match_with_no_profile_commit(self):
+        model_dir = self.make_model_dir(
+            "eb-derive-match-model", repo=EB_PASS_REPO_RECOMMEND
+        )
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_RECOMMEND.launch._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT_RECOMMEND,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_argv(model_dir, engine_bin)
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["status"], "match")
+        self.assertIsNone(row["engineBuild"]["message"])
+
+    # (2) A dirty source tree's commit does not faithfully name the exact
+    # bytes that were built -- stays undeclared, notice present.
+    def test_dirty_source_stays_undeclared(self):
+        model_dir = self.make_model_dir(
+            "eb-derive-dirty-model", repo=EB_PASS_REPO_RECOMMEND
+        )
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_RECOMMEND.launch._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT_RECOMMEND,
+            source_dirty=True,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_argv(model_dir, engine_bin)
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["status"], "undeclared")
+        self.assertIsNotNone(row["engineBuild"]["message"])
+
+    # (3) provenance.json names a binary hash that does not match the
+    # ACTUAL binary at --engine-bin: stays undeclared (never an error row,
+    # never a changed exit code) -- a sibling text file is not a seal.
+    def test_binary_sha256_mismatch_stays_undeclared_not_an_error(self):
+        model_dir = self.make_model_dir(
+            "eb-derive-sha-mismatch-model", repo=EB_PASS_REPO_RECOMMEND
+        )
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_RECOMMEND.launch._sha256_file(str(engine_bin))
+        wrong_sha256 = ("0" if actual_sha256[0] != "0" else "1") + actual_sha256[1:]
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT_RECOMMEND,
+            source_dirty=False,
+            engine_binary_sha256=wrong_sha256,
+        )
+        argv = self.base_argv(model_dir, engine_bin)
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["status"], "undeclared")
+        self.assertNotEqual(row["status"], "error")
+
+    # (4) Absent / malformed / non-dict provenance.json: undeclared, no
+    # traceback, no refusal -- an underivable build is a fact this script
+    # cannot assert, never a crash.
+    def test_absent_or_malformed_provenance_stays_undeclared(self):
+        cases = {
+            "absent": lambda: write_release_provenance(self.root, omit=True),
+            "malformed-json": lambda: write_release_provenance(
+                self.root, raw_text="{not-json"
+            ),
+            "non-dict": lambda: write_release_provenance(
+                self.root, raw_text=json.dumps(["not", "a", "dict"])
+            ),
+        }
+        for label, write_provenance in cases.items():
+            with self.subTest(provenance=label):
+                # A carded candidate (repo=EB_PASS_REPO_RECOMMEND) so the
+                # card's OWN commit is known: this makes a bad
+                # provenance.json read as "undeclared" (card names a
+                # commit, launch has none), not "unrecorded" (no card
+                # commit at all, the status an uncarded candidate would
+                # get regardless of provenance -- a weaker, less
+                # discriminating control).
+                model_dir = self.make_model_dir(
+                    f"eb-derive-{label}-model", repo=EB_PASS_REPO_RECOMMEND
+                )
+                engine_bin = write_release_engine_binary(self.root, name=f"{label}-serve")
+                write_provenance()
+                argv = self.base_argv(model_dir, engine_bin)
+                code, stdout, _ = self.run_main(argv)
+                self.assertEqual(code, 0)
+                doc = json.loads(stdout)
+                row = doc["rows"][0]
+                self.assertEqual(row["engineBuild"]["status"], "undeclared")
+                self.assertNotEqual(row["status"], "error")
+
+    # (5) Precedence: an operator-declared engineBuild.commit in the
+    # profile always wins over a derivable one, even when a valid release
+    # layout is present.
+    def test_profile_declared_commit_beats_derived_commit(self):
+        model_dir = self.make_model_dir(
+            "eb-derive-precedence-model", repo=EB_PASS_REPO_RECOMMEND
+        )
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_RECOMMEND.launch._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_OTHER_COMMIT_RECOMMEND,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        profile_path = self._write_profile(commit=EB_CARD_COMMIT_RECOMMEND)
+        argv = self.base_argv(
+            model_dir, engine_bin, **{"--engine-profile": str(profile_path)}
+        )
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["launch"], EB_CARD_COMMIT_RECOMMEND)
+
+    # (6) A derived commit that disagrees with the card's own commit is a
+    # mismatch, not a match -- and the notice names both 12-char shas so
+    # an operator can tell the two builds apart.
+    def test_derived_commit_mismatch_names_both_shas(self):
+        model_dir = self.make_model_dir(
+            "eb-derive-mismatch-model", repo=EB_PASS_REPO_RECOMMEND
+        )
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_RECOMMEND.launch._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_OTHER_COMMIT_RECOMMEND,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+        argv = self.base_argv(model_dir, engine_bin)
+        code, stdout, _ = self.run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+        row = doc["rows"][0]
+        self.assertEqual(row["engineBuild"]["status"], "mismatch")
+        self.assertIn(EB_CARD_COMMIT_RECOMMEND[:12], row["engineBuild"]["message"])
+        self.assertIn(EB_OTHER_COMMIT_RECOMMEND[:12], row["engineBuild"]["message"])
+
+    # (7) Non-interference control: for the SAME candidate set, the
+    # derivation-available arm (--engine-bin naming a valid release
+    # layout) and the derivation-unavailable arm (no --engine-bin at all)
+    # must differ in the `engineBuild` sub-object ONLY -- ranking order
+    # and every other field (`fit`, `status`, ...) stay byte-identical.
+    # Proven with a structural per-row dict diff, not a test-count delta.
+    def test_derivation_changes_only_the_engineBuild_sub_object(self):
+        carded_dir = self.make_model_dir(
+            "eb-derive-noninterference-carded", repo=EB_PASS_REPO_RECOMMEND
+        )
+        uncarded_dir = self.make_model_dir("eb-derive-noninterference-uncarded")
+        engine_bin = write_release_engine_binary(self.root)
+        actual_sha256 = FASTMLX_RECOMMEND.launch._sha256_file(str(engine_bin))
+        write_release_provenance(
+            self.root,
+            source_commit=EB_CARD_COMMIT_RECOMMEND,
+            source_dirty=False,
+            engine_binary_sha256=actual_sha256,
+        )
+
+        def argv_for(model_dirs, engine_bin_arg):
+            args = {
+                "--quality-cards": str(self.manifest_path),
+                "--fit-check-bin": str(self.green_fit_bin),
+                "--engine-bin": engine_bin_arg,
+            }
+            argv = ["recommend"]
+            for model_dir in model_dirs:
+                argv += ["--model-path", str(model_dir)]
+            for key, value in args.items():
+                if value is None:
+                    continue
+                argv += [key, str(value)]
+            return argv + ["--json"]
+
+        model_dirs = [carded_dir, uncarded_dir]
+        code_with, stdout_with, _ = self.run_main(
+            argv_for(model_dirs, str(engine_bin))
+        )
+        code_without, stdout_without, _ = self.run_main(
+            argv_for(model_dirs, None)
+        )
+        self.assertEqual(code_with, code_without)
+        rows_with = json.loads(stdout_with)["rows"]
+        rows_without = json.loads(stdout_without)["rows"]
+        self.assertEqual(len(rows_with), len(rows_without))
+        self.assertEqual(
+            [row["name"] for row in rows_with], [row["name"] for row in rows_without]
+        )
+        for row_with, row_without in zip(rows_with, rows_without):
+            stripped_with = {k: v for k, v in row_with.items() if k != "engineBuild"}
+            stripped_without = {
+                k: v for k, v in row_without.items() if k != "engineBuild"
+            }
+            self.assertEqual(stripped_with, stripped_without)
+            self.assertEqual(row_with["status"], row_without["status"])
+            self.assertEqual(row_with.get("fit"), row_without.get("fit"))
+        # The one field allowed to differ: the carded row's engineBuild
+        # status flips from undeclared (no --engine-bin) to match (a
+        # derivable release layout).
+        self.assertEqual(rows_without[0]["engineBuild"]["status"], "undeclared")
+        self.assertEqual(rows_with[0]["engineBuild"]["status"], "match")
 
 
 # ---------------------------------------------------------------------

@@ -432,9 +432,13 @@ match, a non-release layout, or a missing or malformed `provenance.json` all der
 than guess. Derivation never refuses: it either produces a commit or leaves the launch undeclared.
 An operator-declared `engineBuild.commit` always wins over a derived one.
 
-`fastmlx recommend` does **not** derive: it execs nothing and resolves no engine binary, so it has
-nothing to hash. It still reports `undeclared` for a card measured on a fast-mlx build, even where
-`fastmlx serve` on the same install now reports `match`.
+`fastmlx recommend` derives the same way, through the same helpers `fastmlx serve` uses — but it
+still execs nothing, so it needs an explicit `--engine-bin` naming the binary to describe (there is
+no scanning, no guessing at an install). Pass no `--engine-bin` and, for a non-built-in profile,
+`recommend` has no candidate to hash and stays `undeclared`, exactly as before; for the built-in
+profile it falls back to the same PATH-resolved built-in binary name `serve` would use. A derived
+commit therefore names the binary the operator pointed `--engine-bin` at, not one this command will
+run. An operator-declared `engineBuild.commit` in the profile still always wins over a derived one.
 
 A card is measured with the engine run one way. When the launch's final engine argv adds `--mtp`
 (multi-token prediction), `serve` and `recommend` report whether the card was checked under that flag
