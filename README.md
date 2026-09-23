@@ -731,16 +731,16 @@ Behaviour to know:
   write so concurrent requests' lines cannot interleave. Headers and bodies, including
   `Authorization`, are never logged.
 
-### Install a prebuilt release (v0.1.3)
+### Install a prebuilt release (v0.1.4)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its
 checksum file, verify, then extract:
 
 ```sh
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.3/fastmlx-0.1.3-arm64-macos.tar.gz
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.3/fastmlx-0.1.3-arm64-macos.tar.gz.sha256
-shasum -a 256 -c fastmlx-0.1.3-arm64-macos.tar.gz.sha256
-tar -xzf fastmlx-0.1.3-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.4/fastmlx-0.1.4-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.4/fastmlx-0.1.4-arm64-macos.tar.gz.sha256
+shasum -a 256 -c fastmlx-0.1.4-arm64-macos.tar.gz.sha256
+tar -xzf fastmlx-0.1.4-arm64-macos.tar.gz
 ```
 
 The binaries are unsigned and not notarized. A `curl` download carries no quarantine attribute, so
@@ -748,14 +748,14 @@ nothing further is needed; a browser download does, and macOS will refuse to run
 the tarball until you clear it:
 
 ```sh
-xattr -dr com.apple.quarantine fastmlx-0.1.3-arm64-macos
+xattr -dr com.apple.quarantine fastmlx-0.1.4-arm64-macos
 ```
 
 Add the extracted `bin` directory to `PATH` (or symlink `bin/fastmlx` into a directory already on
 it), then run it:
 
 ```sh
-export PATH="$PWD/fastmlx-0.1.3-arm64-macos/bin:$PATH"
+export PATH="$PWD/fastmlx-0.1.4-arm64-macos/bin:$PATH"
 fastmlx --help
 fastmlx capacity --help
 ```
