@@ -5209,6 +5209,10 @@ class PublicSiteTests(unittest.TestCase):
         "qwen38-flash-next-mixed-4-8bit@m3ultra": ENGINE_BUILD_VALID_COMMIT,
         "qwen38-flash-next-iq-3p3bpw@m3ultra": ENGINE_BUILD_VALID_COMMIT,
         "qwen3-0p6b-4bit@m5": "21af3abd339a0752319ba6b4abe3b3880b16da3b",
+        # Added 2026-09-23 (cycle 144) for the second card cycle 142 shipped. Its build sha
+        # differs from the @m5 card's because the two rows were measured on different hosts --
+        # that is the point of the pin, so they are listed separately rather than shared.
+        "qwen3-0p6b-4bit@m3ultra": "a1f002a00d452a0abf662f7174cae0ae25873b85",
     }
 
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:
