@@ -321,6 +321,63 @@ def _strip_hop_by_hop(header_items, also_strip: Tuple[str, ...] = ()) -> List[Tu
     return result
 
 
+def decode_quality_verdict(card: Optional[dict]) -> str:
+    """THE single fail-closed decoder from a quality card's ``verdict``
+    field to the fixed token this project puts on the wire for it. Both
+    this proxy's ``X-FastMLX-Quality-Verdict`` header / ``qualityVerdict``
+    body field AND ``fastmlx_launch.announce_verdict``'s ``verdict=``
+    startup-line token route through THIS function -- ``announce_verdict``
+    is now a one-line delegation to it (see that function's docstring in
+    ``fastmlx_launch.py``) precisely so the response a client sees and the
+    line an operator sees can never silently drift apart by one of the two
+    copies being edited without the other. Mirrors the Swift
+    ``QualityVerdict`` decoder (``spike/Sources/HarnessCore/
+    QualityAdmission.swift``) and the launcher's admission logic
+    (``fastmlx_launch.decide_admission``) the same way ``announce_verdict``
+    always has. Neither of those two lives in THIS file: this docstring
+    moved here from ``announce_verdict``, where "this file's own" was
+    true, and saying it here would point a reader at the wrong module.
+
+    - ``card is None`` (no quality card was ever consulted for this
+      launch) -> ``"none"``.
+    - ``card.get("verdict")`` in ``("PASS", "REFERENCE", "EXACT",
+      "NO_GO")`` -> that string, unchanged.
+    - Anything else -- a missing ``verdict`` key, an explicit
+      ``"UNMEASURED"``, or an unrecognized string (e.g. ``"MAYBE"``) --
+      fails closed to ``"UNMEASURED"``. This is deliberate: the decoder
+      must never echo back a raw string that ``decide_admission`` itself
+      did not treat as one of the four real verdicts.
+
+    The return value can never contain whitespace, ``/``, or CR/LF: it is
+    always exactly one of ``none``, ``PASS``, ``REFERENCE``, ``EXACT``,
+    ``NO_GO``, or ``UNMEASURED`` -- callers that put it in an HTTP header
+    or a fixed-arity log line therefore never need to sanitize it
+    themselves for THIS reason (``build_provenance_headers`` still routes
+    it through ``_sanitize_header_value`` below, purely as defense in
+    depth alongside every other header value, not because this decoder
+    can actually produce something unsafe).
+    """
+    if card is None:
+        return "none"
+    if not isinstance(card, dict):
+        # Fail closed rather than raise. Both callers below read ``card``
+        # out of the plan immediately beside an ``isinstance(card, dict)``
+        # guard of their own (``card_id`` in build_provenance_headers and
+        # build_provenance_body), so leaving this one unguarded would make
+        # two adjacent lines trust the same value differently -- exactly
+        # the drift this single-decoder refactor exists to prevent. It
+        # matters more here than it looks: build_provenance_headers runs
+        # ONCE at proxy construction, so an AttributeError raised here
+        # would take down every response the proxy would ever serve, not
+        # just one. A malformed card is NOT "no card": it fails closed to
+        # UNMEASURED, never to "none".
+        return "UNMEASURED"
+    verdict = card.get("verdict")
+    if verdict in ("PASS", "REFERENCE", "EXACT", "NO_GO"):
+        return verdict
+    return "UNMEASURED"
+
+
 def build_provenance_headers(plan: dict) -> List[Tuple[str, str]]:
     """The fixed set of ``X-FastMLX-*`` headers computed ONCE from ``plan``
     (the same dict ``fastmlx_launch._run_serve`` builds) and attached to
@@ -354,16 +411,33 @@ def build_provenance_headers(plan: dict) -> List[Tuple[str, str]]:
         ("X-FastMLX-Residency", residency),
         ("X-FastMLX-Engine-Build", build_value),
         ("X-FastMLX-MTP", mtp_value),
+        # NAME NOTE: this is the QUALITY verdict (PASS/REFERENCE/EXACT/
+        # NO_GO/UNMEASURED/none, from decode_quality_verdict above) -- NOT
+        # "X-FastMLX-Verdict". X-FastMLX-Fit, right above, already carries
+        # a field this codebase calls "verdict" (fit_verdict: the FIT
+        # verdict, GREEN/RED), an entirely different quantity measuring an
+        # entirely different thing. Do not rename this header to collide
+        # with that name.
+        ("X-FastMLX-Quality-Verdict", decode_quality_verdict(card)),
     ]
     return [(name, _sanitize_header_value(value)) for name, value in headers]
 
 
 def build_provenance_body(plan: dict) -> dict:
     """The JSON body ``GET /fastmlx/provenance`` answers with: fit verdict,
-    card id, admission, residency, engine build, mtp and front -- deliberately
-    NEVER the raw ``argv`` (it names the resolved engine binary and every
-    passthrough argument) and never a raw model path (fit fields / card
-    contents are not included wholesale for the same reason).
+    card id, admission, residency, engine build, mtp, front, and the
+    decoded quality verdict -- deliberately NEVER the raw ``argv`` (it
+    names the resolved engine binary and every passthrough argument) and
+    never a raw model path (fit fields / card contents are not included
+    wholesale for the same reason).
+
+    ``qualityVerdict`` (from ``decode_quality_verdict`` above) is a
+    DIFFERENT quantity than ``fit["verdict"]`` right above it in this same
+    dict: the former is the QUALITY verdict a card recorded
+    (PASS/REFERENCE/EXACT/NO_GO/UNMEASURED/none), the latter is the FIT
+    verdict (GREEN/RED) -- whether the model fits the host's memory. Do
+    not conflate the two just because both fields happen to be named
+    "verdict" in their own local scope.
     """
     card = plan.get("card")
     card_id = card.get("id") if isinstance(card, dict) and card.get("id") else None
@@ -376,6 +450,7 @@ def build_provenance_body(plan: dict) -> dict:
         "engineBuild": plan.get("engineBuild"),
         "mtp": plan.get("mtp"),
         "front": plan.get("front"),
+        "qualityVerdict": decode_quality_verdict(card),
     }
 
 

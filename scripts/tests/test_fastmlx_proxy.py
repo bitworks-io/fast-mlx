@@ -648,6 +648,191 @@ class ProxyRoundTripTests(unittest.TestCase):
         self.assertEqual(resp.status, 204)
         self.assertEqual(body, b"")
 
+    # ------------------------------------------------------------------
+    # 17. The quality verdict on the wire (header) and in the JSON body are
+    #    decoded from the SAME function for the SAME plan -- a future
+    #    change that touches one surface without the other must fail this.
+    # ------------------------------------------------------------------
+    def test_quality_verdict_header_and_body_agree(self):
+        plan = {**FIXTURE_PLAN, "card": {**FIXTURE_PLAN["card"], "verdict": "EXACT"}}
+        headers = dict(FASTMLX_PROXY.build_provenance_headers(plan))
+        body = FASTMLX_PROXY.build_provenance_body(plan)
+        self.assertEqual(headers["X-FastMLX-Quality-Verdict"], "EXACT")
+        self.assertEqual(body["qualityVerdict"], "EXACT")
+        self.assertEqual(headers["X-FastMLX-Quality-Verdict"], body["qualityVerdict"])
+
+    # ------------------------------------------------------------------
+    # 18. A verdict value carrying CR/LF cannot split the header -- but the
+    #    reason is worth pinning honestly: such a string is unrecognized by
+    #    decode_quality_verdict, so it fails CLOSED to "UNMEASURED" before
+    #    _sanitize_header_value ever runs on it. This asserts the fail-
+    #    closed value itself, not merely "no CR/LF made it out", so the
+    #    decoder gets credit for the defense rather than the sanitizer.
+    # ------------------------------------------------------------------
+    def test_crlf_in_verdict_value_fails_closed_before_sanitization(self):
+        plan = {
+            **FIXTURE_PLAN,
+            "card": {**FIXTURE_PLAN["card"], "verdict": "NO_GO\r\nX-Evil: 1"},
+        }
+        headers = dict(FASTMLX_PROXY.build_provenance_headers(plan))
+        value = headers["X-FastMLX-Quality-Verdict"]
+        self.assertEqual(value, "UNMEASURED")
+        self.assertNotIn("\r", value)
+        self.assertNotIn("\n", value)
+
+    # ------------------------------------------------------------------
+    # 19. THE DISCRIMINATING ASSERTION. Test 10 above (and the concurrency-
+    #    cap bytes-tuple loop elsewhere in this file) only ever check that a
+    #    NAMED header was not dropped -- an ``assertIsNotNone``/``assertIn``
+    #    loop over a fixed name list passes whether or not any NEW header
+    #    exists, so neither one would have caught
+    #    X-FastMLX-Quality-Verdict being forgotten entirely. This test
+    #    instead asserts the EXACT set of ``x-fastmlx-*`` response header
+    #    names on a real proxied response, so a future header that is added
+    #    or dropped without an accompanying test update fails here even
+    #    while every individually-named assertion elsewhere stays green.
+    #    Deliberately NOT folded into those pre-existing loops -- their
+    #    staying green while this one goes red on a reverted header is
+    #    itself a required mutation control.
+    # ------------------------------------------------------------------
+    def test_exact_set_of_fastmlx_response_headers(self):
+        def responder(handler):
+            payload = b"ok"
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = self._start_upstream(responder)
+        proxy = self._start_proxy(FIXTURE_PLAN, upstream)
+
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("GET", "/v1/models")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+        actual = {
+            name.lower() for name, _ in resp.getheaders() if name.lower().startswith("x-fastmlx-")
+        }
+        expected = {
+            "x-fastmlx-admission",
+            "x-fastmlx-card",
+            "x-fastmlx-fit",
+            "x-fastmlx-residency",
+            "x-fastmlx-engine-build",
+            "x-fastmlx-mtp",
+            "x-fastmlx-quality-verdict",
+            "x-fastmlx-request-id",
+        }
+        self.assertEqual(actual, expected)
+
+    # ------------------------------------------------------------------
+    # 20. Upstream spoofing of the NEW header: an upstream sending its own
+    #    X-FastMLX-Quality-Verdict must never reach the client -- exactly
+    #    one such header, valued by OUR plan's decode, must arrive (mirrors
+    #    test 12's X-FastMLX-Evil coverage, but also pins the COUNT so a
+    #    regression that let both the proxy's real value and the spoofed
+    #    one through would fail here even if the spoofed value alone looked
+    #    harmless).
+    # ------------------------------------------------------------------
+    def test_upstream_spoofed_quality_verdict_header_is_stripped(self):
+        def responder(handler):
+            payload = b"ok"
+            handler.send_response(200)
+            handler.send_header("X-FastMLX-Quality-Verdict", "EXACT")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        plan = {**FIXTURE_PLAN, "card": {**FIXTURE_PLAN["card"], "verdict": "NO_GO"}}
+        upstream = self._start_upstream(responder)
+        proxy = self._start_proxy(plan, upstream)
+
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("GET", "/v1/models")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+        values = resp.msg.get_all("X-FastMLX-Quality-Verdict")
+        self.assertEqual(values, ["NO_GO"])
+
+
+class DecodeQualityVerdictTestCase(unittest.TestCase):
+    """Unit arms over ``decode_quality_verdict`` -- the single fail-closed
+    decoder both this proxy's response headers/body AND
+    ``fastmlx_launch.announce_verdict`` route through (see that function's
+    own docstring). Mirrored arm-for-arm against ``AnnounceVerdictTestCase``
+    in ``test_fastmlx_launch.py`` so the two surfaces can never quietly
+    drift apart from each other again.
+    """
+
+    def test_no_card_is_none(self):
+        self.assertEqual(FASTMLX_PROXY.decode_quality_verdict(None), "none")
+
+    def test_pass_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"verdict": "PASS"}), "PASS"
+        )
+
+    def test_reference_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"verdict": "REFERENCE"}), "REFERENCE"
+        )
+
+    def test_exact_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"verdict": "EXACT"}), "EXACT"
+        )
+
+    def test_no_go_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"verdict": "NO_GO"}), "NO_GO"
+        )
+
+    def test_unmeasured_verdict_passes_through(self):
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"verdict": "UNMEASURED"}), "UNMEASURED"
+        )
+
+    def test_unrecognized_verdict_string_fails_closed_to_unmeasured(self):
+        # decide_admission (fastmlx_launch.py) treats any string it does
+        # not recognize as admit_unmeasured -- this decoder must never echo
+        # back "MAYBE" as if it were a verdict the admission logic itself
+        # believed.
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"verdict": "MAYBE"}), "UNMEASURED"
+        )
+
+    def test_card_with_no_verdict_key_fails_closed_to_unmeasured(self):
+        self.assertEqual(
+            FASTMLX_PROXY.decode_quality_verdict({"id": "x"}), "UNMEASURED"
+        )
+
+    def test_non_dict_card_fails_closed_instead_of_raising(self):
+        # A malformed card is not "no card": it must fail closed to
+        # UNMEASURED, never to "none" (which asserts the honest fact that
+        # no card was consulted at all). Raising is the outcome actually
+        # being excluded here -- build_provenance_headers calls this once
+        # at proxy CONSTRUCTION, so an AttributeError would take down every
+        # response rather than degrade one of them.
+        for malformed in ("NO_GO", ["NO_GO"], 7, object()):
+            with self.subTest(card=type(malformed).__name__):
+                self.assertEqual(
+                    FASTMLX_PROXY.decode_quality_verdict(malformed), "UNMEASURED"
+                )
+
+    def test_malformed_card_does_not_break_header_construction(self):
+        # The call-site half of the guard above: the whole point is that a
+        # malformed plan still yields a complete, servable header set.
+        plan = {**FIXTURE_PLAN, "card": "not-a-dict"}
+        headers = dict(FASTMLX_PROXY.build_provenance_headers(plan))
+        self.assertEqual(headers["X-FastMLX-Quality-Verdict"], "UNMEASURED")
+        self.assertEqual(
+            FASTMLX_PROXY.build_provenance_body(plan)["qualityVerdict"], "UNMEASURED"
+        )
+
 
 def headers_dict(resp: http.client.HTTPResponse) -> dict:
     return {name: value for name, value in resp.getheaders()}
@@ -4139,8 +4324,17 @@ class ProxySaturationSnapshotTests(unittest.TestCase):
         body = json.loads(body_bytes)
         self.assertEqual(
             set(body.keys()),
-            {"fit", "card", "admission", "residency", "engineBuild", "mtp", "front"},
-            "the provenance body's key set must stay byte-unchanged by this increment",
+            {
+                "fit", "card", "admission", "residency", "engineBuild", "mtp", "front",
+                # Added by the quality-verdict-on-the-wire increment
+                # (decode_quality_verdict / build_provenance_body) -- an
+                # intentional, tracked addition, unlike the saturation/peer
+                # fields this test guards against below.
+                "qualityVerdict",
+            },
+            "the provenance body's key set must stay byte-unchanged by "
+            "THIS (saturation-snapshot) increment -- qualityVerdict is the "
+            "one intentional exception, added by a separate increment",
         )
         for forbidden in (
             "peer", "top_slots", "distinct_peer_hosts", "slots_reported",

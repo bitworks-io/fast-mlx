@@ -540,9 +540,9 @@ process bound to loopback only, and runs a small reverse proxy of its own in fro
 and body passes through unchanged (only `Host` and hop-by-hop headers are rewritten; see below), and
 every response gains a fixed set of `X-FastMLX-*` headers computed once from the same admission plan `--dry-run`
 prints: `X-FastMLX-Admission`, `X-FastMLX-Card`, `X-FastMLX-Fit`, `X-FastMLX-Residency`,
-`X-FastMLX-Engine-Build`, `X-FastMLX-MTP`, and a per-request `X-FastMLX-Request-Id`. `GET
-/fastmlx/provenance` is answered by the proxy itself with the same plan summary as JSON, never the
-raw argv or a model path.
+`X-FastMLX-Engine-Build`, `X-FastMLX-MTP`, `X-FastMLX-Quality-Verdict`, and a per-request
+`X-FastMLX-Request-Id`. `GET /fastmlx/provenance` is answered by the proxy itself with the same
+plan summary as JSON, never the raw argv or a model path.
 
 ```sh
 python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b --port 8081 --front-port 8080
@@ -562,6 +562,17 @@ the quality card that admitted this pack, engine build and residency; `X-FastMLX
 card's `--mtp` transfer status. They do not prove that a particular response matches the card's
 measurement. Any `X-FastMLX-*` header the engine itself sends back is dropped before the proxy adds
 its own, so the engine can never spoof or duplicate them.
+
+`X-FastMLX-Quality-Verdict` carries the card's decoded QUALITY verdict — `PASS`, `REFERENCE`,
+`EXACT`, or `NO_GO`, or `UNMEASURED` for a card whose verdict is missing or unrecognized, or `none`
+when no card was consulted for this launch at all (the same fail-closed decode the admitted startup
+line's own `verdict=` token uses). It is a different quantity than `X-FastMLX-Fit`, which carries the
+FIT verdict (`GREEN`/`RED`: whether the model fits the host's memory) — do not conflate the two just
+because both are called "verdict" in their own context. `X-FastMLX-Admission` does NOT substitute for
+`X-FastMLX-Quality-Verdict`: admission collapses `PASS`, `REFERENCE`, and `EXACT` into the single
+outcome `admit`, so a client reading `X-FastMLX-Admission` alone cannot tell an `EXACT`-verified pack
+from a merely `PASS`-measured one — `X-FastMLX-Quality-Verdict` is the header that answers that
+question.
 
 Measured cost (2026-09-19, one M3 Ultra 256 GB host, in front of the served engine with the
 `qwen38-flash-next-mixed-4-8bit@m3ultra` pack, greedy, streaming, 128-token replies, 20 prompts, each

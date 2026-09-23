@@ -1212,13 +1212,17 @@ def announce_verdict(card: Optional[dict]) -> str:
     admission logic itself did not believe. The return value can never
     contain whitespace or ``/``: it is always one of ``none``, ``PASS``,
     ``REFERENCE``, ``EXACT``, ``NO_GO``, or ``UNMEASURED``.
+
+    The decode itself now lives in ``fastmlx_proxy.decode_quality_verdict``
+    (the provenance proxy's response headers and JSON body need the exact
+    same fail-closed decode this startup line does, so a client and an
+    operator watching the same launch can never be told two different
+    quality verdicts for it). This function is a thin delegation to that
+    one decoder, not a second copy of its logic, specifically so the
+    startup line and the response headers can never silently disagree
+    with each other again.
     """
-    if card is None:
-        return "none"
-    verdict = card.get("verdict")
-    if verdict in ("PASS", "REFERENCE", "EXACT", "NO_GO"):
-        return verdict
-    return "UNMEASURED"
+    return fastmlx_proxy.decode_quality_verdict(card)
 
 
 def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
