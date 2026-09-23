@@ -862,6 +862,29 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         }
     }
 
+    // --model-revision <sha> joins that same allowlist: the pinned HF commit the launch resolved,
+    // consumed by the admission gate off CommandLine for hfPin-prefix card resolution. It gets its
+    // OWN positive test rather than riding on the suite merely staying green, because green-on-the
+    // -rest is exactly what the regression above looked like: an allowlist omission is invisible to
+    // every test that does not pass the flag, and it fails at process start, in production.
+    func testModelRevisionFlagIsAcceptedByTheParser() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--model", "mlx-community/Qwen3-0.6B-4bit",
+            "--model-revision", "73e3e38d981303bc594367cd910ea6eb48349da8",
+        ])
+        XCTAssertEqual(arguments.backend, .scripted)
+        XCTAssertEqual(arguments.model, "mlx-community/Qwen3-0.6B-4bit")
+    }
+
+    func testModelRevisionFlagRequiresAValue() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--scripted", "--model-revision"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .missingValue("--model-revision"))
+        }
+    }
+
     // MARK: - --quant-pick-only: a dry-run that resolves which quant would load and exits, with NO
     // model load. It is its own early-return mode (like --help), so it needs ONLY --quant-candidates
     // (+ optional --context) — never the runtime load limits, because nothing is loaded.

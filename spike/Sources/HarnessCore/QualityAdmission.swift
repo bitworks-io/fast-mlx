@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// The quality-guidance moat's admission verdict for a resolved model+config, as authored into
 /// `site/quality-guides.json` by `scripts/emit_quality_card.py`. See
@@ -145,6 +148,31 @@ public enum QualityAdmissionOutcome: Sendable, Equatable {
 /// never on "absence of a passing card" — so a model with no card, or an UNMEASURED card, always
 /// admits.
 public enum QualityAdmission {
+    /// The `quality_card=` startup-line fragment: closes the OTHER half of the "operator can always
+    /// SEE, never merely infer" contract that `QualityCardsManifestResolution`'s `quality_cards=`
+    /// fragment left open. `quality_cards=<path>` / `quality_cards=none` only ever say whether a
+    /// MANIFEST was consulted; they say nothing about whether a CARD resolved for the launched
+    /// model+revision. Before this fragment existed, `.none` (no card matched) and `.resolved` were
+    /// externally identical -- both fell through the discriminator switch in
+    /// `applyQualityAdmissionGate` silently -- so an operator seeing `quality_cards=/…/quality-guides.json`
+    /// could not tell "this pack is uncarded" from "this pack is carded and PASS".
+    ///
+    /// `nil` card -> exactly `"quality_card=none"`. Non-nil -> exactly
+    /// `"quality_card=<card.id> verdict=<card.verdict.rawValue>"`. Total over its input (every
+    /// `QualityCard` decodes to a non-optional `id` and `verdict`); no I/O, no force-unwrap.
+    ///
+    /// Deliberately carries `id` and `verdict` ONLY -- never `model.repo`, `model.hfPin`, or the
+    /// manifest path. Both of those already appear verbatim in the published `site/quality-guides.json`,
+    /// so naming a card by `id`/`verdict` in a log line discloses nothing new; a resolved HF repo path
+    /// or revision hash is host/deployment-specific and does not belong in this token. The fragment
+    /// must never contain `/` for the same reason `quality_cards=` is kept as a separate, path-shaped
+    /// token: a supervisor line-parser (launchd/nohup) must be able to split on whitespace without a
+    /// path embedding an ambiguous separator into what is documented as an id+verdict-only field.
+    public static func announceFragment(card: QualityCard?) -> String {
+        guard let card else { return "quality_card=none" }
+        return "quality_card=\(card.id) verdict=\(card.verdict.rawValue)"
+    }
+
     public static func decide(card: QualityCard?, optIn: Bool) -> QualityAdmissionOutcome {
         guard let card else { return .admitUnmeasured }
         switch card.verdict {
@@ -175,6 +203,76 @@ struct QualityCardManifest: Decodable {
 /// missing file, so a serve with no manifest, an unreadable manifest, or a manifest that fails to
 /// parse behaves EXACTLY as today — never a refusal caused by a broken loader.
 public enum QualityCardStore {
+    /// The producer-side fail-closed sentinel a chip probe returns when identification fails (e.g.
+    /// `ProvenanceCLI.chipBrand()`, `fastmlx_bench._chip_identity`). Lowercase alphanumeric, so it
+    /// would otherwise look like a plausible class -- this guard exists so it can never host-match.
+    private static let hardwareClassSentinel = "unknown"
+
+    /// Normalizes a raw chip-brand string into the canonical `config.hardwareClass` / host-probe
+    /// shape: trim, lowercase, then collapse each run of whitespace to a single `-`. `nil` in, `nil`
+    /// out; `nil` for an empty/whitespace-only trimmed result; `nil` for the chip-probe-failed
+    /// sentinel `"unknown"` (checked case-insensitively, i.e. AFTER lowercasing, so `"UNKNOWN"` /
+    /// `" Unknown "` are caught too).
+    ///
+    /// Mirrors `fastmlx_launch.host_hardware_class()`'s normalization (`scripts/fastmlx_launch.py`,
+    /// `brand.lower().replace(" ", "-")`), generalized to arbitrary whitespace runs the way
+    /// `emit_quality_card.validate_hardware_class` does (`scripts/emit_quality_card.py:97`,
+    /// `re.sub(r"\s+", "-", value.strip().lower())`). Deliberately does NOT add canonical-regex
+    /// validation beyond the sentinel check: Python's live detector (`fastmlx_launch.py:775-778`)
+    /// does not validate its own output against the `^[a-z0-9]+(-[a-z0-9]+)*$` shape either -- a
+    /// non-canonical value (e.g. one carrying a comma) is not "fixed up", it simply fails to match
+    /// any card, which is the correct and sufficient outcome. Keeping the rule identical to the
+    /// Python detector -- not to the stricter emitter-side validator -- is the point.
+    ///
+    /// This is a deliberate separate copy rather than an import of the Python normalizer or of
+    /// `SystemProfile`'s own sysctl helper: the codebase already keeps independent copies of this
+    /// rule across `fastmlx_launch.py`, `build_public_site.py`, and `validate_public_site.py`
+    /// (`scripts/emit_quality_card.py:68-74`), and `emit_quality_card.py:82-86` documents directly why
+    /// the sentinel check must survive any such copy. A fourth copy in Swift follows that established
+    /// split rather than reaching across the Python/Swift boundary for a few lines of string logic.
+    public static func canonicalHardwareClass(fromChipBrand brand: String?) -> String? {
+        guard let brand else { return nil }
+        let trimmed = brand.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lowered = trimmed.lowercased()
+        let normalized = lowered.replacingOccurrences(
+            of: "\\s+", with: "-", options: .regularExpression)
+        guard normalized != hardwareClassSentinel else { return nil }
+        return normalized
+    }
+
+    /// Probes THIS host's hardware class for the admission tiebreak (step 3 of
+    /// `card(forRepo:hostHardwareClass:in:)`). Reads ONLY `machdep.cpu.brand_string` via
+    /// `sysctlbyname` and fails closed to `nil` on any failure (a nonzero/absent sysctl, or an empty
+    /// result) -- mirroring `fastmlx_launch.host_hardware_class()`'s fail-closed contract on the
+    /// Swift side.
+    ///
+    /// Deliberately does NOT reuse `SystemProfile.detectHost()`: that detector's `chip` field falls
+    /// back from `machdep.cpu.brand_string` to `hw.model` (e.g. `"Mac17,3"`, which is not canonical
+    /// and carries a comma) and finally to the literal `"unknown"` -- the exact chip-probe-failed
+    /// sentinel `canonicalHardwareClass(fromChipBrand:)` refuses by name. That fallback chain is
+    /// right for the sizer, which wants a best-effort human-readable chip name, and wrong for card
+    /// identity, which must fail closed to `nil` rather than silently emit a non-canonical or
+    /// sentinel value a card validator would reject. Mirrors the narrow, private
+    /// `SystemProfile.sysctlString` reader (`SystemProfile.swift:334+`) rather than making it public
+    /// or importing it, since `SystemProfile` deliberately stays MLX/GPU-toolchain-free and this is a
+    /// one-sysctl probe.
+    public static func hostHardwareClass() -> String? {
+        guard let brand = sysctlString("machdep.cpu.brand_string") else { return nil }
+        return canonicalHardwareClass(fromChipBrand: brand)
+    }
+
+    /// Minimal C-string sysctl read, mirroring `SystemProfile.sysctlString` narrowly rather than
+    /// reusing it (that helper is `private` to `SystemProfile` by design).
+    private static func sysctlString(_ name: String) -> String? {
+        var size = 0
+        guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else { return nil }
+        let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
     /// Pure core: decode `manifestData` as a `fast-mlx-quality-card-v1` manifest and return the first
     /// card whose `model.repo` matches `repoID` AND whose `effectiveResidency` is `"resident"`
     /// (`QualityCard.matchesResidentLaunch`). This engine only serves resident weights — it cannot
@@ -193,15 +291,15 @@ public enum QualityCardStore {
         return card(forRepo: repoID, hostHardwareClass: hostHardwareClass, in: manifest.cards)
     }
 
-    /// The single card-selection rule over already-decoded cards. Every Swift call site that picks a
-    /// card by identity goes through here, so the residency filter cannot be bypassed by a caller
-    /// that loaded the manifest itself.
+    /// The single card-selection rule over an already-narrowed candidate pool (a repo match, a pin
+    /// match, or any other identity-matched set) — shared by `card(forRepo:hostHardwareClass:in:)`
+    /// and `resolve(repo:revision:hostHardwareClass:in:)` so the 4-step rule documented on
+    /// `card(forRepo:hostHardwareClass:in:)` below is implemented exactly once.
     ///
-    /// Filters to `model.repo == repoID && matchesResidentLaunch`, then:
     /// 1. 0 or 1 match — return it. This is TODAY'S BEHAVIOR, byte-for-byte identical to
-    ///    `cards.first { ... }`, and must stay exactly that: it is what preserves every existing
-    ///    user's resolution. (An Ultra card and an M5 card for the same pack are legitimately
-    ///    distinct measurements, not duplicates — see
+    ///    `candidates.first`, and must stay exactly that: it is what preserves every existing user's
+    ///    resolution. (An Ultra card and an M5 card for the same pack are legitimately distinct
+    ///    measurements, not duplicates — see
     ///    `docs/task-inbox/2026-09-22-PREDECLARATION-hardwareclass-joins-identity-never-filters.md`
     ///    — so reaching >1 match here is an expected, supported case, not an error.)
     /// 2. More than one match: manifest array order must NEVER decide the outcome (order is
@@ -222,15 +320,14 @@ public enum QualityCardStore {
     /// 4. Otherwise (no unique host match, or no host hint), pick deterministically by the
     ///    lexicographically smallest card `id` within the pool, so the `--accept-quality <id>` refusal
     ///    message is stable across manifest re-emissions.
-    public static func card(
-        forRepo repoID: String, hostHardwareClass: String? = nil, in cards: [QualityCard]
+    private static func select(
+        from candidates: [QualityCard], hostHardwareClass: String?
     ) -> QualityCard? {
-        let matches = cards.filter { $0.model.repo == repoID && $0.matchesResidentLaunch }
-        if matches.count <= 1 {
-            return matches.first
+        if candidates.count <= 1 {
+            return candidates.first
         }
-        let noGoMatches = matches.filter { $0.verdict == .noGo }
-        let tiePool = noGoMatches.isEmpty ? matches : noGoMatches
+        let noGoMatches = candidates.filter { $0.verdict == .noGo }
+        let tiePool = noGoMatches.isEmpty ? candidates : noGoMatches
         if let hostHardwareClass {
             let hostMatches = tiePool.filter { $0.config?.hardwareClass == hostHardwareClass }
             if hostMatches.count == 1 {
@@ -238,6 +335,64 @@ public enum QualityCardStore {
             }
         }
         return tiePool.min { $0.id < $1.id }
+    }
+
+    /// The single card-selection rule over already-decoded cards. Every Swift call site that picks a
+    /// card by identity goes through here, so the residency filter cannot be bypassed by a caller
+    /// that loaded the manifest itself.
+    ///
+    /// Filters to `model.repo == repoID && matchesResidentLaunch`, then runs the shared 4-step
+    /// selection rule documented on `select(from:hostHardwareClass:)` above.
+    public static func card(
+        forRepo repoID: String, hostHardwareClass: String? = nil, in cards: [QualityCard]
+    ) -> QualityCard? {
+        let matches = cards.filter { $0.model.repo == repoID && $0.matchesResidentLaunch }
+        return select(from: matches, hostHardwareClass: hostHardwareClass)
+    }
+
+    /// Full hex-digit ASCII check mirroring Python's `_HEX_DIGITS_RE = re.compile(r"^[0-9a-fA-F]+$")`
+    /// exactly — deliberately NOT `Character.isHexDigit`, which also accepts non-ASCII Unicode
+    /// "Hex_Digit"-property characters (e.g. fullwidth digit forms) that Python's regex would reject.
+    private static func isAllASCIIHexDigits(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.utf8.allSatisfy { byte in
+                (0x30...0x39).contains(byte) || (0x41...0x46).contains(byte)
+                    || (0x61...0x66).contains(byte)
+            }
+    }
+
+    /// Mirrors Python `_is_full_hex_revision` (`scripts/fastmlx_launch.py:628`): exactly 40 hex
+    /// characters, else `false` — including `nil`.
+    private static func isFullHexRevision(_ value: String?) -> Bool {
+        guard let value, value.count == 40 else { return false }
+        return isAllASCIIHexDigits(value)
+    }
+
+    /// Mirrors Python `_is_usable_hf_pin` (`scripts/fastmlx_launch.py:636`): at least 8 hex
+    /// characters, else `false` — including `nil`.
+    private static func isUsableHfPin(_ value: String?) -> Bool {
+        guard let value, value.count >= 8 else { return false }
+        return isAllASCIIHexDigits(value)
+    }
+
+    /// Mirrors Python `_hf_pin_matches_revision` (`scripts/fastmlx_launch.py:644`): `revision` must
+    /// be a full 40-hex sha, `hfPin` must be a usable (>= 8 hex) pin, and `revision` must
+    /// case-insensitively PREFIX-match `hfPin` (not equal it — a card's `hfPin` may itself be a short
+    /// prefix of the pinned commit).
+    private static func hfPinMatchesRevision(hfPin: String?, revision: String?) -> Bool {
+        guard isFullHexRevision(revision), isUsableHfPin(hfPin), let hfPin, let revision else {
+            return false
+        }
+        return revision.lowercased().hasPrefix(hfPin.lowercased())
+    }
+
+    /// Every resident card whose `hfPin` prefix-matches `revision`, mirroring Python
+    /// `find_cards_by_pin` (`scripts/fastmlx_launch.py:659`). Empty when `revision` is not a full
+    /// 40-hex sha (`isFullHexRevision`), or when no card's `hfPin` is a usable prefix of it.
+    private static func pinMatches(revision: String?, in residentCards: [QualityCard]) -> [QualityCard]
+    {
+        guard isFullHexRevision(revision) else { return [] }
+        return residentCards.filter { hfPinMatchesRevision(hfPin: $0.model.hfPin, revision: revision) }
     }
 
     /// Convenience: read `manifestURL` and decode it. Returns `nil` (never throws) when the file is
@@ -262,6 +417,61 @@ public enum QualityCardStore {
         }
         return manifest.cards
     }
+
+    /// The implicit (no `--card-id`) lookup: a repo match (`card(forRepo:hostHardwareClass:in:)`'s
+    /// semantics) OR an `hfPin`-prefix match against `revision`. Mirrors Python `resolve_card`
+    /// (`scripts/fastmlx_launch.py:952-1082`) exactly, generalized to return a `QualityCardResolution`
+    /// rather than `Optional<QualityCard>`: `card(forRepo:hostHardwareClass:in:)`'s `nil` already
+    /// means "no card" (→ `QualityAdmission.decide` → `.admitUnmeasured`), so an ambiguous
+    /// repo-vs-pin collision cannot be expressed by that return type without silently admitting a
+    /// launch this lookup could not actually disambiguate — `.ambiguous` is a THIRD outcome, distinct
+    /// from both `.none` and `.resolved`, precisely so a caller is forced to refuse rather than guess.
+    ///
+    /// 1. `repoCards`: resident cards with `model.repo == repo` (empty when `repo == nil`).
+    /// 2. `pinCards`: resident cards whose `hfPin` prefix-matches `revision`
+    ///    (`pinMatches(revision:in:)`; empty when `revision == nil` or not a full 40-hex sha).
+    /// 3. If both are non-empty AND name different card-id sets, the lookup is ambiguous: a manifest
+    ///    naming the same model twice, once keyed by repo and once only by pin, cannot be resolved by
+    ///    silently preferring one over the other.
+    /// 4. Otherwise, `candidates` = `repoCards` if non-empty, else `pinCards`; `.none` when empty.
+    /// 5. The shared `select(from:hostHardwareClass:)` 4-step rule runs over `candidates` — identical
+    ///    fail-closed-NO_GO-first narrowing and hardwareClass tiebreak whether the pool came from the
+    ///    repo path or the pin path.
+    public static func resolve(
+        repo: String?, revision: String?, hostHardwareClass: String? = nil, in cards: [QualityCard]
+    ) -> QualityCardResolution {
+        let residentCards = cards.filter { $0.matchesResidentLaunch }
+        let repoCards: [QualityCard] =
+            repo.map { repoID in residentCards.filter { $0.model.repo == repoID } } ?? []
+        let pinCards = pinMatches(revision: revision, in: residentCards)
+
+        let repoIDs = Set(repoCards.map(\.id))
+        let pinIDs = Set(pinCards.map(\.id))
+        if !repoIDs.isEmpty, !pinIDs.isEmpty, repoIDs != pinIDs {
+            return .ambiguous(repoCardIDs: repoIDs.sorted(), pinCardIDs: pinIDs.sorted())
+        }
+
+        let candidates = repoCards.isEmpty ? pinCards : repoCards
+        guard !candidates.isEmpty else { return .none }
+        guard let selected = select(from: candidates, hostHardwareClass: hostHardwareClass) else {
+            return .none
+        }
+        return .resolved(selected)
+    }
+}
+
+/// The outcome of `QualityCardStore.resolve(repo:revision:hostHardwareClass:in:)`. Distinct from
+/// `QualityCard?` so an ambiguous repo-vs-pin collision (`.ambiguous`) can never be confused with "no
+/// card" (`.none`, which `QualityAdmission.decide` treats as `.admitUnmeasured`) — see `resolve`'s
+/// doc comment.
+public enum QualityCardResolution: Sendable, Equatable {
+    /// No repo or pin candidate at all.
+    case none
+    /// Exactly one card survived the repo/pin lookup and the shared selection rule.
+    case resolved(QualityCard)
+    /// The repo lookup and the pin lookup both matched, but named DIFFERENT card id sets. Both id
+    /// lists are sorted for a stable, reproducible refusal message.
+    case ambiguous(repoCardIDs: [String], pinCardIDs: [String])
 }
 
 /// Thrown by `QualityCardStore.loadManifest(contentsOf:)`.
@@ -369,11 +579,27 @@ public struct QualityOptIn: Sendable, Equatable {
         self.acceptedIDs = acceptedIDs
     }
 
-    /// `true` when the operator elected either this card's `id` or its `model.repo` — whichever
-    /// identity is more convenient at the CLI.
-    public func isElected(cardID: String?, repoID: String?) -> Bool {
+    /// `true` when the operator elected this card's `id`, its `model.repo`, or its `model.hfPin` —
+    /// whichever identity is more convenient at the CLI. `nil` for an absent card: nothing to elect.
+    /// Mirrors Python `is_opted_in` (`scripts/fastmlx_launch.py:1099-1109`), which is the reference
+    /// semantics this Swift path must match — a card whose `model.repo` is `nil` (e.g. a shipped
+    /// NO_GO card identified only by `hfPin`) would otherwise only be electable by card id, which is
+    /// the escape hatch this overload exists to restore before a later increment teaches card lookup
+    /// itself to resolve by pin.
+    public func isElected(card: QualityCard?) -> Bool {
+        guard let card else { return false }
+        return isElected(cardID: card.id, repoID: card.model.repo, hfPin: card.model.hfPin)
+    }
+
+    /// `true` when `acceptedIDs` contains any non-nil one of `cardID`, `repoID`, `hfPin`. `hfPin` has
+    /// no default value deliberately: the bug class this widening closes is "a field that is decoded
+    /// and never read" (a repo-less card's `hfPin` was exactly that until this change) — a defaulted
+    /// parameter would let a future call site silently reintroduce the same gap by omitting it, so
+    /// every caller is forced to pass an explicit choice (`nil` included) rather than inherit one.
+    public func isElected(cardID: String?, repoID: String?, hfPin: String?) -> Bool {
         if let cardID, acceptedIDs.contains(cardID) { return true }
         if let repoID, acceptedIDs.contains(repoID) { return true }
+        if let hfPin, acceptedIDs.contains(hfPin) { return true }
         return false
     }
 

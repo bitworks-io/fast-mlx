@@ -582,6 +582,21 @@ private func qualityCardsExplicitPathArgument(rawArguments: [String]) -> String?
     return rawArguments[index + 1]
 }
 
+/// Scan the raw argument list for an explicit `--model-revision <value>` value — the pinned HF
+/// commit sha this launch resolved, consulted by `QualityCardStore.resolve(repo:revision:...)` for
+/// hfPin-prefix card matching. Mirrors `qualityCardsExplicitPathArgument`'s scan idiom exactly:
+/// additive, off the raw arguments directly, so `ServingCore`'s strict allowlist parser only needs to
+/// accept + value-consume the flag, never store it (see the flag's own case comment in
+/// `FastMLXServeArguments.parse`).
+private func modelRevisionArgument(rawArguments: [String]) -> String? {
+    guard let index = rawArguments.firstIndex(of: "--model-revision"),
+        index + 1 < rawArguments.count
+    else {
+        return nil
+    }
+    return rawArguments[index + 1]
+}
+
 /// The quality-guidance moat's pre-load admission hook. Resolves the effective manifest path once
 /// (`QualityCardsManifestResolver.resolve`, against the REAL process working directory — the only
 /// place in this file that reads it for this gate), loads the card for `model` if a manifest
@@ -591,6 +606,14 @@ private func qualityCardsExplicitPathArgument(rawArguments: [String]) -> String?
 /// whether this run is consulting a manifest at all; this is the fix for the defect where a
 /// default lookup relative to the CWD silently ran with no gate.
 ///
+/// When a manifest is active, the return value ALSO appends `QualityAdmission.announceFragment`
+/// (`quality_card=<id> verdict=<verdict>` or `quality_card=none`) so an operator can additionally
+/// SEE whether a card actually resolved for this model+revision, not just whether a manifest was
+/// consulted — `.none` and `.resolved` were externally identical before this fragment existed. The
+/// two early `quality_cards=none` returns below (no manifest active / default manifest unreadable)
+/// stay byte-identical and emit no such fragment: no manifest was consulted, so "which card
+/// resolved" is not a meaningful question there.
+///
 /// `.admit`/`.admitUnmeasured` proceed silently — the required behavior when no manifest/card
 /// exists, keeping the default announce byte-identical apart from the new `quality_cards=`
 /// fragment. `.admitWithQualityFlag` prints its one-line message and proceeds;
@@ -598,6 +621,14 @@ private func qualityCardsExplicitPathArgument(rawArguments: [String]) -> String?
 /// validations in `run()`. An EXPLICIT `--quality-cards` path that does not exist or fails to
 /// decode ALSO exits non-zero (never fails open); the conventional default keeps today's
 /// fail-open behavior on the same two conditions.
+///
+/// Card lookup goes through `QualityCardStore.resolve(repo:revision:hostHardwareClass:in:)` — a
+/// repo match (`model`) or an hfPin-prefix match against an explicit `--model-revision` value (read
+/// off `rawArguments` exactly like `--accept-quality`). `.none` behaves exactly like today's `nil`
+/// card; `.resolved` runs today's `QualityAdmission.decide` path unchanged; `.ambiguous` (the repo
+/// and pin lookups named different cards) is a hard refusal — exit 2, the same configuration-refusal
+/// exit code every other refusal in this gate already uses (the Python launcher exits 3 for this
+/// case; this binary stays self-consistent on 2 instead of introducing a second refusal exit code).
 private func applyQualityAdmissionGate(model: String, rawArguments: [String]) -> String {
     let explicitPath = qualityCardsExplicitPathArgument(rawArguments: rawArguments)
     let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
@@ -632,10 +663,29 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         return "quality_cards=none"
     }
 
-    let card = QualityCardStore.card(forRepo: model, in: cards)
+    let revision = modelRevisionArgument(rawArguments: rawArguments)
+    let cardResolution = QualityCardStore.resolve(
+        repo: model, revision: revision, hostHardwareClass: QualityCardStore.hostHardwareClass(),
+        in: cards)
+    let card: QualityCard?
+    switch cardResolution {
+    case .none:
+        card = nil
+    case .resolved(let resolvedCard):
+        card = resolvedCard
+    case .ambiguous(let repoCardIDs, let pinCardIDs):
+        FileHandle.standardError.write(
+            Data(
+                """
+                fastmlx-serve configuration=refused reason=quality_card_ambiguous detail=repo \
+                \(model) matches card(s) \(repoCardIDs) but --model-revision \
+                \(revision ?? "nil") matches different card(s) \(pinCardIDs)\n
+                """.utf8))
+        exit(2)
+    }
     let optIn = QualityOptIn.parse(rawArguments)
     let outcome = QualityAdmission.decide(
-        card: card, optIn: optIn.isElected(cardID: card?.id, repoID: card?.model.repo))
+        card: card, optIn: optIn.isElected(card: card))
     switch outcome {
     case .admit, .admitUnmeasured:
         break
@@ -645,7 +695,7 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         FileHandle.standardError.write(Data((message + "\n").utf8))
         exit(2)
     }
-    return "quality_cards=\(manifestURL.path)"
+    return "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))"
 }
 
 /// Resolve the `--tier` serve dial into a `ServingPolicy`, composing any explicit `--kv-quant`

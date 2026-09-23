@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-21T00:16:00Z",
+  "generatedAt": "2026-09-23T05:53:09Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -85,7 +85,7 @@
         }
       },
       "boundary": {
-        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
         "unmeasured": [
           "closeness to the full-precision (BF16) model",
           "context beyond the native 262,144-token window (YaRN)",
@@ -170,7 +170,7 @@
         }
       },
       "boundary": {
-        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server matches cards by repo only and does not consult it",
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
         "unmeasured": [
           "closeness to the full-precision (BF16) model",
           "context beyond the native 262,144-token window (YaRN)",
@@ -527,6 +527,86 @@
       },
       "boundary": {
         "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-0p6b-4bit@m3ultra",
+      "model": {
+        "family": "Qwen3-0.6B",
+        "repo": "mlx-community/Qwen3-0.6B-4bit",
+        "hfPin": "73e3e38d"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 14.41% top-1 disagreement (85.59% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 7 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 7,
+          "top1AgreementPct": 85.5859
+        },
+        "regressionFocus": "open-ended enumerative, procedural and advisory writing (19-25% next-word drift); canonical technical explanations drift least (4.7-9.4%)",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract a real disagreement from the peer-divergence cell's raw observations corresponding to peer-divergence-qwen3-0p6b-4bit-vs-8bit-m3ultra-2026-09-23.json"
+        },
+        "benefit": {
+          "fit": "0.33 GB on disk - negligible against a 256 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 2560,
+        "disagreements": 369,
+        "disagreement_rate": 0.144140625,
+        "tier": "SIGNIFICANT",
+        "wilson_lo": 0.13106781122459543,
+        "wilson_hi": 0.1582798222916843,
+        "tv_lower_bound_median": 0.048867369157473806,
+        "tv_lower_bound_p95": 0.45349123497193794,
+        "tv_lower_bound_raw_min": -8.657405583534228e-07,
+        "kl_lower_bound_median_nats": 0.02505870986727511,
+        "kl_lower_bound_p95_nats": 0.5804167885199208
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-v1",
+        "sourceVerdict": "peer-divergence-qwen3-0p6b-4bit-vs-8bit-m3ultra-2026-09-23.json",
+        "measuredAt": "2026-09-23T05:53:09Z",
+        "engineBuild": {
+          "commit": "a1f002a00d452a0abf662f7174cae0ae25873b85"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build on THIS hardware class",
         "unmeasured": [
           "perplexity delta",
           "decode throughput (speedX)"

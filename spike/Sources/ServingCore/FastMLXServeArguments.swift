@@ -1246,9 +1246,10 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.invalidRequestLogMode
                 }
                 requestLog = parsedRequestLog
-            case "--quality-cards", "--accept-quality":
-                // Quality-guidance moat admission flags. Accepted + value-consumed here so the strict
-                // allowlist parser does not reject them; the values are read directly off
+            case "--quality-cards", "--accept-quality", "--model-revision":
+                // Quality-guidance moat admission flags, plus --model-revision (the pinned HF commit
+                // sha used for hfPin-prefix card resolution). Accepted + value-consumed here so the
+                // strict allowlist parser does not reject them; the values are read directly off
                 // CommandLine.arguments by the pre-load QualityAdmission gate in FastMLXServe.run()
                 // (keeps ServingCore free of a HarnessCore dependency — same boundary idiom as
                 // --kv-quant/--tier/--prefer). Fail closed on a missing value.
@@ -1799,6 +1800,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--request-log",
         "--quality-cards",
         "--accept-quality",
+        "--model-revision",
     ]
 
     private static func value(
