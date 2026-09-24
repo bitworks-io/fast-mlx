@@ -26,8 +26,20 @@ public enum QualityVerdict: String, Sendable, Codable {
 
 /// The minimal slice of a quality card the Swift serve gate + announce need: the admission
 /// discriminator inputs (`verdict`, `admission`) and the legible one-line summary the refusal/flag
-/// message quotes. Decoded leniently (`CodingKeys` names only the fields consumed here) so new
-/// emitter-side fields (`rawMetrics`, `provenance`, `boundary`, …) never break this decode.
+/// message quotes. Decoded via an explicit `CodingKeys` + hand-rolled `init(from:)` (not synthesized
+/// `Decodable` — see below): `id`, `model`, `verdict`, and `legible` stay REQUIRED, exactly as strict
+/// synthesis would decode them (any missing or malformed value still throws, dropping the whole card
+/// at the `LenientQualityCard` layer above); `config` keeps synthesis's `decodeIfPresent` semantics
+/// verbatim (present-but-wrong-type still throws). Only `admission` is decoded via
+/// `try? container.decodeIfPresent(Admission.self, forKey: .admission)`, so a missing, null, or
+/// STRUCTURALLY CORRUPT `admission` value (not only a missing `optIn`) yields `nil` instead of
+/// throwing — see docs/task-inbox/2026-09-23-PREDECLARATION-a-dropped-card-still-admits.md (D2: a
+/// synthesized `Admission?` alone does NOT achieve this, since synthesized `decodeIfPresent` only
+/// returns `nil` for an absent/null key, not a present-but-malformed one; D3: this is deliberately
+/// wider than "missing `optIn`" alone; D4: safe only because nothing in Swift ever reads a decoded
+/// `.admission` value). New emitter-side fields (`rawMetrics`, `provenance`, `boundary`, …) never
+/// break this decode simply because `CodingKeys` never names them — ordinary `Decodable` behavior,
+/// not special leniency.
 public struct QualityCard: Sendable, Decodable, Equatable {
     public struct Model: Sendable, Decodable, Equatable {
         /// `nil` for a non-checkpoint-specific card (e.g. an "enhancement" card like native MTP,
@@ -88,14 +100,14 @@ public struct QualityCard: Sendable, Decodable, Equatable {
     public let id: String
     public let model: Model
     public let verdict: QualityVerdict
-    public let admission: Admission
+    public let admission: Admission?
     public let legible: Legible
     /// `nil` when the card predates the `config.residency` field, or when its `config` object omits
     /// `residency` — both mean "measured resident" per `effectiveResidency` below.
     public let config: Config?
 
     public init(
-        id: String, model: Model, verdict: QualityVerdict, admission: Admission, legible: Legible,
+        id: String, model: Model, verdict: QualityVerdict, admission: Admission?, legible: Legible,
         config: Config? = nil
     ) {
         self.id = id
@@ -104,6 +116,24 @@ public struct QualityCard: Sendable, Decodable, Equatable {
         self.admission = admission
         self.legible = legible
         self.config = config
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, model, verdict, admission, legible, config
+    }
+
+    /// Hand-rolled rather than synthesized so `admission` alone can tolerate a present-but-malformed
+    /// value (see the type's doc comment above for why the naive `Admission?` + synthesized decode is
+    /// NOT sufficient). Every other property is decoded with the exact strictness synthesis would have
+    /// given it -- this decoder is a narrowing of leniency to one field, not a wholesale relaxation.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        model = try container.decode(Model.self, forKey: .model)
+        verdict = try container.decode(QualityVerdict.self, forKey: .verdict)
+        admission = try? container.decodeIfPresent(Admission.self, forKey: .admission)
+        legible = try container.decode(Legible.self, forKey: .legible)
+        config = try container.decodeIfPresent(Config.self, forKey: .config)
     }
 
     /// The residency this card was measured under: `config.residency` verbatim, or `"resident"` when
@@ -193,9 +223,10 @@ public enum QualityAdmission {
 
 /// A single element of the manifest's `cards` array, decoded leniently: `card` is `nil` when this
 /// element fails to decode as a `QualityCard` for ANY reason (a missing required field such as
-/// `admission.optIn`, a malformed value, or a non-object element) rather than throwing out of the
-/// surrounding array decode. `init(from:)` here must NEVER throw -- CRITICAL, do not "fix" this by
-/// removing the `try?` below.
+/// `verdict`, a malformed value, or a non-object element) rather than throwing out of the
+/// surrounding array decode. `admission` is the deliberate EXCEPTION: `QualityCard.init(from:)`
+/// decodes it via `try?`, so a missing or malformed `admission` no longer drops the card here.
+/// `init(from:)` here must NEVER throw -- CRITICAL, do not "fix" this by removing the `try?` below.
 ///
 /// `UnkeyedDecodingContainer.decode(_:)` does NOT advance `currentIndex` when the element decode
 /// throws (probed directly on Apple Swift 6.4). A naive
@@ -215,9 +246,11 @@ private struct LenientQualityCard: Decodable {
 /// `generatedAt` are carried but not asserted here; only `cards` is consulted.
 ///
 /// `cards` itself is decoded per-element leniently via `LenientQualityCard`: one malformed card
-/// (e.g. missing `admission.optIn`) is dropped and counted in `droppedCardCount`, never thrown out of
+/// (e.g. missing `verdict`) is dropped and counted in `droppedCardCount`, never thrown out of
 /// the whole manifest decode -- closing the defect where one bad card silently disarmed every other
-/// card's admission gate. The ENVELOPE stays strict: `cards` must still decode as a JSON array (the
+/// card's admission gate. `admission` is the exception: it decodes leniently inside `QualityCard`
+/// itself (see its doc comment), so a missing/malformed `admission` alone never drops a card here.
+/// The ENVELOPE stays strict: `cards` must still decode as a JSON array (the
 /// keyed `container.decode([LenientQualityCard].self, forKey: .cards)` call below still throws on a
 /// structurally corrupt envelope, e.g. `cards` as an object) -- leniency must never turn a corrupt
 /// manifest into "0 cards, gate armed, everything silently admits".

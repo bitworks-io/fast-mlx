@@ -1885,10 +1885,15 @@ final class MLXScalarServingTests: XCTestCase {
     // REQUIRED black-box arm that closes that gap, plus one bonus arm for the D2 explicit-path
     // refusal decision.
 
-    /// A `site/quality-guides.json`-shaped manifest with exactly one malformed card — present
-    /// `admission` object, but missing `optIn` — the same malformed shape
-    /// `QualityAdmissionTests`'s HarnessCore-level fixture uses (reproduced here rather than shared
-    /// across targets, since HarnessCoreTests fixtures are private to that target).
+    /// A `site/quality-guides.json`-shaped manifest with exactly one malformed card — missing the
+    /// required `verdict` key entirely. Re-based off a missing-`optIn`-only shape (docs/task-inbox/
+    /// 2026-09-23-PREDECLARATION-a-dropped-card-still-admits.md, A6): once `QualityCard`'s decoder
+    /// tolerates a present-but-malformed `admission` (`try? decodeIfPresent`), a card missing only
+    /// `optIn` no longer drops, so this fixture must exercise a field that still throws — `verdict` is
+    /// required and absent here on purpose, mirroring the same rebase
+    /// `QualityAdmissionTests.malformedCardMissingVerdictJSON` (HarnessCore-level) uses (reproduced
+    /// here rather than shared across targets, since HarnessCoreTests fixtures are private to that
+    /// target).
     private func writeQualityGuidesManifestWithOneMalformedCard(at url: URL) throws {
         let json = #"""
             {
@@ -1898,8 +1903,7 @@ final class MLXScalarServingTests: XCTestCase {
                 {
                   "id": "cli-fixture-malformed@m3ultra",
                   "model": { "repo": "mlx-community/cli-fixture-malformed" },
-                  "verdict": "NO_GO",
-                  "admission": { "default": false, "reason": "missing optIn" },
+                  "admission": { "default": false, "optIn": true, "reason": "fixture" },
                   "legible": { "tier": "Noticeable", "headline": "h" }
                 }
               ]

@@ -791,35 +791,39 @@ final class QualityAdmissionTests: XCTestCase {
     // never thrown out of the whole manifest decode; a corrupt ENVELOPE must still throw.
 
     /// The one malformed element used by both `testMalformedCardFixtureReachabilityControl...`
-    /// (standalone) and `eightCardManifestWithOneMissingOptInJSON` (embedded) — present `admission`
-    /// object, but missing exactly the `optIn` field `QualityCard.Admission`'s synthesized decode
-    /// requires. Factored into one property so the two tests can never silently drift apart.
-    private var malformedCardMissingOptInJSON: String {
+    /// (standalone) and `eightCardManifestWithOneMissingVerdictJSON` (embedded) — missing the
+    /// required `verdict` key entirely. Re-based off a missing-`optIn` shape (docs/task-inbox/
+    /// 2026-09-23-PREDECLARATION-a-dropped-card-still-admits.md, A5): once `admission` decodes via
+    /// `try? decodeIfPresent` (see `QualityCard.init(from:)`), a card missing only `optIn` no longer
+    /// drops, so this fixture must exercise a field that still throws — `verdict` is required and
+    /// absent here on purpose, the field whose absence most deserves a drop. Factored into one
+    /// property so the two tests can never silently drift apart.
+    private var malformedCardMissingVerdictJSON: String {
         """
         {
           "id": "sixth-card@fixture",
           "model": { "repo": "mlx-community/sixth-card-repo" },
-          "verdict": "NO_GO",
-          "admission": { "default": false, "reason": "missing optIn" },
+          "admission": { "default": false, "optIn": true, "reason": "fixture" },
           "legible": { "tier": "Noticeable", "headline": "h" }
         }
         """
     }
 
     /// Mandatory reachability control (predeclaration, "Arms and mutations"): before trusting any
-    /// outcome asserted against `malformedCardMissingOptInJSON` below, prove the fixture is malformed
-    /// on exactly the intended key by decoding it STANDALONE with a strict decoder. Without this, a
-    /// fixture typo could leave the element well-formed, every "dropped" assertion downstream would
-    /// read `droppedCardCount == 0` for the wrong reason, and the whole increment would pass vacuously.
-    func testMalformedCardFixtureReachabilityControlThrowsKeyNotFoundOnOptIn() {
+    /// outcome asserted against `malformedCardMissingVerdictJSON` below, prove the fixture is
+    /// malformed on exactly the intended key by decoding it STANDALONE with a strict decoder. Without
+    /// this, a fixture typo could leave the element well-formed, every "dropped" assertion downstream
+    /// would read `droppedCardCount == 0` for the wrong reason, and the whole increment would pass
+    /// vacuously.
+    func testMalformedCardFixtureReachabilityControlThrowsKeyNotFoundOnVerdict() {
         XCTAssertThrowsError(
-            try JSONDecoder().decode(QualityCard.self, from: Data(malformedCardMissingOptInJSON.utf8))
+            try JSONDecoder().decode(QualityCard.self, from: Data(malformedCardMissingVerdictJSON.utf8))
         ) { error in
             guard case DecodingError.keyNotFound(let key, _) = error else {
                 return XCTFail("expected DecodingError.keyNotFound, got \(error)")
             }
             XCTAssertEqual(
-                key.stringValue, "optIn",
+                key.stringValue, "verdict",
                 "fixture must be malformed on exactly the intended key; got missing key "
                     + key.stringValue)
         }
@@ -828,7 +832,7 @@ final class QualityAdmissionTests: XCTestCase {
     /// 8 cards, exactly one (`sixth-card@fixture`) malformed — the shape the predeclaration
     /// mandates. `third-card@fixture` is a well-formed NO_GO card so the "a surviving NO_GO card
     /// still refuses" assertion is not vacuous.
-    private var eightCardManifestWithOneMissingOptInJSON: String {
+    private var eightCardManifestWithOneMissingVerdictJSON: String {
         func wellFormedCard(id: String, verdict: String) -> String {
             """
             {
@@ -846,7 +850,7 @@ final class QualityAdmissionTests: XCTestCase {
             wellFormedCard(id: "third-card@fixture", verdict: "NO_GO"),
             wellFormedCard(id: "fourth-card@fixture", verdict: "PASS"),
             wellFormedCard(id: "fifth-card@fixture", verdict: "REFERENCE"),
-            malformedCardMissingOptInJSON,
+            malformedCardMissingVerdictJSON,
             wellFormedCard(id: "seventh-card@fixture", verdict: "EXACT"),
             wellFormedCard(id: "eighth-card@fixture", verdict: "UNMEASURED"),
         ]
@@ -870,7 +874,7 @@ final class QualityAdmissionTests: XCTestCase {
     {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("quality-guides-one-malformed-\(UUID().uuidString).json")
-        try Data(eightCardManifestWithOneMissingOptInJSON.utf8).write(to: url)
+        try Data(eightCardManifestWithOneMissingVerdictJSON.utf8).write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
 
         let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
@@ -897,10 +901,312 @@ final class QualityAdmissionTests: XCTestCase {
     func testLoadManifestClassicWrapperAlsoDropsMalformedCardsWithoutThrowing() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("quality-guides-one-malformed-wrapper-\(UUID().uuidString).json")
-        try Data(eightCardManifestWithOneMissingOptInJSON.utf8).write(to: url)
+        try Data(eightCardManifestWithOneMissingVerdictJSON.utf8).write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
         let cards = try QualityCardStore.loadManifest(contentsOf: url)
         XCTAssertEqual(cards.count, 7)
+    }
+
+    // MARK: - A card malformed ONLY in `admission` (docs/task-inbox/2026-09-23-PREDECLARATION-a-
+    // dropped-card-still-admits.md) — key present, non-null, missing exactly `optIn`. Before this
+    // increment such a card dropped (see the rebased fixture above); after it, it must DECODE and
+    // still GATE, because a dropped card is an absent card and `decide(card: nil, ...)` admits.
+
+    /// The single malformed-only-in-`admission` element used by the A1/A2/A3 arms below — present
+    /// `admission` object missing exactly `optIn`, otherwise fully well-formed (unlike
+    /// `malformedCardMissingVerdictJSON` above, whose job is to keep proving the OTHER fields still
+    /// drop). Factored into one property so all three arms decode the identical fixture.
+    private var malformedOnlyInAdmissionCardJSON: String {
+        """
+        {
+          "id": "admission-only-malformed@fixture",
+          "model": { "repo": "mlx-community/admission-only-malformed-repo" },
+          "verdict": "NO_GO",
+          "admission": { "default": false, "reason": "missing optIn" },
+          "legible": { "tier": "Noticeable", "headline": "h" }
+        }
+        """
+    }
+
+    private func singleCardManifestJSON(cardJSON: String) -> String {
+        """
+        {
+          "schema": "fast-mlx-quality-card-v1",
+          "generatedAt": "2026-09-23T00:00:00Z",
+          "cards": [\(cardJSON)]
+        }
+        """
+    }
+
+    /// A1 — reachability control, structural rather than decode-based: after this increment, decoding
+    /// `malformedOnlyInAdmissionCardJSON` no longer throws (that is the whole point), so the
+    /// `XCTAssertThrowsError` idiom used for `malformedCardMissingVerdictJSON` above cannot prove
+    /// this fixture's shape. Parse it as plain JSON instead and assert directly on the structure the
+    /// predeclaration claims: `admission` present, an object, and missing exactly `optIn`.
+    func testMalformedOnlyInAdmissionFixtureReachabilityControlAdmissionKeyPresentButMissingOptIn()
+        throws
+    {
+        let object =
+            try JSONSerialization.jsonObject(
+                with: Data(malformedOnlyInAdmissionCardJSON.utf8)) as? [String: Any]
+        let admission = object?["admission"] as? [String: Any]
+        XCTAssertNotNil(
+            admission,
+            "fixture must carry a present, non-null `admission` object — a missing/null admission "
+                + "would exercise decodeIfPresent's ordinary nil case, not the malformed-but-present "
+                + "case this fixture exists to prove")
+        XCTAssertNil(
+            admission?["optIn"],
+            "fixture must be malformed on exactly `optIn` — its absence is what used to throw "
+                + "keyNotFound(\"optIn\") and drop the card before this change")
+    }
+
+    /// A2 — the decisive post-change acceptance case: a card malformed only in `admission` must
+    /// decode and must NOT be dropped. Asserting `droppedCardCount == 0` (not just that a card with
+    /// the right id is present) is essential — without it a regression that dropped this card AND
+    /// something else silently admitted could still read `cards.count == 1` for the wrong reason.
+    func testCardMalformedOnlyInAdmissionDecodesAndIsNotDropped() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "quality-guides-admission-only-malformed-\(UUID().uuidString).json")
+        try Data(singleCardManifestJSON(cardJSON: malformedOnlyInAdmissionCardJSON).utf8)
+            .write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(
+            result.droppedCardCount, 0,
+            "a card malformed ONLY in `admission` must no longer drop")
+        XCTAssertEqual(result.cards.count, 1)
+        XCTAssertEqual(result.cards.first?.id, "admission-only-malformed@fixture")
+        XCTAssertNil(
+            result.cards.first?.admission,
+            "the malformed admission value itself must decode to nil, not a half-populated struct")
+    }
+
+    /// A3 — the card decoded in A2 is not merely PRESENT, it still GATES: NO_GO without opt-in must
+    /// refuse exactly as if `admission` had decoded successfully. `QualityAdmission.decide` never
+    /// reads `.admission` at all (D4 in the predeclaration), so this is really pinning that A2's
+    /// decode didn't silently corrupt `verdict`/`legible`/`id`, the fields `decide` actually consults.
+    func testCardMalformedOnlyInAdmissionNoGoRefusesWithoutOptIn() throws {
+        let decoded = try decodeCard(malformedOnlyInAdmissionCardJSON)
+        XCTAssertNil(decoded.admission)
+        let outcome = QualityAdmission.decide(card: decoded, optIn: false)
+        guard case .refuseQualityFlagged = outcome else {
+            return XCTFail(
+                "a NO_GO card malformed only in `admission` must still refuse without opt-in, got "
+                    + "\(outcome)")
+        }
+    }
+
+    /// CANARY, not a test of our own logic — pins the SWIFT LANGUAGE/stdlib semantic D2 (docs/
+    /// task-inbox/2026-09-23-PREDECLARATION-a-dropped-card-still-admits.md) rests on: synthesized
+    /// `Decodable`'s `decodeIfPresent` returns `nil` only for an ABSENT or NULL key, and still THROWS
+    /// for a key that is PRESENT, non-null, but malformed (e.g. `admission` missing its required
+    /// `optIn`). D2 recorded this as the reason `let admission: Admission?` alone, kept under
+    /// SYNTHESIZED `Decodable`, is not sufficient — only `QualityCard`'s hand-rolled `init(from:)` +
+    /// `try? decodeIfPresent` closes the gap. That evidence was produced once by temporarily mutating
+    /// `QualityCard.swift` and observing a RED run, then reverting — nothing pinned it afterward. This
+    /// test pins it permanently WITHOUT touching production source: a local `SynthesizedDecodeProbe`
+    /// mirrors `QualityCard`'s shape but keeps synthesized `Decodable` with an optional `admission`,
+    /// and is decoded against the identical `admission` JSON (present, non-null, missing `optIn`) that
+    /// `malformedOnlyInAdmissionCardJSON` already uses above. The probe must THROW
+    /// `DecodingError.keyNotFound("optIn")`; the real `QualityCard` decoder, run on the same
+    /// `admission` object plus the extra keys it additionally requires, must NOT throw and must yield
+    /// `admission == nil` — proving the two decoders genuinely diverge on identical input, which is the
+    /// whole justification for the hand-rolled decoder's existence. If this test ever fails because a
+    /// future Swift toolchain made synthesized `decodeIfPresent` lenient toward malformed-but-present
+    /// values, the correct response is to re-evaluate whether `QualityCard.init(from:)` is still
+    /// needed — NOT to delete this test.
+    func testSynthesizedDecodableDecodeIfPresentThrowsOnMalformedPresentAdmissionUnlikeHandRolledQualityCard()
+        throws
+    {
+        struct SynthesizedDecodeProbe: Decodable {
+            let id: String
+            let verdict: QualityVerdict
+            let admission: QualityCard.Admission?
+        }
+
+        let probeJSON = """
+            {
+              "id": "synthesized-probe@fixture",
+              "verdict": "NO_GO",
+              "admission": { "default": false, "reason": "missing optIn" }
+            }
+            """
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(SynthesizedDecodeProbe.self, from: Data(probeJSON.utf8))
+        ) { error in
+            guard case DecodingError.keyNotFound(let key, _) = error else {
+                return XCTFail(
+                    "expected DecodingError.keyNotFound -- synthesized decodeIfPresent must still "
+                        + "throw on a present-but-malformed value, got \(error)")
+            }
+            XCTAssertEqual(
+                key.stringValue, "optIn",
+                "synthesized decode must throw on exactly the missing `optIn` key, got missing key "
+                    + key.stringValue)
+        }
+
+        // Identical `admission` object, decoded through the real QualityCard path instead -- must NOT
+        // throw, and must decode `admission` to nil, unlike the synthesized probe above.
+        let cardJSON = """
+            {
+              "id": "synthesized-probe@fixture",
+              "model": { "repo": "mlx-community/synthesized-probe-repo" },
+              "verdict": "NO_GO",
+              "admission": { "default": false, "reason": "missing optIn" },
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+            """
+        let decoded = try decodeCard(cardJSON)
+        XCTAssertNil(
+            decoded.admission,
+            "the hand-rolled QualityCard decoder must tolerate the identical malformed admission "
+                + "value the synthesized probe just threw on")
+    }
+
+    /// A4 — the regression guard hand-rolling the decoder could silently introduce: `config` must
+    /// keep the strictness the SYNTHESIZED decode gave it for free. A present-but-wrong-type `config`
+    /// (a string, not an object) must still fail the whole card's decode and still drop, exactly like
+    /// before `admission` was singled out for leniency.
+    func testCardWithTypeMismatchedConfigStillDropsPreservingSynthesizedSemantics() throws {
+        let badConfigCardJSON = """
+            {
+              "id": "bad-config-type@fixture",
+              "model": { "repo": "mlx-community/bad-config-type-repo" },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "fixture" },
+              "config": "junk",
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+            """
+        // Reachability control: a standalone strict decode of this single card must still throw --
+        // proving the fixture is malformed on exactly `config`'s type before trusting the
+        // manifest-level drop assertion below. Pinned to the exact case and key, not just
+        // `error is DecodingError`: a bare type check would still pass if the fixture drifted onto a
+        // DIFFERENT malformed field, and this arm would silently stop measuring `config`.
+        XCTAssertThrowsError(try decodeCard(badConfigCardJSON)) { error in
+            guard case DecodingError.typeMismatch(_, let context) = error else {
+                return XCTFail("expected DecodingError.typeMismatch, got \(error)")
+            }
+            XCTAssertEqual(
+                context.codingPath.map(\.stringValue), ["config"],
+                "fixture must be malformed on exactly `config`; got codingPath "
+                    + "\(context.codingPath.map(\.stringValue))")
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-bad-config-type-\(UUID().uuidString).json")
+        try Data(singleCardManifestJSON(cardJSON: badConfigCardJSON).utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(
+            result.droppedCardCount, 1,
+            "a present-but-wrong-type `config` must still fail the decode and drop -- hand-rolling "
+                + "the decoder must not silently widen leniency to fields other than `admission`")
+        XCTAssertTrue(result.cards.isEmpty)
+    }
+
+    /// The coalesced-widening regression this guards against: `id`, `model`, and `legible` are the
+    /// three properties `QualityCard.init(from:)` still decodes with plain `container.decode` (never
+    /// `decodeIfPresent`/`try?`, unlike `admission` above), and `decide`/`announceFragment` read `id`
+    /// and `legible.{tier,headline}` directly to build the refusal/announce strings a stray operator
+    /// or automation reads. A future edit that "helpfully" coalesces one of them the way `admission`
+    /// was coalesced -- e.g. `id = (try? container.decode(String.self, forKey: .id)) ?? ""` -- would
+    /// compile silently and let a card missing that key decode anyway, then gate with an empty id or
+    /// a fabricated headline instead of dropping. Nothing upstream of this test currently pins that
+    /// all three stay REQUIRED; this closes that gap by asserting a card missing any one of them
+    /// still throws `keyNotFound` on exactly that key.
+    func testCardMissingIdModelOrLegibleStillThrowsKeyNotFoundOnExactlyThatKey() throws {
+        let fixturesMissingOneRequiredKey: [(missingKey: String, json: String)] = [
+            (
+                missingKey: "id",
+                json: """
+                    {
+                      "model": { "repo": "mlx-community/missing-id-repo" },
+                      "verdict": "PASS",
+                      "admission": { "default": false, "optIn": true, "reason": "fixture" },
+                      "legible": { "tier": "Noticeable", "headline": "h" }
+                    }
+                    """
+            ),
+            (
+                missingKey: "model",
+                json: """
+                    {
+                      "id": "missing-model@fixture",
+                      "verdict": "PASS",
+                      "admission": { "default": false, "optIn": true, "reason": "fixture" },
+                      "legible": { "tier": "Noticeable", "headline": "h" }
+                    }
+                    """
+            ),
+            (
+                missingKey: "legible",
+                json: """
+                    {
+                      "id": "missing-legible@fixture",
+                      "model": { "repo": "mlx-community/missing-legible-repo" },
+                      "verdict": "PASS",
+                      "admission": { "default": false, "optIn": true, "reason": "fixture" }
+                    }
+                    """
+            ),
+        ]
+
+        for fixture in fixturesMissingOneRequiredKey {
+            XCTAssertThrowsError(try decodeCard(fixture.json)) { error in
+                guard case DecodingError.keyNotFound(let key, _) = error else {
+                    return XCTFail(
+                        "missing `\(fixture.missingKey)`: expected DecodingError.keyNotFound, got "
+                            + "\(error)")
+                }
+                XCTAssertEqual(
+                    key.stringValue, fixture.missingKey,
+                    "fixture must be malformed on exactly `\(fixture.missingKey)`; got missing key "
+                        + key.stringValue)
+            }
+        }
+    }
+
+    /// A9 — D3 of the predeclaration (docs/task-inbox/2026-09-23-PREDECLARATION-a-dropped-card-still-
+    /// admits.md) recorded that `try? decodeIfPresent` deliberately swallows a STRUCTURALLY corrupt
+    /// `admission` (a string where an object belongs), not only a missing `optIn`. That widening was
+    /// recorded as a DECISION but no predeclared arm pinned it, so a later narrowing back to
+    /// "tolerate a missing `optIn` only" would leave every other arm here green. This is that pin.
+    func testCardWithStructurallyCorruptAdmissionDecodesAndStillGates() throws {
+        let corruptAdmissionCardJSON = """
+            {
+              "id": "admission-junk@fixture",
+              "model": { "repo": "mlx-community/admission-junk-repo" },
+              "verdict": "NO_GO",
+              "admission": "junk",
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+            """
+        // Reachability control: `admission` must be PRESENT and NOT an object, otherwise this fixture
+        // would be re-exercising A2's missing-`optIn` case rather than D3's structural-corruption case.
+        let object =
+            try JSONSerialization.jsonObject(
+                with: Data(corruptAdmissionCardJSON.utf8)) as? [String: Any]
+        XCTAssertNotNil(
+            object?["admission"],
+            "fixture must carry a present `admission` -- an absent one is decodeIfPresent's ordinary "
+                + "nil case, not the structurally-corrupt case D3 records")
+        XCTAssertNil(
+            object?["admission"] as? [String: Any],
+            "fixture's `admission` must NOT be an object -- D3's case is a present value of the WRONG "
+                + "SHAPE, which synthesized decodeIfPresent would have thrown on")
+
+        let decoded = try decodeCard(corruptAdmissionCardJSON)
+        XCTAssertNil(decoded.admission)
+        guard case .refuseQualityFlagged = QualityAdmission.decide(card: decoded, optIn: false) else {
+            return XCTFail(
+                "a NO_GO card whose `admission` is structurally corrupt must still refuse without "
+                    + "opt-in -- D3 is only defensible because the card still GATES")
+        }
     }
 
     /// The REQUIRED property: envelope corruption stays FATAL. `cards` as an object (not an array)
