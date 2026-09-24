@@ -949,6 +949,32 @@ def mtp_notice_text(
     raise ValueError(f"mtp_notice_text: no notice for status {status!r}")
 
 
+def _card_identity(card: dict) -> tuple:
+    """The narrow identity tuple ``resolve_card``'s ambiguity check compares,
+    instead of comparing ``id`` strings alone: ``(id, model.repo,
+    model.hfPin, verdict, config.hardwareClass)`` -- exactly the fields that
+    can change ``resolve_card``'s own selection outcome, and nothing else.
+
+    This is a deliberate NARROWING, not an oversight: two cards differing
+    only in ``admission``/``rawMetrics``/``provenance``/``legible`` compare
+    IDENTICAL here and raise no ambiguity, because none of those fields can
+    change which card ``select`` would pick. Do not "complete" this tuple by
+    adding ``.admission`` or any other field -- doing so would make an
+    unread field decision-bearing. This MUST stay in lockstep with the
+    Swift identity tuple in ``QualityAdmission.swift``'s ``resolve``; a
+    divergence here would make the two runtimes reach different verdicts
+    for the same manifest.
+    """
+    model = card.get("model") or {}
+    return (
+        card.get("id"),
+        model.get("repo"),
+        model.get("hfPin"),
+        card.get("verdict"),
+        card_hardware_class(card),
+    )
+
+
 def resolve_card(
     cards: Optional[list],
     model_repo: Optional[str],
@@ -1013,14 +1039,28 @@ def resolve_card(
     pin_cards = find_cards_by_pin(residency_cards, model_revision)
     repo_ids = {card.get("id") for card in repo_cards}
     pin_ids = {card.get("id") for card in pin_cards}
-    if repo_ids and pin_ids and repo_ids != pin_ids:
-        raise LaunchRefusal(
-            3,
+    # Compare the narrow identity tuple (see ``_card_identity``), not the
+    # ``id`` sets alone: two structurally different cards -- e.g. a
+    # repo-matched PASS and a pin-matched NO_GO -- can share one ``id``,
+    # which would make ``repo_ids == pin_ids`` even though the underlying
+    # cards disagree, silently hiding the NO_GO from the ambiguity check.
+    repo_identities = {_card_identity(card) for card in repo_cards}
+    pin_identities = {_card_identity(card) for card in pin_cards}
+    if repo_identities and pin_identities and repo_identities != pin_identities:
+        message = (
             "quality card lookup is ambiguous: repo "
             f"{model_repo!r} matches card(s) {sorted(repo_ids)} but pinned "
             f"revision {model_revision!r} matches different card(s) "
-            f"{sorted(pin_ids)}",
+            f"{sorted(pin_ids)}"
         )
+        if repo_ids == pin_ids:
+            # The id sets alone would read as consistent even though the
+            # identity tuples differ -- name the shared id(s) so the
+            # message doesn't self-contradict ("matches card(s) ['dup']
+            # but ... matches different card(s) ['dup']").
+            for duplicate_id in sorted(repo_ids & pin_ids):
+                message += f" duplicate_card_id={duplicate_id}"
+        raise LaunchRefusal(3, message)
     candidates = repo_cards if repo_cards else pin_cards
     if not candidates:
         return None

@@ -712,13 +712,10 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     case .resolved(let resolvedCard):
         card = resolvedCard
     case .ambiguous(let repoCardIDs, let pinCardIDs):
+        let detail = QualityAdmission.ambiguousRefusalDetail(
+            model: model, revision: revision, repoCardIDs: repoCardIDs, pinCardIDs: pinCardIDs)
         FileHandle.standardError.write(
-            Data(
-                """
-                fastmlx-serve configuration=refused reason=quality_card_ambiguous detail=repo \
-                \(model) matches card(s) \(repoCardIDs) but --model-revision \
-                \(revision ?? "nil") matches different card(s) \(pinCardIDs)\n
-                """.utf8))
+            Data("fastmlx-serve configuration=refused reason=quality_card_ambiguous detail=\(detail)\n".utf8))
         exit(2)
     }
     let optIn = QualityOptIn.parse(rawArguments)
@@ -736,8 +733,14 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     // Never emit `quality_cards_dropped=0` -- that would break the byte-identical happy-path
     // announce for every existing launch of a fully well-formed manifest.
     let droppedFragment = droppedCardCount > 0 ? " quality_cards_dropped=\(droppedCardCount)" : ""
+    // D-B: an active manifest that decoded to zero cards (a truncated write, a hand-authored
+    // `{"cards": []}`) silently admits every NO_GO pack with no operator-visible difference from a
+    // legitimately uncarded model -- make it loud. Mirrors the `quality_cards_dropped` idiom above:
+    // never emit `quality_cards_count=0` for a well-formed non-empty manifest, so that happy path
+    // stays byte-identical.
+    let countFragment = QualityAdmission.cardsCountFragment(cards: cards)
     return
-        "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))\(droppedFragment)"
+        "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))\(droppedFragment)\(countFragment)"
 }
 
 /// Resolve the `--tier` serve dial into a `ServingPolicy`, composing any explicit `--kv-quant`

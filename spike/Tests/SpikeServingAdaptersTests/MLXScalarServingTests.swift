@@ -1912,6 +1912,21 @@ final class MLXScalarServingTests: XCTestCase {
         try Data(json.utf8).write(to: url)
     }
 
+    /// A well-formed envelope carrying ZERO cards. Distinct from the malformed-card fixture above:
+    /// nothing is dropped here, so `droppedCardCount` is 0 and the pre-existing
+    /// `quality_cards_dropped=<n>` fragment is (correctly) absent. That absence is exactly what used
+    /// to make this case indistinguishable from a legitimately uncarded model.
+    private func writeEmptyQualityGuidesManifest(at url: URL) throws {
+        let json = #"""
+            {
+              "schema": "fast-mlx-quality-card-v1",
+              "generatedAt": "2026-09-24T00:00:00Z",
+              "cards": []
+            }
+            """#
+        try Data(json.utf8).write(to: url)
+    }
+
     /// Runs `fastmlx-serve` as a LONG-LIVED server (it never exits on its own once past startup)
     /// with `currentDirectory` as the process's working directory, reads stdout INCREMENTALLY with
     /// an explicit timeout until a complete line containing `marker` appears, then terminates the
@@ -1998,6 +2013,46 @@ final class MLXScalarServingTests: XCTestCase {
             line.contains(siteDirectory.appendingPathComponent("quality-guides.json").path),
             "the quality_cards= path token must still name the conventional default manifest: \(line)"
         )
+    }
+
+    /// ARM E2 (predeclared in
+    /// `docs/task-inbox/2026-09-24-PREDECLARATION-duplicate-card-ids-blind-the-ambiguity-check.md`).
+    ///
+    /// A conventional-default `site/quality-guides.json` whose `cards` array is EMPTY decodes
+    /// cleanly, drops nothing, and resolves no card -- so before this arm the real startup line was
+    /// BYTE-IDENTICAL to one printed with no manifest present at all. A truncated write or a failed
+    /// re-emission therefore silently admitted every published `NO_GO` pack with nothing an operator
+    /// could see. This proves the REAL binary now surfaces ` quality_cards_count=0`.
+    ///
+    /// It also proves the chosen remedy is ANNOUNCE, not REFUSE: reaching the startup line at all
+    /// means the process got past `applyQualityAdmissionGate` and is serving. A truncated manifest
+    /// must never become a serving outage on every host.
+    func testServeCLIEmptyManifestAnnouncesZeroCountAndStillServes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "quality-cards-empty-cli-\(UUID().uuidString)", isDirectory: true)
+        let siteDirectory = directory.appendingPathComponent("site", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: siteDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifestURL = siteDirectory.appendingPathComponent("quality-guides.json")
+        try writeEmptyQualityGuidesManifest(at: manifestURL)
+
+        let line = try runLongLivedServeAndCaptureLine(
+            arguments: ["--scripted", "--host", "127.0.0.1", "--port", "0"],
+            currentDirectory: directory, containing: "quality_cards_count=0")
+
+        XCTAssertTrue(
+            line.contains("quality_cards_count=0"),
+            "expected quality_cards_count=0 in the real startup line, got: \(line)")
+        XCTAssertTrue(
+            line.contains(manifestURL.path),
+            "the quality_cards= path token must still name the conventional default manifest: \(line)"
+        )
+        XCTAssertFalse(
+            line.contains("quality_cards_dropped="),
+            "an EMPTY envelope drops nothing, so no dropped fragment may appear -- that is what "
+                + "distinguishes it from an all-dropped manifest: \(line)")
     }
 
     /// Bonus arm covering decision D2: an EXPLICITLY supplied `--quality-cards <path>` manifest with

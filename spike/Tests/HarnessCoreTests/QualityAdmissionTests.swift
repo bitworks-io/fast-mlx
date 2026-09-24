@@ -1711,4 +1711,200 @@ final class QualityAdmissionTests: XCTestCase {
             QualityAdmission.announceFragment(card: contrastCard),
             "quality_card=repoless-a@m3ultra verdict=NO_GO")
     }
+
+    // MARK: - docs/task-inbox/2026-09-24-PREDECLARATION-duplicate-card-ids-blind-the-ambiguity-check.md
+    // D-A: `resolve`'s ambiguity check compared id STRING sets, so two structurally different cards
+    // published under the same `id` (a repo-matched PASS and a pin-matched NO_GO) produced equal sets
+    // and the NO_GO was never consulted. Fixed by comparing an identity TUPLE
+    // (id, model.repo, model.hfPin, verdict, config?.hardwareClass) instead.
+
+    /// Both the R1 fixture (JSON, proves the decode itself is reachable) and R3/R4/R6's Swift-object
+    /// fixtures below share the id `"dup@h"` and this revision, so a reader can see they describe the
+    /// same conceptual duplicate-id scenario even though they're built two different ways.
+    private var duplicateCardIDRevision: String { "abcdefab0123456789abcdef0123456789abcdef" }
+
+    private var duplicateCardIDManifestJSON: String {
+        """
+        {
+          "schema": "fast-mlx-quality-card-v1",
+          "generatedAt": "2026-09-24T00:00:00Z",
+          "cards": [
+            {
+              "id": "dup@h",
+              "model": { "repo": "mlx-community/dup-repo" },
+              "verdict": "PASS",
+              "admission": { "default": false, "optIn": true, "reason": "fixture" },
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            },
+            {
+              "id": "dup@h",
+              "model": { "hfPin": "abcdefab" },
+              "verdict": "NO_GO",
+              "admission": { "default": false, "optIn": true, "reason": "fixture" },
+              "legible": { "tier": "Noticeable", "headline": "h" }
+            }
+          ]
+        }
+        """
+    }
+
+    /// R1 — reachability control (predeclaration, "Arms"): before trusting any outcome asserted
+    /// against the duplicate-id fixture below, prove it actually decodes into two cards sharing one
+    /// id but differing in verdict — not silently dropped, not accidentally collapsed to one card.
+    func testR1DuplicateCardIDFixtureDecodesAsTwoCardsSharingOneIdDifferingInVerdict() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-duplicate-id-\(UUID().uuidString).json")
+        try Data(duplicateCardIDManifestJSON.utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(result.droppedCardCount, 0, "both cards must decode; neither is malformed")
+        XCTAssertEqual(result.cards.count, 2)
+        XCTAssertEqual(
+            Set(result.cards.map(\.id)).count, 1,
+            "both cards must share exactly one id — that collision is what the fixture exists to prove")
+        let verdicts = Set(result.cards.map(\.verdict))
+        XCTAssertEqual(
+            verdicts, [.pass, .noGo],
+            "the two same-id cards must differ on verdict, else the ambiguity check has nothing to catch")
+    }
+
+    /// R3 — post-change: a repo-matched card and a pin-matched card sharing one `id` but differing in
+    /// `verdict` must resolve `.ambiguous`, not fall through to the repo-matched (non-`NO_GO`) card.
+    /// Asserts the repo and pin id lists are IDENTICAL strings (`["dup@h"]` both sides) — that exact
+    /// identity is what blinded the old id-string-set comparison.
+    func testR3DuplicateCardIDResolvesAmbiguousDespiteIdenticalIdLists() {
+        let repoCard = card(id: "dup@h", repo: "mlx-community/dup-repo", verdict: .pass)
+        let pinCard = repolessCard(id: "dup@h", hfPin: "abcdefab", verdict: .noGo)
+        let resolution = QualityCardStore.resolve(
+            repo: repoCard.model.repo, revision: duplicateCardIDRevision, in: [repoCard, pinCard])
+        switch resolution {
+        case .resolved, .none:
+            XCTFail("expected .ambiguous, got \(resolution)")
+        case .ambiguous(let repoCardIDs, let pinCardIDs):
+            XCTAssertEqual(repoCardIDs, ["dup@h"])
+            XCTAssertEqual(pinCardIDs, ["dup@h"])
+            XCTAssertEqual(
+                repoCardIDs, pinCardIDs,
+                "the id lists must be IDENTICAL strings — that identity is exactly what the old "
+                    + "id-string-set comparison could not distinguish from a true non-collision")
+        }
+    }
+
+    /// R4 — no false ambiguity: the SAME card object (identical id, repo, hfPin, verdict,
+    /// hardwareClass) present in both the repo pool and the pin pool must still resolve, not become
+    /// ambiguous merely because both pools are non-empty.
+    func testR4SameCardInBothPoolsResolvesNotAmbiguous() {
+        let sameCard = card(id: "same-both-pools@h", repo: "mlx-community/dup-repo", verdict: .noGo)
+        // `card(...)`'s fixed hfPin is "b04599de" — a 40-hex revision it prefixes puts this one card
+        // in both the repo pool (by `model.repo`) and the pin pool (by `hfPin` prefix match).
+        let revision = "b04599de0123456789abcdef0123456789abcdef"
+        let resolution = QualityCardStore.resolve(
+            repo: sameCard.model.repo, revision: revision, in: [sameCard])
+        guard case .resolved(let resolved) = resolution else {
+            return XCTFail("expected .resolved, got \(resolution)")
+        }
+        XCTAssertEqual(resolved.id, sameCard.id)
+    }
+
+    /// R5 — installed base / blast-radius check: the two real shipped `qwen3-0p6b-4bit@m3ultra` /
+    /// `@m5` cards share BOTH `repo` and `hfPin`, so a revision beginning `73e3e38d` puts the SAME two
+    /// card objects in both the repo and pin pools. That must resolve (never `.ambiguous`) to a
+    /// `NO_GO` verdict, exactly as it did before the identity-tuple fix — this is the one real shipped
+    /// configuration where both pools are non-empty.
+    func testR5InstalledBaseSharedRepoAndPinResolvesNoGoNeverAmbiguous() throws {
+        guard let url = locateSiteQualityGuidesJSON() else {
+            XCTFail("could not locate site/quality-guides.json by walking up from #filePath")
+            return
+        }
+        let cards = try QualityCardStore.loadManifest(contentsOf: url)
+        let resolution = QualityCardStore.resolve(
+            repo: "mlx-community/Qwen3-0.6B-4bit",
+            revision: "73e3e38d981303bc594367cd910ea6eb48349da8", in: cards)
+        guard case .resolved(let resolved) = resolution else {
+            return XCTFail(
+                "expected .resolved (never .ambiguous) for the shared repo+pin shipped pack, got \(resolution)"
+            )
+        }
+        XCTAssertEqual(resolved.verdict, .noGo)
+    }
+
+    /// R6 — the duplicate-id refusal message must name the actual defect (`duplicate_card_id=<id>`)
+    /// rather than the plain wording, which self-contradicts when the two id lists are identical
+    /// ("matches card(s) [X] but ... matches different card(s) [X]").
+    func testR6AmbiguousRefusalDetailNamesDuplicateCardIdWhenIdListsCollide() {
+        let detail = QualityAdmission.ambiguousRefusalDetail(
+            model: "mlx-community/dup-repo", revision: duplicateCardIDRevision,
+            repoCardIDs: ["dup@h"], pinCardIDs: ["dup@h"])
+        XCTAssertTrue(
+            detail.contains("duplicate_card_id="),
+            "duplicate-id refusal detail must name the token, got: \(detail)")
+    }
+
+    /// Contrast control: a genuine repo-vs-pin ambiguity (different id lists, the B5 shape) must NOT
+    /// carry the duplicate-id token — it names a real distinct-card collision, not an id collision.
+    func testAmbiguousRefusalDetailOmitsDuplicateTokenWhenIdListsGenuinelyDiffer() {
+        let detail = QualityAdmission.ambiguousRefusalDetail(
+            model: "mlx-community/dup-repo", revision: "abcdefab0123456789abcdef0123456789abcdef",
+            repoCardIDs: ["repo-card@m3ultra"], pinCardIDs: ["pin-card@m3ultra"])
+        XCTAssertFalse(
+            detail.contains("duplicate_card_id="),
+            "distinct id lists must not be mislabeled as a duplicate id, got: \(detail)")
+    }
+
+    // MARK: - docs/task-inbox/2026-09-24-PREDECLARATION-duplicate-card-ids-blind-the-ambiguity-check.md
+    // D-B: an active manifest decoding to zero cards was externally indistinguishable from a
+    // legitimately uncarded model. `QualityAdmission.cardsCountFragment(cards:)` makes it loud.
+
+    /// E1 — reachability: `{"cards": []}` decodes with `cards.count == 0` AND `droppedCardCount == 0`
+    /// — the latter is what distinguishes a genuinely empty envelope from a manifest whose cards all
+    /// individually failed to decode (which also reads `cards.count == 0`, but with drops counted).
+    func testE1EmptyCardsManifestDecodesWithZeroCountAndZeroDropped() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-empty-cards-\(UUID().uuidString).json")
+        try Data(#"{"cards": []}"#.utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(result.cards.count, 0)
+        XCTAssertEqual(
+            result.droppedCardCount, 0,
+            "an empty envelope must read zero drops, distinguishing it from an all-dropped manifest")
+    }
+
+    /// The mirror of E1: a manifest whose one card is malformed also reads `cards.count == 0`, but
+    /// with `droppedCardCount == 1` — proving E1's zero-drops assertion is not vacuously true for
+    /// every empty `.cards` array.
+    func testAllCardsDroppedManifestAlsoReadsZeroCardsButWithNonzeroDropped() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-all-dropped-\(UUID().uuidString).json")
+        try Data(singleCardManifestJSON(cardJSON: malformedCardMissingVerdictJSON).utf8)
+            .write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let result = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        XCTAssertEqual(result.cards.count, 0)
+        XCTAssertEqual(result.droppedCardCount, 1)
+    }
+
+    /// E3 — happy path: the fragment for the real shipped (well-formed, non-empty) manifest must
+    /// never carry `quality_cards_count` at all, keeping the existing announce line byte-identical.
+    func testE3CardsCountFragmentEmptyForRealShippedNonEmptyManifest() throws {
+        guard let url = locateSiteQualityGuidesJSON() else {
+            XCTFail("could not locate site/quality-guides.json by walking up from #filePath")
+            return
+        }
+        let cards = try QualityCardStore.loadManifest(contentsOf: url)
+        XCTAssertFalse(cards.isEmpty, "sanity: the real manifest must carry at least one card")
+        let fragment = QualityAdmission.cardsCountFragment(cards: cards)
+        XCTAssertFalse(
+            fragment.contains("quality_cards_count"),
+            "a well-formed non-empty manifest's fragment must stay empty, got: \(fragment)")
+    }
+
+    /// Positive control: an empty card list DOES produce the token, so the E3 assertion above is not
+    /// vacuously true for a function that always returns "".
+    func testCardsCountFragmentPresentForEmptyCardList() {
+        XCTAssertEqual(QualityAdmission.cardsCountFragment(cards: []), " quality_cards_count=0")
+    }
 }

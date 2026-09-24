@@ -4284,6 +4284,267 @@ class NoGoFailClosedTieBreakTestCase(unittest.TestCase):
         self.assertEqual(card["verdict"], "NO_GO")
 
 
+# ---------------------------------------------------------------------
+# Duplicate card ``id``: docs/task-inbox/2026-09-24-PREDECLARATION-
+# duplicate-card-ids-blind-the-ambiguity-check.md (arms P1/P2). Two
+# structurally different cards sharing one ``id`` -- a repo-matched PASS
+# and a pin-matched NO_GO -- must still be detected as ambiguous: the
+# ``id`` string sets alone compare equal and would silently hide the
+# NO_GO. ``resolve_card`` compares the narrower identity tuple
+# (``_card_identity``) instead.
+# ---------------------------------------------------------------------
+DUPLICATE_ID_REPO = "example/DuplicateIdModel"
+DUPLICATE_ID_CARD_ID = "dup@test"
+DUPLICATE_ID_HF_PIN = "deadbeef"
+DUPLICATE_ID_REVISION = DUPLICATE_ID_HF_PIN + "0" * 32  # 40 hex chars
+
+SHARED_ID_REPO = "example/SharedIdModel"
+SHARED_ID_CARD_ID = "shared@test"
+SHARED_ID_HF_PIN = "cafebabe"
+SHARED_ID_REVISION = SHARED_ID_HF_PIN + "0" * 32
+
+
+def duplicate_id_cards() -> list:
+    # Same ``id`` on both cards, but structurally different: card A is
+    # reachable only by repo (PASS), card B only by hfPin prefix (NO_GO).
+    # ``{"dup@test"} == {"dup@test"}`` even though the two cards disagree
+    # on verdict -- exactly the defect the identity tuple closes.
+    return [
+        {
+            "id": DUPLICATE_ID_CARD_ID,
+            "model": {"repo": DUPLICATE_ID_REPO, "hfPin": None},
+            "verdict": "PASS",
+            "config": {},
+            "admission": {"default": True, "optIn": True, "reason": "pass by repo"},
+            "legible": {"tier": "Reference", "headline": "Repo pass."},
+        },
+        {
+            "id": DUPLICATE_ID_CARD_ID,
+            "model": {"repo": None, "hfPin": DUPLICATE_ID_HF_PIN},
+            "verdict": "NO_GO",
+            "config": {},
+            "admission": {"default": False, "optIn": True, "reason": "pin no-go"},
+            "legible": {"tier": "Unquantified", "headline": "Pin no-go."},
+        },
+    ]
+
+
+def shared_id_card() -> dict:
+    # One card, reachable by BOTH repo and hfPin -- repo_cards and
+    # pin_cards end up holding the SAME card object, so this must stay
+    # NOT ambiguous.
+    return {
+        "id": SHARED_ID_CARD_ID,
+        "model": {"repo": SHARED_ID_REPO, "hfPin": SHARED_ID_HF_PIN},
+        "verdict": "PASS",
+        "config": {},
+        "admission": {"default": True, "optIn": True, "reason": "pass"},
+        "legible": {"tier": "Reference", "headline": "Shared."},
+    }
+
+
+class DuplicateCardIdentityTestCase(unittest.TestCase):
+    # P1: a shared ``id`` across two structurally different cards must
+    # still raise the AMBIGUITY refusal, not merely "some LaunchRefusal".
+    # resolve_card ALREADY raises LaunchRefusal(3, "... cards for this
+    # pack at builds ...") from the unrelated engine-build tiebreak
+    # further down, so asserting only "raises LaunchRefusal" would pass
+    # for free even without this fix; the message must name "ambiguous"
+    # AND carry the disambiguating duplicate_card_id= token.
+    def test_duplicate_id_structurally_different_cards_raises_ambiguous(self):
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                duplicate_id_cards(), DUPLICATE_ID_REPO, DUPLICATE_ID_REVISION
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("ambiguous", ctx.exception.message)
+        self.assertIn(f"duplicate_card_id={DUPLICATE_ID_CARD_ID}", ctx.exception.message)
+
+    # P2 (control): one card present in BOTH pools (matched by repo AND
+    # by hfPin) still resolves normally -- no false ambiguity.
+    def test_card_matched_by_both_repo_and_pin_resolves_not_ambiguous(self):
+        card = FASTMLX_LAUNCH.resolve_card(
+            [shared_id_card()], SHARED_ID_REPO, SHARED_ID_REVISION
+        )
+        self.assertEqual(card["id"], SHARED_ID_CARD_ID)
+
+
+# ---------------------------------------------------------------------
+# Arm P3: the Python launch path (resolve_card) has NEVER been exercised
+# against the REAL shipped site/quality-guides.json -- every test above
+# feeds it hand-written fixtures. Swift already has installed-base
+# coverage over this exact file (see
+# spike/Tests/HarnessCoreTests/QualityAdmissionTests.swift
+# testRealShippedManifestHasNoDroppedCardsAndEveryRepoIdentifiedNoGoCard
+# StillRefuses). This closes the Python twin. The manifest is the
+# AUTHORITY here, not the fixture: a RED assertion below means the
+# instrument or the code is wrong, not the manifest.
+# ---------------------------------------------------------------------
+REAL_QUALITY_GUIDES_PATH = LAUNCH_PATH.parents[1] / "site" / "quality-guides.json"
+
+# The one configuration the manifest puts in BOTH the repo pool and the
+# pin pool: mlx-community/Qwen3-0.6B-4bit with a revision starting
+# 73e3e38d resolves the SAME TWO card objects (qwen3-0p6b-4bit@m5 and
+# qwen3-0p6b-4bit@m3ultra) via repo match AND via pin-prefix match. They
+# differ ONLY in config.hardwareClass, so this must NOT raise ambiguity.
+P3_SHARED_REPO_AND_PIN_REPO = "mlx-community/Qwen3-0.6B-4bit"
+P3_SHARED_REPO_AND_PIN_PIN_PREFIX = "73e3e38d"
+# Pad the 8-hex note pin out to a valid 40-char revision (note pins are
+# SHORT; matching is prefix-against-a-full-40-hex-revision).
+P3_SHARED_REPO_AND_PIN_REVISION = P3_SHARED_REPO_AND_PIN_PIN_PREFIX + "0" * 32
+
+
+def _load_real_quality_guides_manifest() -> dict:
+    """Load the REAL shipped site/quality-guides.json -- never a fixture.
+
+    Deliberately raises loudly (no ``skipTest``, no silent conditional) if
+    the file is missing: a missing manifest is itself a defect this test
+    must surface, not quietly pass around.
+    """
+    if not REAL_QUALITY_GUIDES_PATH.is_file():
+        raise AssertionError(
+            f"real manifest not found at {REAL_QUALITY_GUIDES_PATH}; "
+            "arm P3 requires the shipped site/quality-guides.json to exist"
+        )
+    with REAL_QUALITY_GUIDES_PATH.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+class RealShippedManifestTestCase(unittest.TestCase):
+    """P3: resolve_card against the REAL installed-base manifest, not a
+    hand-written fixture. Every ``host_hardware_class`` is passed
+    EXPLICITLY (never the real sysctl-backed default) so these tests are
+    HOST-INDEPENDENT: they must pass identically on a non-Apple Linux CI
+    box and on any Mac, regardless of which machine runs them.
+    """
+
+    # P3a: the structural pin. Hand-derived from site/quality-guides.json
+    # by inspection -- schema string, exactly 8 cards, exactly 6 NO_GO.
+    # If this manifest ever ships without one of those cards, or a NO_GO
+    # verdict silently flips, this is the test that must go RED.
+    def test_real_manifest_schema_and_card_and_no_go_counts(self):
+        manifest = _load_real_quality_guides_manifest()
+        self.assertEqual(
+            manifest.get("schema"),
+            "fast-mlx-quality-card-v1",
+            f"unexpected schema in {REAL_QUALITY_GUIDES_PATH}",
+        )
+        cards = manifest.get("cards")
+        self.assertIsInstance(
+            cards, list, f"'cards' is not a list in {REAL_QUALITY_GUIDES_PATH}"
+        )
+        self.assertEqual(
+            len(cards),
+            8,
+            f"expected exactly 8 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
+        )
+        no_go_ids = sorted(
+            card.get("id") for card in cards if card.get("verdict") == "NO_GO"
+        )
+        self.assertEqual(
+            len(no_go_ids),
+            6,
+            f"expected exactly 6 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
+            f"got {len(no_go_ids)}: {no_go_ids}",
+        )
+
+    # P3b: the installed-base non-ambiguity control. This repo/pin
+    # combination puts the SAME TWO card objects (qwen3-0p6b-4bit@m5 and
+    # qwen3-0p6b-4bit@m3ultra) in both the repo pool and the pin pool.
+    # They differ only in config.hardwareClass, never in identity, so
+    # resolve_card must not raise the ambiguity refusal. Pass an explicit
+    # host_hardware_class so the choice between the two NO_GO siblings is
+    # deterministic regardless of which machine runs this test.
+    def test_shared_repo_and_pin_card_is_not_falsely_ambiguous(self):
+        manifest = _load_real_quality_guides_manifest()
+        cards = manifest["cards"]
+        try:
+            card = FASTMLX_LAUNCH.resolve_card(
+                cards,
+                P3_SHARED_REPO_AND_PIN_REPO,
+                P3_SHARED_REPO_AND_PIN_REVISION,
+                host_hardware_class=lambda: "apple-m5",
+            )
+        except FASTMLX_LAUNCH.LaunchRefusal as exc:
+            raise AssertionError(
+                f"resolve_card raised an ambiguity refusal for repo "
+                f"{P3_SHARED_REPO_AND_PIN_REPO!r} / revision "
+                f"{P3_SHARED_REPO_AND_PIN_REVISION!r}, which the real manifest "
+                f"must NOT do (same two card objects reachable by both repo "
+                f"and pin, differing only in hardwareClass): {exc.message}"
+            ) from exc
+        self.assertIsNotNone(
+            card,
+            f"resolve_card returned None for repo "
+            f"{P3_SHARED_REPO_AND_PIN_REPO!r}, expected a NO_GO card",
+        )
+        self.assertEqual(
+            card.get("verdict"),
+            "NO_GO",
+            f"card {card.get('id')!r} resolved for repo "
+            f"{P3_SHARED_REPO_AND_PIN_REPO!r} is not NO_GO",
+        )
+
+    # P3c: every repo-identified NO_GO card in the real manifest still
+    # resolves by its own repo, and is still NO_GO -- the Python twin of
+    # the Swift installed-base test named in the module docstring above.
+    #
+    # mlx-community/Qwen3-0.6B-4bit names TWO repo-identified NO_GO cards
+    # (qwen3-0p6b-4bit@m5 and qwen3-0p6b-4bit@m3ultra) that differ only in
+    # config.hardwareClass and carry no engineBuild.commit -- with an
+    # UNKNOWN host, resolve_card correctly (and separately from the P3b
+    # false-ambiguity case above) refuses with exit 3 asking the operator
+    # to declare engineBuild.commit or pass --card-id: that is real,
+    # intended multi-hardware-variant disambiguation, not a bug. To keep
+    # this test about "does the card I'm iterating still refuse" rather
+    # than that unrelated, already-covered refusal, the simulated host is
+    # pinned to THIS card's own hardwareClass (or ``None`` when the card
+    # carries none) -- deterministic and host-independent, since it never
+    # depends on which machine actually runs the test.
+    def test_every_repo_identified_no_go_card_still_resolves_and_refuses(self):
+        manifest = _load_real_quality_guides_manifest()
+        cards = manifest["cards"]
+        no_go_repo_cards = [
+            card
+            for card in cards
+            if card.get("verdict") == "NO_GO" and card.get("model", {}).get("repo")
+        ]
+        # A non-empty pool is itself part of the pin: an empty list here
+        # would make the loop below vacuously pass.
+        self.assertTrue(
+            no_go_repo_cards,
+            f"expected at least one repo-identified NO_GO card in "
+            f"{REAL_QUALITY_GUIDES_PATH}, found none",
+        )
+        for card in no_go_repo_cards:
+            card_id = card.get("id")
+            repo = card["model"]["repo"]
+            own_hardware_class = card.get("config", {}).get("hardwareClass")
+            try:
+                resolved = FASTMLX_LAUNCH.resolve_card(
+                    cards,
+                    repo,
+                    None,
+                    host_hardware_class=lambda hc=own_hardware_class: hc,
+                )
+            except FASTMLX_LAUNCH.LaunchRefusal as exc:
+                raise AssertionError(
+                    f"resolve_card raised for NO_GO card {card_id!r} (repo "
+                    f"{repo!r}) even when the simulated host matched this "
+                    f"card's own hardwareClass {own_hardware_class!r}: "
+                    f"{exc.message}"
+                ) from exc
+            self.assertIsNotNone(
+                resolved, f"resolve_card returned None for NO_GO card {card_id!r} (repo {repo!r})"
+            )
+            self.assertEqual(
+                resolved.get("verdict"),
+                "NO_GO",
+                f"card {card_id!r} (repo {repo!r}) resolved to verdict "
+                f"{resolved.get('verdict')!r}, expected NO_GO",
+            )
+
+
 class CardHardwareClassTestCase(unittest.TestCase):
     def test_returns_config_hardware_class(self):
         card = {"config": {"hardwareClass": "apple-m5"}}

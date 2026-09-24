@@ -203,6 +203,37 @@ public enum QualityAdmission {
         return "quality_card=\(card.id) verdict=\(card.verdict.rawValue)"
     }
 
+    /// Builds the `quality_card_ambiguous` refusal detail string for
+    /// `FastMLXServe.applyQualityAdmissionGate`'s `.ambiguous` case, given the launch's `model` repo,
+    /// its `--model-revision` (or `nil`), and the ambiguous resolution's sorted repo/pin card id
+    /// lists. Pulled out as a pure function so the CLI's message content is independently testable
+    /// (see `QualityAdmissionTests`) without exercising the `exit(2)` process-termination path.
+    ///
+    /// When the two id lists are equal AS SETS -- a duplicate `id` published on two structurally
+    /// different cards, see `QualityCardStore`'s `CardIdentity` doc comment -- the plain wording
+    /// self-contradicts ("matches card(s) [X] but ... matches different card(s) [X]"); a
+    /// `duplicate_card_id=<id>` token is appended so the refusal names the actual defect. Wording is
+    /// otherwise unchanged from before this token existed.
+    public static func ambiguousRefusalDetail(
+        model: String, revision: String?, repoCardIDs: [String], pinCardIDs: [String]
+    ) -> String {
+        let duplicateToken =
+            Set(repoCardIDs) == Set(pinCardIDs)
+            ? " duplicate_card_id=\(repoCardIDs.sorted().joined(separator: ","))" : ""
+        return
+            "repo \(model) matches card(s) \(repoCardIDs) but --model-revision \(revision ?? "nil") matches different card(s) \(pinCardIDs)\(duplicateToken)"
+    }
+
+    /// The D-B visibility fragment: `" quality_cards_count=0"` when the manifest decoded to zero
+    /// cards (a truncated write, a hand-authored `{"cards": []}`), or `""` otherwise. Mirrors the
+    /// existing `quality_cards_dropped` idiom in `FastMLXServe.applyQualityAdmissionGate`: never emit
+    /// `quality_cards_count=0` for a well-formed non-empty manifest, so the happy-path announce line
+    /// for every existing launch stays byte-identical. Pulled out as a pure, independently testable
+    /// function (see `QualityAdmissionTests`) rather than inlined at its one call site.
+    public static func cardsCountFragment(cards: [QualityCard]) -> String {
+        cards.isEmpty ? " quality_cards_count=0" : ""
+    }
+
     public static func decide(card: QualityCard?, optIn: Bool) -> QualityAdmissionOutcome {
         guard let card else { return .admitUnmeasured }
         switch card.verdict {
@@ -544,6 +575,32 @@ public enum QualityCardStore {
     /// 5. The shared `select(from:hostHardwareClass:)` 4-step rule runs over `candidates` — identical
     ///    fail-closed-NO_GO-first narrowing and hardwareClass tiebreak whether the pool came from the
     ///    repo path or the pin path.
+    /// The identity fields ambiguity comparison narrows to — exactly the five fields that can change
+    /// `select`'s outcome: `id`, `model.repo`, `model.hfPin`, `verdict`, and `config?.hardwareClass`.
+    /// This is a DELIBERATE NARROWING, not an oversight: two cards that differ only in `legible`,
+    /// `admission`, or `rawMetrics` (a field this decode never even keeps) compare EQUAL here and
+    /// raise no ambiguity, because neither field can change which card `select` would choose. Two
+    /// cards sharing `id` but differing in any of these five fields (e.g. a repo-matched `PASS` and a
+    /// pin-matched `NO_GO` published under the same `id` by mistake) compare DIFFERENT, so the id
+    /// string alone can no longer hide a real ambiguity behind an accidental id collision.
+    ///
+    /// Do NOT add `admission` to this tuple. `QualityCard.admission` is decoded via `try?` specifically
+    /// so nothing in Swift ever reads a decoded value from it (see `QualityCard`'s doc comment, D4) —
+    /// folding it in here would read it and silently make a `try?`-decoded field outcome-bearing.
+    private struct CardIdentity: Hashable {
+        let id: String
+        let repo: String?
+        let hfPin: String?
+        let verdict: QualityVerdict
+        let hardwareClass: String?
+    }
+
+    private static func identity(of card: QualityCard) -> CardIdentity {
+        CardIdentity(
+            id: card.id, repo: card.model.repo, hfPin: card.model.hfPin, verdict: card.verdict,
+            hardwareClass: card.config?.hardwareClass)
+    }
+
     public static func resolve(
         repo: String?, revision: String?, hostHardwareClass: String? = nil, in cards: [QualityCard]
     ) -> QualityCardResolution {
@@ -552,9 +609,11 @@ public enum QualityCardStore {
             repo.map { repoID in residentCards.filter { $0.model.repo == repoID } } ?? []
         let pinCards = pinMatches(revision: revision, in: residentCards)
 
-        let repoIDs = Set(repoCards.map(\.id))
-        let pinIDs = Set(pinCards.map(\.id))
-        if !repoIDs.isEmpty, !pinIDs.isEmpty, repoIDs != pinIDs {
+        let repoIdentities = Set(repoCards.map(identity(of:)))
+        let pinIdentities = Set(pinCards.map(identity(of:)))
+        if !repoIdentities.isEmpty, !pinIdentities.isEmpty, repoIdentities != pinIdentities {
+            let repoIDs = Set(repoCards.map(\.id))
+            let pinIDs = Set(pinCards.map(\.id))
             return .ambiguous(repoCardIDs: repoIDs.sorted(), pinCardIDs: pinIDs.sorted())
         }
 
