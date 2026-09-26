@@ -1907,4 +1907,184 @@ final class QualityAdmissionTests: XCTestCase {
     func testCardsCountFragmentPresentForEmptyCardList() {
         XCTAssertEqual(QualityAdmission.cardsCountFragment(cards: []), " quality_cards_count=0")
     }
+
+    // MARK: - pin: `QualityCard.admission` stays UNREAD
+    // (docs/task-inbox/2026-09-25-PREDECLARATION-admission-stays-unread-pin.md)
+    //
+    // `QualityCard.init(from:)` decodes `admission` via `try? container.decodeIfPresent(...)`
+    // (`QualityAdmission.swift`) -- safe ONLY because no Swift code ever reads a decoded
+    // `.admission` value: admission is decided from `verdict` + the operator's opt-in, never from
+    // the card's own claim. A future `card.admission?.optIn ?? true` would silently turn a card
+    // corrupt in `admission` (decoded as `nil`) into an ADMIT, reintroducing cycle 154's fail-open
+    // with no test catching it. This test is a source-text pin, not a behavioral one: it cannot see
+    // reflection/`Mirror` or a read reached through a type alias (see the spec's Residual section).
+
+    private static let spikeSourcesRelativePath = "spike/Sources"
+
+    /// Walks parent directories upward from this test file's own location looking for
+    /// `spike/Sources`, the same walk-up idiom `locateFastMLXServeSwift()` above uses -- so the pin
+    /// survives a different checkout/worktree layout.
+    private func locateSpikeSourcesDir() -> URL? {
+        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        while true {
+            let candidate = dir.appendingPathComponent(Self.spikeSourcesRelativePath)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
+                isDirectory.boolValue
+            {
+                return candidate
+            }
+            let parent = dir.deletingLastPathComponent()
+            if parent.path == dir.path {
+                return nil
+            }
+            dir = parent
+        }
+    }
+
+    /// Every `*.swift` file under `dir`, recursively.
+    private func swiftFiles(under dir: URL) -> [URL] {
+        guard
+            let enumerator = FileManager.default.enumerator(
+                at: dir, includingPropertiesForKeys: nil)
+        else { return [] }
+        var result: [URL] = []
+        for case let url as URL in enumerator where url.pathExtension == "swift" {
+            result.append(url)
+        }
+        return result
+    }
+
+    /// Strips `/* ... */` block comments (non-nested, may span multiple lines) and then `//` line
+    /// comments, so a comment mentioning `admission`/`QualityCard` can never satisfy this test's
+    /// assertions (see the C1 arm in the spec).
+    private func stripComments(_ source: String) -> String {
+        let blockPattern = try! NSRegularExpression(
+            pattern: "/\\*.*?\\*/", options: [.dotMatchesLineSeparators])
+        let withoutBlocks = blockPattern.stringByReplacingMatches(
+            in: source, options: [], range: NSRange(location: 0, length: (source as NSString).length),
+            withTemplate: "")
+        return
+            withoutBlocks
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                if let range = line.range(of: "//") {
+                    return line[line.startIndex..<range.lowerBound]
+                }
+                return line
+            }
+            .joined(separator: "\n")
+    }
+
+    /// Every line of `text` (split on `\n`) matching `pattern` at least once.
+    private func linesMatching(_ text: String, pattern: String) -> [String] {
+        let regex = try! NSRegularExpression(pattern: pattern)
+        return text.split(separator: "\n", omittingEmptySubsequences: false).compactMap {
+            substring -> String? in
+            let line = String(substring)
+            let range = NSRange(location: 0, length: (line as NSString).length)
+            return regex.firstMatch(in: line, options: [], range: range) != nil ? line : nil
+        }
+    }
+
+    /// Trim, then collapse every run of whitespace to a single space.
+    private func normalizeWhitespace(_ line: String) -> String {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        return trimmed.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    }
+
+    /// Scope 1 (defining file): every comment-stripped, whitespace-normalized line of
+    /// `QualityAdmission.swift` naming the word `admission` must be one of exactly the five
+    /// allowlisted declaration/init-parameter/assignment/`CodingKeys`/decode lines from the spec,
+    /// AND all five must be present (positive control: proves the stripper/matcher still sees the
+    /// file rather than vacuously passing on an empty scan). Scope 2 (consumers): every other
+    /// `spike/Sources/**/*.swift` file naming `QualityCard` (discovered dynamically, so a new
+    /// consumer is covered without editing this test) must contain zero qualified `.admission`
+    /// reads; `FastMLXServe.swift` must be among the discovered files (anti-vacuity). Additionally,
+    /// any such file containing a `QualityCard` extension must contain zero BARE `admission`
+    /// mentions at all -- closing the gap where an extension's own methods can read an unqualified
+    /// `admission?.optIn` that the qualified `.admission` check alone would not see.
+    func testQualityCardAdmissionFieldStaysUnread() throws {
+        let allowlist = Set(
+            [
+                "public let admission: Admission?",
+                "id: String, model: Model, verdict: QualityVerdict, admission: Admission?, legible: Legible,",
+                "self.admission = admission",
+                "case id, model, verdict, admission, legible, config",
+                "admission = try? container.decodeIfPresent(Admission.self, forKey: .admission)",
+            ].map(normalizeWhitespace))
+
+        guard let sourcesDir = locateSpikeSourcesDir() else {
+            XCTFail(
+                "could not locate spike/Sources by walking up from #filePath -- checkout layout may have changed"
+            )
+            return
+        }
+        let definingFile = sourcesDir.appendingPathComponent("HarnessCore/QualityAdmission.swift")
+        guard FileManager.default.fileExists(atPath: definingFile.path) else {
+            XCTFail("could not locate HarnessCore/QualityAdmission.swift under \(sourcesDir.path)")
+            return
+        }
+
+        let definingSource = try String(contentsOf: definingFile, encoding: .utf8)
+        let definingStripped = stripComments(definingSource)
+        let definingMatches = linesMatching(definingStripped, pattern: "\\badmission\\b")
+            .map(normalizeWhitespace)
+
+        var seenAllowlisted: Set<String> = []
+        for line in definingMatches {
+            if allowlist.contains(line) {
+                seenAllowlisted.insert(line)
+            } else {
+                XCTFail(
+                    "QualityAdmission.swift: an `admission`-mentioning line is not one of the five "
+                        + "allowlisted declaration/init/decode lines -- this looks like a READ of the "
+                        + "decoded field, which must stay unread per "
+                        + "docs/task-inbox/2026-09-25-PREDECLARATION-admission-stays-unread-pin.md: \(line)"
+                )
+            }
+        }
+        XCTAssertEqual(
+            seenAllowlisted, allowlist,
+            "positive control: all five allowlisted lines must still be found in QualityAdmission.swift "
+                + "(stripper/matcher regression) -- missing: \(allowlist.subtracting(seenAllowlisted))"
+        )
+
+        let consumerCandidates = swiftFiles(under: sourcesDir).filter {
+            $0.standardizedFileURL != definingFile.standardizedFileURL
+        }
+        var consumersNamingQualityCard: [URL] = []
+        for url in consumerCandidates {
+            guard let source = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            let stripped = stripComments(source)
+            guard stripped.range(of: "\\bQualityCard\\b", options: .regularExpression) != nil else {
+                continue
+            }
+            consumersNamingQualityCard.append(url)
+
+            let dotAdmissionMatches = linesMatching(stripped, pattern: "\\.admission\\b")
+            XCTAssertTrue(
+                dotAdmissionMatches.isEmpty,
+                "\(url.lastPathComponent): found a qualified `.admission` read on a QualityCard value -- "
+                    + "admission must stay unread per "
+                    + "docs/task-inbox/2026-09-25-PREDECLARATION-admission-stays-unread-pin.md: "
+                    + dotAdmissionMatches.joined(separator: " | "))
+
+            if stripped.range(of: "extension\\s+QualityCard\\b", options: .regularExpression) != nil {
+                let bareAdmissionMatches = linesMatching(stripped, pattern: "\\badmission\\b")
+                XCTAssertTrue(
+                    bareAdmissionMatches.isEmpty,
+                    "\(url.lastPathComponent): a QualityCard extension names bare `admission` -- an "
+                        + "unqualified read (e.g. `admission?.optIn`) inside the extension's own type "
+                        + "would otherwise slip past the qualified `.admission` check above: "
+                        + bareAdmissionMatches.joined(separator: " | "))
+            }
+        }
+
+        XCTAssertTrue(
+            consumersNamingQualityCard.contains { $0.lastPathComponent == "FastMLXServe.swift" },
+            "anti-vacuity: FastMLXServe.swift must be among the discovered QualityCard-naming consumer "
+                + "files -- if it is missing, the discovery scan itself is broken, not proof of a clean "
+                + "codebase")
+    }
 }
