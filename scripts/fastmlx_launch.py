@@ -975,6 +975,23 @@ def _card_identity(card: dict) -> tuple:
     )
 
 
+def tiebreak_notice(chosen_id: str, tied_ids: list, host_class: Optional[str]) -> str:
+    """One line surfaced to the operator when ``resolve_card``'s
+    same-verdict lowest-id tiebreak fires and picked ``chosen_id`` out of
+    ``tied_ids`` (every candidate that shared the tied verdict, INCLUDING
+    ``chosen_id`` itself) -- so the pick is never silent, even though (per
+    ``resolve_card``'s docstring) it never changes the admission decision.
+    ``host_class`` is this host's ``host_hardware_class()`` value; ``None``
+    is rendered as the literal ``"unrecognized"``, never guessed at.
+    """
+    host_label = host_class if host_class is not None else "unrecognized"
+    return (
+        f"quality card {chosen_id!r} was chosen by lowest id among tied "
+        f"card(s) {sorted(tied_ids)!r} on host hardware class {host_label!r}; "
+        "pass --card-id <id> to choose"
+    )
+
+
 def resolve_card(
     cards: Optional[list],
     model_repo: Optional[str],
@@ -982,6 +999,7 @@ def resolve_card(
     residency: str = "resident",
     engine_build_commit: Optional[str] = None,
     host_hardware_class=host_hardware_class,
+    notices: Optional[list] = None,
 ) -> Optional[dict]:
     """The implicit (no ``--card-id``) lookup: a repo match (Swift semantics)
     OR an hfPin-prefix match against the model's pinned revision. If both
@@ -1023,10 +1041,38 @@ def resolve_card(
     If hardware class does not narrow to one, the single card whose
     ``provenance.engineBuild.commit`` equals ``engine_build_commit`` (this
     launch's own engine build) is selected next. An undeclared launch
-    (``None``) selects none of them, not even an unrecorded card; anything else (no exact match, or more than one) refuses
-    (exit 3) rather than silently picking one -- engine build is never used
-    to FILTER a card the way residency does, only to disambiguate an
-    otherwise-tied identity match.
+    (``None``) selects none of them, not even an unrecorded card -- engine
+    build is never used to FILTER a card the way residency does, only to
+    disambiguate an otherwise-tied identity match.
+
+    If that still leaves more than one candidate and every remaining
+    candidate shares the SAME ``verdict`` (the common case: the same pack
+    measured on more than one hardware class and/or engine build, all
+    agreeing on e.g. ``NO_GO``), the candidate with the lexicographically
+    smallest ``id`` is selected -- independent of manifest order. This is
+    safe precisely BECAUSE the pool already shares one verdict: after the
+    NO_GO narrowing above, a same-verdict pool is decision-equivalent (the
+    admission outcome would be identical regardless of which sibling is
+    chosen) and label-equivalent (the reported verdict/legible summary
+    would be identical too); only which hardware-class evidence gets
+    CITED in the resolved card's ``config`` changes. This mirrors the
+    Swift ``QualityAdmission.select`` step 4 (``tiePool.min { $0.id <
+    $1.id }``), with two differences: this Python lookup still refuses
+    (exit 3, naming the duplicated id) when the lowest id is itself
+    shared by more than one structurally different candidate -- an
+    ambiguity the Swift ``min`` would silently resolve by iteration
+    order -- and it refuses (exit 3) rather than lowest-id-picking when
+    the remaining candidates carry DIFFERENT verdicts (only possible when
+    none of them is ``NO_GO``, e.g. a ``PASS`` sibling and an ``EXACT``
+    sibling): unlike a same-verdict pool, an arbitrary pick there WOULD
+    change the verdict reported to the operator/client, so the refusal
+    names every tied card id (sorted) and tells the operator to declare
+    ``provenance.engineBuild.commit`` in the engine profile or pass
+    ``--card-id <id>``. When ``notices`` is not ``None`` and the lowest-id
+    tiebreak fires, one string built by ``tiebreak_notice`` (naming the
+    chosen id, every tied id, and this host's hardware class) is appended
+    to it, so the pick is never silent even though it never changes the
+    admission outcome.
     """
     if cards is None:
         return None
@@ -1110,15 +1156,51 @@ def resolve_card(
     ]
     if len(exact_matches) == 1:
         return exact_matches[0]
-    build_labels = sorted(
-        f"{card_hardware_class(card) or 'unrecorded'}@"
-        f"{(card_engine_build_commit(card) or 'undeclared')[:12]}"
-        for card in candidates
-    )
+
+    # Same-verdict pool: safe to pick the lowest id (see the docstring
+    # above) -- decision- and label-equivalent, only the cited
+    # hardware-class evidence changes. Compare the raw ``id`` values
+    # (not the sorted-string reprs) so a duplicated lowest id is caught
+    # even when it is the ONLY id present.
+    # The loader does no card-shape validation, so an id may be absent or
+    # not a string; sorting it would raise TypeError. Refuse instead.
+    if any(not isinstance(card.get("id"), str) for card in candidates):
+        raise LaunchRefusal(
+            3,
+            f"{len(candidates)} cards for this pack are tied and at least one "
+            "has no string id, so they cannot be told apart; pass --card-id",
+        )
+    verdicts = {card.get("verdict") for card in candidates}
+    if len(verdicts) == 1:
+        candidate_ids = sorted(card.get("id") for card in candidates)
+        chosen_id = candidate_ids[0]
+        lowest_id_count = sum(1 for cid in candidate_ids if cid == chosen_id)
+        if lowest_id_count > 1:
+            raise LaunchRefusal(
+                3,
+                f"{lowest_id_count} cards for this pack share the lowest id "
+                f"{chosen_id!r} and cannot be told apart by id alone; "
+                "declare engineBuild.commit in the engine profile or pass "
+                "--card-id",
+            )
+        chosen = next(card for card in candidates if card.get("id") == chosen_id)
+        if notices is not None:
+            notices.append(
+                tiebreak_notice(chosen_id, candidate_ids, host_hardware_class())
+            )
+        return chosen
+
+    # Mixed verdicts (only reachable when none of them is NO_GO, since
+    # NO_GO narrowing above already ran): an arbitrary pick here WOULD
+    # make the reported verdict arbitrary too, so this keeps refusing --
+    # naming every tied id (sorted) rather than the build-label summary,
+    # since it is the id the operator needs for --card-id.
+    tied_ids = sorted(card.get("id") for card in candidates)
     raise LaunchRefusal(
         3,
-        f"{len(candidates)} cards for this pack at builds {','.join(build_labels)}; "
-        "declare engineBuild.commit in the engine profile or pass --card-id",
+        f"{len(candidates)} cards for this pack have different verdicts: "
+        f"card id(s) {tied_ids}; declare engineBuild.commit in the engine "
+        "profile or pass --card-id <id>",
     )
 
 
@@ -2514,6 +2596,10 @@ def _run_serve(args, passthrough_args: list) -> int:
         )
 
     card: Optional[dict] = None
+    # Only ``resolve_card`` (the no-``--card-id`` lookup below) can ever
+    # append to this -- an explicit ``--card-id`` names its own card
+    # directly, with no tiebreak to report.
+    resolve_notices: list = []
     if args.card_id is not None:
         card = find_card_by_id(cards, args.card_id) if cards is not None else None
         if card is None:
@@ -2568,6 +2654,7 @@ def _run_serve(args, passthrough_args: list) -> int:
             model_revision,
             residency=residency,
             engine_build_commit=launch_engine_build_commit,
+            notices=resolve_notices,
         )
 
     # --- engine-build status (never gates admission; see decide_admission
@@ -2599,8 +2686,10 @@ def _run_serve(args, passthrough_args: list) -> int:
     opted_in = is_opted_in(card, opt_in_ids)
     outcome, message = decide_admission(card, opted_in)
     if outcome == "refuse_quality_flagged":
-        notices = " ".join(notice for notice in (build_notice, mtp_notice) if notice)
-        full_message = f"{message} {notices}" if notices else message
+        notice_texts = " ".join(
+            notice for notice in (build_notice, mtp_notice, *resolve_notices) if notice
+        )
+        full_message = f"{message} {notice_texts}" if notice_texts else message
         raise LaunchRefusal(2, full_message)
     if outcome == "admit_with_quality_flag":
         print(message)
@@ -2608,6 +2697,8 @@ def _run_serve(args, passthrough_args: list) -> int:
         print(f"fastmlx serve: {build_notice}", file=sys.stderr)
     if mtp_notice:
         print(f"fastmlx serve: {mtp_notice}", file=sys.stderr)
+    for resolve_notice in resolve_notices:
+        print(f"fastmlx serve: {resolve_notice}", file=sys.stderr)
 
     # --- front mode (--front-port) validation ---------------------------
     # Checked before the final argv is built at all: a refusal here must

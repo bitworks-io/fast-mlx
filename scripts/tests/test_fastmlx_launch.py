@@ -3992,7 +3992,14 @@ class EngineBuildTestCase(unittest.TestCase):
         plan = self.last_json_line(stdout)
         self.assertEqual(plan["card"]["id"], DUAL_BUILD_CARD_A_ID)
 
-    def test_two_cards_same_pack_undeclared_launch_refuses_exit_3(self):
+    # UPDATED for the same-verdict lowest-id tiebreak (see resolve_card's
+    # docstring): both cards are PASS, so an undeclared launch no longer
+    # refuses here -- it picks the lowest id (dual-build-a@test), and
+    # since PASS admits silently the launch proceeds to exit 0. This test
+    # used to assert an exit-3 refusal; that refusal only ever fired
+    # because the OLD fallthrough refused on ANY unresolved multi-card
+    # tie, not just a mixed-verdict one.
+    def test_two_cards_same_pack_undeclared_launch_picks_lowest_id(self):
         manifest_path = write_dual_engine_build_card_manifest(self.root)
         argv = self.base_args(
             **{
@@ -4001,10 +4008,10 @@ class EngineBuildTestCase(unittest.TestCase):
                 "--context": "2048",
             }
         ) + ["--dry-run"]
-        code, _, stderr = self.run_main(argv)
-        self.assertEqual(code, 3, stderr)
-        self.assertIn("cards for this pack", stderr)
-        self.assertIn("--card-id", stderr)
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["card"]["id"], DUAL_BUILD_CARD_A_ID)
 
     def test_two_cards_same_pack_picks_the_second_listed_build(self):
         # Build B is listed second, so a first-wins lookup would return A.
@@ -4014,13 +4021,21 @@ class EngineBuildTestCase(unittest.TestCase):
         )
         self.assertEqual(card["id"], DUAL_BUILD_CARD_B_ID)
 
-    def test_undeclared_launch_never_picks_the_unrecorded_card_of_several(self):
+    # UPDATED for the same-verdict lowest-id tiebreak: an undeclared launch
+    # (``engine_build_commit=None``) never reaches the exact-build-match
+    # step (it can never equal ``None``), so it used to always refuse on
+    # any unresolved multi-card tie. It now falls through to the lowest-id
+    # tiebreak like any other same-verdict pool -- recordedness of the
+    # OTHER candidate's build plays no part in which id is lowest, so
+    # deleting card B's ``provenance.engineBuild`` here changes nothing
+    # about the pick (still card A, the lower id).
+    def test_undeclared_launch_picks_lowest_id_regardless_of_the_other_cards_recordedness(
+        self,
+    ):
         cards = dual_engine_build_card_manifest()["cards"]
         del cards[1]["provenance"]["engineBuild"]
-        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
-            FASTMLX_LAUNCH.resolve_card(cards, DUAL_BUILD_REPO, None)
-        self.assertEqual(ctx.exception.exit_code, 3)
-        self.assertIn("undeclared", ctx.exception.message)
+        card = FASTMLX_LAUNCH.resolve_card(cards, DUAL_BUILD_REPO, None)
+        self.assertEqual(card["id"], DUAL_BUILD_CARD_A_ID)
 
 
 # ---------------------------------------------------------------------
@@ -4139,28 +4154,30 @@ class HardwareClassTieBreakTestCase(unittest.TestCase):
         self.assertEqual(card["id"], HWC_CARD_ULTRA_ID)
 
     # Criterion 5b: an unknown host class (None) never narrows -- falls
-    # through to the existing exit-3 refusal, whose message names the
-    # hardware classes so the refusal is diagnosable.
-    def test_two_candidates_differ_only_in_hardware_class_unknown_host_refuses(self):
+    # through to the same-verdict lowest-id tiebreak (both cards are
+    # PASS), NOT a refusal: "hwc-m5@test" < "hwc-ultra@test". UPDATED for
+    # that tiebreak -- this used to assert an exit-3 refusal, back when
+    # the fallthrough refused on ANY unresolved tie regardless of verdict.
+    def test_two_candidates_differ_only_in_hardware_class_unknown_host_picks_lowest_id(
+        self,
+    ):
         cards = hardware_class_card_manifest()["cards"]
-        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
-            FASTMLX_LAUNCH.resolve_card(
-                cards, HWC_REPO, None, host_hardware_class=lambda: None
-            )
-        self.assertEqual(ctx.exception.exit_code, 3)
-        self.assertIn("apple-m3-ultra", ctx.exception.message)
-        self.assertIn("apple-m5", ctx.exception.message)
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, HWC_REPO, None, host_hardware_class=lambda: None
+        )
+        self.assertEqual(card["id"], HWC_CARD_M5_ID)
 
-    # Same refusal when the host class matches NEITHER candidate.
-    def test_two_candidates_differ_only_in_hardware_class_host_matches_neither_refuses(self):
+    # Same lowest-id pick when the host class matches NEITHER candidate --
+    # an unmatched host narrows nothing, same as an unknown one. UPDATED
+    # alongside the test above.
+    def test_two_candidates_differ_only_in_hardware_class_host_matches_neither_picks_lowest_id(
+        self,
+    ):
         cards = hardware_class_card_manifest()["cards"]
-        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
-            FASTMLX_LAUNCH.resolve_card(
-                cards, HWC_REPO, None, host_hardware_class=lambda: "apple-m1"
-            )
-        self.assertEqual(ctx.exception.exit_code, 3)
-        self.assertIn("apple-m3-ultra", ctx.exception.message)
-        self.assertIn("apple-m5", ctx.exception.message)
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, HWC_REPO, None, host_hardware_class=lambda: "apple-m1"
+        )
+        self.assertEqual(card["id"], HWC_CARD_M5_ID)
 
     # When candidates all share one class (or all carry none), the host
     # seam is never consulted at all -- the existing engine-build tiebreak
@@ -4543,6 +4560,325 @@ class RealShippedManifestTestCase(unittest.TestCase):
                 f"card {card_id!r} (repo {repo!r}) resolved to verdict "
                 f"{resolved.get('verdict')!r}, expected NO_GO",
             )
+
+
+# ---------------------------------------------------------------------
+# Same-verdict multi-candidate fallthrough: once NO_GO narrowing,
+# hardwareClass, and engineBuild.commit all fail to narrow a repo/pin
+# match to one candidate, resolve_card no longer refuses outright when
+# every remaining candidate shares one verdict -- it picks the
+# lexicographically smallest id (mirrors Swift QualityAdmission.select
+# step 4's ``tiePool.min { $0.id < $1.id }``, except it still refuses on
+# a duplicated lowest id or a genuinely mixed-verdict tie). See
+# resolve_card's docstring and tiebreak_notice.
+# ---------------------------------------------------------------------
+def _synthetic_card(
+    card_id: str,
+    repo: str,
+    verdict: str,
+    hardware_class: Optional[str] = None,
+    engine_build_commit: Optional[str] = None,
+) -> dict:
+    card: dict = {
+        "id": card_id,
+        "model": {"repo": repo, "hfPin": card_id},
+        "verdict": verdict,
+        "admission": {"default": verdict != "NO_GO", "optIn": True, "reason": "synthetic"},
+        "legible": {
+            "tier": "Reference" if verdict != "NO_GO" else "Unquantified",
+            "headline": f"{verdict} synthetic card.",
+        },
+    }
+    if hardware_class is not None:
+        card["config"] = {"hardwareClass": hardware_class}
+    if engine_build_commit is not None:
+        card["provenance"] = {"engineBuild": {"commit": engine_build_commit}}
+    return card
+
+
+class SameVerdictLowestIdTiebreakTestCase(unittest.TestCase):
+    # T1: real shipped manifest -- host recognized but matching NEITHER
+    # candidate's hardwareClass (or unrecognized entirely) never narrows,
+    # so the lowest id always wins: "qwen3-0p6b-4bit@m3ultra" <
+    # "qwen3-0p6b-4bit@m5" ('3' < '5').
+    def test_real_manifest_qwen3_pair_picks_lowest_id_on_any_unmatched_host(self):
+        manifest = _load_real_quality_guides_manifest()
+        cards = manifest["cards"]
+        for host_class in (None, "apple-m4-max", "apple-m5-pro"):
+            with self.subTest(host_class=host_class):
+                card = FASTMLX_LAUNCH.resolve_card(
+                    cards,
+                    P3_SHARED_REPO_AND_PIN_REPO,
+                    None,
+                    host_hardware_class=lambda hc=host_class: hc,
+                )
+                self.assertEqual(card.get("id"), "qwen3-0p6b-4bit@m3ultra")
+                self.assertEqual(card.get("verdict"), "NO_GO")
+
+    # T3: manifest-order independence -- the SAME two card objects, listed
+    # in the OPPOSITE order, still resolve to the same lowest id.
+    def test_manifest_order_independence(self):
+        # Checked in BOTH orders (not just reversed): a manifest-order
+        # pick (e.g. "first candidate wins") would agree with the lowest
+        # id in whichever order happens to already list the lowest id
+        # first, and only disagree in the other order -- asserting just
+        # one order risks a coincidental pass. m3ultra is the lowest id
+        # ("m3ultra" < "m5"), and the real manifest lists m5 FIRST, so the
+        # forward-order call alone already distinguishes "lowest id" from
+        # "manifest order".
+        manifest = _load_real_quality_guides_manifest()
+        pair = [
+            card
+            for card in manifest["cards"]
+            if card.get("id") in ("qwen3-0p6b-4bit@m5", "qwen3-0p6b-4bit@m3ultra")
+        ]
+        self.assertEqual(len(pair), 2)
+        self.assertEqual(
+            [c.get("id") for c in pair],
+            ["qwen3-0p6b-4bit@m5", "qwen3-0p6b-4bit@m3ultra"],
+        )
+        reversed_pair = list(reversed(pair))
+        for cards, label in ((pair, "forward"), (reversed_pair, "reversed")):
+            with self.subTest(order=label):
+                card = FASTMLX_LAUNCH.resolve_card(
+                    cards,
+                    P3_SHARED_REPO_AND_PIN_REPO,
+                    None,
+                    host_hardware_class=lambda: None,
+                )
+                self.assertEqual(card.get("id"), "qwen3-0p6b-4bit@m3ultra")
+
+    # T4: fail-closed control -- a PASS id 'aaa' (lexicographically the
+    # smaller id) must NEVER be preferred over a same-repo NO_GO id 'zzz'.
+    # The NO_GO-narrowing step runs FIRST (see resolve_card's docstring),
+    # so the same-verdict pool the lowest-id tiebreak ever sees here is
+    # {'zzz'} alone -- a single-candidate shortcut, never a real tie.
+    def test_no_go_still_outranks_a_lexicographically_smaller_pass_id(self):
+        repo = "example/FailClosedIdOrderModel"
+        cards = [
+            _synthetic_card("aaa", repo, "PASS"),
+            _synthetic_card("zzz", repo, "NO_GO"),
+        ]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, repo, None, host_hardware_class=lambda: None
+        )
+        self.assertEqual(card.get("id"), "zzz")
+        self.assertEqual(card.get("verdict"), "NO_GO")
+
+    # T5: build precedence -- the engineBuild.commit exact-match step
+    # still runs BEFORE the lowest-id tiebreak, so a launch that declares
+    # the HIGHER id's commit gets that card, not the lowest id.
+    def test_declared_engine_build_outranks_the_lowest_id(self):
+        repo = "example/BuildPrecedenceModel"
+        commit_for_zzz = "ab" * 20
+        cards = [
+            _synthetic_card("aaa", repo, "NO_GO"),
+            _synthetic_card("zzz", repo, "NO_GO", engine_build_commit=commit_for_zzz),
+        ]
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards,
+            repo,
+            None,
+            engine_build_commit=commit_for_zzz,
+            host_hardware_class=lambda: None,
+        )
+        self.assertEqual(card.get("id"), "zzz")
+
+    # T6: a duplicated lowest id -- two structurally different same-verdict
+    # cards both named 'dup' (differing hardwareClass), plus a third 'zzz'
+    # -- refuses (exit 3) rather than silently picking either 'dup', and
+    # the refusal names the duplicated id.
+    def test_duplicated_lowest_id_refuses_naming_the_duplicate(self):
+        repo = "example/DuplicateLowestIdModel"
+        cards = [
+            _synthetic_card("dup", repo, "NO_GO", hardware_class="apple-m5"),
+            _synthetic_card("dup", repo, "NO_GO", hardware_class="apple-m3-ultra"),
+            _synthetic_card("zzz", repo, "NO_GO"),
+        ]
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                cards, repo, None, host_hardware_class=lambda: None
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("dup", ctx.exception.message)
+
+    # T7: a genuinely mixed-verdict tie (only reachable when none of the
+    # candidates is NO_GO) still refuses -- an arbitrary pick here would
+    # make the reported verdict arbitrary too. The message must name both
+    # tied ids and tell the operator to pass --card-id.
+    def test_mixed_non_no_go_verdicts_still_refuses_naming_both_ids(self):
+        repo = "example/MixedNonNoGoVerdictModel"
+        cards = [
+            _synthetic_card("a", repo, "PASS", hardware_class="apple-m5"),
+            _synthetic_card("b", repo, "EXACT", hardware_class="apple-m3-ultra"),
+        ]
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                cards, repo, None, host_hardware_class=lambda: None
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("['a', 'b']", ctx.exception.message)
+        self.assertIn("different verdicts", ctx.exception.message)
+        self.assertIn("--card-id", ctx.exception.message)
+
+    # The loader does no card-shape validation: a tied card with no string
+    # id must refuse cleanly (exit 3), never crash sorting None against str.
+    def test_tied_card_without_string_id_refuses_instead_of_crashing(self):
+        repo = "example/MissingIdTieModel"
+        cards = [
+            _synthetic_card("a", repo, "NO_GO", hardware_class="apple-m5"),
+            _synthetic_card("b", repo, "NO_GO", hardware_class="apple-m3-ultra"),
+        ]
+        del cards[1]["id"]
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                cards, repo, None, host_hardware_class=lambda: None
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertIn("no string id", ctx.exception.message)
+        self.assertIn("--card-id", ctx.exception.message)
+
+    # T8: tiebreak_notice unit test -- names the chosen id, every tied id
+    # (sorted), the host hardware class (or "unrecognized" when None), and
+    # tells the operator how to override.
+    def test_tiebreak_notice_names_chosen_tied_and_host(self):
+        notice = FASTMLX_LAUNCH.tiebreak_notice(
+            "qwen3-0p6b-4bit@m3ultra",
+            ["qwen3-0p6b-4bit@m5", "qwen3-0p6b-4bit@m3ultra"],
+            "apple-m4-max",
+        )
+        self.assertIn("qwen3-0p6b-4bit@m3ultra", notice)
+        self.assertIn("qwen3-0p6b-4bit@m5", notice)
+        self.assertIn("apple-m4-max", notice)
+        self.assertIn("--card-id", notice)
+
+    def test_tiebreak_notice_renders_none_host_as_unrecognized(self):
+        notice = FASTMLX_LAUNCH.tiebreak_notice("a", ["a", "b"], None)
+        self.assertIn("unrecognized", notice)
+        self.assertNotIn("None", notice)
+
+    # The notices list is populated (not just non-empty by side effect
+    # elsewhere) exactly when the lowest-id tiebreak fires, with exactly
+    # one entry, and NOT populated on a single-candidate shortcut.
+    def test_notices_list_receives_exactly_one_entry_on_tiebreak(self):
+        repo = "example/NoticesListModel"
+        cards = [
+            _synthetic_card("aaa", repo, "NO_GO"),
+            _synthetic_card("zzz", repo, "NO_GO"),
+        ]
+        notices: list = []
+        card = FASTMLX_LAUNCH.resolve_card(
+            cards, repo, None, host_hardware_class=lambda: None, notices=notices
+        )
+        self.assertEqual(card.get("id"), "aaa")
+        self.assertEqual(len(notices), 1)
+        self.assertIn("aaa", notices[0])
+        self.assertIn("zzz", notices[0])
+
+    def test_notices_list_untouched_on_single_candidate(self):
+        cards = [single_ultra_card()]
+        notices: list = []
+        FASTMLX_LAUNCH.resolve_card(
+            cards, SAFETY_ULTRA_REPO, None, notices=notices
+        )
+        self.assertEqual(notices, [])
+
+
+# ---------------------------------------------------------------------
+# T2: main() end-to-end, real shipped manifest, host forced to
+# unrecognized (None) by making the underlying sysctl call fail --
+# host_hardware_class's own default-parameter binding means a bare
+# module-attribute patch of ``host_hardware_class`` would not reach
+# resolve_card's call inside main() (see the HardwareClassTieBreak
+# comment above), so this patches the shared ``subprocess.run`` instead,
+# the same seam host_hardware_class itself calls through.
+# ---------------------------------------------------------------------
+class MainEndToEndSameVerdictTiebreakTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    def base_args(self, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(REAL_QUALITY_GUIDES_PATH),
+            "--model-repo": P3_SHARED_REPO_AND_PIN_REPO,
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--context": "2048",
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    # Captured BEFORE any patch.object call below replaces it -- ``subprocess``
+    # is the one shared module object, so this is the real ``run``.
+    _REAL_SUBPROCESS_RUN = subprocess.run
+
+    @classmethod
+    def _fail_only_the_sysctl_call(cls, *args, **kwargs):
+        """Delegates to the REAL ``subprocess.run`` for every call except
+        ``host_hardware_class``'s own ``sysctl -n machdep.cpu.brand_string``
+        -- the fit-check-bin and engine-bin stubs this harness launches are
+        themselves started via ``subprocess.run`` and must keep working.
+        """
+        argv = args[0] if args else kwargs.get("args")
+        if argv == ["sysctl", "-n", "machdep.cpu.brand_string"]:
+            raise OSError("no sysctl here")
+        return cls._REAL_SUBPROCESS_RUN(*args, **kwargs)
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(
+                    FASTMLX_LAUNCH.subprocess,
+                    "run",
+                    side_effect=self._fail_only_the_sysctl_call,
+                ):
+                    FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def last_json_line(stdout: str) -> dict:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        return json.loads(lines[-1])
+
+    # T2a: no opt-in -- refuses exit 2 (the resolved card is NO_GO), and
+    # the refusal names BOTH tied card ids and the unrecognized host, from
+    # the tiebreak notice appended alongside the existing NO_GO notices.
+    def test_no_opt_in_refuses_naming_both_ids_and_unrecognized_host(self):
+        argv = self.base_args() + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("qwen3-0p6b-4bit@m3ultra", stderr)
+        self.assertIn("qwen3-0p6b-4bit@m5", stderr)
+        self.assertIn("unrecognized", stderr)
+
+    # T2b: --accept-quality the resolved (lowest-id) card id admits.
+    def test_accept_quality_for_resolved_lowest_id_admits(self):
+        argv = self.base_args(
+            **{"--accept-quality": "qwen3-0p6b-4bit@m3ultra"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        self.assertEqual(plan["card"]["id"], "qwen3-0p6b-4bit@m3ultra")
+        # The tiebreak notice is still surfaced on the admit path (never
+        # silent), on stderr rather than folded into the refusal message.
+        self.assertIn("qwen3-0p6b-4bit@m5", stderr)
 
 
 class CardHardwareClassTestCase(unittest.TestCase):
