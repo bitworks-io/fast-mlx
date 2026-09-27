@@ -298,17 +298,19 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-3",
-                "title": "Publish v0.1.3: the engine no longer outlives its launcher",
-                "publishedAt": "2026-09-19T21:17:52Z",
+                "id": "tagged-distribution-v0-1-5",
+                "title": "Publish v0.1.5: the quality verdict reaches the client",
+                "publishedAt": "2026-09-27T05:11:57Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.3 arm64 macOS distribution, in which the "
-                    "fastmlx serve --front-port launcher no longer leaves its engine "
-                    "running: the engine is stopped when the launcher or its guard is "
-                    "killed, a requested stop exits 143, and a busy engine port is "
-                    "refused rather than adopted."
+                    "Publishes the v0.1.5 arm64 macOS distribution, in which fastmlx "
+                    "serve --front-port names the quality verdict that admitted the "
+                    "pack on every response, a pack may carry several quality cards "
+                    "with a NO_GO card always taking precedence, a duplicated or "
+                    "malformed card can no longer disarm the quality gate, and the "
+                    "safetensors sizer explains why it refuses a Hugging Face cache "
+                    "snapshot."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -317,7 +319,7 @@ class PublicSiteTests(unittest.TestCase):
                     "host-qualification, deployment, or production-promotion claim "
                     "follows."
                 ),
-                "publicCommit": "f418b8e47b35ff030485bd2878ad5dad63be31fd",
+                "publicCommit": "8dcd8b9244841514c640131f1d363ab8b00f65d8",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -334,6 +336,8 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "8dcd8b9244841514c640131f1d363ab8b00f65d8",
+                "2538456a936cefbe0c624d15f4e038fac9158102",
                 "f418b8e47b35ff030485bd2878ad5dad63be31fd",
                 "9bb06501a38684c08293d900fcc6e804e59b11e4",
                 "8aab34b45b8dbd39163f8c507343105b55de123f",

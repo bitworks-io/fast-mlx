@@ -232,9 +232,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 10_640
+REVIEWED_HOME_PAGE_BYTES = 10_741
 REVIEWED_HOME_PAGE_SHA256 = (
-    "c5bdbcec29e8e5657c5447e50a7a1f1249468e77b81662fc04377d70b6825d7a"
+    "3917f670d756777048f7456feba0e88a033da620f2c08f5f3764cf2860e6145d"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -258,9 +258,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 22_967
+REVIEWED_STATUS_PAGE_BYTES = 23_068
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "712ac1777888801c41e5a08503f05746c872e9877f97bc81155d8878a12b4d10"
+    "e8887f7be5466e139258d996786d86cb1c2d5f31154d263f2dd773bd6bb6f1fa"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -436,8 +436,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/tagged-distribution-v0-1-3/",
-    "https://github.com/bitworks-io/fast-mlx/commit/f418b8e47b35ff030485bd2878ad5dad63be31fd",
+    "../releases/tagged-distribution-v0-1-5/",
+    "https://github.com/bitworks-io/fast-mlx/commit/8dcd8b9244841514c640131f1d363ab8b00f65d8",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -449,7 +449,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "32 published research notes",
-    "26 reviewed release records",
+    "28 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -610,11 +610,19 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 27_872
+REVIEWED_RELEASE_INDEX_BYTES = 30_470
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "28dffb77385d5da65a18593b84e9a6f3d7d07cef25521494ae7541822543dc33"
+    "4d5efa62ffdc966760a578ba450e0d5168a60addba5fe41961dce770e80b01f0"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "tagged-distribution-v0-1-5",
+        "Publish v0.1.5: the quality verdict reaches the client",
+    ),
+    (
+        "tagged-distribution-v0-1-4",
+        "Publish v0.1.4: fastmlx bench ships in a release",
+    ),
     (
         "tagged-distribution-v0-1-3",
         "Publish v0.1.3: the engine no longer outlives its launcher",
@@ -682,6 +690,14 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "tagged-distribution-v0-1-5": (
+        4_977,
+        "9cc1337d1c93ade1d18f8123d9ab9ab1520c1739a9187fd36af09947058e6f87",
+    ),
+    "tagged-distribution-v0-1-4": (
+        4_893,
+        "ec729d9c865fdec122c9ae711b0a5459e8ab310fc8a11f76e2e3f0c8a8fb68c5",
+    ),
     "tagged-distribution-v0-1-3": (
         4_884,
         "1e53801b1dd9adf262f61a159ba321cd00d9fef3d65158cf67fd55a496d6cc46",
@@ -3503,7 +3519,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "tagged-distribution-v0-1-3",
+        "data-latest-release-id": "tagged-distribution-v0-1-5",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }
