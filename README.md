@@ -224,6 +224,8 @@ otherwise, when the tied cards share a verdict, it takes the lowest card id and 
 naming the chosen id and every tied one. Tied cards with different verdicts are refused rather than
 picked. `--accept-quality` matches the chosen card's id,
 the model's repo name, or its pinned revision, and `--card-id <id>` selects a specific card instead.
+`recommend` prints the same notice on the affected row's status line, and in `--json` as the row's
+`tiebreakNotice` key (`null` when no tiebreak fired).
 
 A card states what a pack **buys**, not only what it costs, and both surfaces say so at the moment
 you choose. Alongside the quality cost, `serve`'s admission message and each `recommend` row carry

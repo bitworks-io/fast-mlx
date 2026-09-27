@@ -68,7 +68,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 
 _LAUNCH_PATH = Path(__file__).resolve().parent / "fastmlx_launch.py"
@@ -258,6 +258,7 @@ def build_row(
     engine_build_commit: Optional[str] = None,
     mtp_launch: bool = False,
     kv_reserve_gib: Optional[float] = None,
+    host_hardware_class: Optional[Callable[[], Optional[str]]] = None,
 ) -> dict:
     """Resolve one candidate to a fully-classified row. Never raises: an
     ambiguous card lookup (``LaunchRefusal`` from ``resolve_card``) or a fit
@@ -274,7 +275,23 @@ def build_row(
     it is ``None`` and a built-in sizer was auto-selected for this
     candidate, that is an actionable ``error`` row (never a silently
     assumed zero KV-cache reserve) naming the exact flag to pass.
+
+    ``host_hardware_class``, when given, overrides which callable is passed
+    to ``resolve_card`` as ITS OWN ``host_hardware_class`` argument -- used
+    by tests to simulate a specific host without touching the real sysctl
+    call. When ``None`` (the default, and what every real CLI invocation
+    uses), it is resolved to ``launch.host_hardware_class`` HERE, at call
+    time, rather than defaulted in this function's own signature: a
+    default bound at *def* time would capture launch's host_hardware_class
+    as it existed when this module was first imported, so a test that
+    monkeypatches ``launch.host_hardware_class`` afterwards would silently
+    miss it -- the exact trap ``resolve_card``'s own
+    ``host_hardware_class=host_hardware_class`` default parameter has (see
+    that function's call sites in ``fastmlx_launch.py``).
     """
+    resolved_host_hardware_class = (
+        host_hardware_class if host_hardware_class is not None else launch.host_hardware_class
+    )
     name = model_path.name
     row: dict = {
         "path": str(model_path),
@@ -289,6 +306,7 @@ def build_row(
         "accept_quality_flag": None,
         "engineBuild": None,
         "mtp": None,
+        "tiebreakNotice": None,
     }
 
     if not model_path.is_dir():
@@ -320,6 +338,7 @@ def build_row(
     if model_repo is None and model_revision is None:
         _print_recommend_no_model_identity_hint(str(model_path))
 
+    notices: list = []
     try:
         card = launch.resolve_card(
             cards,
@@ -327,11 +346,20 @@ def build_row(
             model_revision,
             residency=residency,
             engine_build_commit=engine_build_commit,
+            host_hardware_class=resolved_host_hardware_class,
+            notices=notices,
         )
     except launch.LaunchRefusal as refusal:
         row["status"] = STATUS_ERROR
         row["message"] = refusal.message
         return row
+
+    # Set immediately after resolve_card returns, before the
+    # engineBuild/mtp/fit-check logic below, so a does-not-fit or error row
+    # (returned further down) still carries whichever notice fired here --
+    # mirrors how `row["engineBuild"]`/`row["mtp"]` are always present
+    # (initialized above) even on rows that return early.
+    row["tiebreakNotice"] = notices[0] if notices else None
 
     # Engine-build status/notice: informational only, never gates a row's
     # status/verdict (mirrors fastmlx serve -- see docs/quality-card-schema-v1.md
@@ -601,6 +629,9 @@ def _format_row_text(rank: int, row: dict) -> str:
     mtp_message = mtp.get("message") if mtp else None
     if mtp_message and mtp_message not in (row.get("message") or ""):
         tail += f" {mtp_message}"
+    tiebreak_notice = row.get("tiebreakNotice")
+    if tiebreak_notice and tiebreak_notice not in (row.get("message") or ""):
+        tail += f" {tiebreak_notice}"
     lines.append(tail)
     return "\n".join(lines)
 

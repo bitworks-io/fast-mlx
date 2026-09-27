@@ -10,14 +10,19 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.tests.test_fastmlx_gguf_fit import build_gguf_bytes
 from scripts.tests.test_fastmlx_launch import (
     CAPTURING_FIT_CHECK_BODY,
     GREEN_ATTESTATION_WITH_RESIDENCY_BODY,
+    P3_SHARED_REPO_AND_PIN_REPO,
+    P3_SHARED_REPO_AND_PIN_REVISION,
     SYNTHETIC_CARD_ID,
     SYNTHETIC_CARD_REPO,
     SYNTHETIC_CARD_REVISION,
+    _load_real_quality_guides_manifest,
+    _synthetic_card,
     write_expert_stream_card_manifest,
     write_release_engine_binary,
     write_release_provenance,
@@ -2189,6 +2194,197 @@ class RecommendNoIdentityHintFlagsTestCase(unittest.TestCase):
         self.assertIn("no model identity", stderr)
         self.assertIn("fastmlx pull", stderr)
         self.assertIn("--adopt", stderr)
+
+
+# ---------------------------------------------------------------------
+# tiebreakNotice: `fastmlx recommend` must surface the SAME same-verdict
+# lowest-id tiebreak notice `fastmlx serve` already surfaces (see
+# `resolve_card`'s docstring and `tiebreak_notice` in fastmlx_launch.py) --
+# `build_row` previously called `launch.resolve_card(...)` without
+# `notices=`, so the pick was silently reported as though it were
+# unambiguous. `build_row`'s own `host_hardware_class=` override lets these
+# tests simulate a specific host WITHOUT touching the real sysctl call and
+# without relying on subprocess patching (unlike fastmlx_launch's own
+# `MainEndToEndSameVerdictTiebreakTestCase`, which has to patch
+# `subprocess.run` because `resolve_card`'s default parameter is bound at
+# *def* time -- `build_row` resolves its own default at *call* time
+# instead, precisely to avoid that trap; see build_row's docstring).
+# ---------------------------------------------------------------------
+class RecommendTiebreakNoticeTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.red_fit_bin = write_script(self.root / "fit-red.py", RED_FIT_CHECK_BODY)
+        self.real_cards = _load_real_quality_guides_manifest()["cards"]
+
+    def make_model_dir(self, name: str, repo: str, revision: str) -> Path:
+        model_dir = self.root / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        write_pull_receipt(model_dir, repo_id=repo, revision=revision)
+        return model_dir
+
+    def qwen_row(self, fit_check_bin: Path, host_hardware_class) -> dict:
+        model_dir = self.make_model_dir(
+            "qwen-tiebreak-model",
+            P3_SHARED_REPO_AND_PIN_REPO,
+            P3_SHARED_REPO_AND_PIN_REVISION,
+        )
+        return FASTMLX_RECOMMEND.build_row(
+            model_path=model_dir,
+            cards=self.real_cards,
+            fit_check_bin=str(fit_check_bin),
+            host_use="shared",
+            context=None,
+            fit_check_args=[],
+            host_hardware_class=host_hardware_class,
+        )
+
+    # (a) Real shipped manifest, host class apple-m4-max (matches NEITHER
+    # sibling card's own hardwareClass): the lowest-id tiebreak fires, and
+    # the exact notice fastmlx_launch.tiebreak_notice would build is
+    # present verbatim in both the JSON row and the text rendering, naming
+    # both tied card ids and the host class. Status/flag are unchanged
+    # from what the pre-existing tiebreak behavior already produces for
+    # this NO_GO pack (opt-in, naming the resolved lowest-id card).
+    def test_json_and_text_carry_the_exact_tiebreak_notice_on_m4_max(self):
+        row = self.qwen_row(self.green_fit_bin, host_hardware_class=lambda: "apple-m4-max")
+
+        expected = FASTMLX_RECOMMEND.launch.tiebreak_notice(
+            "qwen3-0p6b-4bit@m3ultra",
+            ["qwen3-0p6b-4bit@m3ultra", "qwen3-0p6b-4bit@m5"],
+            "apple-m4-max",
+        )
+        self.assertEqual(row["tiebreakNotice"], expected)
+        self.assertIn("qwen3-0p6b-4bit@m3ultra", row["tiebreakNotice"])
+        self.assertIn("qwen3-0p6b-4bit@m5", row["tiebreakNotice"])
+        self.assertIn("apple-m4-max", row["tiebreakNotice"])
+
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_OPT_IN)
+        self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m3ultra")
+
+        text = FASTMLX_RECOMMEND._format_row_text(1, row)
+        self.assertIn(expected, text)
+
+    # (b) host apple-m5: hardwareClass narrows to exactly one candidate
+    # (the m5 card itself), so the lowest-id tiebreak never fires --
+    # tiebreakNotice is null, no notice line in the text rendering, and
+    # the resolved card is the host-matched one (not the lowest id).
+    def test_host_class_match_wins_no_notice(self):
+        row = self.qwen_row(self.green_fit_bin, host_hardware_class=lambda: "apple-m5")
+
+        self.assertIsNone(row["tiebreakNotice"])
+        self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m5")
+
+        text = FASTMLX_RECOMMEND._format_row_text(1, row)
+        self.assertNotIn("chosen by lowest id", text)
+        self.assertNotIn("--card-id", text)
+
+    # (c) host class None (unrecognized): the lowest-id tiebreak fires
+    # exactly like (a), but the notice names the host as 'unrecognized'
+    # (tiebreak_notice's own rendering for a None host), never the
+    # literal string "None".
+    def test_unrecognized_host_notice_says_unrecognized(self):
+        row = self.qwen_row(self.green_fit_bin, host_hardware_class=lambda: None)
+
+        self.assertIsNotNone(row["tiebreakNotice"])
+        self.assertIn("unrecognized", row["tiebreakNotice"])
+        self.assertNotIn("None", row["tiebreakNotice"])
+        self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m3ultra")
+
+    # (e) A does-not-fit row (RED fit check verdict) still carries the
+    # notice: it must be set BEFORE the fit-check logic runs, so a card
+    # resolved via the tiebreak is never silently dropped from a
+    # does-not-fit row.
+    def test_does_not_fit_row_still_carries_the_notice(self):
+        row = self.qwen_row(self.red_fit_bin, host_hardware_class=lambda: "apple-m4-max")
+
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_DOES_NOT_FIT)
+        expected = FASTMLX_RECOMMEND.launch.tiebreak_notice(
+            "qwen3-0p6b-4bit@m3ultra",
+            ["qwen3-0p6b-4bit@m3ultra", "qwen3-0p6b-4bit@m5"],
+            "apple-m4-max",
+        )
+        self.assertEqual(row["tiebreakNotice"], expected)
+
+    # (d1) Refusal path, unchanged: cards sharing the lowest id refuse
+    # (status=error) exactly like fastmlx serve's identical refusal (see
+    # fastmlx_launch's SameVerdictLowestIdTiebreakTestCase.
+    # test_duplicated_lowest_id_refuses_naming_the_duplicate), and never
+    # populate tiebreakNotice (the row returns before it would be set).
+    def test_duplicated_lowest_id_refusal_is_unchanged(self):
+        repo = "example/RecommendDuplicateLowestIdModel"
+        cards = [
+            _synthetic_card("dup", repo, "NO_GO", hardware_class="apple-m5"),
+            _synthetic_card("dup", repo, "NO_GO", hardware_class="apple-m3-ultra"),
+            _synthetic_card("zzz", repo, "NO_GO"),
+        ]
+        model_dir = self.make_model_dir("dup-lowest-id-model", repo, "d" * 40)
+        row = FASTMLX_RECOMMEND.build_row(
+            model_path=model_dir,
+            cards=cards,
+            fit_check_bin=str(self.green_fit_bin),
+            host_use="shared",
+            context=None,
+            fit_check_args=[],
+            host_hardware_class=lambda: None,
+        )
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_ERROR)
+        self.assertIn("dup", row["message"])
+        self.assertIn("cannot be told apart", row["message"])
+        self.assertIsNone(row["tiebreakNotice"])
+
+    # (d2) Refusal path, unchanged: a genuinely mixed-verdict tie (only
+    # reachable when none of the tied candidates is NO_GO) still refuses,
+    # naming both tied ids, and never populates tiebreakNotice.
+    def test_mixed_verdict_refusal_is_unchanged(self):
+        repo = "example/RecommendMixedVerdictModel"
+        cards = [
+            _synthetic_card("a", repo, "PASS", hardware_class="apple-m5"),
+            _synthetic_card("b", repo, "EXACT", hardware_class="apple-m3-ultra"),
+        ]
+        model_dir = self.make_model_dir("mixed-verdict-model", repo, "e" * 40)
+        row = FASTMLX_RECOMMEND.build_row(
+            model_path=model_dir,
+            cards=cards,
+            fit_check_bin=str(self.green_fit_bin),
+            host_use="shared",
+            context=None,
+            fit_check_args=[],
+            host_hardware_class=lambda: None,
+        )
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_ERROR)
+        self.assertIn("['a', 'b']", row["message"])
+        self.assertIn("different verdicts", row["message"])
+        self.assertIn("--card-id", row["message"])
+        self.assertIsNone(row["tiebreakNotice"])
+
+    # The default (no explicit host_hardware_class passed to build_row)
+    # resolves `launch.host_hardware_class` AT CALL TIME, not at def time
+    # -- monkeypatching the module attribute reaches it, closing the same
+    # trap `resolve_card`'s own default parameter has. This is the seam
+    # `_run_recommend` (the real CLI path) relies on; it is exercised here
+    # directly rather than via `main()` since that is the narrowest test
+    # of the actual fix.
+    def test_default_host_hardware_class_resolved_at_call_time(self):
+        model_dir = self.make_model_dir(
+            "qwen-default-host-model",
+            P3_SHARED_REPO_AND_PIN_REPO,
+            P3_SHARED_REPO_AND_PIN_REVISION,
+        )
+        with patch.object(FASTMLX_RECOMMEND.launch, "host_hardware_class", lambda: "apple-m5"):
+            row = FASTMLX_RECOMMEND.build_row(
+                model_path=model_dir,
+                cards=self.real_cards,
+                fit_check_bin=str(self.green_fit_bin),
+                host_use="shared",
+                context=None,
+                fit_check_args=[],
+            )
+        self.assertIsNone(row["tiebreakNotice"])
+        self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m5")
 
 
 if __name__ == "__main__":
