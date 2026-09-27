@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from typing import Optional
 from unittest.mock import patch
 
 from scripts.tests.test_fastmlx_gguf_fit import build_gguf_bytes
