@@ -5944,5 +5944,340 @@ class AnnounceVerdictTestCase(unittest.TestCase):
         self.assertNotEqual(pass_verdict, no_go_verdict)
 
 
+# ---------------------------------------------------------------------
+# PREDECLARATION 2026-09-27: an unrecognized verdict is announced (never
+# refused -- the admission OUTCOME is pinned unchanged), and a malformed
+# nested card field no longer crashes `fastmlx serve`.
+# ---------------------------------------------------------------------
+UNRECOGNIZED_VERDICT_RAW_VALUES = ("no_go", "NO-GO", "NO_G", 123, ["NO_GO"])
+
+
+class UnrecognizedVerdictNoticeTestCase(unittest.TestCase):
+    """Pure-function coverage for ``unrecognized_verdict_notice`` -- the
+    notice-only helper ``fastmlx serve``/``fastmlx recommend`` both use to
+    surface an unrecognized (or missing) verdict WITHOUT changing
+    ``decide_admission``'s own outcome (see that helper's docstring).
+    """
+
+    # AC3 control: no card at all is no notice.
+    def test_no_card_is_no_notice(self):
+        self.assertIsNone(FASTMLX_LAUNCH.unrecognized_verdict_notice(None))
+
+    # AC3 control: every recognized verdict (the four real ones, plus the
+    # explicit UNMEASURED sentinel) is no notice.
+    def test_recognized_verdicts_are_no_notice(self):
+        for verdict in ("PASS", "REFERENCE", "EXACT", "NO_GO", "UNMEASURED"):
+            with self.subTest(verdict=verdict):
+                card = {"id": "x", "verdict": verdict}
+                # Reachability: the card really carries this verdict.
+                self.assertEqual(card["verdict"], verdict)
+                self.assertIsNone(FASTMLX_LAUNCH.unrecognized_verdict_notice(card))
+
+    # AC1b: a missing verdict key gets its OWN wording, never the
+    # "unrecognized verdict" wording a present-but-wrong value gets.
+    def test_missing_verdict_key_has_its_own_wording(self):
+        card = {"id": "missing-verdict@test"}
+        self.assertNotIn("verdict", card)  # reachability
+        notice = FASTMLX_LAUNCH.unrecognized_verdict_notice(card)
+        self.assertIsNotNone(notice)
+        self.assertIn("missing-verdict@test", notice)
+        self.assertIn("no verdict field", notice)
+        self.assertIn("treated as unmeasured", notice)
+        self.assertIn("upgrade fastmlx or fix the card", notice)
+        self.assertNotIn("unrecognized verdict", notice)
+
+    # AC1: all five raw unrecognized values -- the notice names the card
+    # id, a bounded repr of the raw value, "treated as unmeasured", and
+    # "upgrade fastmlx or fix the card".
+    def test_each_unrecognized_raw_value_is_named_and_treated_as_unmeasured(self):
+        for raw_verdict in UNRECOGNIZED_VERDICT_RAW_VALUES:
+            with self.subTest(raw_verdict=raw_verdict):
+                card = {"id": "unrecognized@test", "verdict": raw_verdict}
+                # Reachability: the card really carries this raw value.
+                self.assertEqual(card["verdict"], raw_verdict)
+                notice = FASTMLX_LAUNCH.unrecognized_verdict_notice(card)
+                self.assertIsNotNone(notice)
+                self.assertIn("unrecognized@test", notice)
+                self.assertIn("treated as unmeasured", notice)
+                self.assertIn("upgrade fastmlx or fix the card", notice)
+                self.assertIn(repr(raw_verdict), notice)
+
+    # M3 pin: decide_admission's own OUTCOME never changes for any of the
+    # five raw values -- still admit_unmeasured, still silent (message is
+    # None; the notice is a SEPARATE channel).
+    def test_decide_admission_outcome_unchanged_for_every_unrecognized_value(self):
+        for raw_verdict in UNRECOGNIZED_VERDICT_RAW_VALUES:
+            with self.subTest(raw_verdict=raw_verdict):
+                card = {"id": "x", "verdict": raw_verdict}
+                outcome, message = FASTMLX_LAUNCH.decide_admission(card, opted_in=False)
+                self.assertEqual(outcome, "admit_unmeasured")
+                self.assertIsNone(message)
+
+    # AC4: an over-length raw value containing CR/LF renders as a single
+    # line, bounded, with a truncation marker -- never the full raw value.
+    def test_notice_bounds_and_strips_an_overlong_crlf_verdict(self):
+        raw_verdict = "x" * 50 + "\r\n" + "y" * 10
+        card = {"id": "crlf@test", "verdict": raw_verdict}
+        self.assertIn("\r\n", card["verdict"])  # reachability
+        self.assertGreater(len(card["verdict"]), 40)
+        notice = FASTMLX_LAUNCH.unrecognized_verdict_notice(card)
+        self.assertIsNotNone(notice)
+        self.assertNotIn("\r", notice)
+        self.assertNotIn("\n", notice)
+        self.assertNotIn(raw_verdict, notice)
+        self.assertIn(FASTMLX_LAUNCH._NOTICE_TRUNCATION_MARKER, notice)
+
+    # AC4 (id side): the card id itself may be malformed too -- rendered
+    # through the same bounded repr, never interpolated raw.
+    def test_malformed_card_id_is_rendered_safely_too(self):
+        malformed_id = "z" * 50 + "\r\n" + "tail"
+        card = {"id": malformed_id, "verdict": 999}
+        notice = FASTMLX_LAUNCH.unrecognized_verdict_notice(card)
+        self.assertIsNotNone(notice)
+        self.assertNotIn("\r", notice)
+        self.assertNotIn("\n", notice)
+        self.assertNotIn(malformed_id, notice)
+
+
+class MalformedCardShapeTestCase(unittest.TestCase):
+    """Unit coverage: a malformed nested card field (a non-object
+    ``model``, a non-object ``legible``, an unhashable/non-string
+    ``verdict`` among tied siblings) must never crash -- see
+    ``fastmlx_launch._as_dict``'s docstring.
+    """
+
+    def test_find_cards_by_repo_skips_null_model_and_notices(self):
+        malformed = {"id": "malformed-null@test", "model": None}
+        wellformed = {"id": "wellformed@test", "model": {"repo": "r"}}
+        notices: list = []
+        matches = FASTMLX_LAUNCH.find_cards_by_repo(
+            [malformed, wellformed], "r", notices=notices
+        )
+        self.assertEqual([c["id"] for c in matches], ["wellformed@test"])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("malformed-null@test", notices[0])
+
+    def test_find_cards_by_repo_skips_string_model_and_notices(self):
+        malformed = {"id": "malformed-str@test", "model": "x"}
+        wellformed = {"id": "wellformed2@test", "model": {"repo": "r"}}
+        notices: list = []
+        matches = FASTMLX_LAUNCH.find_cards_by_repo(
+            [malformed, wellformed], "r", notices=notices
+        )
+        self.assertEqual([c["id"] for c in matches], ["wellformed2@test"])
+        self.assertEqual(len(notices), 1)
+        self.assertIn("malformed-str@test", notices[0])
+
+    def test_find_cards_by_pin_skips_non_object_model_without_crashing(self):
+        malformed = {"id": "malformed@test", "model": "x"}
+        revision = "a" * 40
+        self.assertIsNone(FASTMLX_LAUNCH.find_card_by_pin([malformed], revision))
+
+    def test_decide_admission_no_go_with_non_object_legible_still_refuses(self):
+        card = {"id": "x", "verdict": "NO_GO", "legible": "x"}
+        self.assertEqual(card["legible"], "x")  # reachability
+        outcome, message = FASTMLX_LAUNCH.decide_admission(card, opted_in=False)
+        self.assertEqual(outcome, "refuse_quality_flagged")
+        self.assertIsNotNone(message)
+
+    # AC5c: a list-valued verdict among tied siblings must never raise
+    # (unhashable) -- it counts as its own distinct verdict, so a mixed
+    # pool still refuses exit 3, exactly like any other mixed pool.
+    def test_resolve_card_mixed_pool_with_list_valued_verdict_exits_3(self):
+        repo = "example/UnhashableVerdictModel"
+        cards = [
+            _synthetic_card("a", repo, "PASS"),
+            {**_synthetic_card("b", repo, "PASS"), "verdict": ["NO_GO"]},
+        ]
+        # Reachability: the pool really is mixed (one string verdict, one
+        # list-valued one), not two identical verdicts.
+        self.assertEqual(cards[0]["verdict"], "PASS")
+        self.assertEqual(cards[1]["verdict"], ["NO_GO"])
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.resolve_card(
+                cards, repo, None, host_hardware_class=lambda: None
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+
+def _unrecognized_verdict_manifest_cards() -> list:
+    cards = []
+    for index, raw_verdict in enumerate(UNRECOGNIZED_VERDICT_RAW_VALUES):
+        cards.append(
+            {
+                "id": f"fixture-unrecognized-verdict-{index}@test",
+                "model": {"repo": f"example/UnrecognizedVerdict{index}Model"},
+                "verdict": raw_verdict,
+            }
+        )
+    # AC1b: the verdict key is entirely absent.
+    cards.append(
+        {
+            "id": "fixture-missing-verdict@test",
+            "model": {"repo": "example/MissingVerdictModel"},
+        }
+    )
+    return cards
+
+
+class UnrecognizedVerdictServeEndToEndTestCase(FastmlxLaunchTestCase):
+    """AC1/AC1b through the real CLI entry point (``fastmlx serve``, i.e.
+    ``FASTMLX_LAUNCH.main``): an unrecognized (or missing) verdict still
+    admits as UNMEASURED, on BOTH the implicit-resolution path and the
+    explicit ``--card-id`` path, with exactly one stderr notice.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.extra_cards = _unrecognized_verdict_manifest_cards()
+        manifest = fixture_manifest()
+        manifest["cards"] = manifest["cards"] + self.extra_cards
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def _assert_admits_unmeasured_with_notice(self, argv, card_id):
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        plan = self.last_json_line(stdout)
+        # Reachability: the resolved card really is the malformed one
+        # under test -- never None, never a different fixture card.
+        self.assertIsNotNone(plan["card"], stderr)
+        self.assertEqual(plan["card"]["id"], card_id)
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertEqual(stderr.count("treated as unmeasured"), 1, stderr)
+        self.assertIn(card_id, stderr)
+        self.assertIn("upgrade fastmlx or fix the card", stderr)
+        return stderr
+
+    def test_unrecognized_verdicts_admit_unmeasured_with_notice_implicit_resolution(self):
+        for card in self.extra_cards:
+            if "verdict" not in card:
+                continue
+            repo = card["model"]["repo"]
+            card_id = card["id"]
+            with self.subTest(card_id=card_id, path="implicit"):
+                argv = self.base_args(
+                    **{"--model-repo": repo, "--context": "2048"}
+                ) + ["--dry-run"]
+                stderr = self._assert_admits_unmeasured_with_notice(argv, card_id)
+                self.assertIn("unrecognized verdict", stderr)
+
+    def test_unrecognized_verdicts_admit_unmeasured_with_notice_via_card_id(self):
+        for card in self.extra_cards:
+            if "verdict" not in card:
+                continue
+            repo = card["model"]["repo"]
+            card_id = card["id"]
+            with self.subTest(card_id=card_id, path="card-id"):
+                argv = self.base_args(
+                    **{
+                        "--model-repo": repo,
+                        "--card-id": card_id,
+                        "--context": "2048",
+                    }
+                ) + ["--dry-run"]
+                stderr = self._assert_admits_unmeasured_with_notice(argv, card_id)
+                self.assertIn("unrecognized verdict", stderr)
+
+    def test_missing_verdict_key_admits_unmeasured_with_notice_both_paths(self):
+        card = next(c for c in self.extra_cards if "verdict" not in c)
+        repo = card["model"]["repo"]
+        card_id = card["id"]
+
+        implicit_argv = self.base_args(
+            **{"--model-repo": repo, "--context": "2048"}
+        ) + ["--dry-run"]
+        stderr = self._assert_admits_unmeasured_with_notice(implicit_argv, card_id)
+        self.assertIn("no verdict field", stderr)
+
+        card_id_argv = self.base_args(
+            **{"--model-repo": repo, "--card-id": card_id, "--context": "2048"}
+        ) + ["--dry-run"]
+        stderr = self._assert_admits_unmeasured_with_notice(card_id_argv, card_id)
+        self.assertIn("no verdict field", stderr)
+
+    # AC3 control, at the CLI level: the pre-existing fixture cards (real
+    # PASS/EXACT/NO_GO verdicts) never gain the new notice -- output stays
+    # exactly as it was before this change.
+    def test_real_verdicts_never_gain_the_new_notice(self):
+        for repo, opt_in in (
+            (PASS_REPO, None),
+            (EXACT_REPO, None),
+            (NO_GO_REPO, NO_GO_CARD_ID),
+        ):
+            with self.subTest(repo=repo):
+                overrides = {"--model-repo": repo, "--context": "2048"}
+                if opt_in:
+                    overrides["--accept-quality"] = opt_in
+                argv = self.base_args(**overrides) + ["--dry-run"]
+                code, stdout, stderr = self.run_main(argv)
+                self.assertEqual(code, 0, stderr)
+                self.assertNotIn("treated as unmeasured", stderr)
+                self.assertNotIn("upgrade fastmlx or fix the card", stderr)
+
+    # AC3 control: no card at all (no --model-repo, no receipt) never
+    # gains the new notice either.
+    def test_no_card_never_gains_the_new_notice(self):
+        argv = self.base_args(**{"--context": "2048"}) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("treated as unmeasured", stderr)
+
+
+class MalformedCardServeEndToEndTestCase(FastmlxLaunchTestCase):
+    """AC5/AC5b through the real CLI entry point: a malformed nested card
+    field elsewhere in the manifest must never crash ``fastmlx serve``.
+    """
+
+    def test_non_object_model_card_is_skipped_and_no_go_sibling_still_refuses(self):
+        manifest = fixture_manifest()
+        malformed_id = "malformed-model@test"
+        manifest["cards"].append({"id": malformed_id, "model": None, "verdict": "NO_GO"})
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        # Reachability: the manifest on disk really carries the malformed
+        # card, and the target NO_GO card is present and well-formed.
+        loaded = json.loads(self.manifest_path.read_text())
+        malformed_cards = [c for c in loaded["cards"] if c["id"] == malformed_id]
+        self.assertEqual(len(malformed_cards), 1)
+        self.assertIsNone(malformed_cards[0]["model"])
+        no_go_cards = [c for c in loaded["cards"] if c["id"] == NO_GO_CARD_ID]
+        self.assertEqual(len(no_go_cards), 1)
+        self.assertEqual(no_go_cards[0]["model"]["repo"], NO_GO_REPO)
+
+        argv = self.base_args(**{"--model-repo": NO_GO_REPO, "--context": "2048"}) + [
+            "--dry-run"
+        ]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(NO_GO_CARD_ID, stderr)
+        self.assertIn(malformed_id, stderr)
+
+    def test_no_go_card_with_non_object_legible_still_refuses_exit_2(self):
+        manifest = fixture_manifest()
+        malformed_no_go_id = "malformed-legible-no-go@test"
+        malformed_no_go_repo = "example/MalformedLegibleNoGoModel"
+        manifest["cards"].append(
+            {
+                "id": malformed_no_go_id,
+                "model": {"repo": malformed_no_go_repo},
+                "verdict": "NO_GO",
+                "legible": "x",
+            }
+        )
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        loaded = json.loads(self.manifest_path.read_text())
+        matched = [c for c in loaded["cards"] if c["id"] == malformed_no_go_id]
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(matched[0]["legible"], "x")
+
+        argv = self.base_args(
+            **{"--model-repo": malformed_no_go_repo, "--context": "2048"}
+        ) + ["--dry-run"]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(malformed_no_go_id, stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

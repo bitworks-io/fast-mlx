@@ -210,17 +210,22 @@ def _print_recommend_no_model_identity_hint(subject: str) -> None:
 def _card_summary(card: Optional[dict]) -> Optional[dict]:
     if card is None:
         return None
-    legible = card.get("legible") or {}
+    # The loader does no card-shape validation, so every nested field below
+    # is guarded with ``launch._as_dict`` (not ``... or {}``, which lets a
+    # truthy non-dict value -- a string, a list -- through unchanged and
+    # crashes the next ``.get()``): a malformed ``legible``/``benefit``/
+    # ``nextWordDrift`` must never crash this summary.
+    legible = launch._as_dict(card.get("legible"))
     summary = {
         "id": card.get("id"),
         "verdict": card.get("verdict"),
         "tier": legible.get("tier"),
         "headline": legible.get("headline"),
     }
-    top1 = (legible.get("nextWordDrift") or {}).get("top1AgreementPct")
+    top1 = launch._as_dict(legible.get("nextWordDrift")).get("top1AgreementPct")
     if isinstance(top1, (int, float)) and not isinstance(top1, bool):
         summary["top1AgreementPct"] = top1
-    benefit = legible.get("benefit") or {}
+    benefit = launch._as_dict(legible.get("benefit"))
     status = benefit.get("speedXStatus")
     if status is not None:
         # speedXStatus carries the only measurement boundary fast-mlx has
@@ -307,6 +312,7 @@ def build_row(
         "engineBuild": None,
         "mtp": None,
         "tiebreakNotice": None,
+        "verdictNotice": None,
     }
 
     if not model_path.is_dir():
@@ -348,6 +354,8 @@ def build_row(
             engine_build_commit=engine_build_commit,
             host_hardware_class=resolved_host_hardware_class,
             notices=notices,
+            # Kept apart so `notices` holds only the tiebreak notice.
+            shape_notices=[],
         )
     except launch.LaunchRefusal as refusal:
         row["status"] = STATUS_ERROR
@@ -360,6 +368,11 @@ def build_row(
     # mirrors how `row["engineBuild"]`/`row["mtp"]` are always present
     # (initialized above) even on rows that return early.
     row["tiebreakNotice"] = notices[0] if notices else None
+    # Same reasoning: an unrecognized/missing-verdict notice must survive
+    # into a does-not-fit/error row too, never only a recommended/opt-in/
+    # uncarded one -- see the "not recommended: no measured quality card"
+    # override further down for the uncarded case specifically.
+    row["verdictNotice"] = launch.unrecognized_verdict_notice(card)
 
     # Engine-build status/notice: informational only, never gates a row's
     # status/verdict (mirrors fastmlx serve -- see docs/quality-card-schema-v1.md
@@ -507,7 +520,12 @@ def build_row(
     else:  # "admit_unmeasured": no card, or an UNMEASURED/unrecognized verdict
         row["status"] = STATUS_UNCARDED
         row["card"] = _card_summary(card)
-        row["message"] = "not recommended: no measured quality card"
+        # A card WITH an unrecognized verdict is a different fact than "no
+        # measured quality card at all" (no card, or an explicit
+        # UNMEASURED) -- show the verdict notice instead of the generic
+        # message so an operator can tell a misspelled/malformed verdict
+        # apart from a pack that was simply never measured.
+        row["message"] = row["verdictNotice"] or "not recommended: no measured quality card"
 
     return row
 
@@ -632,6 +650,9 @@ def _format_row_text(rank: int, row: dict) -> str:
     tiebreak_notice = row.get("tiebreakNotice")
     if tiebreak_notice and tiebreak_notice not in (row.get("message") or ""):
         tail += f" {tiebreak_notice}"
+    verdict_notice = row.get("verdictNotice")
+    if verdict_notice and verdict_notice not in (row.get("message") or ""):
+        tail += f" {verdict_notice}"
     lines.append(tail)
     return "\n".join(lines)
 

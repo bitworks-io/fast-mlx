@@ -2294,6 +2294,39 @@ class RecommendTiebreakNoticeTestCase(unittest.TestCase):
         self.assertNotIn("None", row["tiebreakNotice"])
         self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m3ultra")
 
+    # (d) A malformed-`model` card elsewhere in the manifest must never be
+    # reported as the tiebreak notice: `build_row` reads `notices[0]` as
+    # `tiebreakNotice`, so the malformed-card notice is kept out of that
+    # list. Both arms first assert the malformed card is present and
+    # really is skipped by `find_cards_by_repo` (reachability).
+    def _cards_with_a_malformed_model_card(self) -> list:
+        malformed = {"id": "zz-malformed-model", "model": None, "verdict": "PASS"}
+        shape_notices: list = []
+        FASTMLX_RECOMMEND.launch.find_cards_by_repo(
+            [malformed], P3_SHARED_REPO_AND_PIN_REPO, notices=shape_notices
+        )
+        self.assertEqual(len(shape_notices), 1)
+        self.assertIn("zz-malformed-model", shape_notices[0])
+        return [malformed, *self.real_cards]
+
+    def test_malformed_model_card_is_not_reported_as_the_tiebreak(self):
+        self.real_cards = self._cards_with_a_malformed_model_card()
+        row = self.qwen_row(self.green_fit_bin, host_hardware_class=lambda: "apple-m4-max")
+
+        expected = FASTMLX_RECOMMEND.launch.tiebreak_notice(
+            "qwen3-0p6b-4bit@m3ultra",
+            ["qwen3-0p6b-4bit@m3ultra", "qwen3-0p6b-4bit@m5"],
+            "apple-m4-max",
+        )
+        self.assertEqual(row["tiebreakNotice"], expected)
+
+    def test_malformed_model_card_without_a_tie_leaves_tiebreak_null(self):
+        self.real_cards = self._cards_with_a_malformed_model_card()
+        row = self.qwen_row(self.green_fit_bin, host_hardware_class=lambda: "apple-m5")
+
+        self.assertIsNone(row["tiebreakNotice"])
+        self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m5")
+
     # (e) A does-not-fit row (RED fit check verdict) still carries the
     # notice: it must be set BEFORE the fit-check logic runs, so a card
     # resolved via the tiebreak is never silently dropped from a
@@ -2385,6 +2418,119 @@ class RecommendTiebreakNoticeTestCase(unittest.TestCase):
             )
         self.assertIsNone(row["tiebreakNotice"])
         self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m5")
+
+
+# ---------------------------------------------------------------------
+# PREDECLARATION 2026-09-27: `fastmlx recommend` surfaces the SAME
+# unrecognized-verdict notice `fastmlx serve` does (AC2), via a new
+# ``verdictNotice`` row field (JSON) and its text-row rendering. Row
+# status/exit-code classification is UNCHANGED -- see
+# ``fastmlx_launch.unrecognized_verdict_notice`` for the notice-only
+# contract this reuses verbatim.
+# ---------------------------------------------------------------------
+UNRECOGNIZED_VERDICT_RAW_VALUES = ("no_go", "NO-GO", "NO_G", 123, ["NO_GO"])
+
+
+def _unrecognized_verdict_manifest_cards() -> list:
+    cards = []
+    for index, raw_verdict in enumerate(UNRECOGNIZED_VERDICT_RAW_VALUES):
+        cards.append(
+            {
+                "id": f"fixture-unrecognized-verdict-{index}@test",
+                "model": {"repo": f"example/UnrecognizedVerdict{index}Model"},
+                "verdict": raw_verdict,
+            }
+        )
+    # AC1b: the verdict key is entirely absent.
+    cards.append(
+        {
+            "id": "fixture-missing-verdict@test",
+            "model": {"repo": "example/MissingVerdictModel"},
+        }
+    )
+    return cards
+
+
+class UnrecognizedVerdictRecommendTestCase(FastmlxRecommendTestCase):
+    def setUp(self):
+        super().setUp()
+        self.extra_cards = _unrecognized_verdict_manifest_cards()
+        manifest = fixture_manifest()
+        manifest["cards"] = manifest["cards"] + self.extra_cards
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    # AC2 (json): every unrecognized raw value's row carries a
+    # ``verdictNotice`` string naming the card, and the generic "not
+    # recommended" message is REPLACED by it (still status "uncarded").
+    def test_json_row_carries_verdict_notice_for_each_unrecognized_value(self):
+        for card in self.extra_cards:
+            if "verdict" not in card:
+                continue
+            repo = card["model"]["repo"]
+            card_id = card["id"]
+            with self.subTest(card_id=card_id):
+                model_dir = self.make_model_dir(card_id.replace("@", "-"), repo=repo)
+                code, doc, stderr = self.run_json(self.base_argv([model_dir]))
+                self.assertEqual(code, 1, stderr)
+                row = doc["rows"][0]
+                # Reachability: the row's card really is the malformed one
+                # under test.
+                self.assertIsNotNone(row["card"])
+                self.assertEqual(row["card"]["id"], card_id)
+                self.assertEqual(row["status"], "uncarded")
+                self.assertIsNotNone(row["verdictNotice"])
+                self.assertIn(card_id, row["verdictNotice"])
+                self.assertIn("treated as unmeasured", row["verdictNotice"])
+                self.assertIn("upgrade fastmlx or fix the card", row["verdictNotice"])
+                self.assertEqual(row["message"], row["verdictNotice"])
+
+    # AC2 (text): the same notice reaches the text rendering.
+    def test_text_row_carries_verdict_notice(self):
+        card = self.extra_cards[0]
+        repo = card["model"]["repo"]
+        card_id = card["id"]
+        model_dir = self.make_model_dir("text-row-model", repo=repo)
+        code, stdout, stderr = self.run_main(self.base_argv([model_dir]))
+        self.assertEqual(code, 1, stderr)
+        self.assertIn(card_id, stdout)
+        self.assertIn("treated as unmeasured", stdout)
+
+    # AC1b, at the recommend level: the missing-verdict wording differs
+    # from the unrecognized-verdict wording, exactly like on the serve
+    # side.
+    def test_missing_verdict_key_json_row_has_its_own_notice(self):
+        card = next(c for c in self.extra_cards if "verdict" not in c)
+        repo = card["model"]["repo"]
+        self.assertNotIn("verdict", card)  # reachability
+        model_dir = self.make_model_dir("missing-verdict-model", repo=repo)
+        code, doc, stderr = self.run_json(self.base_argv([model_dir]))
+        self.assertEqual(code, 1, stderr)
+        row = doc["rows"][0]
+        self.assertEqual(row["card"]["id"], card["id"])
+        self.assertIn("no verdict field", row["verdictNotice"])
+        self.assertNotIn("unrecognized verdict", row["verdictNotice"])
+
+    # AC3 controls: no card, an explicit UNMEASURED, and each of the four
+    # real verdicts never carry a verdictNotice -- status/message stay
+    # exactly as they were before this change.
+    def test_controls_have_no_verdict_notice(self):
+        cases = (
+            (UNCARDED_REPO, "uncarded"),
+            (UNMEASURED_REPO, "uncarded"),
+            (PASS_REPO, "recommended"),
+            (REFERENCE_REPO, "recommended"),
+            (EXACT_REPO, "recommended"),
+            (NO_GO_REPO, "opt-in"),
+        )
+        for repo, expected_status in cases:
+            with self.subTest(repo=repo):
+                model_dir = self.make_model_dir(
+                    f"control-{repo.rsplit('/', 1)[-1]}", repo=repo
+                )
+                code, doc, stderr = self.run_json(self.base_argv([model_dir]))
+                row = doc["rows"][0]
+                self.assertEqual(row["status"], expected_status, stderr)
+                self.assertIsNone(row["verdictNotice"])
 
 
 if __name__ == "__main__":

@@ -573,6 +573,59 @@ def run_fit_check(
 # ---------------------------------------------------------------------
 # 2. Quality-card admission: mirrors HarnessCore/QualityAdmission.swift.
 # ---------------------------------------------------------------------
+def _as_dict(value) -> dict:
+    """``value`` if it is a dict, else ``{}`` -- the safe guard a nested
+    card field access needs before the next ``.get()``. ``value or {}`` is
+    NOT equivalent: a truthy non-dict (a non-empty string, a list, an int)
+    passes straight through and crashes the following ``.get()``, which is
+    exactly how a hand-edited/malformed quality card (``"model": "x"``,
+    ``"legible": "x"``, ...) used to crash every ``fastmlx serve``/
+    ``fastmlx recommend`` that scanned it. ``load_quality_cards`` never
+    validates a card against the schema, so every nested field this module
+    reads from a resolved card must go through this (or an equivalent
+    ``isinstance`` check) rather than assuming the shape a well-formed card
+    has.
+    """
+    return value if isinstance(value, dict) else {}
+
+
+_NOTICE_REPR_MAX_LEN = 40
+_NOTICE_TRUNCATION_MARKER = "…"
+
+
+def _bounded_repr(value, max_len: int = _NOTICE_REPR_MAX_LEN) -> str:
+    """``repr(value)``, bounded to at most ``max_len`` characters -- used
+    for any raw, untrusted card field (a verdict, a malformed id) embedded
+    in an operator-facing notice. ``repr()`` alone already renders any
+    embedded control character (a raw ``\\r``/``\\n``) as a printable
+    two-character escape sequence, never a raw byte, so bounding the
+    LENGTH is the only remaining guard a notice built from an arbitrary
+    card field needs to stay a single line. A truncated result ends in
+    ``_NOTICE_TRUNCATION_MARKER`` so it is never mistaken for the whole
+    value.
+    """
+    text = repr(value)
+    if len(text) <= max_len:
+        return text
+    keep = max(0, max_len - len(_NOTICE_TRUNCATION_MARKER))
+    return text[:keep] + _NOTICE_TRUNCATION_MARKER
+
+
+def malformed_model_card_notice(card: dict) -> str:
+    """One stderr line naming a card whose ``model`` field is not an
+    object: it cannot identify a pack by ``repo`` or ``hfPin``, so
+    ``find_cards_by_repo`` skips it entirely (see that function) rather
+    than raising on the next ``.get()``. The card's own ``id`` may ALSO be
+    malformed, so it is rendered through the same bounded ``repr()`` as
+    ``unrecognized_verdict_notice`` uses.
+    """
+    card_id = _bounded_repr(card.get("id") if isinstance(card, dict) else None)
+    return (
+        f"quality card {card_id} has a missing or non-object 'model' field "
+        "and cannot identify a pack; skipped."
+    )
+
+
 def load_quality_cards(path: Path) -> Optional[list]:
     """Decode a ``fast-mlx-quality-card-v1`` manifest's ``cards`` list.
 
@@ -600,19 +653,36 @@ def find_card_by_id(cards: list, card_id: str) -> Optional[dict]:
     return None
 
 
-def find_cards_by_repo(cards: list, repo: Optional[str]) -> list:
+def find_cards_by_repo(
+    cards: list, repo: Optional[str], notices: Optional[list] = None
+) -> list:
     """Every card matching ``repo`` exactly, in list order -- the plural form
     ``resolve_card`` uses to detect when a repo names MORE than one card
     (the "multiple cards for one pack" engine-build-disambiguation case; see
     ``docs/quality-card-schema-v1.md`` "Engine build").
+
+    A card whose ``model`` field is present but not an object cannot
+    identify a pack at all -- it matches nothing, is skipped rather than
+    raising on ``model.get("repo")``, and (when ``notices`` is not
+    ``None``) a notice naming it is appended, exactly once per malformed
+    card, regardless of what ``repo`` is being searched for -- this is the
+    only scan that visits every card in the manifest, so it is the single
+    place that can ever surface the defect to the operator.
     """
     if repo is None:
         return []
-    return [
-        card
-        for card in cards
-        if isinstance(card, dict) and card.get("model", {}).get("repo") == repo
-    ]
+    matches = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        model = card.get("model")
+        if not isinstance(model, dict):
+            if notices is not None:
+                notices.append(malformed_model_card_notice(card))
+            continue
+        if model.get("repo") == repo:
+            matches.append(card)
+    return matches
 
 
 def find_card_by_repo(cards: list, repo: Optional[str]) -> Optional[dict]:
@@ -667,7 +737,14 @@ def find_cards_by_pin(cards: list, model_revision: Optional[str]) -> list:
     for card in cards:
         if not isinstance(card, dict):
             continue
-        hf_pin = (card.get("model") or {}).get("hfPin")
+        model = card.get("model")
+        if not isinstance(model, dict):
+            # A malformed 'model' is already named by find_cards_by_repo's
+            # own notice (called first, over the same card list, whenever
+            # a repo is being resolved) -- skipping silently here avoids a
+            # duplicate notice for the same card.
+            continue
+        hf_pin = model.get("hfPin")
         if _hf_pin_matches_revision(hf_pin, model_revision):
             matches.append(card)
     return matches
@@ -965,12 +1042,21 @@ def _card_identity(card: dict) -> tuple:
     divergence here would make the two runtimes reach different verdicts
     for the same manifest.
     """
-    model = card.get("model") or {}
+    model = _as_dict(card.get("model"))
+    verdict = card.get("verdict")
     return (
         card.get("id"),
         model.get("repo"),
         model.get("hfPin"),
-        card.get("verdict"),
+        # The loader does no card-shape validation, so ``verdict`` may be
+        # unhashable (a list, a dict) -- this tuple is later put into a
+        # SET (see resolve_card's repo/pin ambiguity check), so an
+        # unhashable element here would raise TypeError before that check
+        # ever ran. Keyed the same hashable-safe way as the tiebreak
+        # verdict set below: the verdict itself when it is a str, else its
+        # ``repr()`` -- still distinguishes any two differently-malformed
+        # verdicts from each other.
+        verdict if isinstance(verdict, str) else repr(verdict),
         card_hardware_class(card),
     )
 
@@ -1000,6 +1086,7 @@ def resolve_card(
     engine_build_commit: Optional[str] = None,
     host_hardware_class=host_hardware_class,
     notices: Optional[list] = None,
+    shape_notices: Optional[list] = None,
 ) -> Optional[dict]:
     """The implicit (no ``--card-id``) lookup: a repo match (Swift semantics)
     OR an hfPin-prefix match against the model's pinned revision. If both
@@ -1081,7 +1168,14 @@ def resolve_card(
         for card in cards
         if isinstance(card, dict) and card_residency(card) == residency
     ]
-    repo_cards = find_cards_by_repo(residency_cards, model_repo)
+    # Malformed-card notices go to ``shape_notices`` when the caller keeps
+    # them apart (``fastmlx recommend`` reads ``notices`` as the tiebreak
+    # notice), else into ``notices`` alongside it (``fastmlx serve`` prints both).
+    repo_cards = find_cards_by_repo(
+        residency_cards,
+        model_repo,
+        notices=shape_notices if shape_notices is not None else notices,
+    )
     pin_cards = find_cards_by_pin(residency_cards, model_revision)
     repo_ids = {card.get("id") for card in repo_cards}
     pin_ids = {card.get("id") for card in pin_cards}
@@ -1170,7 +1264,18 @@ def resolve_card(
             f"{len(candidates)} cards for this pack are tied and at least one "
             "has no string id, so they cannot be told apart; pass --card-id",
         )
-    verdicts = {card.get("verdict") for card in candidates}
+    # The loader does no card-shape validation, so ``verdict`` may be an
+    # unhashable value (a list, a dict) -- keying the set on the raw value
+    # directly would raise TypeError. Keyed on the verdict itself when it
+    # is a str (the well-formed case, unchanged), else on its ``repr()``:
+    # an unhashable/non-string verdict simply counts as its own distinct
+    # verdict, so a mixed pool (one real string verdict plus one
+    # list-valued one) still refuses (exit 3) exactly like any other mixed
+    # pool, rather than crashing.
+    verdicts = {
+        verdict if isinstance(verdict, str) else repr(verdict)
+        for verdict in (card.get("verdict") for card in candidates)
+    }
     if len(verdicts) == 1:
         candidate_ids = sorted(card.get("id") for card in candidates)
         chosen_id = candidate_ids[0]
@@ -1211,7 +1316,7 @@ def card_matches_model_identity(
     model identity -- used to gate an explicit ``--card-id``, which must
     never be trusted as an unverified operator assertion.
     """
-    model = card.get("model") or {}
+    model = _as_dict(card.get("model"))
     repo = model.get("repo")
     if repo is not None and model_repo is not None and repo == model_repo:
         return True
@@ -1224,7 +1329,7 @@ def is_opted_in(card: Optional[dict], opt_in_ids: set) -> bool:
     """
     if card is None:
         return False
-    model = card.get("model") or {}
+    model = _as_dict(card.get("model"))
     for candidate in (card.get("id"), model.get("repo"), model.get("hfPin")):
         if candidate is not None and candidate in opt_in_ids:
             return True
@@ -1264,7 +1369,8 @@ def card_benefit_line(card: Optional[dict]) -> Optional[str]:
     """
     if card is None:
         return None
-    benefit = (card.get("legible") or {}).get("benefit")
+    legible = _as_dict(card.get("legible"))
+    benefit = _as_dict(legible.get("benefit"))
     if not benefit:
         return None
 
@@ -1300,7 +1406,8 @@ def card_fit_line(card: Optional[dict]) -> Optional[str]:
     """
     if card is None:
         return None
-    benefit = (card.get("legible") or {}).get("benefit")
+    legible = _as_dict(card.get("legible"))
+    benefit = _as_dict(legible.get("benefit"))
     if not benefit:
         return None
     fit = benefit.get("fit")
@@ -1371,7 +1478,7 @@ def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
     if verdict != "NO_GO":
         return ("admit_unmeasured", None)
 
-    legible = card.get("legible") or {}
+    legible = _as_dict(card.get("legible"))
     summary = f"{legible.get('tier')}: {legible.get('headline')}"
     # The cost (tier/headline) must never be shown without the benefit it
     # buys -- the operator deciding whether to opt in is exactly who needs
@@ -1403,6 +1510,57 @@ def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
     # so its refusal message stays byte-identical to before this change.
     separator = " - " if len(clauses) > 1 else " "
     return ("refuse_quality_flagged", summary + separator + hint)
+
+
+_RECOGNIZED_VERDICTS = ("PASS", "REFERENCE", "EXACT", "NO_GO", "UNMEASURED")
+
+
+def unrecognized_verdict_notice(card: Optional[dict]) -> Optional[str]:
+    """A stderr-facing notice for an admitted-unmeasured card whose
+    ``verdict`` field ``decide_admission`` did NOT recognize -- ``None``
+    for a well-formed card (``verdict`` one of ``_RECOGNIZED_VERDICTS``)
+    and for ``card is None``.
+
+    This is a NOTICE-ONLY helper: it never changes ``decide_admission``'s
+    outcome (an unrecognized verdict still silently admits as UNMEASURED,
+    mirroring the Swift ``QualityVerdict`` decoder's own fail-closed
+    default -- see ``decide_admission``'s docstring). It exists ONLY so
+    that silent admission is no longer also a SILENT operator-facing
+    event: a misspelled/mistyped/newer-schema verdict string now surfaces
+    exactly once, on stderr, rather than being indistinguishable from a
+    card that never carried a verdict at all.
+
+    Two distinct wordings, both naming the card id:
+    - the ``verdict`` key is entirely absent -- "no verdict" wording.
+    - ``verdict`` is present but not one of the five recognized strings
+      (a misspelling, a wrong type, a future schema's sixth verdict) --
+      "unrecognized verdict" wording, which also shows a BOUNDED
+      ``repr()`` of the raw value (see ``_bounded_repr``): the raw value
+      is untrusted (may be arbitrarily long, or contain control
+      characters), and ``repr()`` renders any embedded ``\\r``/``\\n`` as
+      a printable escape rather than a raw byte, so the returned notice
+      is always exactly one line.
+
+    The card's own ``id`` is rendered through the same bounded ``repr()``
+    -- the loader does no card-shape validation, so ``id`` itself may be
+    malformed (missing, non-string, or containing control characters).
+    """
+    if not isinstance(card, dict):
+        return None
+    card_id = _bounded_repr(card.get("id"))
+    if "verdict" not in card:
+        return (
+            f"quality card {card_id} has no verdict field; treated as "
+            "unmeasured. upgrade fastmlx or fix the card."
+        )
+    verdict = card.get("verdict")
+    if verdict in _RECOGNIZED_VERDICTS:
+        return None
+    raw = _bounded_repr(verdict)
+    return (
+        f"quality card {card_id} has unrecognized verdict {raw}; treated "
+        "as unmeasured. upgrade fastmlx or fix the card."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -2685,6 +2843,14 @@ def _run_serve(args, passthrough_args: list) -> int:
     opt_in_ids = set(args.accept_quality)
     opted_in = is_opted_in(card, opt_in_ids)
     outcome, message = decide_admission(card, opted_in)
+    # Never fires for a NO_GO card (unrecognized_verdict_notice returns
+    # None for every recognized verdict, NO_GO included), so this never
+    # changes the refuse_quality_flagged message built just below -- it is
+    # relevant only to the two silent-admit outcomes. Computed for the
+    # resolved card on BOTH the --card-id path and implicit resolution
+    # (whichever one set ``card`` above), so an unrecognized verdict is
+    # announced regardless of how the card was found.
+    verdict_notice = unrecognized_verdict_notice(card)
     if outcome == "refuse_quality_flagged":
         notice_texts = " ".join(
             notice for notice in (build_notice, mtp_notice, *resolve_notices) if notice
@@ -2697,6 +2863,8 @@ def _run_serve(args, passthrough_args: list) -> int:
         print(f"fastmlx serve: {build_notice}", file=sys.stderr)
     if mtp_notice:
         print(f"fastmlx serve: {mtp_notice}", file=sys.stderr)
+    if verdict_notice:
+        print(f"fastmlx serve: {verdict_notice}", file=sys.stderr)
     for resolve_notice in resolve_notices:
         print(f"fastmlx serve: {resolve_notice}", file=sys.stderr)
 
