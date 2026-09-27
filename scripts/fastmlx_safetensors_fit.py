@@ -373,6 +373,34 @@ def _iter_regular_files(model_path: Path):
                 yield child_path.relative_to(model_path).as_posix(), child_path
 
 
+def _contains_safetensors_symlink(model_path: Path) -> bool:
+    """Returns True if a symlink whose name ends in ``.safetensors`` exists
+    anywhere under ``model_path``, scoped exactly like
+    ``_iter_regular_files`` (a dot-prefixed entry is skipped, and a
+    symlinked directory is never descended into). Only the symlink's own
+    name is inspected -- its target is never resolved, opened, or sized --
+    because this is used solely to word a refusal message, never to size
+    anything (a Hugging Face hub snapshot directory is exactly this
+    shape: every weight file is a symlink into ``../../blobs/``)."""
+    stack = [model_path]
+    while stack:
+        current = stack.pop()
+        try:
+            children = sorted(os.scandir(current), key=lambda e: e.name)
+        except OSError:
+            return False
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            if child.is_symlink():
+                if child.name.endswith(".safetensors"):
+                    return True
+                continue
+            if child.is_dir(follow_symlinks=False):
+                stack.append(Path(child.path))
+    return False
+
+
 def _check_safetensors_index(model_path: Path, weight_by_relative: dict) -> None:
     """If a top-level ``model.safetensors.index.json`` is present, every
     shard filename its ``weight_map`` names must exist and be among the
@@ -460,6 +488,19 @@ def compute_model_bytes(model_path: Path, mmap_side_files: Optional[list] = None
             )
 
     if not weight_files:
+        if _contains_safetensors_symlink(model_path):
+            raise FitCheckError(
+                f"no regular .safetensors files found under {model_path}: "
+                "its weight files are symlinks (this looks like a Hugging "
+                "Face hub snapshot directory, whose files link into "
+                "blobs/). This checker only sizes real on-disk bytes it "
+                "can verify, so it never follows symlinks. Materialize a "
+                "pack it can size: `fastmlx pull <repo>@<revision> --dest "
+                "<new-dir>` (downloads real files), or copy the snapshot "
+                "with `cp -RL <snapshot-dir> <new-dir>` and verify it in "
+                "place with `fastmlx pull <repo>@<revision> --dest "
+                "<new-dir> --adopt`; then point at <new-dir>."
+            )
         raise FitCheckError(f"no .safetensors files found under {model_path}")
 
     for requested in requested_side_files:

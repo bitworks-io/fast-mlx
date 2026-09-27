@@ -217,6 +217,14 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 `recommend` read it to find the model's quality card. A pack whose card says NO_GO is refused until
 you opt in with `--accept-quality <card-id>`, so a measured quality cost is never applied silently.
 
+One pack can carry several cards -- the same pack measured on different hardware. A NO_GO card
+always takes precedence over admitting ones. Among the rest, `serve` picks the card measured on this
+Mac's chip when exactly one matches, then the one measured with this launch's engine build;
+otherwise, when the tied cards share a verdict, it takes the lowest card id and prints a notice
+naming the chosen id and every tied one. Tied cards with different verdicts are refused rather than
+picked. `--accept-quality` matches the chosen card's id,
+the model's repo name, or its pinned revision, and `--card-id <id>` selects a specific card instead.
+
 A card states what a pack **buys**, not only what it costs, and both surfaces say so at the moment
 you choose. Alongside the quality cost, `serve`'s admission message and each `recommend` row carry
 the card's measured benefit as two separately labelled facts -- `speed:` (a decode-throughput ratio)
@@ -742,16 +750,16 @@ Behaviour to know:
   write so concurrent requests' lines cannot interleave. Headers and bodies, including
   `Authorization`, are never logged.
 
-### Install a prebuilt release (v0.1.4)
+### Install a prebuilt release (v0.1.5)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its
 checksum file, verify, then extract:
 
 ```sh
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.4/fastmlx-0.1.4-arm64-macos.tar.gz
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.4/fastmlx-0.1.4-arm64-macos.tar.gz.sha256
-shasum -a 256 -c fastmlx-0.1.4-arm64-macos.tar.gz.sha256
-tar -xzf fastmlx-0.1.4-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.5/fastmlx-0.1.5-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.5/fastmlx-0.1.5-arm64-macos.tar.gz.sha256
+shasum -a 256 -c fastmlx-0.1.5-arm64-macos.tar.gz.sha256
+tar -xzf fastmlx-0.1.5-arm64-macos.tar.gz
 ```
 
 The binaries are unsigned and not notarized. A `curl` download carries no quarantine attribute, so
@@ -759,14 +767,14 @@ nothing further is needed; a browser download does, and macOS will refuse to run
 the tarball until you clear it:
 
 ```sh
-xattr -dr com.apple.quarantine fastmlx-0.1.4-arm64-macos
+xattr -dr com.apple.quarantine fastmlx-0.1.5-arm64-macos
 ```
 
 Add the extracted `bin` directory to `PATH` (or symlink `bin/fastmlx` into a directory already on
 it), then run it:
 
 ```sh
-export PATH="$PWD/fastmlx-0.1.4-arm64-macos/bin:$PATH"
+export PATH="$PWD/fastmlx-0.1.5-arm64-macos/bin:$PATH"
 fastmlx --help
 fastmlx capacity --help
 ```

@@ -299,6 +299,83 @@ class RecursiveShardDiscoveryTests(unittest.TestCase):
         )
 
 
+class HubSnapshotSymlinkTests(unittest.TestCase):
+    """A Hugging Face hub snapshot directory is a symlink farm into
+    ../../blobs/: every weight file is a symlink, so the no-follow walk
+    finds zero weight files. That invariant must not change; the refusal
+    must instead name the cause (symlinks) and a working route (a plain
+    fastmlx pull into a new directory, or cp -RL then pull --adopt) instead
+    of just "no .safetensors files found"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_snapshot_symlink_farm_names_cause_and_route(self):
+        blob_path = self.root / "blobs" / "abc"
+        blob_path.parent.mkdir(parents=True)
+        write_file(blob_path, b"not sized: this checker never follows symlinks")
+
+        snapshot_dir = self.root / "snapshots" / ("a" * 40)
+        snapshot_dir.mkdir(parents=True)
+        (snapshot_dir / "model.safetensors").symlink_to(
+            Path("..") / ".." / "blobs" / "abc"
+        )
+        write_file(snapshot_dir / "config.json", b"{}")
+
+        with self.assertRaises(FIT.FitCheckError) as ctx:
+            FIT.compute_model_bytes(snapshot_dir)
+        message = str(ctx.exception)
+        self.assertIn("symlink", message)
+        self.assertIn("fastmlx pull", message)
+        # Not just the --adopt route: --adopt refuses a fresh destination
+        # and refuses symlinked files (scripts/fastmlx_pull.py), so the
+        # message must also offer a working route -- a plain `pull` into a
+        # new directory, or a `cp -RL` materialize-then-adopt.
+        self.assertIn("cp -RL", message)
+        self.assertIn("--dest <new-dir>`", message)
+
+    def test_no_symlinks_keeps_the_original_message(self):
+        write_file(self.root / "config.json", b"{}")
+
+        with self.assertRaises(FIT.FitCheckError) as ctx:
+            FIT.compute_model_bytes(self.root)
+        self.assertEqual(
+            str(ctx.exception), f"no .safetensors files found under {self.root}"
+        )
+
+    def test_real_shard_alongside_a_symlinked_one_sizes_only_the_real_shard(self):
+        blob = build_safetensors_bytes(
+            [("t.a", "F32", [4], zero_tensor_bytes("F32", [4]))]
+        )
+        write_file(self.root / "model-real.safetensors", blob)
+
+        blob_path = self.root / "blobs" / "abc"
+        blob_path.parent.mkdir(parents=True)
+        write_file(blob_path, b"not sized: this checker never follows symlinks")
+        (self.root / "model-linked.safetensors").symlink_to(
+            Path("blobs") / "abc"
+        )
+
+        weight_bytes, weight_files, _side = FIT.compute_model_bytes(self.root)
+        self.assertEqual(weight_bytes, len(blob))
+        self.assertEqual(
+            [f["name"] for f in weight_files], ["model-real.safetensors"]
+        )
+
+    def test_dangling_symlink_also_gets_the_signpost_message(self):
+        (self.root / "x.safetensors").symlink_to(self.root / "does-not-exist")
+
+        with self.assertRaises(FIT.FitCheckError) as ctx:
+            FIT.compute_model_bytes(self.root)
+        message = str(ctx.exception)
+        self.assertIn("symlink", message)
+        self.assertIn("fastmlx pull", message)
+        self.assertIn("cp -RL", message)
+        self.assertIn("--dest <new-dir>`", message)
+
+
 class SafetensorsIndexTests(unittest.TestCase):
     """A top-level model.safetensors.index.json must name only shards this
     checker actually found and counted."""
