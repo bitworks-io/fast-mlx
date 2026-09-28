@@ -5580,6 +5580,9 @@ class PublicSiteTests(unittest.TestCase):
     EXPECTED_ENGINE_BUILD_BY_CARD_ID = {
         "qwen38-flash-next-mixed-4-8bit@m3ultra": ENGINE_BUILD_VALID_COMMIT,
         "qwen38-flash-next-iq-3p3bpw@m3ultra": ENGINE_BUILD_VALID_COMMIT,
+        # Added 2026-09-28 (cycle 167): the same iQ-3.3 pack re-measured on served-engine
+        # build v26.9.6. A sibling card, not a replacement, so both builds are pinned.
+        "qwen38-flash-next-iq-3p3bpw@m3ultra-v2696": "1745ffe89e4670f1e0c6de22c75a9875b27399de",
         "qwen3-0p6b-4bit@m5": "21af3abd339a0752319ba6b4abe3b3880b16da3b",
         # Added 2026-09-23 (cycle 144) for the second card cycle 142 shipped. Its build sha
         # differs from the @m5 card's because the two rows were measured on different hosts --
@@ -5590,15 +5593,25 @@ class PublicSiteTests(unittest.TestCase):
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:
         loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
         self.assertIsNotNone(loaded)
-        # (1) unchanged: every Flash Next card carries the build it was measured on.
+        # (1) every Flash Next card carries the build it was measured on. Sibling cards
+        # re-measured on a later served-engine build carry that build, so each card is
+        # checked against its own expected entry rather than one shared sha.
         flash_next_cards = [
             card for card in loaded["cards"] if card["model"]["family"] == "Qwen3.8-Flash-Next"
         ]
         self.assertTrue(flash_next_cards, "expected at least one Qwen3.8-Flash-Next card")
+        self.assertTrue(
+            any(
+                card["provenance"].get("engineBuild") == {"commit": self.ENGINE_BUILD_VALID_COMMIT}
+                for card in flash_next_cards
+            ),
+            "expected at least one Flash Next card on the original served-engine build",
+        )
         for card in flash_next_cards:
+            self.assertIn(card["id"], self.EXPECTED_ENGINE_BUILD_BY_CARD_ID, card["id"])
             self.assertEqual(
                 card["provenance"].get("engineBuild"),
-                {"commit": self.ENGINE_BUILD_VALID_COMMIT},
+                {"commit": self.EXPECTED_ENGINE_BUILD_BY_CARD_ID[card["id"]]},
                 card["id"],
             )
         # (2) every recorded build, on every card, is the expected one -- a new
