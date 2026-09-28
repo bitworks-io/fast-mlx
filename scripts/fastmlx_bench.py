@@ -216,11 +216,51 @@ The output row's own ``combinedFrom`` field records each input file's
 role (``referenceFirst``/``candidate``/``referenceLast``) and its
 ``sha256`` (of the file's raw bytes) -- a durable link from the combined
 row back to the exact three files it was built from.
+
+``--public-view ROW.json`` is a further, separate mode that takes NO
+measurement of its own (the same mutual-exclusion convention as
+``--combine``, including exclusion from ``--combine`` itself -- see
+``_COMBINE_INCOMPATIBLE_FLAG_NAMES``): it reads one already-produced row,
+deep-copies it, drops its own ``publishable`` key, and replaces
+``controls.flags.listenerCmdline`` (a string in a single-run row, or --
+for a ``--combine`` output row -- a per-role dict of strings; see
+``_combine_flags_control``) with ``listenerFlags`` (a redacted token
+list, or a per-role dict of redacted token lists). ``argv[0]`` (the
+listener BINARY itself) is always DROPPED, never redacted to a basename
+-- the real captured binary's basename is a third-party engine name this
+module already treats as unpublishable everywhere else (see
+``publishability_control``'s own-binary exception), so promoting it into
+a published field via a basename shortcut would be exactly the mistake
+the decision doc this implements
+(``docs/task-inbox/2026-09-20-DECISION-bench-row-publishability-verdict.md``)
+warns against. Every remaining token that carries a filesystem path
+(contains ``/``, starts with ``~``, or is a ``--key=value`` pair whose
+value does) is replaced with ``<path>`` (or ``--key=<path>``); every
+other token (a bare flag, or a numeric/short value) is left as-is.
+``controls.flags.status`` becomes ``"captured_redacted"`` -- a row in
+that state can no longer be given to ``--combine``, whose one-position
+argv comparison needs the raw, unredacted argv (see
+``_combine_flags_control``). No hash of the raw argv is published
+alongside the redacted form: the decision doc rejected that as a
+confirmation oracle for the low-entropy rig account name the argv would
+otherwise carry. ``publishability_control`` is then RE-RUN over the
+transformed row (never the original) and attached as the printed row's
+own ``publishable`` -- only a row whose recomputed verdict is
+``"publishable"`` is ever printed: as one line of JSON on stdout (the
+same serialization style ``--json`` uses), exit 0. Every other outcome
+(a withheld/refused verdict, or a ``listenerCmdline`` that is missing or
+fails to parse) prints NOTHING on stdout and the verdict's status plus
+its marker CLASSES (never matched text) on stderr, exit 1 -- this mode
+never emits a partially-redacted row. Known limit: the redacted view
+reports ``--model <path>`` for every arm, so a published card's model-
+pack identity must come from elsewhere (e.g. a pinned card id/revision),
+never from this row's own flags.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import importlib.util
 import itertools
@@ -1456,6 +1496,27 @@ def _combine_flags_control(loaded: "Sequence[dict]") -> dict:
         role: _nested_status(entry["row"], "controls", "flags", "listenerCmdline")
         for role, entry in zip(_COMBINE_ROLES, loaded)
     }
+    # A --public-view row has already replaced its raw listenerCmdline with
+    # a redacted listenerFlags and set this status to "captured_redacted"
+    # (see module docstring's --public-view section) -- refuse with a
+    # dedicated, clear reason naming that BEFORE the generic "!= captured"
+    # check below, whose own reason would not say WHY the argv is gone.
+    redacted_roles = [
+        role for role, status in per_role_status.items() if status == "captured_redacted"
+    ]
+    if redacted_roles:
+        return {
+            "status": "mismatch",
+            "perRole": per_role_status,
+            "listenerCmdline": per_role_cmdline,
+            "reason": (
+                "input row(s) "
+                + ", ".join(redacted_roles)
+                + " have a redacted flags control (controls.flags.status == "
+                "'captured_redacted', from --public-view) -- --combine's "
+                "one-position argv comparison needs the raw, unredacted argv"
+            ),
+        }
     if any(status != "captured" for status in per_role_status.values()):
         return {
             "status": "mismatch",
@@ -1670,6 +1731,152 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
 
 
 # ---------------------------------------------------------------------
+# --public-view: redact one already-measured row's captured listener argv
+# and re-verify it, publishing it ONLY when the recomputed verdict says
+# so. See module docstring's --public-view section for the full contract.
+# ---------------------------------------------------------------------
+def _looks_like_path(value: str) -> bool:
+    return "/" in value or value.startswith("~")
+
+
+def _redact_token(token: str) -> str:
+    """Redacts one already-tokenized argv entry (never argv[0] -- callers
+    must drop that themselves; see ``_redact_listener_cmdline``): a
+    ``--key=value`` pair whose value carries a path becomes
+    ``--key=<path>``; any other token carrying a path becomes the literal
+    ``<path>``; everything else (a bare flag, or a short/numeric value) is
+    left exactly as captured.
+    """
+    if token.startswith("--") and "=" in token:
+        key, _, value = token.partition("=")
+        if _looks_like_path(value):
+            return f"{key}=<path>"
+        return token
+    if _looks_like_path(token):
+        return "<path>"
+    return token
+
+
+def _redact_listener_cmdline(cmdline: "Optional[str]") -> "Optional[List[str]]":
+    """Parses one captured ``listenerCmdline`` string (see
+    ``flags_control``) with ``shlex.split``, DROPS argv[0] (the listener
+    binary itself -- see module docstring for why this is never redacted
+    to a basename, only dropped), and redacts every remaining token (see
+    ``_redact_token``). Returns ``None`` -- never a partial result -- when
+    ``cmdline`` is ``None``/empty, fails to parse, or parses to nothing at
+    all (argv[0] with no remaining tokens is a distinct, valid outcome:
+    an empty ``listenerFlags`` list -- but an EMPTY/absent cmdline itself
+    has no argv[0] to drop and so cannot be redacted).
+    """
+    if not cmdline:
+        return None
+    try:
+        tokens = shlex.split(cmdline)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    return [_redact_token(token) for token in tokens[1:]]
+
+
+def _public_view_redact_flags(flags: dict) -> "Optional[dict]":
+    """Transforms one row's ``controls.flags`` (already a shallow part of
+    a deep-copied row -- see ``run_public_view``) for ``--public-view``:
+    replaces ``listenerCmdline`` -- a string in a single-run row, or a
+    per-role dict of strings in a ``--combine`` output row (see
+    ``_combine_flags_control``) -- with ``listenerFlags`` in the matching
+    shape, and sets ``status`` to ``"captured_redacted"``. Returns
+    ``None`` when ANY cmdline in play is missing or fails to parse (see
+    ``_redact_listener_cmdline``) -- ``run_public_view`` turns that into a
+    whole-view refusal, never a partially-redacted row.
+    """
+    cmdline = flags.get("listenerCmdline")
+    new_flags = dict(flags)
+    if isinstance(cmdline, dict):
+        per_role_tokens = {}
+        for role, value in cmdline.items():
+            tokens = _redact_listener_cmdline(value)
+            if tokens is None:
+                return None
+            per_role_tokens[role] = tokens
+        new_flags.pop("listenerCmdline", None)
+        new_flags["listenerFlags"] = per_role_tokens
+    else:
+        tokens = _redact_listener_cmdline(cmdline)
+        if tokens is None:
+            return None
+        new_flags.pop("listenerCmdline", None)
+        new_flags["listenerFlags"] = tokens
+    new_flags["status"] = "captured_redacted"
+    return new_flags
+
+
+def run_public_view(path: str) -> "tuple[int, Optional[dict]]":
+    """Implements ``--public-view PATH`` (see module docstring): reads one
+    already-measured row, deep-copies it, redacts its
+    ``controls.flags`` argv, RE-RUNS ``publishability_control`` over the
+    transformed row (never the original), and returns ``(0, view)`` ONLY
+    when that recomputed verdict is ``"publishable"``. Every other
+    outcome -- an unreadable/malformed input, a row with no
+    ``controls.flags`` to redact, a ``listenerCmdline`` that could not be
+    redacted, or a recomputed verdict that is anything other than
+    ``"publishable"`` -- prints its own reason on stderr and returns
+    ``(1, None)``: this mode never returns a row for ``main`` to print
+    unless that row is itself publishable.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        print(f"fastmlx bench: --public-view: could not read {path}: {exc}", file=sys.stderr)
+        return 1, None
+    try:
+        row = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"fastmlx bench: --public-view: {path} is not valid JSON: {exc}", file=sys.stderr)
+        return 1, None
+    if not isinstance(row, dict):
+        print(f"fastmlx bench: --public-view: {path} is not a JSON object", file=sys.stderr)
+        return 1, None
+
+    view = copy.deepcopy(row)
+    view.pop("publishable", None)
+
+    controls = view.get("controls")
+    flags = controls.get("flags") if isinstance(controls, dict) else None
+    if not isinstance(flags, dict):
+        print(
+            "fastmlx bench: --public-view: row has no controls.flags to redact",
+            file=sys.stderr,
+        )
+        return 1, None
+
+    redacted_flags = _public_view_redact_flags(flags)
+    if redacted_flags is None:
+        print(
+            "fastmlx bench: --public-view: controls.flags.listenerCmdline is "
+            "missing or could not be parsed; refusing rather than emitting a "
+            "partially-redacted row",
+            file=sys.stderr,
+        )
+        return 1, None
+    controls["flags"] = redacted_flags
+
+    # Same calling convention as run_bench/run_combine: computed LAST, over
+    # the (redacted) row as otherwise complete, and attached only after.
+    verdict = publishability_control(view)
+    view["publishable"] = verdict
+    if verdict["status"] != "publishable":
+        classes = verdict.get("markerClasses") or []
+        suffix = " [" + ", ".join(classes) + "]" if classes else ""
+        print(
+            f"fastmlx bench: --public-view: {verdict['status']}{suffix}",
+            file=sys.stderr,
+        )
+        return 1, None
+    return 0, view
+
+
+# ---------------------------------------------------------------------
 # Rendering.
 # ---------------------------------------------------------------------
 def format_text(row: dict) -> str:
@@ -1799,6 +2006,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--public-view", default=None, metavar="ROW_JSON",
+        help=(
+            "Redact one already-measured --json row's controls.flags "
+            "listener argv (drop argv[0], replace any remaining "
+            "path-carrying token with <path>), re-verify it with the same "
+            "publishability check every row carries, and print it ONLY "
+            "if that recomputed verdict is 'publishable'. Takes no "
+            "measurement of its own -- mutually exclusive with --combine "
+            "and with --base-url/--model/--reference-model/--prompt/"
+            "--expect-listener-pid/--runs/--warmup/--max-tokens/"
+            "--temperature/--host-label/--api-key."
+        ),
+    )
+    parser.add_argument(
         "--reference-model", default=None,
         help="Reference model name; when given, runs ratio mode with the candidate sandwiched between two reference-arm measurements.",
     )
@@ -1872,6 +2093,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+
+    if args.public_view is not None:
+        # --public-view takes NO measurement of its own, and cannot be
+        # combined with --combine either (see module docstring's
+        # --public-view section) -- same checked-against-the-RAW-parsed-
+        # value convention as --combine's own check just below.
+        given = [
+            _COMBINE_INCOMPATIBLE_FLAG_NAMES[dest]
+            for dest in _COMBINE_INCOMPATIBLE_FLAG_NAMES
+            if getattr(args, dest) is not None
+        ]
+        if args.combine is not None:
+            given.append("--combine")
+        if given:
+            parser.error(
+                "--public-view cannot be combined with "
+                + ", ".join(given)
+                + " -- --public-view measures nothing of its own, it only "
+                "redacts and re-verifies one already-measured row"
+            )
+        code, row = run_public_view(args.public_view)
+        if row is not None:
+            print(json.dumps(row))
+        raise SystemExit(code)
 
     if args.combine is not None:
         # --combine takes NO measurement of its own -- any flag that

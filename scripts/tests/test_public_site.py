@@ -4378,6 +4378,40 @@ class PublicSiteTests(unittest.TestCase):
             ],
         }
 
+    def _assert_manifest_stage_passes(self, manifest: dict[str, object]) -> None:
+        """Guard against the validate_quality_guide_page blinding hazard
+        (docs/task-inbox/2026-09-28-NEXT-manifest-rule-blinds-page-level-assertions.md):
+        that function validates the manifest first and returns early on ANY
+        manifest-level failure, so a page-level check built downstream of it
+        never runs once the manifest trips an unrelated rule. A NEGATIVE
+        page-level assertion (a failure is absent, or the page "validates
+        clean") would then stay silently GREEN for the wrong reason instead
+        of exercising the page code it claims to test. Call this on the
+        exact manifest a page-level test builds its site from, immediately
+        before trusting such an assertion, so a blinded page stage fails
+        loudly here instead."""
+        manifest_failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertEqual(
+            manifest_failures,
+            [],
+            "manifest fails validate_quality_guide_manifest, so "
+            "validate_quality_guide_page returns early and every page-level "
+            "check below it never ran (manifest-rule blinding hazard): "
+            f"{manifest_failures}",
+        )
+
+    def test_shared_quality_guide_fixture_satisfies_every_manifest_rule(self) -> None:
+        """Guard test for the manifest-rule blinding hazard: page-level tests
+        build a site from this shared fixture and assert on
+        validate_quality_guide_page's output, but that function returns
+        early on any manifest failure. Load the fixture exactly the way
+        those page-level tests do and pin it to zero manifest failures, so a
+        future manifest rule this fixture trips fails here with one clear
+        signal instead of silently blinding every page-level assertion
+        downstream."""
+        manifest = self.quality_guide_manifest()
+        self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
+
     def test_quality_guide_is_skipped_gracefully_when_manifest_is_absent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -4757,6 +4791,12 @@ class PublicSiteTests(unittest.TestCase):
 
     def test_quality_guide_page_is_generated_when_manifest_is_present(self) -> None:
         manifest = self.quality_guide_manifest()
+        # Reachability: the assertEqual(failures, []) below is a negative/
+        # acceptance claim about validate()'s output, which chains through
+        # validate_quality_guide_page -- pin that this exact manifest clears
+        # the manifest stage first, or a blinded page stage would still show
+        # a (correctly) non-empty failures list here for the wrong reason.
+        self._assert_manifest_stage_passes(manifest)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "site"
             output.mkdir()

@@ -1811,6 +1811,179 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIn("combined from 3", stdout)
 
     # ------------------------------------------------------------------
+    # --public-view: redact one already-measured row's listenerCmdline and
+    # re-verify it, printing it ONLY when the recomputed verdict says
+    # "publishable". See module docstring's --public-view section.
+    # ------------------------------------------------------------------
+    def test_public_view_real_shape_row_is_publishable_and_keeps_flags(self):
+        # Shaped like a real controlled run: argv[0] is an absolute-user-
+        # path engine binary whose basename is the third-party engine
+        # name (built by concatenation -- this file is itself publicly
+        # projected), --model takes an absolute user path, and the rest
+        # of the argv is ordinary engine flags. Loopback baseUrl.
+        engine_bin = "/" + "Users/" + "operator/bin/" + ("mlx" + "-serve")
+        model_path = "/" + "Users/" + "operator/models/candidate-pack"
+        cmdline = (
+            f"{engine_bin} --model {model_path} --ctx-size 262144 "
+            "--no-mtp --no-pld --no-drafter"
+        )
+        row = _combine_fixture_row("candidate", [123.4], listener_cmdline=cmdline)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["publishable"]["status"], "publishable")
+        flags = doc["controls"]["flags"]
+        self.assertNotIn("listenerCmdline", flags)
+        listener_flags = flags["listenerFlags"]
+        for expected in ("--ctx-size", "262144", "--no-mtp", "--no-pld", "--no-drafter"):
+            self.assertIn(expected, listener_flags)
+
+    def test_public_view_leaves_everything_else_deep_equal(self):
+        cmdline = "fastmlx-serve --model /models/x --port 8080"
+        row = _combine_fixture_row("candidate", [123.4, 130.0], listener_cmdline=cmdline)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["arms"], row["arms"])
+        self.assertEqual(doc["ratio"], row["ratio"])
+        self.assertEqual(doc["boundary"], row["boundary"])
+        for name in ("tokens", "drift", "magnitude", "owner"):
+            self.assertEqual(doc["controls"][name], row["controls"][name])
+
+    def test_public_view_eq_path_value_redacted(self):
+        cmdline = "fastmlx-serve --model=/opt/models/candidate ~/x"
+        row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(
+            doc["controls"]["flags"]["listenerFlags"],
+            ["--model=<path>", "<path>"],
+        )
+
+    def test_public_view_combined_row_redacts_every_role(self):
+        trio = self._combine_baseline()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            combine_paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *combine_paths, "--json"])
+            self.assertEqual(code, 0, stderr)
+            combined_row = json.loads(stdout)
+            combined_path = _write_json_file(tmp_dir, "combined.json", combined_row)
+            code2, stdout2, stderr2 = self._run_main(["--public-view", combined_path])
+        self.assertEqual(code2, 0, stderr2)
+        doc = json.loads(stdout2)
+        listener_flags = doc["controls"]["flags"]["listenerFlags"]
+        self.assertEqual(
+            set(listener_flags.keys()), {"referenceFirst", "candidate", "referenceLast"}
+        )
+        self.assertEqual(
+            listener_flags["referenceFirst"], ["--model", "<path>", "--port", "8080"]
+        )
+        self.assertEqual(
+            listener_flags["candidate"], ["--model", "<path>", "--port", "8080"]
+        )
+        self.assertEqual(
+            listener_flags["referenceLast"], ["--model", "<path>", "--port", "8080"]
+        )
+
+    def test_public_view_residual_marker_exits_1_no_stdout(self):
+        cmdline = "fastmlx-serve --model /models/candidate --port 8080"
+        base_row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
+
+        private_ip = "192" + ".168.1.5"
+        row_with_ip = copy.deepcopy(base_row)
+        row_with_ip["baseUrl"] = f"http://{private_ip}:8080"
+
+        host_label_marker = "llm" + "bench-box3"
+        row_with_host_label = copy.deepcopy(base_row)
+        row_with_host_label["boundary"] = (
+            row_with_host_label["boundary"] + f"; hostLabel={host_label_marker}"
+        )
+
+        cases = {
+            "private-network-address": (row_with_ip, private_ip),
+            "internal-host-account": (row_with_host_label, host_label_marker),
+        }
+        for expected_class, (row, marker_text) in cases.items():
+            with self.subTest(expected_class=expected_class):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    path = _write_json_file(tmp_dir, "row.json", row)
+                    code, stdout, stderr = self._run_main(["--public-view", path])
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn(expected_class, stderr)
+                self.assertIn("withheld_marker_present", stderr)
+                self.assertNotIn(marker_text, stderr)
+
+    def test_public_view_sweep_unavailable_refuses(self):
+        cmdline = "fastmlx-serve --model /models/candidate --port 8080"
+        row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            with mock.patch.object(FASTMLX_BENCH, "_load_marker_source", return_value=None):
+                code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("refused_sweep_unavailable", stderr)
+
+    def test_public_view_missing_cmdline_refuses(self):
+        row = _combine_fixture_row("candidate", [100.0], flags_status="capture_failed")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("could not be parsed", stderr)
+
+    def test_combine_refuses_redacted_rows(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["controls"]["flags"]["status"] = "captured_redacted"
+        del trio["candidate"]["controls"]["flags"]["listenerCmdline"]
+        trio["candidate"]["controls"]["flags"]["listenerFlags"] = [
+            "--model", "<path>", "--port", "8080",
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("captured_redacted", stderr)
+        # The dedicated redacted-row reason, not just the generic
+        # "!= captured" mismatch reason (which would ALSO happen to
+        # contain the substring "captured_redacted" via the interpolated
+        # per-role status -- this phrase only appears from the dedicated
+        # check).
+        self.assertIn("raw, unredacted argv", stderr)
+
+    def test_public_view_with_base_url_exits_64(self):
+        code, stdout, stderr = self._run_main(
+            ["--public-view", "row.json", "--base-url", "http://127.0.0.1:9"]
+        )
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        # Not just "any mention of --base-url anywhere in stderr" (the
+        # usage banner alone would satisfy that) -- the actual usage-
+        # error TEXT this mode's own mutual-exclusion check produces.
+        self.assertIn("--public-view cannot be combined with", stderr)
+        self.assertIn("--base-url", stderr)
+
+    def test_public_view_with_combine_exits_64(self):
+        code, stdout, stderr = self._run_main(
+            ["--public-view", "row.json", "--combine", "a.json", "b.json", "c.json"]
+        )
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        self.assertIn("--public-view cannot be combined with", stderr)
+        self.assertIn("--combine", stderr)
+
+    # ------------------------------------------------------------------
     def _run_main(self, argv: list):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
