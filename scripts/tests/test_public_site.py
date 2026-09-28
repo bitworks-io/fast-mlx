@@ -4503,6 +4503,15 @@ class PublicSiteTests(unittest.TestCase):
         card["legible"]["benefit"]["speedXStatus"] = (
             "measured on m3ultra, 4-bit vs reference, 40-prompt corpus"
         )
+        # A numeric speedX is now a measured decode-throughput claim; the
+        # fixture's own "decode throughput (speedX)" disclaimer must come
+        # out in the same mutation or this card contradicts itself (see the
+        # QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX contradiction rule).
+        card["boundary"]["unmeasured"] = [
+            item
+            for item in card["boundary"]["unmeasured"]
+            if not item.startswith("decode throughput (speedX")
+        ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_quality_guide_manifest(root, manifest)
@@ -4522,6 +4531,12 @@ class PublicSiteTests(unittest.TestCase):
         card["legible"]["benefit"]["speedXStatus"] = (
             "measured on m3ultra, 4-bit vs reference, 40-prompt corpus"
         )
+        # See the same fixup in test_quality_speed_line_below_one_never_says_faster.
+        card["boundary"]["unmeasured"] = [
+            item
+            for item in card["boundary"]["unmeasured"]
+            if not item.startswith("decode throughput (speedX")
+        ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_quality_guide_manifest(root, manifest)
@@ -4544,6 +4559,12 @@ class PublicSiteTests(unittest.TestCase):
         manifest["cards"][0]["legible"]["benefit"]["speedXStatus"] = (
             "measured on m3ultra, 4-bit vs reference, 40-prompt corpus"
         )
+        # See the same fixup in test_quality_speed_line_below_one_never_says_faster.
+        manifest["cards"][0]["boundary"]["unmeasured"] = [
+            item
+            for item in manifest["cards"][0]["boundary"]["unmeasured"]
+            if not item.startswith("decode throughput (speedX")
+        ]
         original_render_quality_guide = build_public_site.render_quality_guide
 
         def render_without_speed_dd(cards: object) -> str:
@@ -5268,6 +5289,175 @@ class PublicSiteTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         failures = validate_public_site.validate_quality_guide_manifest(loaded)
         self.assertEqual(failures, [])
+
+    # ------------------------------------------------------------------
+    # boundary.unmeasured / legible.benefit.speedX contradiction gate (the
+    # QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX comment in both
+    # validate_public_site.py and build_public_site.py has the full
+    # rationale). ONE-SIDED and PREFIX-matched: a numeric speedX is a
+    # measured decode-throughput claim, so boundary.unmeasured must not
+    # carry an entry starting "decode throughput (speedX" -- but a null
+    # speedX does NOT require that entry to be present (boundary.unmeasured
+    # is not a contractually exhaustive list, and speedXStatus already
+    # carries the "why no number" reason). Each fixture card here is a deep
+    # copy of the real fixture's card 0 wrapped in its own single-card
+    # manifest, not the shared 4-card `self.quality_guide_manifest()` --
+    # cards 1 and 2 of that shared fixture carry a null speedX with a
+    # boundary.unmeasured list that never mentions decode throughput at all
+    # (they predate this rule and are pinned as accepted by
+    # test_unmodified_sample_fixture_is_accepted_by_both_validators), so
+    # reusing it here would make these tests depend on carve-outs unrelated
+    # to this rule.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _single_card_manifest(card: dict[str, object]) -> dict[str, object]:
+        return {
+            "schema": "fast-mlx-quality-card-v1",
+            "generatedAt": "2026-01-01T00:00:00Z",
+            "cards": [card],
+        }
+
+    def test_speedx_numeric_with_unmeasured_entry_is_rejected(self) -> None:
+        manifest = self.quality_guide_manifest()
+        card = json.loads(json.dumps(manifest["cards"][0]))
+        self.assertIsNone(card["legible"]["benefit"]["speedX"])
+        self.assertIn("decode throughput (speedX)", card["boundary"]["unmeasured"])
+        card["legible"]["benefit"]["speedX"] = 1.25
+        failures = validate_public_site.validate_quality_guide_manifest(
+            self._single_card_manifest(card)
+        )
+        self.assertTrue(
+            any(
+                "quality card entry 0" in f
+                and "speedX is numeric" in f
+                and "decode throughput (speedX)" in f
+                for f in failures
+            ),
+            failures,
+        )
+
+    def test_speedx_null_without_unmeasured_entry_is_accepted(self) -> None:
+        # The removed direction: a null speedX makes no decode-throughput
+        # claim, so the absence of a disclaiming entry is NOT an error --
+        # this must be provably unenforced, not merely untested.
+        manifest = self.quality_guide_manifest()
+        card = json.loads(json.dumps(manifest["cards"][0]))
+        self.assertIsNone(card["legible"]["benefit"]["speedX"])
+        card["boundary"]["unmeasured"] = ["tool-call quality"]
+        failures = validate_public_site.validate_quality_guide_manifest(
+            self._single_card_manifest(card)
+        )
+        self.assertEqual(failures, [])
+
+    def test_speedx_numeric_without_unmeasured_entry_passes(self) -> None:
+        manifest = self.quality_guide_manifest()
+        card = json.loads(json.dumps(manifest["cards"][0]))
+        card["legible"]["benefit"]["speedX"] = 1.25
+        card["boundary"]["unmeasured"] = ["tool-call quality"]
+        failures = validate_public_site.validate_quality_guide_manifest(
+            self._single_card_manifest(card)
+        )
+        self.assertEqual(failures, [])
+
+    def test_speedx_numeric_with_informative_variant_entry_is_rejected(self) -> None:
+        # Proves PREFIX matching, not exact-literal membership: the real
+        # fixture card qwen38-27b-mtp@m3ultra (index 3 of the shared 4-card
+        # fixture) disclaims decode throughput with a strictly MORE
+        # informative phrasing than the bare sentinel. An exact-literal rule
+        # would let this sit undetected beside a numeric speedX.
+        manifest = self.quality_guide_manifest()
+        card = json.loads(json.dumps(manifest["cards"][3]))
+        self.assertEqual(card["id"], "qwen38-27b-mtp@m3ultra")
+        self.assertIsNone(card["legible"]["benefit"]["speedX"])
+        informative_entry = "decode throughput (speedX, tracked in the MTP performance scorecard)"
+        self.assertEqual(card["boundary"]["unmeasured"], [informative_entry])
+        card["legible"]["benefit"]["speedX"] = 1.25
+        failures = validate_public_site.validate_quality_guide_manifest(
+            self._single_card_manifest(card)
+        )
+        self.assertTrue(
+            any(
+                "quality card entry 0" in f
+                and "speedX is numeric" in f
+                and informative_entry in f
+                for f in failures
+            ),
+            failures,
+        )
+
+    def test_malformed_unmeasured_with_numeric_speedx_yields_shape_failure_only(
+        self,
+    ) -> None:
+        # Reachability pin: the contradiction check lives inside the `else`
+        # branch of the boundary.unmeasured shape check, by design -- a
+        # malformed `unmeasured` skips the contradiction check entirely
+        # rather than being checked against it. Without this pin, a later
+        # refactor could move the gate out of reach (e.g. hoist it above the
+        # shape check, or drop the `else`) and every other test here would
+        # stay green.
+        manifest = self.quality_guide_manifest()
+        card = json.loads(json.dumps(manifest["cards"][0]))
+        card["legible"]["benefit"]["speedX"] = 1.25
+        # Malformed: a bare string instead of a list of strings.
+        card["boundary"]["unmeasured"] = "decode throughput (speedX)"
+        failures = validate_public_site.validate_quality_guide_manifest(
+            self._single_card_manifest(card)
+        )
+        self.assertTrue(
+            any("boundary.unmeasured must be a list of non-empty strings" in f for f in failures),
+            failures,
+        )
+        self.assertFalse(any("speedX is numeric" in f for f in failures), failures)
+
+    def test_speedx_contradiction_is_rejected_by_both_validators(self) -> None:
+        # build_public_site.validate_quality_card_document is fail-FAST
+        # (raises SystemExit on the first failure); validate_public_site's
+        # validate_quality_guide_manifest accumulates a failure list. Both
+        # must refuse the same contradiction.
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][0]
+        self.assertIsNone(card["legible"]["benefit"]["speedX"])
+        self.assertIn("decode throughput (speedX)", card["boundary"]["unmeasured"])
+        card["legible"]["benefit"]["speedX"] = 1.25
+
+        with self.assertRaises(SystemExit) as build_ctx:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        build_message = str(build_ctx.exception)
+        self.assertIn("speedX is numeric", build_message)
+        self.assertIn("decode throughput (speedX)", build_message)
+
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(
+            any(
+                "speedX is numeric" in f and "decode throughput (speedX)" in f
+                for f in failures
+            ),
+            failures,
+        )
+
+    def test_shipped_quality_guide_manifest_satisfies_speedx_contradiction_rule(
+        self,
+    ) -> None:
+        loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)
+        self.assertIsNotNone(loaded)
+        failures = validate_public_site.validate_quality_guide_manifest(loaded)
+        self.assertEqual(failures, [])
+
+    # Two hand-maintained copies of the speedX/boundary.unmeasured
+    # contradiction-prefix rule exist by design (the projection split, same
+    # convention as QUALITY_CARD_HARDWARE_CLASS below): build_public_site.py
+    # and validate_public_site.py each own a separate constant rather than
+    # importing a shared one. Pin them directly against each other so a
+    # future edit to only one copy (e.g. adding the closing paren back, or
+    # changing the wording) cannot drift silently past every other test in
+    # this file.
+    def test_speedx_unmeasured_prefix_constants_agree_between_both_validators(
+        self,
+    ) -> None:
+        self.assertEqual(
+            build_public_site.QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX,
+            validate_public_site.QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX,
+        )
 
     # ------------------------------------------------------------------
     # provenance.engineBuild (docs/quality-card-schema-v1.md "Engine

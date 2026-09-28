@@ -652,9 +652,9 @@
           "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026a combination of direct indexing and efficient collision resolution. The process', the reference picks ' works' and this pack picks ' begins'."
         },
         "benefit": {
-          "fit": "50.6 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context, and GREEN on a 96 GB Mac at 65,536 context (58.6 GiB needed with an 8 GiB KV reserve, against a 64 GiB shared-host ceiling) \u2014 where the mixed 4/8-bit pack is RED. This smaller footprint, not speed, is what the 3.3-bit pack buys.",
-          "speedX": null,
-          "speedXStatus": "not-measured-on-this-engine"
+          "fit": "50.6 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context, and GREEN on a 96 GB Mac at 65,536 context (58.6 GiB needed with an 8 GiB KV reserve, against a 64 GiB shared-host ceiling) \u2014 where the mixed 4/8-bit pack is RED. On this engine build the two packs decode at about the same speed, so this smaller footprint is what the 3.3-bit pack buys.",
+          "speedX": 1.18,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build 1745ffe8: median 60.0 vs 51.0 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts with up to 256 tokens each (every answer ended after 56 to 75 tokens, so this is short-decode throughput), one warmup pass discarded, median of 3 per-pass pooled rates; the reference arm ran first and last and drifted 0.29%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
         }
       },
       "rawMetrics": {
@@ -687,8 +687,7 @@
       "boundary": {
         "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
         "unmeasured": [
-          "perplexity delta",
-          "decode throughput (speedX)"
+          "perplexity delta"
         ]
       }
     },
@@ -732,8 +731,8 @@
         },
         "benefit": {
           "fit": "70.1 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context (86.1 GiB needed with a 16 GiB KV reserve, against an 88 GiB shared-host ceiling). RED on a 96 GB Mac at any context \u2014 the weights alone exceed that machine's 64 GiB ceiling.",
-          "speedX": null,
-          "speedXStatus": "not-measured-on-this-engine"
+          "speedX": 1.19,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build 1745ffe8: median 60.6 vs 51.0 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts with up to 256 tokens each (every answer ended after 56 to 75 tokens, so this is short-decode throughput), one warmup pass discarded, median of 3 per-pass pooled rates; the reference arm ran first and last and drifted 0.29%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
         }
       },
       "rawMetrics": {
@@ -766,8 +765,7 @@
       "boundary": {
         "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
         "unmeasured": [
-          "perplexity delta",
-          "decode throughput (speedX)"
+          "perplexity delta"
         ]
       }
     }

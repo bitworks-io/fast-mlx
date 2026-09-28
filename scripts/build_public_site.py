@@ -157,6 +157,27 @@ QUALITY_CARD_HARDWARE_CLASS = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 # this dedicated message rather than the generic shape message.
 # Must stay byte-consistent with the copy in `validate_public_site.py`.
 QUALITY_CARD_HARDWARE_CLASS_SENTINEL = "unknown"
+# The wire-format PREFIX that names the "decode throughput" claim inside
+# `boundary.unmeasured`. A numeric `legible.benefit.speedX` is a measured
+# decode-throughput claim, so `boundary.unmeasured` must not also carry an
+# entry disclaiming that same claim as unmeasured -- a card cannot both
+# publish a throughput number and disclaim throughput as unmeasured.
+# Matched by PREFIX, not exact-string membership: the real fixture card
+# `qwen38-27b-mtp@m3ultra` disclaims decode throughput with the more
+# informative "decode throughput (speedX, tracked in the MTP performance
+# scorecard)", which still names the same claim and must still be refused
+# beside a numeric speedX; an exact-literal rule would let that phrasing
+# sit beside a numeric speedX undetected.
+#
+# The converse is deliberately NOT enforced: a null speedX does not require
+# this entry to be present. `boundary.unmeasured` is not a contractually
+# exhaustive list -- docs/quality-card-schema-v1.md specifies it only as a
+# "list of non-empty strings" -- and the "why is there no number" guarantee
+# is already structural, since `speedXStatus` is required non-empty text
+# regardless of speedX.
+#
+# Must stay byte-consistent with the copy in `validate_public_site.py`.
+QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX = "decode throughput (speedX"
 QUALITY_VERDICT_LABELS: Dict[str, str] = {
     "NO_GO": "Opt-in only",
     "PASS": "Passes review",
@@ -1129,6 +1150,24 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
             # no measurement in this schema actually makes; the empty-list case
             # slips past the check above (`any(...)` over `[]` is False).
             fail(f"{card_label} boundary.unmeasured must not be empty")
+        # A numeric speedX is a measured decode-throughput claim;
+        # boundary.unmeasured must not also carry an entry disclaiming that
+        # same claim as unmeasured (matched by PREFIX -- see the
+        # QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX comment above). The converse
+        # (a null speedX requiring the entry) is deliberately NOT enforced;
+        # see that comment. This is the producer-side mirror of the
+        # identical check in validate_public_site.validate_quality_guide_manifest
+        # -- without it, build_site could publish a self-contradictory card
+        # that only the separate validator would later catch.
+        if isinstance(speed_x, (int, float)) and not isinstance(speed_x, bool):
+            offending = [
+                item for item in unmeasured if item.strip().startswith(QUALITY_CARD_SPEEDX_UNMEASURED_PREFIX)
+            ]
+            if offending:
+                fail(
+                    f"{card_label} legible.benefit.speedX is numeric but "
+                    f"boundary.unmeasured still lists {offending[0]!r}"
+                )
 
         repo_value = model.get("repo")
         identity = repo_value if repo_value is not None else model.get("hfPin")

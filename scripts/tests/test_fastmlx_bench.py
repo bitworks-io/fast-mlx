@@ -21,10 +21,13 @@ sleeping close to ``x``.
 from __future__ import annotations
 
 import contextlib
+import copy
+import hashlib
 import importlib.util
 import io
 import json
 import shutil
+import statistics
 import sys
 import tempfile
 import threading
@@ -250,6 +253,103 @@ def make_body_capturing_stream(
         _write_done(handler)
 
     return fn
+
+
+# ---------------------------------------------------------------------
+# --combine fixtures: a --combine input is itself just a previously-
+# printed single-arm ``--json`` row, so these helpers build that exact
+# dict shape directly (per the module docstring's own allowance to
+# "construct rows directly from known passRates") rather than needing a
+# live fake server for every combine test.
+# ---------------------------------------------------------------------
+def _reading_json(decode_tok_s, measurable=True, token_source=None):
+    return {
+        "decodeTokS": decode_tok_s,
+        "ttftS": 0.01,
+        "completionTokens": 128,
+        "tokenSource": token_source or FASTMLX_BENCH.TOKEN_SOURCE_USAGE,
+        "measurable": measurable,
+        "unmeasurableReason": None,
+    }
+
+
+def _combine_fixture_row(
+    model,
+    pass_rates,
+    *,
+    boundary="chip=Apple M3 Ultra (arm64); promptSet=default-3-prompt-set (prompts=3; chars=10/20/30); maxTokens=256; runs=3; warmup=1; temperature=0.0",
+    tokens_status="verified",
+    owner_status="verified",
+    flags_status="captured",
+    listener_cmdline="fastmlx-serve --model /models/default --port 8080",
+    schema=None,
+    ratio=None,
+    readings=None,
+    warmup_discarded=1,
+    include_pass_rates=True,
+    median=None,
+):
+    """One single-arm ``--json`` row, in the exact shape ``run_bench``
+    itself prints -- a --combine input file is nothing but this, written
+    to disk.
+    """
+    measurable_rates = [r for r in (pass_rates or []) if r is not None]
+    if median is None:
+        median = statistics.median(measurable_rates) if measurable_rates else None
+    arm = {
+        "model": model,
+        "readings": readings if readings is not None else [],
+        "medianDecodeTokS": median,
+        "warmupDiscarded": warmup_discarded,
+    }
+    if include_pass_rates:
+        arm["passRates"] = list(pass_rates) if pass_rates is not None else []
+    return {
+        "schema": schema if schema is not None else FASTMLX_BENCH.SCHEMA,
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "baseUrl": "http://127.0.0.1:9999",
+        "boundary": boundary,
+        "arms": [arm],
+        "ratio": ratio,
+        "controls": {
+            "tokens": {
+                "status": tokens_status,
+                "reason": None if tokens_status == "verified" else "unverified in fixture",
+            },
+            "drift": {
+                "status": "not_applicable",
+                "firstMedianDecodeTokS": None,
+                "lastMedianDecodeTokS": None,
+                "driftRatio": None,
+                "toleranceRatio": 0.05,
+                "reason": "no --reference-model given; drift is only measured in ratio mode",
+            },
+            "magnitude": {
+                "magnitudeImplausible": False,
+                "floor": 25.0,
+                "ceiling": 2000.0,
+                "arms": [{"model": model, "medianDecodeTokS": median}],
+                "reason": None,
+            },
+            "owner": {
+                "status": owner_status,
+                "expectedPid": 4242,
+                "actualPid": 4242 if owner_status == "verified" else None,
+                "reason": None if owner_status == "verified" else "mismatch in fixture",
+            },
+            "flags": {
+                "status": flags_status,
+                "listenerCmdline": listener_cmdline if flags_status == "captured" else None,
+                "reason": None if flags_status == "captured" else "capture_failed in fixture",
+            },
+        },
+    }
+
+
+def _write_json_file(directory, name: str, obj) -> str:
+    path = Path(directory) / name
+    path.write_text(json.dumps(obj))
+    return str(path)
 
 
 class FastmlxBenchTestCase(unittest.TestCase):
@@ -983,6 +1083,24 @@ class FastmlxBenchTestCase(unittest.TestCase):
         # discarded warmup PASS is one discarded request per prompt.
         self.assertEqual(candidate_arm["warmupDiscarded"], warmup)
 
+    def test_arm_json_carries_the_pass_rates_its_median_is_taken_over(self):
+        # A one-model-per-process engine needs one server per arm, so a
+        # ratio has to be combined from separate rows afterwards. That is
+        # only possible if each arm's JSON carries the per-pass pooled rates
+        # its median came from; readings alone cannot rebuild them.
+        runs = 3
+        base_url = self.start(make_simple_stream(3, completion_tokens=11))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", str(runs),
+            "--warmup", "0", "--timeout", "10", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        arm = json.loads(stdout)["arms"][0]
+        self.assertEqual(len(arm["passRates"]), runs)
+        self.assertTrue(all(isinstance(rate, float) for rate in arm["passRates"]))
+        self.assertEqual(statistics.median(arm["passRates"]), arm["medianDecodeTokS"])
+
     def test_max_tokens_default_is_256_in_request_body_and_boundary(self):
         self.assertEqual(FASTMLX_BENCH.DEFAULT_MAX_TOKENS, 256)
         captured_bodies: list = []
@@ -1376,6 +1494,321 @@ class FastmlxBenchTestCase(unittest.TestCase):
         code, stdout, _ = self._run_main(argv)
         self.assertEqual(code, 0)
         self.assertIn("publishable: publishable", stdout)
+
+    # ------------------------------------------------------------------
+    # --combine: three separately-measured single-arm rows -> one ratio
+    # row, using the SAME estimator as in-process ratio mode. See module
+    # docstring's --combine section.
+    # ------------------------------------------------------------------
+    _COMBINE_REF_MODEL = "reference-model"
+    _COMBINE_CAND_MODEL = "candidate-model"
+
+    def _combine_cmdline(self, model_path: str) -> str:
+        return f"fastmlx-serve --model {model_path} --port 8080"
+
+    def _combine_baseline(self):
+        """A mutually-consistent, fully-verified trio of single-arm rows --
+        every --combine test starts from a deep copy of this and mutates
+        exactly ONE thing, so each test is isolated to the ONE refusal (or
+        success path) it names.
+        """
+        ref_cmdline = self._combine_cmdline("/models/reference")
+        cand_cmdline = self._combine_cmdline("/models/candidate")
+        ref_first = _combine_fixture_row(
+            self._COMBINE_REF_MODEL, [100.0, 110.0], listener_cmdline=ref_cmdline
+        )
+        ref_last = _combine_fixture_row(
+            self._COMBINE_REF_MODEL, [100.0, 110.0], listener_cmdline=ref_cmdline
+        )
+        candidate = _combine_fixture_row(
+            self._COMBINE_CAND_MODEL, [200.0, 210.0, 205.0], listener_cmdline=cand_cmdline
+        )
+        return {"ref_first": ref_first, "candidate": candidate, "ref_last": ref_last}
+
+    def _write_combine_trio(self, tmp_dir, trio) -> list:
+        return [
+            _write_json_file(tmp_dir, "ref_first.json", trio["ref_first"]),
+            _write_json_file(tmp_dir, "candidate.json", trio["candidate"]),
+            _write_json_file(tmp_dir, "ref_last.json", trio["ref_last"]),
+        ]
+
+    # -- EQUIVALENCE: the combined ratio and reference median must equal
+    # what in-process ratio mode's own estimator computes from the SAME
+    # pass rates (constructed here from known numbers, independently of
+    # the module's own combine code).
+    def test_combine_ratio_equals_in_process_estimator_from_known_pass_rates(self):
+        # Chosen so the two bookends' OWN medians (100.0 and 95.5) are
+        # within the default drift tolerance of each other (ratio 0.955,
+        # |0.955 - 1| = 0.045 < 0.05), while the POOLED median over all
+        # four pass rates (95.5) is still numerically distinct from the
+        # (wrong) mean-of-the-two-medians formula (97.75) -- see the
+        # anti-vacuity assertion below.
+        ref_first_rates = [90.0, 110.0]
+        ref_last_rates = [95.0, 96.0]
+        candidate_rates = [300.0, 305.0, 295.0]
+        trio = {
+            "ref_first": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, ref_first_rates,
+                listener_cmdline=self._combine_cmdline("/models/reference"),
+            ),
+            "ref_last": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, ref_last_rates,
+                listener_cmdline=self._combine_cmdline("/models/reference"),
+            ),
+            "candidate": _combine_fixture_row(
+                self._COMBINE_CAND_MODEL, candidate_rates,
+                listener_cmdline=self._combine_cmdline("/models/candidate"),
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+
+        # The SAME formula ratio mode's own reference-arm combination uses
+        # (see _combine_reference_bookends): pool the two bookends' pass
+        # rates together and take ONE median over the pooled list.
+        expected_reference_median = statistics.median(ref_first_rates + ref_last_rates)
+        expected_candidate_median = statistics.median(candidate_rates)
+        expected_ratio = expected_candidate_median / expected_reference_median
+
+        reference_arm = next(a for a in doc["arms"] if a["model"] == self._COMBINE_REF_MODEL)
+        self.assertEqual(reference_arm["medianDecodeTokS"], expected_reference_median)
+        self.assertEqual(doc["ratio"], expected_ratio)
+
+        # Anti-vacuity: prove the fixture actually discriminates -- the
+        # formula this guards against (mean of the two bookends' OWN
+        # medians, rather than a pooled median over all four pass rates)
+        # gives a numerically DIFFERENT answer here.
+        wrong_reference_median = (
+            statistics.median(ref_first_rates) + statistics.median(ref_last_rates)
+        ) / 2.0
+        self.assertNotEqual(expected_reference_median, wrong_reference_median)
+
+    # -- The reference median must come from passRates, NOT from a
+    # recomputation over the readings' own decodeTokS values.
+    def test_combine_reference_median_uses_pass_rates_not_reading_decode_tok_s(self):
+        trio = self._combine_baseline()
+        # Deliberately mismatched readings -- if the median were (wrongly)
+        # recomputed from these instead of passRates, it would read far
+        # lower than the passRates-based value below.
+        trio["ref_first"]["arms"][0]["readings"] = [
+            _reading_json(10.0), _reading_json(12.0),
+        ]
+        trio["ref_last"]["arms"][0]["readings"] = [
+            _reading_json(8.0), _reading_json(9.0),
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        reference_arm = next(a for a in doc["arms"] if a["model"] == self._COMBINE_REF_MODEL)
+
+        passrates_based_median = statistics.median([100.0, 110.0, 100.0, 110.0])
+        readings_based_median = statistics.median([10.0, 12.0, 8.0, 9.0])
+        self.assertNotAlmostEqual(passrates_based_median, readings_based_median)
+        self.assertEqual(reference_arm["medianDecodeTokS"], passrates_based_median)
+        self.assertNotAlmostEqual(reference_arm["medianDecodeTokS"], readings_based_median)
+
+    # -- Refusal 1: not a single-arm row (already carries a ratio).
+    def test_combine_refuses_a_row_that_is_not_single_arm(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["ratio"] = 0.5
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("not a single-arm row", stderr)
+
+    # -- Refusal 2: an input arm predates passRates.
+    def test_combine_refuses_an_arm_missing_pass_rates(self):
+        trio = self._combine_baseline()
+        del trio["candidate"]["arms"][0]["passRates"]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("predates passRates", stderr)
+
+    # -- Refusal 3: the two reference rows name different models.
+    def test_combine_refuses_reference_rows_naming_different_models(self):
+        trio = self._combine_baseline()
+        trio["ref_last"]["arms"][0]["model"] = "a-different-reference-model"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("different models", stderr)
+
+    # -- Refusal 3b: the candidate names the same model as the reference.
+    def test_combine_refuses_candidate_naming_the_same_model_as_the_reference(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["arms"][0]["model"] = self._COMBINE_REF_MODEL
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("same model", stderr)
+
+    # -- Refusal 4: the three rows do not share the same boundary.
+    def test_combine_refuses_mismatched_boundary(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["boundary"] = trio["candidate"]["boundary"] + "; hostLabel=only-candidate"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("do not share the same boundary", stderr)
+
+    # -- Refusal 5: an input's C-tokens is not verified.
+    def test_combine_refuses_an_unverified_tokens_control(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["controls"]["tokens"]["status"] = "unverified"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("tokens control", stderr)
+
+    # -- Refusal 6: an input's C-owner is not verified.
+    def test_combine_refuses_an_unverified_owner_control(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["controls"]["owner"]["status"] = "mismatch"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("owner control", stderr)
+
+    # -- Refusal 7: captured argvs differ in more than one position.
+    def test_combine_refuses_argvs_differing_in_more_than_one_position(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["controls"]["flags"]["listenerCmdline"] = (
+            "fastmlx-serve --model /models/candidate --port 9999"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("argv differs", stderr)
+
+    # -- Refusal 8: drift between the reference bookends beyond tolerance.
+    def test_combine_refuses_drift_beyond_tolerance(self):
+        trio = self._combine_baseline()
+        trio["ref_first"]["arms"][0]["passRates"] = [100.0, 100.0]
+        trio["ref_first"]["arms"][0]["medianDecodeTokS"] = 100.0
+        trio["ref_last"]["arms"][0]["passRates"] = [200.0, 200.0]
+        trio["ref_last"]["arms"][0]["medianDecodeTokS"] = 200.0
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("drifted beyond tolerance", stderr)
+
+    # -- Refusal 9: a median is unmeasurable (None).
+    def test_combine_refuses_when_a_median_is_unmeasurable(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["arms"][0]["passRates"] = []
+        trio["candidate"]["arms"][0]["medianDecodeTokS"] = None
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("no measurable decode-rate median", stderr)
+
+    # -- Usage errors: exit 64, not 1 -- --combine measures nothing of its
+    # own, so a measurement flag alongside it is a USAGE error.
+    def test_combine_and_base_url_exits_64(self):
+        code, stdout, stderr = self._run_main(
+            ["--combine", "a.json", "b.json", "c.json", "--base-url", "http://127.0.0.1:9"]
+        )
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        self.assertIn("--base-url", stderr)
+
+    def test_combine_and_model_exits_64(self):
+        code, stdout, stderr = self._run_main(
+            ["--combine", "a.json", "b.json", "c.json", "--model", "x"]
+        )
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        self.assertIn("--model", stderr)
+
+    def test_combine_wrong_file_count_exits_64(self):
+        code, stdout, stderr = self._run_main(["--combine", "a.json", "b.json"])
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+
+    def test_neither_combine_nor_base_url_model_given_exits_64(self):
+        code, stdout, stderr = self._run_main([])
+        self.assertEqual(code, 64)
+        self.assertEqual(stdout, "")
+        self.assertIn("--base-url", stderr)
+        self.assertIn("--model", stderr)
+
+    # -- combinedFrom carries the sha256 of each file's own raw bytes.
+    def test_combine_combined_from_sha256_matches_file_bytes(self):
+        trio = self._combine_baseline()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+            self.assertEqual(code, 0, stderr)
+            doc = json.loads(stdout)
+            expected_roles = ["referenceFirst", "candidate", "referenceLast"]
+            self.assertEqual([entry["role"] for entry in doc["combinedFrom"]], expected_roles)
+            for path, entry in zip(paths, doc["combinedFrom"]):
+                expected_sha256 = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                self.assertEqual(entry["sha256"], expected_sha256)
+
+    # -- Happy path: exit 0, --json.
+    def test_combine_happy_path_exits_0_with_json(self):
+        trio = self._combine_baseline()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["schema"], FASTMLX_BENCH.SCHEMA)
+        self.assertIsNone(doc["baseUrl"])
+        self.assertIsNotNone(doc["ratio"])
+        expected_reference_median = statistics.median([100.0, 110.0, 100.0, 110.0])
+        expected_candidate_median = statistics.median([200.0, 210.0, 205.0])
+        self.assertAlmostEqual(
+            doc["ratio"], expected_candidate_median / expected_reference_median, places=9
+        )
+        self.assertEqual(doc["publishable"]["status"], "publishable")
+
+    # -- Happy path: text mode renders without crashing and says it was
+    # combined from three rows.
+    def test_combine_text_mode_renders_without_crashing(self):
+        trio = self._combine_baseline()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths])
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("combined from 3", stdout)
 
     # ------------------------------------------------------------------
     def _run_main(self, argv: list):

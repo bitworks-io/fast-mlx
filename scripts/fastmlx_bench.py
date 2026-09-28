@@ -165,14 +165,68 @@ not. The verdict is metadata and NEVER changes the process exit code --
 a row measured over the LAN is a perfectly valid measurement, only not a
 publishable one; see the five controls above for what can actually void a
 run.
+
+``--combine REF_FIRST.json CANDIDATE.json REF_LAST.json`` is a SEPARATE
+mode for engines that hold one model per process, where a single
+``--base-url`` cannot serve both the candidate and the reference at once
+(so ratio mode's own sandwiched ``--reference-model`` measurement cannot
+run against them at all). The caller instead takes three ORDINARY
+single-arm rows -- one ``fastmlx bench --json`` invocation per server,
+reference first, candidate, reference last -- and this mode combines
+them into the SAME ratio-row shape ratio mode itself produces, using the
+IDENTICAL bookend-combination estimator (see ``_combine_reference_
+bookends``, shared with ``run_bench``'s own ratio-mode code path): the
+combined reference arm's ``passRates`` is the first row's ``passRates``
+plus the last row's, and its median is taken over that combined list,
+never recomputed from any row's per-reading ``decodeTokS`` values. This
+is only possible because each arm's JSON already carries its own
+``passRates`` (see ``ArmResult.to_json``) -- readings alone cannot
+rebuild it. ``--combine`` takes NO measurement of its own -- it is a
+usage error (exit 64) together with any flag that measures something
+(``--base-url``, ``--model``, ``--reference-model``, ``--prompt``,
+``--expect-listener-pid``, ``--runs``, ``--warmup``, ``--max-tokens``,
+``--temperature``, ``--host-label``, ``--api-key``); ``--base-url`` and
+``--model`` become NOT required at the argparse level for this reason,
+but remain required (usage error) whenever ``--combine`` is absent.
+``--drift-tolerance``/``--magnitude-floor``/``--magnitude-ceiling``/
+``--json`` still apply, since combining still runs C-drift and
+C-magnitude over the three rows' own numbers.
+
+A combined row REFUSES (ratio ``null``, a reason on stderr, still a
+printed row, exit 1) unless: every input is itself a single-arm,
+non-ratio row of this module's own schema; every input arm carries
+``passRates`` (a row from before commit 663980ac lacks it and cannot be
+combined); the two reference rows name the SAME model and the candidate
+names a DIFFERENT one; all three rows share the same ``boundary`` (they
+were not measured under the same workload); every input's C-tokens is
+``verified``; every input's C-owner is ``verified`` (a card-grade ratio
+needs every arm's socket owner proven, same as ratio mode); every
+input's C-flags captured an argv, and the three captured argvs (split
+with ``shlex.split``) have the same length and differ from each other in
+AT MOST one position -- the model path is the only argument a caller's
+own invocation is expected to vary between arms, so a second differing
+flag means the three servers were not run under comparably-configured
+invocations; C-drift passes over the reference rows' own first/last
+medians (identical semantics to ratio mode's own C-drift); and neither
+the combined reference median nor the candidate's own median is
+``None``. An unreadable file or one that is not valid JSON is a harder
+failure than a refusal -- it is reported on stderr naming the file and
+exits 1 with NO row printed at all (there is nothing to combine into).
+The output row's own ``combinedFrom`` field records each input file's
+role (``referenceFirst``/``candidate``/``referenceLast``) and its
+``sha256`` (of the file's raw bytes) -- a durable link from the combined
+row back to the exact three files it was built from.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
+import itertools
 import json
 import platform
+import shlex
 import statistics
 import subprocess
 import sys
@@ -342,7 +396,11 @@ class ArmResult:
         # measure_arm() calls' own PASS rates, not recomputed from pooled
         # per-reading rates across a multi-prompt set (that would mix
         # different prompts' individual rates into one median instead of
-        # each pass's own pooled rate).
+        # each pass's own pooled rate). Also emitted by to_json as
+        # ``passRates``: an engine that holds one model per process needs
+        # one server per arm, and combining those separate rows into a
+        # ratio needs the same per-pass rates, which readings alone cannot
+        # rebuild (their elapsed spans are not serialized).
         self.pass_rates = list(pass_rates) if pass_rates is not None else []
 
     def to_json(self) -> dict:
@@ -351,6 +409,7 @@ class ArmResult:
             "readings": [reading.to_json() for reading in self.readings],
             "medianDecodeTokS": self.median_decode_tok_s,
             "warmupDiscarded": self.warmup_discarded,
+            "passRates": list(self.pass_rates),
         }
 
 
@@ -1085,6 +1144,37 @@ def _boundary(args: argparse.Namespace, prompts: Sequence[str], prompt_is_defaul
     return boundary
 
 
+def _combine_reference_bookends(
+    reference_model: Optional[str], first_arm: ArmResult, last_arm: ArmResult
+) -> ArmResult:
+    """Combines two reference-arm measurements (the first and last bookend)
+    into one ``ArmResult``, over their own PASS rates -- never recomputed
+    from per-reading ``decodeTokS`` values (see module docstring's --warmup/
+    pooling discussion for why a per-reading median would mix different
+    prompts' individual rates together instead of each pass's own pooled
+    one). Shared between ``run_bench``'s own ratio mode and ``run_combine``
+    (see module docstring's --combine section) so BOTH paths use the
+    IDENTICAL estimator -- a card-grade ratio computed by combining three
+    separately-measured rows must be numerically indistinguishable from the
+    same ratio computed in-process, or --combine would be measuring a
+    different quantity than the mode it exists to substitute for.
+    """
+    combined_readings = first_arm.readings + last_arm.readings
+    combined_pass_rates = first_arm.pass_rates + last_arm.pass_rates
+    combined_measurable_rates = [rate for rate in combined_pass_rates if rate is not None]
+    median = statistics.median(combined_measurable_rates) if combined_measurable_rates else None
+    return ArmResult(
+        model=reference_model,
+        readings=combined_readings,
+        median_decode_tok_s=median,
+        # Both bookend measurements discarded their own warmup passes
+        # independently (see design decision 1) -- the combined arm's count
+        # is their sum, not either one alone.
+        warmup_discarded=first_arm.warmup_discarded + last_arm.warmup_discarded,
+        pass_rates=combined_pass_rates,
+    )
+
+
 def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
     """Runs the full measurement plan for ``args`` and returns
     ``(exit_code, row)``. ``row`` is ``None`` only when a reading could not
@@ -1122,27 +1212,12 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
                 args.base_url, args.reference_model, prompts, args.max_tokens,
                 args.runs, args.api_key, args.timeout, args.warmup, args.temperature,
             )
-            combined_readings = first_reference.readings + last_reference.readings
-            # Combined over the two bookends' own PASS rates (each already
-            # pooled per pass by measure_arm/_pool_pass), never recomputed
-            # from raw per-reading rates -- with a multi-prompt set, a
-            # per-reading median would mix different prompts' individual
-            # rates into one number instead of each pass's own pooled one.
-            combined_pass_rates = first_reference.pass_rates + last_reference.pass_rates
-            combined_measurable_rates = [rate for rate in combined_pass_rates if rate is not None]
-            reference_median = (
-                statistics.median(combined_measurable_rates) if combined_measurable_rates else None
-            )
-            reference_arm = ArmResult(
-                model=args.reference_model,
-                readings=combined_readings,
-                median_decode_tok_s=reference_median,
-                # Both bookend measure_arm() calls discarded their own
-                # warmup passes (see design decision 1: every measure_arm
-                # invocation warms up independently) -- the combined arm's
-                # count is their sum, not either one alone.
-                warmup_discarded=first_reference.warmup_discarded + last_reference.warmup_discarded,
-                pass_rates=combined_pass_rates,
+            # Combined over the two bookends' own PASS rates via the SAME
+            # estimator --combine uses to combine three separately-measured
+            # rows (see _combine_reference_bookends) -- never recomputed
+            # from raw per-reading rates.
+            reference_arm = _combine_reference_bookends(
+                args.reference_model, first_reference, last_reference
             )
             arms = [candidate, reference_arm]
         else:
@@ -1219,10 +1294,393 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
 
 
 # ---------------------------------------------------------------------
+# --combine: three separately-measured single-arm rows -> one ratio row.
+# See module docstring's --combine section for the full contract.
+# ---------------------------------------------------------------------
+_COMBINE_ROLES = ("referenceFirst", "candidate", "referenceLast")
+
+# Flags that measure something of their own -- meaningless (and refused)
+# together with --combine, which takes NO measurement and only combines
+# three already-measured rows. Keyed by the argparse dest name.
+_COMBINE_INCOMPATIBLE_FLAG_NAMES: dict = {
+    "base_url": "--base-url",
+    "model": "--model",
+    "reference_model": "--reference-model",
+    "prompt": "--prompt",
+    "expect_listener_pid": "--expect-listener-pid",
+    "runs": "--runs",
+    "warmup": "--warmup",
+    "max_tokens": "--max-tokens",
+    "temperature": "--temperature",
+    "host_label": "--host-label",
+    "api_key": "--api-key",
+}
+
+
+class _CombineInputError(Exception):
+    """One of --combine's three input files could not be read or parsed at
+    all -- this is a harder failure than a refusal (there is nothing to
+    combine into), so ``run_combine`` reports it and returns ``(1, None)``,
+    the same "no row at all" shape as ``run_bench``'s own ``BenchError``
+    path.
+    """
+
+
+def _load_combine_input(path: str) -> dict:
+    try:
+        raw_bytes = Path(path).read_bytes()
+    except OSError as exc:
+        raise _CombineInputError(f"could not read {path}: {exc}")
+    try:
+        row = json.loads(raw_bytes)
+    except json.JSONDecodeError as exc:
+        raise _CombineInputError(f"{path} is not valid JSON: {exc}")
+    return {
+        "path": path,
+        "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "row": row,
+    }
+
+
+def _first_arm(row) -> dict:
+    """Defensively returns ``row["arms"][0]`` (or ``{}``) -- used so a
+    structurally-malformed input (wrong arm count, not a dict at all) still
+    lets ``run_combine`` assemble a best-effort output row instead of
+    crashing before it can even report the refusal reason.
+    """
+    if not isinstance(row, dict):
+        return {}
+    arms = row.get("arms")
+    if isinstance(arms, list) and arms and isinstance(arms[0], dict):
+        return arms[0]
+    return {}
+
+
+def _reading_from_json(data) -> Reading:
+    if not isinstance(data, dict):
+        data = {}
+    return Reading(
+        decode_tok_s=data.get("decodeTokS"),
+        ttft_s=data.get("ttftS") or 0.0,
+        completion_tokens=data.get("completionTokens") or 0,
+        token_source=data.get("tokenSource"),
+        measurable=bool(data.get("measurable")),
+        unmeasurable_reason=data.get("unmeasurableReason"),
+        # elapsed_s is NOT part of Reading.to_json's public shape (see its
+        # docstring) -- not recoverable from a serialized row, and not
+        # needed by anything --combine computes (which works from passRates,
+        # never from readings' elapsed spans).
+        elapsed_s=0.0,
+    )
+
+
+def _arm_result_from_json(data) -> ArmResult:
+    if not isinstance(data, dict):
+        data = {}
+    readings_json = data.get("readings")
+    readings = (
+        [_reading_from_json(r) for r in readings_json] if isinstance(readings_json, list) else []
+    )
+    pass_rates = data.get("passRates")
+    return ArmResult(
+        model=data.get("model"),
+        readings=readings,
+        median_decode_tok_s=data.get("medianDecodeTokS"),
+        warmup_discarded=data.get("warmupDiscarded") or 0,
+        pass_rates=pass_rates if isinstance(pass_rates, list) else None,
+    )
+
+
+def _nested_status(row, *keys) -> Optional[str]:
+    current = row
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _combine_tokens_control(loaded: "Sequence[dict]") -> dict:
+    per_role = {
+        role: _nested_status(entry["row"], "controls", "tokens", "status")
+        for role, entry in zip(_COMBINE_ROLES, loaded)
+    }
+    verified = all(status == "verified" for status in per_role.values())
+    return {
+        "status": "verified" if verified else "unverified",
+        "perRole": per_role,
+        "reason": (
+            None
+            if verified
+            else (
+                "not every input row's tokens control is verified: "
+                + ", ".join(f"{role}={status}" for role, status in per_role.items())
+            )
+        ),
+    }
+
+
+def _combine_owner_control(loaded: "Sequence[dict]") -> dict:
+    per_role = {
+        role: _nested_status(entry["row"], "controls", "owner", "status")
+        for role, entry in zip(_COMBINE_ROLES, loaded)
+    }
+    verified = all(status == "verified" for status in per_role.values())
+    return {
+        "status": "verified" if verified else "unverified",
+        "perRole": per_role,
+        "reason": (
+            None
+            if verified
+            else (
+                "not every input row's owner control is verified (a "
+                "card-grade ratio needs every arm's socket owner proven): "
+                + ", ".join(f"{role}={status}" for role, status in per_role.items())
+            )
+        ),
+    }
+
+
+def _combine_flags_control(loaded: "Sequence[dict]") -> dict:
+    """Every input's C-flags must have captured an argv, AND the three
+    captured argvs (split with ``shlex.split``) must have the same length
+    and differ from each other in AT MOST one position -- the model path is
+    the only argument a caller's own invocation is expected to vary between
+    arms (see module docstring's --combine section).
+    """
+    per_role_status = {
+        role: _nested_status(entry["row"], "controls", "flags", "status")
+        for role, entry in zip(_COMBINE_ROLES, loaded)
+    }
+    per_role_cmdline = {
+        role: _nested_status(entry["row"], "controls", "flags", "listenerCmdline")
+        for role, entry in zip(_COMBINE_ROLES, loaded)
+    }
+    if any(status != "captured" for status in per_role_status.values()):
+        return {
+            "status": "mismatch",
+            "perRole": per_role_status,
+            "listenerCmdline": per_role_cmdline,
+            "reason": (
+                "not every input row's flags control captured an argv: "
+                + ", ".join(f"{role}={status}" for role, status in per_role_status.items())
+            ),
+        }
+    try:
+        split = {role: shlex.split(cmdline or "") for role, cmdline in per_role_cmdline.items()}
+    except ValueError as exc:
+        return {
+            "status": "mismatch",
+            "perRole": per_role_status,
+            "listenerCmdline": per_role_cmdline,
+            "reason": f"could not parse a captured listener argv: {exc}",
+        }
+    lengths = {len(argv) for argv in split.values()}
+    if len(lengths) > 1:
+        return {
+            "status": "mismatch",
+            "perRole": per_role_status,
+            "listenerCmdline": per_role_cmdline,
+            "reason": (
+                "captured listener argvs have different lengths across the "
+                "three rows -- the model path is the only argument allowed "
+                "to vary between arms"
+            ),
+        }
+    worst_diff = 0
+    worst_pair = None
+    for (role_a, argv_a), (role_b, argv_b) in itertools.combinations(split.items(), 2):
+        diff_positions = sum(1 for a, b in zip(argv_a, argv_b) if a != b)
+        if diff_positions > worst_diff:
+            worst_diff = diff_positions
+            worst_pair = (role_a, role_b)
+    if worst_diff > 1:
+        role_a, role_b = worst_pair
+        return {
+            "status": "mismatch",
+            "perRole": per_role_status,
+            "listenerCmdline": per_role_cmdline,
+            "reason": (
+                f"captured listener argv differs in {worst_diff} position(s) "
+                f"between {role_a} and {role_b} -- only the model path may "
+                "vary between arms"
+            ),
+        }
+    return {
+        "status": "captured",
+        "perRole": per_role_status,
+        "listenerCmdline": per_role_cmdline,
+        "reason": None,
+    }
+
+
+def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
+    """Combines three separately-measured single-arm rows (see module
+    docstring's --combine section) into one ratio row, using the SAME
+    bookend-combination estimator ratio mode's own reference arm uses (see
+    ``_combine_reference_bookends``, shared with ``run_bench``). Returns
+    ``(exit_code, row)`` in the same shape as ``run_bench``: ``row`` is
+    ``None`` only when an input file itself could not be read/parsed (see
+    ``_CombineInputError``); every REFUSAL still returns a row with
+    ``ratio=None``, same as ``run_bench``'s own control refusals.
+    """
+    try:
+        loaded = [_load_combine_input(path) for path in args.combine]
+    except _CombineInputError as error:
+        print(f"fastmlx bench: {error}", file=sys.stderr)
+        return 1, None
+
+    ref_first, candidate_in, ref_last = loaded
+    combined_from = [
+        {"role": role, "sha256": entry["sha256"]} for role, entry in zip(_COMBINE_ROLES, loaded)
+    ]
+
+    refusal_reason: Optional[str] = None
+
+    # 1: each input must be a single-arm, non-ratio row of this module's
+    # own schema -- --combine takes rows measured with --model and no
+    # --reference-model only (a two-arm/ratio row is not one of those).
+    for role, entry in zip(_COMBINE_ROLES, loaded):
+        row = entry["row"]
+        if not isinstance(row, dict) or row.get("schema") != SCHEMA:
+            refusal_reason = (
+                f"{role} ({entry['path']}) is not a single-arm row of schema "
+                f"{SCHEMA!r} (got schema="
+                f"{row.get('schema') if isinstance(row, dict) else None!r})"
+            )
+            break
+        arms = row.get("arms")
+        if not isinstance(arms, list) or len(arms) != 1 or row.get("ratio") is not None:
+            refusal_reason = (
+                f"{role} ({entry['path']}) is not a single-arm row -- "
+                "--combine takes rows measured with --model and no "
+                "--reference-model only"
+            )
+            break
+
+    # 2: every input arm must carry passRates (added in commit 663980ac) --
+    # a row measured before that carries no per-pass rates to combine.
+    if refusal_reason is None:
+        for role, entry in zip(_COMBINE_ROLES, loaded):
+            if "passRates" not in _first_arm(entry["row"]):
+                refusal_reason = (
+                    f"{role} ({entry['path']}) predates passRates (added in "
+                    "commit 663980ac) and cannot be combined"
+                )
+                break
+
+    ref_first_model = _first_arm(ref_first["row"]).get("model")
+    ref_last_model = _first_arm(ref_last["row"]).get("model")
+    candidate_model = _first_arm(candidate_in["row"]).get("model")
+
+    # 3: the two reference rows must name the SAME model; the candidate
+    # must name a DIFFERENT one -- otherwise there is no meaningful ratio.
+    if refusal_reason is None:
+        if ref_first_model != ref_last_model:
+            refusal_reason = (
+                "the two reference rows name different models "
+                f"({ref_first_model!r} vs {ref_last_model!r})"
+            )
+        elif candidate_model == ref_first_model:
+            refusal_reason = (
+                f"the candidate names the same model ({candidate_model!r}) "
+                "as the reference -- a ratio needs two different models"
+            )
+
+    # 4: all three rows must share the same boundary (the same workload) --
+    # a ratio combined across differing workloads is not one measurement.
+    boundaries = {
+        entry["row"].get("boundary") if isinstance(entry["row"], dict) else None
+        for entry in loaded
+    }
+    if refusal_reason is None and len(boundaries) > 1:
+        refusal_reason = "input rows do not share the same boundary: " + "; ".join(
+            repr(b) for b in sorted(str(b) for b in boundaries)
+        )
+
+    tokens = _combine_tokens_control(loaded)
+    if refusal_reason is None and tokens["status"] != "verified":
+        refusal_reason = tokens["reason"]
+
+    owner = _combine_owner_control(loaded)
+    if refusal_reason is None and owner["status"] != "verified":
+        refusal_reason = owner["reason"]
+
+    flags = _combine_flags_control(loaded)
+    if refusal_reason is None and flags["status"] != "captured":
+        refusal_reason = flags["reason"]
+
+    candidate_arm = _arm_result_from_json(_first_arm(candidate_in["row"]))
+    ref_first_arm = _arm_result_from_json(_first_arm(ref_first["row"]))
+    ref_last_arm = _arm_result_from_json(_first_arm(ref_last["row"]))
+    reference_arm = _combine_reference_bookends(ref_first_model, ref_first_arm, ref_last_arm)
+
+    # 8: C-drift over the reference rows' own first/last medians -- same
+    # semantics (and the same shape in the output row) as ratio mode's own
+    # C-drift.
+    drift = drift_control(ref_first_model, ref_first_arm, ref_last_arm, args.drift_tolerance)
+    if refusal_reason is None and drift["status"] != "verified":
+        refusal_reason = drift["reason"] or "drift control voided the combination"
+
+    magnitude = magnitude_control(
+        [candidate_arm, reference_arm], args.magnitude_floor, args.magnitude_ceiling
+    )
+
+    # 9: neither median may be unmeasurable -- there is no rate to divide.
+    if refusal_reason is None and (
+        candidate_arm.median_decode_tok_s is None or reference_arm.median_decode_tok_s is None
+    ):
+        unmeasurable = [
+            role
+            for role, arm in (("candidate", candidate_arm), ("reference", reference_arm))
+            if arm.median_decode_tok_s is None
+        ]
+        refusal_reason = "no measurable decode-rate median for: " + ", ".join(unmeasurable)
+
+    ratio = None
+    if refusal_reason is None:
+        ratio = candidate_arm.median_decode_tok_s / reference_arm.median_decode_tok_s
+
+    row = {
+        "schema": SCHEMA,
+        "generatedAt": _utc_now_iso(),
+        "baseUrl": None,
+        "boundary": (
+            candidate_in["row"].get("boundary") if isinstance(candidate_in["row"], dict) else None
+        ),
+        "arms": [candidate_arm.to_json(), reference_arm.to_json()],
+        "ratio": ratio,
+        "controls": {
+            "tokens": tokens,
+            "drift": drift,
+            "magnitude": magnitude,
+            "owner": owner,
+            "flags": flags,
+        },
+        "combinedFrom": combined_from,
+    }
+    # Same calling convention as run_bench: computed LAST, over the row as
+    # otherwise complete, and attached only after.
+    row["publishable"] = publishability_control(row)
+
+    if refusal_reason:
+        print(f"fastmlx bench: {refusal_reason}", file=sys.stderr)
+        return 1, row
+    return 0, row
+
+
+# ---------------------------------------------------------------------
 # Rendering.
 # ---------------------------------------------------------------------
 def format_text(row: dict) -> str:
-    lines = [f"fastmlx bench: {row['baseUrl']}"]
+    combined_from = row.get("combinedFrom")
+    if combined_from:
+        # A --combine row has no single --base-url of its own (see module
+        # docstring) -- say what it WAS combined from instead of printing
+        # the (always-null) baseUrl field.
+        lines = [f"fastmlx bench: combined from {len(combined_from)} separately-measured rows"]
+    else:
+        lines = [f"fastmlx bench: {row['baseUrl']}"]
     for arm in row["arms"]:
         median = arm["medianDecodeTokS"]
         median_desc = f"{median:.2f} tok/s" if median is not None else "UNMEASURABLE"
@@ -1281,12 +1739,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--base-url", required=True,
-        help="Base URL of the OpenAI-compatible server to measure (e.g. http://127.0.0.1:8080).",
+        # NOT required at the argparse level -- --combine's own three input
+        # rows are already-measured, so it takes no --base-url of its own
+        # (see module docstring's --combine section). Still required
+        # (usage error, exit 64) whenever --combine is absent -- see main().
+        "--base-url", default=None,
+        help=(
+            "Base URL of the OpenAI-compatible server to measure (e.g. "
+            "http://127.0.0.1:8080). Required unless --combine is given."
+        ),
     )
     parser.add_argument(
-        "--model", required=True,
-        help="Model name requested for the measured (candidate) arm.",
+        # Same NOT-required-at-argparse-level reasoning as --base-url above.
+        "--model", default=None,
+        help=(
+            "Model name requested for the measured (candidate) arm. "
+            "Required unless --combine is given."
+        ),
     )
     parser.add_argument(
         "--prompt", action="append", default=None,
@@ -1299,12 +1768,35 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+        # default=None (a sentinel), not DEFAULT_MAX_TOKENS -- main() must
+        # be able to tell "not given" apart from "given, and it happens to
+        # equal the default" so --combine's mutual-exclusion check (see
+        # module docstring) can refuse an explicit --max-tokens without
+        # also refusing every ordinary measurement invocation that never
+        # passed it at all. The real default is filled in by main() only
+        # once combine mode has been ruled out.
+        "--max-tokens", type=int, default=None,
         help=f"Maximum completion tokens requested per pass (default: {DEFAULT_MAX_TOKENS}).",
     )
     parser.add_argument(
-        "--runs", type=int, default=DEFAULT_RUNS,
+        # Same sentinel-default reasoning as --max-tokens above.
+        "--runs", type=int, default=None,
         help=f"Measured passes per arm; the arm's median decode rate is taken over these (default: {DEFAULT_RUNS}).",
+    )
+    parser.add_argument(
+        "--combine", nargs=3, default=None,
+        metavar=("REFERENCE_FIRST_JSON", "CANDIDATE_JSON", "REFERENCE_LAST_JSON"),
+        help=(
+            "Combine three already-measured single-arm --json rows (one "
+            "fastmlx bench --json invocation per server: reference first, "
+            "candidate, reference last) into one ratio row, for engines "
+            "that hold one model per process and so cannot be measured by "
+            "ratio mode's own --reference-model (which needs one --base-url "
+            "serving both models). Takes no measurement of its own -- "
+            "mutually exclusive with --base-url/--model/--reference-model/"
+            "--prompt/--expect-listener-pid/--runs/--warmup/--max-tokens/"
+            "--temperature/--host-label/--api-key."
+        ),
     )
     parser.add_argument(
         "--reference-model", default=None,
@@ -1348,14 +1840,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Emit the result row as one line of JSON on stdout instead of human-readable text.",
     )
     parser.add_argument(
-        "--warmup", type=int, default=DEFAULT_WARMUP,
+        # Sentinel default=None -- see --max-tokens's comment above for why.
+        "--warmup", type=int, default=None,
         help=(
             "Passes executed and discarded per arm measurement before the "
             f"measured passes begin; 0 opts out (default: {DEFAULT_WARMUP})."
         ),
     )
     parser.add_argument(
-        "--temperature", type=float, default=DEFAULT_TEMPERATURE,
+        # Sentinel default=None -- see --max-tokens's comment above for why.
+        "--temperature", type=float, default=None,
         help=(
             "Sampling temperature sent with every pass, warmup and measured "
             "alike; a timing instrument must hold its workload fixed, and "
@@ -1378,19 +1872,64 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
-    if args.warmup < 0:
-        # argparse's type=int happily accepts a negative value -- this is a
-        # usage error (design decision 4), not a measurement outcome, so it
-        # must route through parser.error()'s exit-64 path (see
-        # _UsageErrorArgumentParser), never a bare ValueError or exit 1.
-        parser.error(f"--warmup must be >= 0 (got {args.warmup})")
-    if args.temperature < 0:
-        # Same shape as --warmup's check above: a negative sampling
-        # temperature is nonsensical, so it is a usage error, not a
-        # measurement outcome -- exit 64 via parser.error(), never a bare
-        # ValueError or exit 1.
-        parser.error(f"--temperature must be >= 0 (got {args.temperature})")
-    code, row = run_bench(args)
+
+    if args.combine is not None:
+        # --combine takes NO measurement of its own -- any flag that
+        # measures something is a usage error together with it (see module
+        # docstring's --combine section). Checked against the RAW parsed
+        # value (before any default is filled in), so an ordinary
+        # measurement invocation that never passed one of these flags at
+        # all is never mistaken for having given it.
+        given = [
+            _COMBINE_INCOMPATIBLE_FLAG_NAMES[dest]
+            for dest in _COMBINE_INCOMPATIBLE_FLAG_NAMES
+            if getattr(args, dest) is not None
+        ]
+        if given:
+            parser.error(
+                "--combine cannot be combined with "
+                + ", ".join(given)
+                + " -- --combine measures nothing of its own, it only combines "
+                "three already-measured rows"
+            )
+        code, row = run_combine(args)
+    else:
+        missing = []
+        if args.base_url is None:
+            missing.append("--base-url")
+        if args.model is None:
+            missing.append("--model")
+        if missing:
+            # Usage error, exit 64 -- same as argparse's own required=True
+            # would have produced, restated by hand because --base-url and
+            # --model are no longer required=True at the argparse level
+            # (see their own comments in build_arg_parser): they must stay
+            # required whenever --combine is absent.
+            parser.error(f"the following arguments are required: {', '.join(missing)}")
+        # Sentinel None -> the module's real defaults, now that combine
+        # mode (which needed None to mean "not given") has been ruled out.
+        if args.max_tokens is None:
+            args.max_tokens = DEFAULT_MAX_TOKENS
+        if args.runs is None:
+            args.runs = DEFAULT_RUNS
+        if args.warmup is None:
+            args.warmup = DEFAULT_WARMUP
+        if args.temperature is None:
+            args.temperature = DEFAULT_TEMPERATURE
+        if args.warmup < 0:
+            # argparse's type=int happily accepts a negative value -- this is a
+            # usage error (design decision 4), not a measurement outcome, so it
+            # must route through parser.error()'s exit-64 path (see
+            # _UsageErrorArgumentParser), never a bare ValueError or exit 1.
+            parser.error(f"--warmup must be >= 0 (got {args.warmup})")
+        if args.temperature < 0:
+            # Same shape as --warmup's check above: a negative sampling
+            # temperature is nonsensical, so it is a usage error, not a
+            # measurement outcome -- exit 64 via parser.error(), never a bare
+            # ValueError or exit 1.
+            parser.error(f"--temperature must be >= 0 (got {args.temperature})")
+        code, row = run_bench(args)
+
     if row is not None:
         if args.json:
             print(json.dumps(row))
