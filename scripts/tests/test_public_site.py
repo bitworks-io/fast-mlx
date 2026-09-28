@@ -5583,6 +5583,9 @@ class PublicSiteTests(unittest.TestCase):
         # Added 2026-09-28 (cycle 167): the same iQ-3.3 pack re-measured on served-engine
         # build v26.9.6. A sibling card, not a replacement, so both builds are pinned.
         "qwen38-flash-next-iq-3p3bpw@m3ultra-v2696": "1745ffe89e4670f1e0c6de22c75a9875b27399de",
+        # Added 2026-09-28 (cycle 167): the mixed 4/8-bit pack re-measured on the same
+        # served-engine build v26.9.6, on a fresh corpus disjoint from the original card's.
+        "qwen38-flash-next-mixed-4-8bit@m3ultra-v2696": "1745ffe89e4670f1e0c6de22c75a9875b27399de",
         "qwen3-0p6b-4bit@m5": "21af3abd339a0752319ba6b4abe3b3880b16da3b",
         # Added 2026-09-23 (cycle 144) for the second card cycle 142 shipped. Its build sha
         # differs from the @m5 card's because the two rows were measured on different hosts --

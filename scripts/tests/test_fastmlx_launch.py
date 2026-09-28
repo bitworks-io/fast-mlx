@@ -4437,10 +4437,13 @@ class RealShippedManifestTestCase(unittest.TestCase):
     """
 
     # P3a: the structural pin. Hand-derived from site/quality-guides.json
-    # by inspection -- schema string, exactly 9 cards, exactly 7 NO_GO
+    # by inspection -- schema string, exactly 10 cards, exactly 8 NO_GO
     # (updated when qwen38-flash-next-iq-3p3bpw@m3ultra-v2696, a sibling
     # NO_GO card re-measured on served-engine build 1745ffe8, was added
-    # alongside the pre-existing qwen38-flash-next-iq-3p3bpw@m3ultra card).
+    # alongside the pre-existing qwen38-flash-next-iq-3p3bpw@m3ultra card;
+    # and again when qwen38-flash-next-mixed-4-8bit@m3ultra-v2696, the
+    # analogous sibling for the mixed 4/8-bit pack re-measured on the same
+    # engine build on a fresh corpus, was added).
     # If this manifest ever ships without one of those cards, or a NO_GO
     # verdict silently flips, this is the test that must go RED.
     def test_real_manifest_schema_and_card_and_no_go_counts(self):
@@ -4456,16 +4459,16 @@ class RealShippedManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(
             len(cards),
-            9,
-            f"expected exactly 9 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
+            10,
+            f"expected exactly 10 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
         )
         no_go_ids = sorted(
             card.get("id") for card in cards if card.get("verdict") == "NO_GO"
         )
         self.assertEqual(
             len(no_go_ids),
-            7,
-            f"expected exactly 7 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
+            8,
+            f"expected exactly 8 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
             f"got {len(no_go_ids)}: {no_go_ids}",
         )
 

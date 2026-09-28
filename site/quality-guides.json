@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-28T03:57:47Z",
+  "generatedAt": "2026-09-28T09:09:17Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -680,6 +680,85 @@
         "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
         "sourceVerdict": "card-B2.json",
         "measuredAt": "2026-09-28T03:57:47Z",
+        "engineBuild": {
+          "commit": "1745ffe89e4670f1e0c6de22c75a9875b27399de"
+        }
+      },
+      "boundary": {
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-flash-next-mixed-4-8bit@m3ultra-v2696",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "ef5b919d31534faa1997666f1a22d362cd6383cd"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community mixed pack: 4-bit routed experts, 8-bit other projections"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 2.59% top-1 disagreement (97.41% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 39 differs from what the peer pack would say (forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed).",
+        "nextWordDrift": {
+          "oneInK": 39,
+          "top1AgreementPct": 97.4053
+        },
+        "regressionFocus": "not localized by task; measured on a fresh 160-prompt corpus, disjoint from the corpus behind the earlier card for this pack",
+        "example": {
+          "status": "measured",
+          "prompt": "In your answer, describe the data structure",
+          "referenceOutput": " and",
+          "configOutput": ",",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026In your answer, describe the data structure', the reference picks ' and' and this pack picks ','."
+        },
+        "benefit": {
+          "fit": "70.1 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context (86.1 GiB needed with a 16 GiB KV reserve, against an 88 GiB shared-host ceiling). RED on a 96 GB Mac at any context \u2014 the weights alone exceed that machine's 64 GiB ceiling.",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 9481,
+        "disagreements": 246,
+        "disagreement_rate": 0.025946630102309885,
+        "tier": "NOTICEABLE",
+        "wilson_lo": 0.022933497620694288,
+        "wilson_hi": 0.02934375561262913,
+        "tv_lower_bound_median": 0.004785237525094188,
+        "tv_lower_bound_p95": 0.1121749694285864,
+        "tv_lower_bound_raw_min": -1.7336268522960552e-06,
+        "kl_lower_bound_median_nats": 0.000923664020737891,
+        "kl_lower_bound_p95_nats": 0.03649652412743429
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 22.5% of positions here, so a small value is a floor, not closeness. Controls on this build and corpus: self-replay 0/9993 (card-C4.json); the verdict uses this corpus alone, and an earlier run on the original corpus on this same build (2.43%, interval straddling 2%) is not pooled; the two cards for this pack use different corpora, so their rates are not a like-for-like build comparison. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M3 Ultra / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-B1.json",
+        "measuredAt": "2026-09-28T09:09:17Z",
         "engineBuild": {
           "commit": "1745ffe89e4670f1e0c6de22c75a9875b27399de"
         }
