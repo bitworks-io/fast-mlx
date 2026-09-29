@@ -1290,7 +1290,7 @@ SERVED_BENCHMARK_RERUN_FILENAME = re.compile(r"[a-z0-9-]+\.json")
 # `shasum -a 256`, never transcribed from any other source.
 REVIEWED_SERVED_BENCHMARKS_BYTES = 4380
 REVIEWED_SERVED_BENCHMARKS_SHA256 = (
-    "e9b203488aa1db016f9939411dd706a6c9224517feb1d27dead3c0af0a36032a"
+    "e750cb065ba08b92d6ca1965afbc500d626d11bdc1a6e56bb6ee16aae1dfa4b8"
 )
 # (id, cardId) pairs in the exact newest-first order the reviewed ledger
 # renders them (V3) -- mirrors REVIEWED_RELEASE_IDENTITIES above.
@@ -1304,6 +1304,23 @@ REVIEWED_SERVED_BENCHMARK_IDENTITIES: Tuple[Tuple[str, str], ...] = (
         "qwen38-flash-next-mixed-4-8bit@m3ultra-v2696",
     ),
 )
+# Sealed byte count + sha256 per built `benchmarks/served-benchmark-rows/
+# <id>.json` row file (slice 2) -- same derivation as
+# REVIEWED_SERVED_BENCHMARKS_BYTES/SHA256 above, one pair per
+# REVIEWED_SERVED_BENCHMARK_IDENTITIES entry.
+# Mirrors `build_public_site.SERVED_BENCHMARK_ROWS_DIRNAME` byte-for-byte --
+# see that constant's own comment for why this is a separate copy.
+SERVED_BENCHMARK_ROWS_DIRNAME = "served-benchmark-rows"
+REVIEWED_SERVED_BENCHMARK_ROW_FILES: Dict[str, Tuple[int, str]] = {
+    "qwen38-flash-next-iq-3p3bpw-m3ultra-2026-09-29": (
+        10414,
+        "9b5994c9d05262039c0e2a500bfc2e72ed7ca60460f89fa62695e06f4584d882",
+    ),
+    "qwen38-flash-next-mixed-4-8bit-m3ultra-2026-09-29": (
+        10414,
+        "a796f8552a1f5860fbb2f68e66c5d76710baac36f4c81af347b23f09d37c35a2",
+    ),
+}
 
 
 class LinkCollector(html.parser.HTMLParser):
@@ -4863,7 +4880,13 @@ class ServedBenchmarkCollector(html.parser.HTMLParser):
                 "id": attributes.get("data-served-benchmark"),
                 "cardId": attributes.get("data-card-id"),
                 "text_parts": [],
+                "links": [],
             }
+            return
+        if tag == "a" and self._current is not None and "href" in attributes:
+            links = self._current["links"]
+            if isinstance(links, list):
+                links.append(attributes.get("href"))
 
     def handle_data(self, data: str) -> None:
         if self._current is not None:
@@ -5222,6 +5245,31 @@ def validate_served_benchmarks(site: Path) -> List[str]:
             failures.append("served ledger entries are not newest-first")
         previous_measured_at = measured_at
 
+    # Cross-check each entry's built row file (item 5): its sha256 must
+    # equal the entry's OWN `rowSha256` in the built ledger json (not just
+    # the sealed pin below, which only covers the two REVIEWED identities --
+    # this check runs for every entry, sealed or not).
+    for entry in entries:
+        identifier = str(entry.get("id"))
+        row_path = site / "benchmarks" / SERVED_BENCHMARK_ROWS_DIRNAME / f"{identifier}.json"
+        if row_path.is_symlink() or not row_path.is_file():
+            failures.append(
+                f"served benchmark entry {identifier!r} row file is missing, not a file, or a symlink"
+            )
+            continue
+        row_bytes = row_path.read_bytes()
+        row_sha = hashlib.sha256(row_bytes).hexdigest()
+        if row_sha != str(entry.get("rowSha256")):
+            failures.append(
+                f"served benchmark entry {identifier!r} row file sha256 does not match its own rowSha256"
+            )
+        sealed = REVIEWED_SERVED_BENCHMARK_ROW_FILES.get(identifier)
+        if sealed is not None and (len(row_bytes), row_sha) != sealed:
+            failures.append(
+                f"benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME}/{identifier}.json does not match "
+                "the reviewed served-benchmark row"
+            )
+
     # V3: the rendered `benchmarks/index.html` section against the reviewed
     # identity list -- only meaningful once the ledger itself is clean.
     if failures:
@@ -5291,6 +5339,12 @@ def validate_served_benchmarks(site: Path) -> List[str]:
             failures.append(f"served-engine ledger card {identifier!r} does not render its cardId")
         if str(entry["rowSha256"]) not in text:
             failures.append(f"served-engine ledger card {identifier!r} does not render its rowSha256")
+        expected_row_href = f"{SERVED_BENCHMARK_ROWS_DIRNAME}/{identifier}.json"
+        links = rendered.get("links", [])
+        if not isinstance(links, list) or expected_row_href not in links:
+            failures.append(
+                f"served-engine ledger card {identifier!r} rowSha256 does not link to its row file"
+            )
         for key in ("measure", "combine", "publicView"):
             if str(entry["rerun"][key]) not in text:
                 failures.append(f"served-engine ledger card {identifier!r} does not render its rerun.{key}")
@@ -5914,7 +5968,7 @@ def validate_quality_guide_page(site: Path) -> List[str]:
 def validate_benchmark_detail_pages(site: Path) -> List[str]:
     failures: List[str] = []
     benchmark_root = site / "benchmarks"
-    expected_entries = {"index.html", "served-benchmarks.json"} | {
+    expected_entries = {"index.html", "served-benchmarks.json", SERVED_BENCHMARK_ROWS_DIRNAME} | {
         str(highlight["id"]) for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
     }
     if benchmark_root.is_symlink() or not benchmark_root.is_dir():
@@ -5925,6 +5979,39 @@ def validate_benchmark_detail_pages(site: Path) -> List[str]:
         return [f"cannot inspect benchmark detail routes: {exc}"]
     for extra in sorted(actual_entries - expected_entries):
         failures.append(f"unexpected benchmark route outside reviewed set: {extra}")
+
+    # Item 4/5: `benchmarks/served-benchmark-rows/` may hold exactly one file
+    # per reviewed served-benchmark identity, never a subdirectory, symlink,
+    # or orphan file no ledger entry names. Gated on `expected_row_files`
+    # being non-empty: a REAL build always has at least one served-benchmark
+    # entry (the loader itself refuses an empty ledger), so the directory
+    # always exists there; only a test that substitutes a synthetic EMPTY
+    # ledger (e.g. mocking `load_served_benchmarks`/`validate_served_
+    # benchmarks` to isolate an unrelated page) can legitimately produce a
+    # build with no row directory at all, and that is not this check's
+    # concern.
+    expected_row_files = {
+        f"{identifier}.json" for identifier, _card_id in REVIEWED_SERVED_BENCHMARK_IDENTITIES
+    }
+    if expected_row_files:
+        rows_root = benchmark_root / SERVED_BENCHMARK_ROWS_DIRNAME
+        if rows_root.is_symlink() or not rows_root.is_dir():
+            failures.append(f"benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME} must be a regular non-symlink directory")
+        else:
+            try:
+                actual_row_entries = {entry.name: entry for entry in rows_root.iterdir()}
+            except OSError as exc:
+                failures.append(f"cannot inspect benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME}: {exc}")
+            else:
+                for name, entry in sorted(actual_row_entries.items()):
+                    if entry.is_symlink():
+                        failures.append(f"benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME}/{name} is a symlink")
+                    elif entry.is_dir():
+                        failures.append(f"benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME}/{name} is a subdirectory")
+                    if name not in expected_row_files:
+                        failures.append(
+                            f"unexpected file under benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME}: {name}"
+                        )
 
     for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS:
         identifier = str(highlight["id"])
@@ -6188,6 +6275,10 @@ def validate(site: Path) -> List[str]:
         *[
             f'benchmarks/{highlight["id"]}/index.html'
             for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
+        ],
+        *[
+            f'benchmarks/{SERVED_BENCHMARK_ROWS_DIRNAME}/{identifier}.json'
+            for identifier, _card_id in REVIEWED_SERVED_BENCHMARK_IDENTITIES
         ],
         "releases/index.html",
         "releases/index.json",

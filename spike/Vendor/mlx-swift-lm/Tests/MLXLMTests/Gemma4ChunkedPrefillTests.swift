@@ -16,6 +16,7 @@ import Testing
 /// covers Gemma 4's tricky structures: sliding-window layers whose rotating
 /// caches wrap across chunk boundaries, a global-attention layer, KV-shared
 /// tail layers, and per-layer inputs.
+@Suite(.serialized)
 struct Gemma4ChunkedPrefillTests {
 
     /// Tiny Gemma4 built from a sparse JSON config (all other fields take
@@ -83,6 +84,7 @@ struct Gemma4ChunkedPrefillTests {
         "Chunked and single-pass prefill agree on logits and cache offsets",
         arguments: [3, 5, 8, 16])
     func chunkSizeInvariance(chunkSize: Int) throws {
+        MLXRandom.seed(174)
         let model = try Self.makeTinyModel()
         let tokens = Self.makePrompt(count: 37)
 
@@ -94,8 +96,27 @@ struct Gemma4ChunkedPrefillTests {
         #expect(chunked.cacheOffsets == singlePass.cacheOffsets)
         #expect(chunked.cacheOffsets.allSatisfy { $0 == tokens.count })
 
+        // MLX runs float32 matmuls as TF32 unless MLX_ENABLE_TF32=0 (read once
+        // per process, so a test cannot toggle it). On M5 that alone moves these
+        // logits (max |logit| ~2.6) by up to 1.3e-3 between chunk shapes; with
+        // TF32 off the gap is <= 4e-6. Measured cycle 174 (2026-09-29).
+        let tf32 = ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] != "0"
+        let (rtol, atol): (Double, Double) = tf32 ? (0, 1e-2) : (1e-4, 1e-5)
+
+        // Positive control at the same tolerance: changing one token 36
+        // positions back (reachable only through the global layer) moves the
+        // logits by ~0.6, so the tolerance still catches a chunk that loses
+        // context.
+        var farTokens = tokens
+        farTokens[0] = (farTokens[0] + 1) % 199
+        let control = try Self.prefillLogits(model: model, tokens: farTokens, windowSize: 1024)
+        #expect(
+            !allClose(control.logits, singlePass.logits, rtol: rtol, atol: atol)
+                .item(Bool.self),
+            "The tolerance no longer distinguishes a one-token context loss.")
+
         let close = allClose(
-            chunked.logits, singlePass.logits, rtol: 1e-4, atol: 1e-5
+            chunked.logits, singlePass.logits, rtol: rtol, atol: atol
         ).item(Bool.self)
         #expect(
             close,

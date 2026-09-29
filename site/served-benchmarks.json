@@ -42,7 +42,7 @@
         "referenceDriftPct": 0.09,
         "referencePasses": 6
       },
-      "rowSha256": "75d63faa38464f318ea371e7920c00fc6a3beeb9f779b80f98cc05b0f3bcec55",
+      "rowSha256": "9b5994c9d05262039c0e2a500bfc2e72ed7ca60460f89fa62695e06f4584d882",
       "serving": {
         "contextTokens": 262144,
         "drafter": "off",
@@ -99,7 +99,7 @@
         "referenceDriftPct": 0.09,
         "referencePasses": 6
       },
-      "rowSha256": "0e7b7dedeb6b2efce0df3012441ebf781b23f6f7d89b5682394c87f827213808",
+      "rowSha256": "a796f8552a1f5860fbb2f68e66c5d76710baac36f4c81af347b23f09d37c35a2",
       "serving": {
         "contextTokens": 262144,
         "drafter": "off",

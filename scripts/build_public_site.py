@@ -362,6 +362,38 @@ SERVED_BENCHMARK_RERUN_FLAG_NAMES = {
 SERVED_BENCHMARK_RERUN_PLACEHOLDER = re.compile(r"<[a-z][a-z-]*>(?:\.json)?")
 SERVED_BENCHMARK_RERUN_NUMBER = re.compile(r"\d+(?:\.\d+)?")
 SERVED_BENCHMARK_RERUN_FILENAME = re.compile(r"[a-z0-9-]+\.json")
+# --- Served-benchmark ledger ROW (site/served-benchmark-rows/<id>.json) ---
+# The published, verifiable evidence a reader's `rowSha256` actually hashes
+# (see the ingest tool's own module docstring, item 1). A ledger row is the
+# public-view row with exactly one transformation: `--host`/`--port` and
+# their values dropped from every role's `controls.flags.listenerFlags`.
+# `SERVED_BENCHMARK_LEDGER_ROW_IPV4` is deliberately a SEPARATE, simpler
+# regex than `SERVED_BENCHMARK_IPV4` above -- this one is the exact pattern
+# the design doc specifies for the ledger-row refusal, independent of that
+# other marker scan's own lookaround shape.
+SERVED_BENCHMARK_LEDGER_ROW_IPV4 = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b")
+# Assembled by concatenation, never written as a literal -- this module is
+# itself part of the public projection it scans row text for, so a literal
+# occurrence here would match this project's OWN private-marker scan on
+# every future publish (see `validate_public_repository.PRIVATE_MARKERS`,
+# which the same "/" + "Users/" entry already lives in).
+_SERVED_BENCHMARK_LEDGER_ROW_HOME_PATH = "/" + "Users/"
+SERVED_BENCHMARK_ROWS_DIRNAME = "served-benchmark-rows"
+# Mirrors `served_benchmark_entry._BOUNDARY_RE` byte-for-byte -- the ingest
+# tool's own I5 refusal already enforces this shape before a row can ever be
+# published, so this copy only ever runs against an already-well-formed
+# `boundary` string; it exists here too because `derive_served_benchmark_
+# fields_from_ledger_row` (below) must re-derive chip/prompts/maxTokens/
+# runs/warmup/temperature from a LEDGER ROW file the ingest tool is not
+# involved in reading (the build-time loader, and any future re-deriver).
+SERVED_BENCHMARK_BOUNDARY_RE = re.compile(
+    r"chip=(?P<chip>[^;]+) \([^)]*\); "
+    r"promptSet=default-(?P<prompts>\d+)-prompt-set \([^)]*\); "
+    r"maxTokens=(?P<maxTokens>\d+); "
+    r"runs=(?P<runs>\d+); "
+    r"warmup=(?P<warmup>\d+); "
+    r"temperature=(?P<temperature>\d+(?:\.\d+)?)$"
+)
 
 
 @dataclass(frozen=True)
@@ -1372,6 +1404,100 @@ def _served_benchmark_marker_violation(text: str) -> Optional[str]:
     return None
 
 
+def _served_benchmark_row_listener_flags(row: Dict[str, object]) -> Optional[Dict[str, object]]:
+    controls = row.get("controls") if isinstance(row, dict) else None
+    flags = controls.get("flags") if isinstance(controls, dict) else None
+    listener_flags = flags.get("listenerFlags") if isinstance(flags, dict) else None
+    return listener_flags if isinstance(listener_flags, dict) else None
+
+
+def _served_benchmark_row_path_misplaced(row: Dict[str, object]) -> bool:
+    """AMENDMENT A1: `<path>` is the REQUIRED redaction of `--model`'s value
+    inside a role's `listenerFlags` list -- the ingest tool's own I4 check
+    (`_listener_token_failures`) enforces that `--model`'s value must BE
+    `<path>`, so it is the ONE place `<path>` is legitimate anywhere in a
+    served-benchmark ledger row. Returns `True` if `<path>` appears anywhere
+    ELSE in `row` -- a different flag's value inside a `listenerFlags` list,
+    a longer string such as `--key=<path>` (an EXACT-match requirement at
+    the permitted position, not a substring one), inside another string
+    entirely (e.g. `boundary`), or outside `listenerFlags` altogether.
+    Walks the whole row recursively; only a `listenerFlags` role's own list
+    (identity-matched against the row's own `controls.flags.listenerFlags`
+    dict, never by value) gets the positional exemption.
+    """
+
+    listener_flags = _served_benchmark_row_listener_flags(row)
+
+    def is_role_list(candidate: object) -> bool:
+        return listener_flags is not None and any(
+            candidate is tokens for tokens in listener_flags.values()
+        )
+
+    def scan(node: object) -> bool:
+        if isinstance(node, dict):
+            return any(scan(value) for value in node.values())
+        if isinstance(node, list):
+            if is_role_list(node):
+                for index, token in enumerate(node):
+                    if not isinstance(token, str) or "<path>" not in token:
+                        continue
+                    if token == "<path>" and index > 0 and node[index - 1] == "--model":
+                        continue
+                    return True
+                return False
+            return any(scan(item) for item in node)
+        if isinstance(node, str):
+            return "<path>" in node
+        return False
+
+    return scan(row)
+
+
+def served_benchmark_ledger_row_violation(
+    row_text: str, row_obj: Dict[str, object]
+) -> Optional[str]:
+    """The item-1 marker/IPv4 check for a served-benchmark LEDGER ROW --
+    shared, byte-identical, between the ingest tool's I9 refusal (before it
+    ever writes `--ledger-row-out`) and the build-time loader's re-check of
+    the committed `site/served-benchmark-rows/<id>.json` file. `row_text` is
+    the exact canonical serialization of `row_obj` (see
+    `served_benchmark_entry._canonical_ledger_row_bytes`).
+
+    Refuses if `row_text` carries an IPv4 literal, `localhost`, a raw
+    `--host`/`--port` token (the one transformation a ledger row is supposed
+    to have already had applied), an absolute private home-directory path
+    (see `_SERVED_BENCHMARK_LEDGER_ROW_HOME_PATH` below -- assembled by
+    concatenation for the same reason `PRIVATE_MARKERS` is, so this module's
+    own source never carries the literal marker), or a literal `~/`. Then
+    (AMENDMENT A1) checks `row_obj` STRUCTURALLY for a misplaced `<path>`
+    (`_served_benchmark_row_path_misplaced`, above) -- `<path>` is a
+    REQUIRED redaction inside `listenerFlags`, not a marker, so the generic
+    entry-level `_served_benchmark_marker_violation` cannot be run against a
+    row's raw text unmodified. Only once the row is proven to carry `<path>`
+    in nothing but permitted positions does this neutralize exactly those
+    occurrences (never any other occurrence, because none can remain) and
+    run `_served_benchmark_marker_violation` on the result, so every other
+    rule -- private markers, a third-party engine name, the fleet host
+    shorthand, and a literal `~` -- still applies in full.
+    """
+    if SERVED_BENCHMARK_LEDGER_ROW_IPV4.search(row_text):
+        return "an IPv4 literal"
+    if "localhost" in row_text.casefold():
+        return "a 'localhost' literal"
+    if "--host" in row_text:
+        return "a --host token"
+    if "--port" in row_text:
+        return "a --port token"
+    if _SERVED_BENCHMARK_LEDGER_ROW_HOME_PATH in row_text:
+        return "a private home-directory path"
+    if "~/" in row_text:
+        return "a literal '~/'"
+    if _served_benchmark_row_path_misplaced(row_obj):
+        return "a misplaced <path> placeholder"
+    neutralized_text = row_text.replace("<path>", "\x00")
+    return _served_benchmark_marker_violation(neutralized_text)
+
+
 def _served_benchmark_rerun_failures(key: str, value: object, label: str) -> List[str]:
     """Accumulate-style shape check for one `rerun.<key>` string -- see the
     served-ledger design notes section 3 (`I12`/`L12`): must start
@@ -1406,6 +1532,97 @@ def _served_benchmark_number(value: object) -> Optional[float]:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     return float(value)
+
+
+def _served_benchmark_row_completion_token_bounds(row: Dict[str, object]) -> Tuple[int, int]:
+    values: List[int] = []
+    for arm in row.get("arms", []):
+        for reading in arm.get("readings", []):
+            tokens = reading.get("completionTokens")
+            if isinstance(tokens, int) and not isinstance(tokens, bool):
+                values.append(tokens)
+    if not values:
+        fail("served-benchmark ledger row has no completionTokens")
+    return min(values), max(values)
+
+
+def derive_served_benchmark_fields_from_ledger_row(row: Dict[str, object]) -> Dict[str, object]:
+    """Re-derive every served-benchmark entry field a LEDGER ROW (the
+    public-view row with `--host`/`--port` already stripped from every
+    role's `listenerFlags` -- see `served_benchmark_ledger_row_violation`)
+    determines, using the exact rounding/parsing rules the ingest tool used
+    to derive them (`served_benchmark_entry.build_entry`, prior to this
+    function existing). ONE source of truth: the ingest tool calls this in
+    place of its own former private copy of this logic, and the build-time
+    loader calls it again, independently, against the committed row FILE, so
+    an entry's numbers can never silently drift from the row that is
+    supposed to justify them. Fails closed (`fail()`) on a malformed row --
+    in practice unreachable from the ingest tool, whose own I1/I4/I5 checks
+    already refuse a row this malformed before this function is ever
+    called.
+    """
+
+    arms = row.get("arms")
+    if not isinstance(arms, list) or len(arms) < 2:
+        fail("served-benchmark ledger row does not have two arms")
+    candidate_arm, reference_arm = arms[0], arms[1]
+    candidate_rate = round(float(candidate_arm["medianDecodeTokS"]), 2)
+    reference_rate = round(float(reference_arm["medianDecodeTokS"]), 2)
+    ratio = row.get("ratio")
+    if ratio is None:
+        fail("served-benchmark ledger row has no ratio")
+    ratio = round(float(ratio), 4)
+    candidate_passes = len(candidate_arm["passRates"])
+    reference_passes = len(reference_arm["passRates"])
+    drift = row["controls"]["drift"]
+    drift_ratio = float(drift["driftRatio"])
+    drift_pct = round(abs(1 - drift_ratio) * 100, 2)
+
+    listener_flags = row["controls"]["flags"]["listenerFlags"]["candidate"]
+    context_tokens = None
+    for index, token in enumerate(listener_flags):
+        if token == "--ctx-size":
+            context_tokens = int(listener_flags[index + 1])
+    if context_tokens is None:
+        fail("served-benchmark ledger row has no --ctx-size in listener flags")
+    mtp = "off" if "--no-mtp" in listener_flags else "engine-default"
+    drafter = "off" if "--no-drafter" in listener_flags else "engine-default"
+    prompt_lookup = "off" if "--no-pld" in listener_flags else "engine-default"
+
+    min_tokens, max_tokens = _served_benchmark_row_completion_token_bounds(row)
+
+    boundary = row.get("boundary")
+    if not isinstance(boundary, str):
+        fail("served-benchmark ledger row has no boundary")
+    match = SERVED_BENCHMARK_BOUNDARY_RE.fullmatch(boundary)
+    if match is None:
+        fail(f"served-benchmark ledger row boundary {boundary!r} is not well-formed")
+
+    harness = row.get("harness")
+    if not isinstance(harness, dict):
+        fail("served-benchmark ledger row has no harness")
+
+    return {
+        "candidateDecodeTokS": candidate_rate,
+        "referenceDecodeTokS": reference_rate,
+        "ratio": ratio,
+        "candidatePasses": candidate_passes,
+        "referencePasses": reference_passes,
+        "referenceDriftPct": drift_pct,
+        "completionTokens": [min_tokens, max_tokens],
+        "contextTokens": context_tokens,
+        "mtp": mtp,
+        "drafter": drafter,
+        "promptLookup": prompt_lookup,
+        "benchSha256": harness.get("benchSha256"),
+        "promptSetSha256": harness.get("promptSetSha256"),
+        "chip": match.group("chip"),
+        "prompts": int(match.group("prompts")),
+        "maxTokens": int(match.group("maxTokens")),
+        "runs": int(match.group("runs")),
+        "warmup": int(match.group("warmup")),
+        "temperature": float(match.group("temperature")),
+    }
 
 
 def validate_served_benchmark_entry(
@@ -1577,6 +1794,112 @@ def validate_served_benchmark_entry(
     return entry
 
 
+def _served_benchmark_row_mismatches(
+    entry: Dict[str, object], derived: Dict[str, object], label: str
+) -> List[str]:
+    """Every field `derive_served_benchmark_fields_from_ledger_row` returns,
+    checked against the entry's own nested copy of that same field. Returns
+    an accumulate-style list (never raises itself) so the caller can report
+    the first one via `fail()`, exactly like every other check in this
+    module's fail-on-first-violation style.
+    """
+
+    result = entry.get("result", {})
+    workload = entry.get("workload", {})
+    serving = entry.get("serving", {})
+    harness = entry.get("harness", {})
+    expected: Dict[str, object] = {
+        "candidateDecodeTokS": result.get("candidateDecodeTokS"),
+        "referenceDecodeTokS": result.get("referenceDecodeTokS"),
+        "ratio": result.get("ratio"),
+        "candidatePasses": result.get("candidatePasses"),
+        "referencePasses": result.get("referencePasses"),
+        "referenceDriftPct": result.get("referenceDriftPct"),
+        "completionTokens": workload.get("completionTokens"),
+        "contextTokens": serving.get("contextTokens"),
+        "mtp": serving.get("mtp"),
+        "drafter": serving.get("drafter"),
+        "promptLookup": serving.get("promptLookup"),
+        "benchSha256": harness.get("benchSha256"),
+        "promptSetSha256": harness.get("promptSetSha256"),
+        "chip": entry.get("chip"),
+        "prompts": workload.get("prompts"),
+        "maxTokens": workload.get("maxTokens"),
+        "runs": workload.get("runs"),
+        "warmup": workload.get("warmup"),
+        "temperature": workload.get("temperature"),
+    }
+    failures: List[str] = []
+    for key in sorted(expected):
+        if derived.get(key) != expected[key]:
+            failures.append(
+                f"{label} row file's derived {key} ({derived.get(key)!r}) disagrees with "
+                f"the entry's own {key} ({expected[key]!r})"
+            )
+    return failures
+
+
+def validate_served_benchmark_row_file(
+    repository_root: Path, entry: Dict[str, object], label: str
+) -> bytes:
+    """Load, verify, and return the raw bytes of the published ledger row
+    file (`site/served-benchmark-rows/<entry id>.json`) that `entry["rowSha256"]`
+    is supposed to hash -- the check that makes the "sealed row" claim
+    actually verifiable by a public reader (see the module's served-
+    benchmark-ledger design notes, item 1). Fails closed on the FIRST
+    violation, same style as every other loader check in this module.
+    """
+
+    row_path = repository_root / "site" / SERVED_BENCHMARK_ROWS_DIRNAME / f"{entry['id']}.json"
+    if row_path.is_symlink() or not row_path.is_file():
+        fail(f"{label} row file is missing, not a regular file, or a symlink")
+    raw = row_path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != entry.get("rowSha256"):
+        fail(f"{label} row file sha256 does not match its entry's rowSha256")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        fail(f"{label} row file is not UTF-8: {exc}")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        fail(f"{label} row file is not valid JSON: {exc}")
+    if not isinstance(parsed, dict):
+        fail(f"{label} row file is not a JSON object")
+    canonical = json.dumps(parsed, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+    if canonical != text:
+        fail(f"{label} row file is not canonically serialized")
+    violation = served_benchmark_ledger_row_violation(text, parsed)
+    if violation is not None:
+        fail(f"{label} row file contains {violation}")
+    derived = derive_served_benchmark_fields_from_ledger_row(parsed)
+    mismatches = _served_benchmark_row_mismatches(entry, derived, label)
+    if mismatches:
+        fail(mismatches[0])
+    return raw
+
+
+def _check_served_benchmark_row_orphans(repository_root: Path, entry_ids: Iterable[str]) -> None:
+    """Refuse any file under `site/served-benchmark-rows/` that no entry
+    names (an orphan row nobody's `rowSha256` points at), and refuse a
+    subdirectory. Only ever reached once every entry's own row file has
+    already been individually verified (see `validate_served_benchmark_row_file`),
+    so the directory is guaranteed to exist by this point.
+    """
+
+    rows_dir = repository_root / "site" / SERVED_BENCHMARK_ROWS_DIRNAME
+    if rows_dir.is_symlink() or not rows_dir.is_dir():
+        fail(f"site/{SERVED_BENCHMARK_ROWS_DIRNAME} is missing, not a directory, or a symlink")
+    expected_names = {f"{identifier}.json" for identifier in entry_ids}
+    for path in sorted(rows_dir.iterdir()):
+        if path.is_symlink():
+            fail(f"site/{SERVED_BENCHMARK_ROWS_DIRNAME}/{path.name} is a symlink")
+        if path.is_dir():
+            fail(f"site/{SERVED_BENCHMARK_ROWS_DIRNAME}/{path.name} is a subdirectory")
+        if path.name not in expected_names:
+            fail(f"site/{SERVED_BENCHMARK_ROWS_DIRNAME}/{path.name} is an orphan row file")
+
+
 def load_served_benchmarks(
     repository_root: Path, quality_manifest: Optional[Dict[str, object]]
 ) -> Dict[str, object]:
@@ -1633,7 +1956,9 @@ def load_served_benchmarks(
         if previous_measured_at is not None and measured_at >= previous_measured_at:
             fail("served ledger entries are not newest-first")
         previous_measured_at = measured_at
+        validate_served_benchmark_row_file(repository_root, entry, label)
         entries.append(entry)
+    _check_served_benchmark_row_orphans(repository_root, seen_ids)
     catalog["entries"] = entries
     return catalog
 
@@ -2806,7 +3131,9 @@ def render_benchmark_explorer(
                 '<p class="section-intro">Each row is a fast-mlx measurement, made with fastmlx bench, of a pack '
                 'that carries a published quality card, on a serving engine identified by its build commit, not '
                 'by name. The ratio compares the pack with its card’s 8-bit reference on the same host, build '
-                'and prompt set; it is not a comparison between engines.</p></div>',
+                'and prompt set; it is not a comparison between engines. Each entry’s row sha256 is the sha256 '
+                'of its linked, published row file, so a reader can recompute every number shown from that '
+                'file.</p></div>',
                 '<div class="evidence-grid">',
             ]
         )
@@ -2863,7 +3190,11 @@ def render_benchmark_explorer(
                     f'<div><dt>Engine build</dt><dd><code>{html.escape(engine_commit[:8])}</code></dd></div>',
                     f'<div><dt>Serving</dt><dd>{html.escape(serving_text)}</dd></div>',
                     f'<div><dt>Harness</dt><dd>{harness_dd}</dd></div>',
-                    f'<div><dt>Row sha256</dt><dd><code>{html.escape(str(entry["rowSha256"]))}</code></dd></div>',
+                    '<div><dt>Row sha256</dt><dd><a href="'
+                    + html.escape(
+                        f'{SERVED_BENCHMARK_ROWS_DIRNAME}/{entry["id"]}.json', quote=True
+                    )
+                    + f'"><code>{html.escape(str(entry["rowSha256"]))}</code></a></dd></div>',
                     '<div><dt>Quality card</dt><dd>'
                     f'<a href="../quality/">{html.escape(str(entry["cardId"]))}</a> — card speedX '
                     f'{html.escape(str(speed_x))}</dd></div>',
@@ -3729,6 +4060,16 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "benchmarks/served-benchmarks.json",
         json.dumps(served_ledger, indent=2, ensure_ascii=False),
     )
+    for entry in served_ledger["entries"]:
+        identifier = str(entry["id"])
+        row_source = repository_root / "site" / SERVED_BENCHMARK_ROWS_DIRNAME / f"{identifier}.json"
+        row_destination = output / "benchmarks" / SERVED_BENCHMARK_ROWS_DIRNAME / f"{identifier}.json"
+        row_destination.parent.mkdir(parents=True, exist_ok=True)
+        # Byte-for-byte copy, never re-serialized: `rowSha256` (already
+        # verified against this exact source file by `load_served_benchmarks`
+        # -> `validate_served_benchmark_row_file`) must keep hashing the
+        # PUBLISHED bytes, not a re-encoded copy that could drift from them.
+        row_destination.write_bytes(row_source.read_bytes())
     for highlight in capability_index["performanceHighlights"]:
         identifier = str(highlight["id"])
         public_path = f"benchmarks/{identifier}/"

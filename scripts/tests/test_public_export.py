@@ -262,9 +262,22 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # serialized entry (and every non-rerun field for a stray `--` token) before this file could ever
 # carry one. The two raw measurement rows this ledger's `rowSha256` commits to are NOT published
 # (see `docs/evidence/served-benchmark-rows/`, which `docs/` itself keeps out of this projection).
+# 2026-09-29, 1002 -> 1004: adds the two published ledger ROW files (site/served-benchmark-rows/
+# <id>.json), one per Lane 4(e) slice-1 entry, that `rowSha256` now hashes -- Lane 4(e) slice 2.
+# Each is the same reviewed `fastmlx bench --public-view` row already re-derived and cross-checked
+# against its entry by `scripts/build_public_site.derive_served_benchmark_fields_from_ledger_row` /
+# `validate_served_benchmark_row_file`, with exactly one transformation: `--host`/`--port` and their
+# values dropped from every role's `listenerFlags` (the same rule I4 already applied). Conscious
+# decision to publish: both files were read in full and contain no private host, IP, username,
+# absolute machine-local path, competitor/engine product name, or credential --
+# `served_benchmark_ledger_row_violation` fail-closed scans the whole canonical row text (IPv4,
+# `localhost`, a raw `--host`/`--port` token, a private home-directory path, `~/`, every
+# `_served_benchmark_marker_violation` rule, and -- AMENDMENT A1 -- a `<path>` placeholder anywhere
+# other than exactly `--model`'s own redacted value) before either file could ever carry one; the
+# build-time loader re-runs the identical check against the committed files themselves.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1002,
-    "pathModeSha256": "c820eeba20f44b4a9a9b969e9368e8db5bdfaef41e155ddbfd7a6db70eb45eab",
+    "pathCount": 1004,
+    "pathModeSha256": "210b9f5dd18d85229f5478e110adc1a5f6dff0799d9227f584a50f9ffc987dbf",
 }
 
 

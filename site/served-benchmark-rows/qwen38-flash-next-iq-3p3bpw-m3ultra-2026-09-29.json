@@ -1,0 +1,360 @@
+{
+  "arms": [
+    {
+      "medianDecodeTokS": 66.79966388159522,
+      "model": "pack",
+      "passRates": [
+        66.80764750632493,
+        66.68391557219819,
+        66.79966388159522
+      ],
+      "readings": [
+        {
+          "completionTokens": 56,
+          "decodeTokS": 66.74738716295866,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11661425000056624,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 66.79085167724183,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11628341698087752,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 75,
+          "decodeTokS": 66.86865065624339,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.1116902920184657,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 56,
+          "decodeTokS": 66.66042151470161,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.1164810840273276,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 66.72495702586403,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11636920901946723,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 75,
+          "decodeTokS": 66.66203731595219,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.1115078330039978,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 56,
+          "decodeTokS": 66.81004847563183,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11617829196620733,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 66.75999224328561,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11651304201222956,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 75,
+          "decodeTokS": 66.8300465621935,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11178816598840058,
+          "unmeasurableReason": null
+        }
+      ],
+      "warmupDiscarded": 1
+    },
+    {
+      "medianDecodeTokS": 56.36094607830448,
+      "model": "pack",
+      "passRates": [
+        56.39010007687947,
+        56.36297736729972,
+        56.36275725242444,
+        56.35913490418452,
+        56.3135118218605,
+        56.27931063256238
+      ],
+      "readings": [
+        {
+          "completionTokens": 67,
+          "decodeTokS": 56.420083726208674,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12335249991156161,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 56.46907801244512,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12427491694688797,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 57,
+          "decodeTokS": 56.255112203039815,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12062387494370341,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 67,
+          "decodeTokS": 56.445291474350114,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12351983308326453,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 56.324700228808986,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.1244142500218004,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 57,
+          "decodeTokS": 56.31471007986394,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.11999712500255555,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 67,
+          "decodeTokS": 56.26942855947465,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12382000009529293,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 56.41499962731027,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12443262501619756,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 57,
+          "decodeTokS": 56.40679406902903,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12050475005526096,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 67,
+          "decodeTokS": 56.34654147548556,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12366954097524285,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 56.41760893835714,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12439387489575893,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 57,
+          "decodeTokS": 56.29998274262008,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12040595896542072,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 67,
+          "decodeTokS": 56.381595761472845,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12379016692284495,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 56.28054372901052,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12435449997428805,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 57,
+          "decodeTokS": 56.27521630957996,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12007362500298768,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 67,
+          "decodeTokS": 56.31891671039183,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12366587505675852,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 72,
+          "decodeTokS": 56.31808425890948,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12437908304855227,
+          "unmeasurableReason": null
+        },
+        {
+          "completionTokens": 57,
+          "decodeTokS": 56.183701991974324,
+          "measurable": true,
+          "tokenSource": "usage.completion_tokens",
+          "ttftS": 0.12062704190611839,
+          "unmeasurableReason": null
+        }
+      ],
+      "warmupDiscarded": 2
+    }
+  ],
+  "baseUrl": null,
+  "boundary": "chip=Apple M3 Ultra (arm64); promptSet=default-3-prompt-set (prompts=3; chars=116/112/112); maxTokens=256; runs=3; warmup=1; temperature=0.0",
+  "combinedFrom": [
+    {
+      "role": "referenceFirst",
+      "sha256": "0a4cde8c27e751d20e707a1be3cff177a190b76cbe4b3d030214311eacb96190"
+    },
+    {
+      "role": "candidate",
+      "sha256": "af46578a39ca43308c9c1629166a9c6baadf77c6aec643c6faf8ce138f53935a"
+    },
+    {
+      "role": "referenceLast",
+      "sha256": "ca251627d95f8ac84a67db568533d09ab3a3f593913d323f1e69d23100861950"
+    }
+  ],
+  "controls": {
+    "drift": {
+      "driftRatio": 0.9991223752230677,
+      "firstMedianDecodeTokS": 56.36297736729972,
+      "lastMedianDecodeTokS": 56.3135118218605,
+      "reason": null,
+      "status": "verified",
+      "toleranceRatio": 0.05
+    },
+    "flags": {
+      "listenerFlags": {
+        "candidate": [
+          "--serve",
+          "--model",
+          "<path>",
+          "--ctx-size",
+          "262144",
+          "--no-mtp",
+          "--no-pld",
+          "--no-drafter"
+        ],
+        "referenceFirst": [
+          "--serve",
+          "--model",
+          "<path>",
+          "--ctx-size",
+          "262144",
+          "--no-mtp",
+          "--no-pld",
+          "--no-drafter"
+        ],
+        "referenceLast": [
+          "--serve",
+          "--model",
+          "<path>",
+          "--ctx-size",
+          "262144",
+          "--no-mtp",
+          "--no-pld",
+          "--no-drafter"
+        ]
+      },
+      "perRole": {
+        "candidate": "captured",
+        "referenceFirst": "captured",
+        "referenceLast": "captured"
+      },
+      "reason": null,
+      "status": "captured_redacted"
+    },
+    "magnitude": {
+      "arms": [
+        {
+          "medianDecodeTokS": 66.79966388159522,
+          "model": "pack"
+        },
+        {
+          "medianDecodeTokS": 56.36094607830448,
+          "model": "pack"
+        }
+      ],
+      "ceiling": 2000.0,
+      "floor": 25.0,
+      "magnitudeImplausible": false,
+      "reason": null
+    },
+    "owner": {
+      "perRole": {
+        "candidate": "verified",
+        "referenceFirst": "verified",
+        "referenceLast": "verified"
+      },
+      "reason": null,
+      "status": "verified"
+    },
+    "tokens": {
+      "perRole": {
+        "candidate": "verified",
+        "referenceFirst": "verified",
+        "referenceLast": "verified"
+      },
+      "reason": null,
+      "status": "verified"
+    }
+  },
+  "generatedAt": "2026-09-29T11:27:47Z",
+  "harness": {
+    "benchSha256": "9e00f0519bfc9e8b1139a7ab2d68110df7533584145d61f1a263338b4b87209e",
+    "promptSetSha256": "dfc7eac33059118e6c2d32c1cde7ecd1241aa2a66d0eaec347cbbeb72ee258a1"
+  },
+  "publishable": {
+    "markerClasses": [],
+    "reason": null,
+    "status": "publishable"
+  },
+  "ratio": 1.1852118981251276,
+  "schema": "fastmlx-bench-row-v2"
+}

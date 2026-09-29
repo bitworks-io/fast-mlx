@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime as dt
 import hashlib
 import html
@@ -4835,8 +4836,17 @@ class PublicSiteTests(unittest.TestCase):
 
             self.assertTrue((output / "quality/index.html").is_file())
             self.assertTrue((output / "quality/index.json").is_file())
+            # The stubbed EMPTY ledger above means `build_site` never
+            # creates `benchmarks/served-benchmark-rows/` at all (nothing to
+            # copy) -- blind `validate()`'s OWN served-benchmark-row checks
+            # (the static required-file list and the row-directory check,
+            # both keyed off REVIEWED_SERVED_BENCHMARK_IDENTITIES) to that
+            # too, the same way `validate_served_benchmarks` is already
+            # blinded, so this test stays isolated to the quality-guide page.
             with mock.patch.object(
                 validate_public_site, "validate_served_benchmarks", return_value=[]
+            ), mock.patch.object(
+                validate_public_site, "REVIEWED_SERVED_BENCHMARK_IDENTITIES", ()
             ):
                 failures = validate_public_site.validate(output)
             self.assertEqual(failures, [])
@@ -5534,10 +5544,28 @@ class PublicSiteTests(unittest.TestCase):
         path = REPOSITORY_ROOT / "site/served-benchmarks.json"
         return json.loads(path.read_text(encoding="utf-8"))
 
-    def _write_served_ledger(self, root: Path, ledger: dict) -> None:
+    def _write_served_ledger(
+        self, root: Path, ledger: dict, *, copy_row_files: bool = True
+    ) -> None:
+        """Write `ledger` to `root/site/served-benchmarks.json` and, by
+        default, blanket-copy the REAL committed `site/served-benchmark-rows/`
+        directory alongside it -- `load_served_benchmarks` now requires a
+        row file per entry (slice 2), and every existing narrow test here
+        mutates a schema/cross-check field that `validate_served_benchmark_
+        entry` itself refuses BEFORE the loader ever reaches the row-file
+        check, so the unmutated real row files are the right fixture for
+        them. Tests that specifically exercise the row-file checks pass
+        `copy_row_files=False` and stage their own row file(s).
+        """
         path = root / "site/served-benchmarks.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(ledger), encoding="utf-8")
+        if copy_row_files:
+            source_rows = REPOSITORY_ROOT / "site/served-benchmark-rows"
+            destination_rows = root / "site/served-benchmark-rows"
+            destination_rows.mkdir(parents=True, exist_ok=True)
+            for row_file in source_rows.glob("*.json"):
+                (destination_rows / row_file.name).write_bytes(row_file.read_bytes())
 
     def test_served_ledger_1_real_ledger_loads_two_entries_ids_and_order(self) -> None:
         manifest = self._real_quality_manifest()
@@ -5870,6 +5898,317 @@ class PublicSiteTests(unittest.TestCase):
             self.assertIn("../quality/", page)
             self.assertEqual(page.count('class="benchmark-result"'), unmutated_count)
             self.assertNotIn("data-benchmark-card", page.split("data-served-benchmarks", 1)[1])
+
+    # ------------------------------------------------------------------
+    # Cycle 174 slice 2: the published ledger ROW file
+    # (site/served-benchmark-rows/<id>.json) and AMENDMENT A1's `<path>`-
+    # scoped violation check.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _real_row(entry_id: str) -> dict:
+        path = REPOSITORY_ROOT / f"site/served-benchmark-rows/{entry_id}.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _write_mutated_row_fixture(self, root: Path, entry_id: str, row_transform) -> dict:
+        """Real committed ledger + row files for every entry EXCEPT
+        `entry_id`, whose row gets `row_transform` applied to a deep copy of
+        its REAL committed row, re-canonicalized, and whose `rowSha256` is
+        patched in the written ledger to match those new bytes -- so the
+        sha256 and canonical-bytes checks both pass, isolating whatever
+        `row_transform` actually changes."""
+        ledger = self._real_served_ledger()
+        row = row_transform(copy.deepcopy(self._real_row(entry_id)))
+        canonical = (json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode(
+            "utf-8"
+        )
+        row_sha = hashlib.sha256(canonical).hexdigest()
+        for entry in ledger["entries"]:
+            if entry["id"] == entry_id:
+                entry["rowSha256"] = row_sha
+        self._write_served_ledger(root, ledger, copy_row_files=True)
+        (root / "site/served-benchmark-rows" / f"{entry_id}.json").write_bytes(canonical)
+        return ledger
+
+    def test_served_ledger_row_1_happy_path_loads_clean(self) -> None:
+        # The real, unmutated repository state -- the same acceptance path
+        # test_served_ledger_1 already exercises, restated here to anchor
+        # the row-file test group.
+        manifest = self._real_quality_manifest()
+        loaded = build_public_site.load_served_benchmarks(REPOSITORY_ROOT, manifest)
+        self.assertEqual(len(loaded["entries"]), 2)
+
+    def test_served_ledger_row_2_sha_mismatch_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger, copy_row_files=True)
+            row_path = root / f"site/served-benchmark-rows/{target_id}.json"
+            row_path.write_bytes(row_path.read_bytes() + b" ")
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn(
+                "row file sha256 does not match its entry's rowSha256", str(context.exception)
+            )
+
+    def test_served_ledger_row_3_missing_row_file_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger, copy_row_files=False)
+            rows_dir = root / "site/served-benchmark-rows"
+            rows_dir.mkdir(parents=True, exist_ok=True)
+            for entry in ledger["entries"]:
+                if entry["id"] == target_id:
+                    continue
+                source = REPOSITORY_ROOT / f"site/served-benchmark-rows/{entry['id']}.json"
+                (rows_dir / f"{entry['id']}.json").write_bytes(source.read_bytes())
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn(
+                "row file is missing, not a regular file, or a symlink", str(context.exception)
+            )
+
+    def test_served_ledger_row_4_orphan_file_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger, copy_row_files=True)
+            (root / "site/served-benchmark-rows/orphan.json").write_text("{}", encoding="utf-8")
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("is an orphan row file", str(context.exception))
+
+    def test_served_ledger_row_5_noncanonical_bytes_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+        row = self._real_row(target_id)
+        # Same content, different formatting (indent=4, not 2) -- still
+        # valid JSON, still hashes to what we pin as `rowSha256`, but is NOT
+        # the canonical serialization the loader requires.
+        noncanonical = (json.dumps(row, indent=4, sort_keys=True, ensure_ascii=True) + "\n").encode(
+            "utf-8"
+        )
+        row_sha = hashlib.sha256(noncanonical).hexdigest()
+        for entry in ledger["entries"]:
+            if entry["id"] == target_id:
+                entry["rowSha256"] = row_sha
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger, copy_row_files=True)
+            (root / f"site/served-benchmark-rows/{target_id}.json").write_bytes(noncanonical)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("row file is not canonically serialized", str(context.exception))
+
+    def test_served_ledger_row_6_derived_ratio_disagrees_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        target_id = None
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+
+        def bump_ratio(row: dict) -> dict:
+            row["ratio"] = 9.9999
+            return row
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_mutated_row_fixture(root, target_id, bump_ratio)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("derived ratio", str(context.exception))
+            self.assertIn("disagrees with the entry's own ratio", str(context.exception))
+
+    def test_served_ledger_row_7_ipv4_literal_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+
+        def inject_ipv4(row: dict) -> dict:
+            row["baseUrl"] = "http://8.8.8.8:9999"
+            return row
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_mutated_row_fixture(root, target_id, inject_ipv4)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("row file contains an IPv4 literal", str(context.exception))
+
+    def test_served_ledger_row_8_raw_port_token_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+
+        def inject_port_token(row: dict) -> dict:
+            row["baseUrl"] = "leaked --port flag"
+            return row
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_mutated_row_fixture(root, target_id, inject_port_token)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("row file contains a --port token", str(context.exception))
+
+    def test_served_ledger_row_9_mutation_delete_derived_comparison_goes_red(self) -> None:
+        # Mutation check (item 4's own requirement): delete the derived-
+        # field comparison and confirm the "ratio disagrees" test above
+        # goes RED against the SAME fixture.
+        module = self._load_mutated_build_module(
+            "    mismatches = _served_benchmark_row_mismatches(entry, derived, label)\n"
+            "    if mismatches:\n"
+            "        fail(mismatches[0])\n"
+        )
+        ledger = self._real_served_ledger()
+        target_id = ledger["entries"][1]["id"]
+
+        def bump_ratio(row: dict) -> dict:
+            row["ratio"] = 9.9999
+            return row
+
+        row = bump_ratio(copy.deepcopy(self._real_row(target_id)))
+        canonical = (json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n").encode(
+            "utf-8"
+        )
+        row_sha = hashlib.sha256(canonical).hexdigest()
+        for entry in ledger["entries"]:
+            if entry["id"] == target_id:
+                entry["rowSha256"] = row_sha
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger, copy_row_files=True)
+            (root / f"site/served-benchmark-rows/{target_id}.json").write_bytes(canonical)
+            manifest = module.load_quality_guides(REPOSITORY_ROOT)
+            # Must NOT raise -- with the comparison deleted, the mutated
+            # ratio silently loads clean, proving the check is reachable.
+            module.load_served_benchmarks(root, manifest)
+
+    def test_served_ledger_row_10_mutation_delete_orphan_check_goes_red(self) -> None:
+        module = self._load_mutated_build_module(
+            "    _check_served_benchmark_row_orphans(repository_root, seen_ids)\n"
+        )
+        ledger = self._real_served_ledger()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger, copy_row_files=True)
+            (root / "site/served-benchmark-rows/orphan.json").write_text("{}", encoding="utf-8")
+            manifest = module.load_quality_guides(REPOSITORY_ROOT)
+            # Must NOT raise -- with the orphan check deleted, the extra
+            # file silently loads clean, proving the check is reachable.
+            module.load_served_benchmarks(root, manifest)
+
+    # ------------------------------------------------------------------
+    # AMENDMENT A1: `served_benchmark_ledger_row_violation`'s `<path>`
+    # structural exemption (only the exact element right after `--model`
+    # inside a `listenerFlags` role list is permitted).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _a1_listener_flags() -> dict:
+        return {
+            "candidate": ["--serve", "--model", "<path>", "--ctx-size", "8192"],
+            "referenceFirst": ["--serve", "--model", "<path>", "--ctx-size", "8192"],
+            "referenceLast": ["--serve", "--model", "<path>", "--ctx-size", "8192"],
+        }
+
+    def _a1_row(self, listener_flags: dict, boundary: str = "unused") -> dict:
+        return {
+            "schema": "fastmlx-bench-row-v2",
+            "boundary": boundary,
+            "controls": {"flags": {"listenerFlags": listener_flags}},
+        }
+
+    def test_a1_1_path_after_model_is_accepted(self) -> None:
+        row = self._a1_row(self._a1_listener_flags())
+        text = json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        self.assertIsNone(build_public_site.served_benchmark_ledger_row_violation(text, row))
+
+    def test_a1_2_path_after_another_flag_is_refused(self) -> None:
+        flags = self._a1_listener_flags()
+        # `<path>` after `--serve` (a bare flag), never after `--model`.
+        flags["candidate"] = ["--serve", "<path>", "--model", "<path>", "--ctx-size", "8192"]
+        row = self._a1_row(flags)
+        text = json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        violation = build_public_site.served_benchmark_ledger_row_violation(text, row)
+        self.assertEqual(violation, "a misplaced <path> placeholder")
+
+    def test_a1_3_path_inside_boundary_is_refused(self) -> None:
+        row = self._a1_row(self._a1_listener_flags(), boundary="chip=Apple M3 Ultra <path>")
+        text = json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        violation = build_public_site.served_benchmark_ledger_row_violation(text, row)
+        self.assertEqual(violation, "a misplaced <path> placeholder")
+
+    def test_a1_4_private_marker_alongside_legitimate_path_still_refused(self) -> None:
+        # A legitimate `--model <path>` pair coexists with an unrelated
+        # private marker elsewhere in the row -- the structural check must
+        # pass (so neutralization runs), and the marker must still be
+        # caught by the delegated `_served_benchmark_marker_violation` call.
+        # Uses a PRIVATE_MARKERS entry that is none of this function's OWN
+        # earlier explicit checks (IPv4, localhost, --host, --port, a
+        # private home-directory path, a literal ~/), so the failure
+        # genuinely comes from the delegated marker scan.
+        row = self._a1_row(self._a1_listener_flags(), boundary="host runs " + "llm" + "bench")
+        text = json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        violation = build_public_site.served_benchmark_ledger_row_violation(text, row)
+        self.assertIsNotNone(violation)
+        self.assertIn("private marker", violation)
+
+    def test_a1_5_mutation_delete_structural_check_goes_red(self) -> None:
+        # Mutation check (AMENDMENT A1's own requirement): delete the
+        # structural gate inside `served_benchmark_ledger_row_violation` and
+        # confirm the misplaced-`<path>` test above goes RED.
+        module = self._load_mutated_build_module(
+            "    if _served_benchmark_row_path_misplaced(row_obj):\n"
+            '        return "a misplaced <path> placeholder"\n'
+        )
+        flags = self._a1_listener_flags()
+        flags["candidate"] = ["--serve", "<path>", "--model", "<path>", "--ctx-size", "8192"]
+        row = {
+            "schema": "fastmlx-bench-row-v2",
+            "boundary": "unused",
+            "controls": {"flags": {"listenerFlags": flags}},
+        }
+        text = json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        # Must NOT flag the misplaced `<path>` anymore -- the neutralization
+        # step now blindly replaces every `<path>` occurrence, including
+        # the misplaced one, and `_served_benchmark_marker_violation` never
+        # sees the raw text to catch it either.
+        violation = module.served_benchmark_ledger_row_violation(text, row)
+        self.assertIsNone(violation)
+
+    def _load_mutated_build_module(self, remove_snippet: str):
+        """`build_public_site.py` twin of `_load_mutated_validate_module`
+        above -- loads a TEMP copy with `remove_snippet` deleted via
+        `importlib`, under a throwaway module name, NEVER mutating the
+        working file on disk (sha256-verified below)."""
+        source_path = REPOSITORY_ROOT / "scripts/build_public_site.py"
+        original_bytes = source_path.read_bytes()
+        original_sha = hashlib.sha256(original_bytes).hexdigest()
+        source = original_bytes.decode("utf-8")
+        self.assertIn(remove_snippet, source, "mutation target not found in source")
+        mutated_source = source.replace(remove_snippet, "", 1)
+        with tempfile.TemporaryDirectory() as directory:
+            mutated_path = Path(directory) / "build_public_site_mutated.py"
+            mutated_path.write_text(mutated_source, encoding="utf-8")
+            module_name = f"build_public_site_mutated_{next(self._mutation_counter)}"
+            spec = importlib.util.spec_from_file_location(module_name, mutated_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                del sys.modules[module_name]
+        after_bytes = source_path.read_bytes()
+        self.assertEqual(original_sha, hashlib.sha256(after_bytes).hexdigest())
+        self.assertEqual(original_bytes, after_bytes, "working file must be unchanged")
+        return module
 
     # ------------------------------------------------------------------
     # Cycle 173 review fixes (F1-F9).
