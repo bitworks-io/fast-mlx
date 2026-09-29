@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import hashlib
 import html
 import html.parser
+import importlib.util
 import io
+import itertools
 import json
 import re
 import shutil
@@ -4275,6 +4278,23 @@ class PublicSiteTests(unittest.TestCase):
                 build_public_site.load_articles(root)
 
     @staticmethod
+    def _served_benchmark_stub() -> dict[str, object]:
+        """A structurally-valid, empty served-benchmark ledger for tests
+        that mock `load_quality_guides` with a FIXTURE manifest whose card
+        ids never match the real, committed `site/served-benchmarks.json` --
+        `build_site` now calls `load_served_benchmarks` unconditionally, so
+        those tests must stub it out rather than exercise the real ledger
+        against a fixture manifest it was never measured against."""
+        return {
+            "schemaVersion": 1,
+            "project": "fast-mlx",
+            "policy": "reviewed-served-benchmarks-only",
+            "claimBoundary": "fast-mlx-owned-results-only",
+            "updatedAt": "2026-01-01",
+            "entries": [],
+        }
+
+    @staticmethod
     def quality_guide_manifest() -> dict[str, object]:
         return json.loads(
             (REPOSITORY_ROOT / "scripts/tests/fixtures/quality-guides.sample.json").read_text(
@@ -4617,6 +4637,10 @@ class PublicSiteTests(unittest.TestCase):
                 build_public_site, "load_quality_guides", return_value=manifest
             ), mock.patch.object(
                 build_public_site,
+                "load_served_benchmarks",
+                return_value=self._served_benchmark_stub(),
+            ), mock.patch.object(
+                build_public_site,
                 "render_quality_guide",
                 side_effect=render_without_speed_dd,
             ):
@@ -4802,12 +4826,19 @@ class PublicSiteTests(unittest.TestCase):
             output.mkdir()
             with mock.patch.object(
                 build_public_site, "load_quality_guides", return_value=manifest
+            ), mock.patch.object(
+                build_public_site,
+                "load_served_benchmarks",
+                return_value=self._served_benchmark_stub(),
             ):
                 build_public_site.build_site(REPOSITORY_ROOT, output)
 
             self.assertTrue((output / "quality/index.html").is_file())
             self.assertTrue((output / "quality/index.json").is_file())
-            failures = validate_public_site.validate(output)
+            with mock.patch.object(
+                validate_public_site, "validate_served_benchmarks", return_value=[]
+            ):
+                failures = validate_public_site.validate(output)
             self.assertEqual(failures, [])
 
     def test_validator_rejects_quality_page_missing_family_or_method(self) -> None:
@@ -4829,6 +4860,10 @@ class PublicSiteTests(unittest.TestCase):
             output.mkdir()
             with mock.patch.object(
                 build_public_site, "load_quality_guides", return_value=manifest
+            ), mock.patch.object(
+                build_public_site,
+                "load_served_benchmarks",
+                return_value=self._served_benchmark_stub(),
             ), mock.patch.object(
                 build_public_site,
                 "render_quality_guide",
@@ -4868,6 +4903,10 @@ class PublicSiteTests(unittest.TestCase):
             output.mkdir()
             with mock.patch.object(
                 build_public_site, "load_quality_guides", return_value=manifest
+            ), mock.patch.object(
+                build_public_site,
+                "load_served_benchmarks",
+                return_value=self._served_benchmark_stub(),
             ), mock.patch.object(
                 build_public_site,
                 "render_quality_guide",
@@ -5482,6 +5521,719 @@ class PublicSiteTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         failures = validate_public_site.validate_quality_guide_manifest(loaded)
         self.assertEqual(failures, [])
+
+    # ------------------------------------------------------------------
+    # Served-engine benchmark ledger (site/served-benchmarks.json).
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _real_quality_manifest() -> dict:
+        return build_public_site.load_quality_guides(REPOSITORY_ROOT)
+
+    @staticmethod
+    def _real_served_ledger() -> dict:
+        path = REPOSITORY_ROOT / "site/served-benchmarks.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _write_served_ledger(self, root: Path, ledger: dict) -> None:
+        path = root / "site/served-benchmarks.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    def test_served_ledger_1_real_ledger_loads_two_entries_ids_and_order(self) -> None:
+        manifest = self._real_quality_manifest()
+        loaded = build_public_site.load_served_benchmarks(REPOSITORY_ROOT, manifest)
+        self.assertEqual(len(loaded["entries"]), 2)
+        self.assertEqual(
+            [entry["id"] for entry in loaded["entries"]],
+            [
+                "qwen38-flash-next-iq-3p3bpw-m3ultra-2026-09-29",
+                "qwen38-flash-next-mixed-4-8bit-m3ultra-2026-09-29",
+            ],
+        )
+
+    def test_served_ledger_2_l1_missing_file_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "site").mkdir()
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("missing, not a file, or a symlink", str(context.exception))
+
+    def test_served_ledger_3_l3_unknown_card_id_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["cardId"] = "no-such-pack@m3ultra-v2696"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("is not a published quality card", str(context.exception))
+
+    def test_served_ledger_4_l4_pack_revision_mismatch_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packRevision"] = "0" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("packRevision does not match", str(context.exception))
+
+    def test_served_ledger_5_l5_hardware_class_mismatch_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["hardwareClass"] = "apple-m5"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("hardwareClass does not match", str(context.exception))
+
+    def test_served_ledger_6_l6_engine_build_mismatch_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["engineBuild"]["commit"] = "1" * 40
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("engineBuild.commit does not match", str(context.exception))
+
+    def test_served_ledger_7_l7_ratio_inconsistent_with_rates_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["result"]["ratio"] = 9.9999
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("inconsistent with its own candidate/reference rates", str(context.exception))
+
+    def test_served_ledger_8_l8_ratio_disagrees_with_card_speedx_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        entry = ledger["entries"][0]
+        # Keep L7 satisfied (ratio == candidate/reference) while moving the
+        # rates far enough from the card's own speedX to trip only L8.
+        entry["result"]["candidateDecodeTokS"] = 200.0
+        entry["result"]["referenceDecodeTokS"] = 100.0
+        entry["result"]["ratio"] = 2.0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("disagrees with its quality card's speedX", str(context.exception))
+
+    def test_served_ledger_9_l9_rate_outside_plausible_range_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["result"]["candidateDecodeTokS"] = 5.0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("plausible [25, 2000]", str(context.exception))
+
+    def test_served_ledger_9_l9_drift_over_ceiling_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["result"]["referenceDriftPct"] = 9.0
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("exceeds the 5% ceiling", str(context.exception))
+
+    def test_served_ledger_10_l10_private_path_marker_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "pack at " + "/" + "Users" + "/x/model"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("contains private marker", str(context.exception))
+
+    def test_served_ledger_10_l10_engine_marker_assembled_by_concatenation_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        engine = "ml" + "x-serve"
+        ledger["entries"][0]["packLabel"] = f"pack on {engine}"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("third-party engine name", str(context.exception))
+
+    def test_served_ledger_10_l10_host_shorthand_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "pack on host .252"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("fleet host shorthand", str(context.exception))
+
+    def test_served_ledger_10_l10_ipv4_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "pack at 127.0.0.1"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("IPv4 address", str(context.exception))
+
+    def test_served_ledger_10_l10_raw_no_mtp_outside_rerun_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "pack --no-mtp variant"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("raw '--' flag token outside rerun", str(context.exception))
+
+    def test_served_ledger_10_l10_path_placeholder_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "pack at <path>"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("<path> placeholder", str(context.exception))
+
+    def test_served_ledger_10_l10_positive_control_fastmlx_serve_token_passes(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "fastmlx-serve pack"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            loaded = build_public_site.load_served_benchmarks(root, manifest)
+            self.assertEqual(loaded["entries"][0]["packLabel"], "fastmlx-serve pack")
+
+    def test_served_ledger_11_l11_serving_value_outside_allowlist_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["serving"]["mtp"] = "on"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("serving.mtp is outside the allowed values", str(context.exception))
+
+    def test_served_ledger_12_l12_rerun_unknown_flag_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["rerun"]["measure"] += " --api-key secret"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("has an unknown flag", str(context.exception))
+
+    def test_served_ledger_13_l13_duplicate_id_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][1]["id"] = ledger["entries"][0]["id"]
+        # L13's ordering check would also fire on a naive duplicate-id
+        # fixture (both entries would carry equal-or-later measuredAt), so
+        # pin the id collision specifically by keeping measuredAt strictly
+        # descending.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("duplicate entry id", str(context.exception))
+
+    def test_served_ledger_13_l13_not_newest_first_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"] = list(reversed(ledger["entries"]))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("not newest-first", str(context.exception))
+
+    def test_served_ledger_14_l2_quality_manifest_none_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, None)
+            self.assertIn("requires a quality-card manifest", str(context.exception))
+
+    def test_served_ledger_15_real_build_validates_clean_and_emits_sealed_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            self.assertTrue((output / "benchmarks/served-benchmarks.json").is_file())
+            failures = validate_public_site.validate(output)
+            self.assertEqual(failures, [])
+
+    def test_served_ledger_16_mutated_json_trips_v1(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            path = output / "benchmarks/served-benchmarks.json"
+            path.write_text(path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertIn(
+                "benchmarks/served-benchmarks.json does not match the reviewed served-benchmark ledger",
+                failures,
+            )
+
+    def test_served_ledger_17_html_ratio_replaced_trips_v3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            html_path = output / "benchmarks/index.html"
+            page = html_path.read_text(encoding="utf-8")
+            # F3: the ratio and its "decode rate..." caption are now two
+            # SEPARATE elements (`.metric` holds only the short value), so
+            # the ratio alone -- not a cross-element substring -- is what
+            # V3 matches.
+            self.assertIn('<div class="metric">1.185x</div>', page)
+            html_path.write_text(
+                page.replace('<div class="metric">1.185x</div>', '<div class="metric">9.999x</div>'),
+                encoding="utf-8",
+            )
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(any("does not render its ratio" in failure for failure in failures))
+
+    def test_served_ledger_18_article_removed_trips_v3_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            html_path = output / "benchmarks/index.html"
+            page = html_path.read_text(encoding="utf-8")
+            match = re.search(
+                r'<article class="evidence-card" data-served-benchmark="qwen38-flash-next-iq-3p3bpw[^"]*"[^>]*>.*?</article>',
+                page,
+                re.S,
+            )
+            self.assertIsNotNone(match)
+            html_path.write_text(page.replace(match.group(0), ""), encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertIn(
+                "served-engine ledger identity mismatch in benchmarks/index.html",
+                failures,
+            )
+
+    def test_served_ledger_19_card_id_absent_from_quality_index_trips_v2(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            quality_path = output / "quality/index.json"
+            quality_path.unlink()
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertIn("served ledger requires quality/index.json", failures)
+
+    def test_served_ledger_20_page_renders_every_field_and_benchmark_result_count_unchanged(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            page = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+            unmutated_count = page.count('class="benchmark-result"')
+            ledger = self._real_served_ledger()
+            for entry in ledger["entries"]:
+                self.assertIn(entry["id"], page)
+                self.assertIn(entry["cardId"], page)
+                self.assertIn(entry["rowSha256"], page)
+                self.assertIn(entry["engineBuild"]["commit"][:8], page)
+                for key in ("measure", "combine", "publicView"):
+                    self.assertIn(html.escape(entry["rerun"][key]), page)
+            self.assertIn("../quality/", page)
+            self.assertEqual(page.count('class="benchmark-result"'), unmutated_count)
+            self.assertNotIn("data-benchmark-card", page.split("data-served-benchmarks", 1)[1])
+
+    # ------------------------------------------------------------------
+    # Cycle 173 review fixes (F1-F9).
+    # ------------------------------------------------------------------
+
+    def _load_mutated_validate_module(self, remove_snippet: str):
+        """Load a TEMP copy of `validate_public_site.py` with `remove_snippet`
+        deleted, via `importlib`, under a throwaway module name -- NEVER
+        mutates the working file on disk (sha256-verified below). Used to
+        prove a guard is REACHABLE: the mutated module must fail to report
+        the failure the unmutated module reports for the same fixture.
+        """
+        source_path = REPOSITORY_ROOT / "scripts/validate_public_site.py"
+        original_bytes = source_path.read_bytes()
+        original_sha = hashlib.sha256(original_bytes).hexdigest()
+        source = original_bytes.decode("utf-8")
+        self.assertIn(remove_snippet, source, "mutation target not found in source")
+        mutated_source = source.replace(remove_snippet, "", 1)
+        with tempfile.TemporaryDirectory() as directory:
+            mutated_path = Path(directory) / "validate_public_site_mutated.py"
+            mutated_path.write_text(mutated_source, encoding="utf-8")
+            module_name = f"validate_public_site_mutated_{next(self._mutation_counter)}"
+            spec = importlib.util.spec_from_file_location(module_name, mutated_path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            try:
+                spec.loader.exec_module(module)
+            finally:
+                del sys.modules[module_name]
+        after_bytes = source_path.read_bytes()
+        self.assertEqual(original_sha, hashlib.sha256(after_bytes).hexdigest())
+        self.assertEqual(original_bytes, after_bytes, "working file must be unchanged")
+        return module
+
+    _mutation_counter = itertools.count()
+
+    # -- F1: harness.combineCommit (schema + render) --------------------
+
+    def test_served_ledger_f1_combine_commit_missing_key_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        del ledger["entries"][0]["harness"]["combineCommit"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("harness", str(context.exception))
+
+    def test_served_ledger_f1_combine_commit_not_40_hex_refused(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["harness"]["combineCommit"] = "not-a-commit"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("harness.combineCommit is not a 40-hex sha", str(context.exception))
+
+    def test_served_ledger_f1_combine_commit_v2_catches_malformed_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            ledger_path = output / "benchmarks/served-benchmarks.json"
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger["entries"][0]["harness"]["combineCommit"] = "z" * 40
+            raw = json.dumps(ledger).encode("utf-8")
+            ledger_path.write_bytes(raw)
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any("harness.combineCommit is not a 40-hex sha" in f for f in failures), failures
+            )
+
+    def test_served_ledger_f1_render_shows_measured_with_and_combined_with(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            page = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+            ledger = self._real_served_ledger()
+            for entry in ledger["entries"]:
+                public_commit = entry["harness"]["publicCommit"][:8]
+                combine_commit = entry["harness"]["combineCommit"][:8]
+                self.assertIn(f"measured with <code>{public_commit}</code>", page)
+                self.assertIn(f"combined with <code>{combine_commit}</code>", page)
+
+    # -- F3: markup structure (metric split from caption; rerun blocks) -
+
+    def test_served_ledger_f3_metric_holds_only_the_short_value(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            page = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+            section = page.split("data-served-benchmarks", 1)[1]
+            self.assertIn('<div class="metric">1.185x</div>', section)
+            self.assertIn(
+                '<p class="metric-note">decode rate vs the 8-bit reference</p>', section
+            )
+            # The sentence must NOT be concatenated into .metric itself --
+            # a giant-font element (site/assets/site.css .metric) is meant
+            # to hold a short value only (see site/capabilities.json's own
+            # "+100.5%"/"24 h" metrics for the established shape).
+            self.assertNotIn("1.185x decode rate", section)
+
+    def test_served_ledger_f3_rerun_commands_are_separate_pre_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            page = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+            section = page.split("data-served-benchmarks", 1)[1]
+            # Each command is its own <pre><code> block element -- the old
+            # bug was three bare <code> elements with NOTHING (not even
+            # whitespace) between them, e.g. `</code><code>`; that pattern
+            # must be gone.
+            self.assertNotIn("</code><code>", section)
+            self.assertGreaterEqual(section.count("<pre><code>"), 6)  # 3 commands x 2 entries
+
+    # -- F4: V2 cross-checks re-derived against the BUILT quality/index.json,
+    #    each with a deletion-mutation reachability check. --------------
+
+    def _build_site_and_quality(self, directory: Path):
+        output = directory / "site"
+        build_public_site.build_site(REPOSITORY_ROOT, output)
+        quality_path = output / "quality/index.json"
+        quality = json.loads(quality_path.read_text(encoding="utf-8"))
+        return output, quality_path, quality
+
+    def test_served_ledger_f4_l4_hfpin_cross_check_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output, quality_path, quality = self._build_site_and_quality(Path(directory))
+            ledger = self._real_served_ledger()
+            card_id = ledger["entries"][0]["cardId"]
+            for card in quality["cards"]:
+                if card["id"] == card_id:
+                    card["model"]["hfPin"] = "0" * 40
+            quality_path.write_text(json.dumps(quality), encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any("packRevision does not match its quality card's hfPin" in f for f in failures),
+                failures,
+            )
+            mutated = self._load_mutated_validate_module(
+                '        if pack_revision is not None and pack_revision != card_model.get("hfPin"):\n'
+                '            failures.append(f"{label} packRevision does not match its quality card\'s hfPin")\n'
+            )
+            mutated_failures = mutated.validate_served_benchmarks(output)
+            self.assertFalse(
+                any(
+                    "packRevision does not match its quality card's hfPin" in f
+                    for f in mutated_failures
+                ),
+                mutated_failures,
+            )
+
+    def test_served_ledger_f4_l5_hardware_class_cross_check_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output, quality_path, quality = self._build_site_and_quality(Path(directory))
+            ledger = self._real_served_ledger()
+            card_id = ledger["entries"][0]["cardId"]
+            for card in quality["cards"]:
+                if card["id"] == card_id:
+                    card["config"]["hardwareClass"] = "apple-m5"
+            quality_path.write_text(json.dumps(quality), encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any("hardwareClass does not match its quality card or chip" in f for f in failures),
+                failures,
+            )
+            mutated = self._load_mutated_validate_module(
+                "        if (\n"
+                "            hardware_class is not None\n"
+                "            and chip is not None\n"
+                "            and (\n"
+                '                hardware_class != card_config.get("hardwareClass")\n'
+                '                or chip.lower().replace(" ", "-") != hardware_class\n'
+                "            )\n"
+                "        ):\n"
+                '            failures.append(f"{label} hardwareClass does not match its quality card or chip")\n'
+            )
+            mutated_failures = mutated.validate_served_benchmarks(output)
+            self.assertFalse(
+                any(
+                    "hardwareClass does not match its quality card or chip" in f
+                    for f in mutated_failures
+                ),
+                mutated_failures,
+            )
+
+    def test_served_ledger_f4_l6_engine_build_cross_check_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output, quality_path, quality = self._build_site_and_quality(Path(directory))
+            ledger = self._real_served_ledger()
+            card_id = ledger["entries"][0]["cardId"]
+            for card in quality["cards"]:
+                if card["id"] == card_id:
+                    card["provenance"]["engineBuild"] = {"commit": "1" * 40}
+            quality_path.write_text(json.dumps(quality), encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any("engineBuild.commit does not match its quality card" in f for f in failures),
+                failures,
+            )
+            mutated = self._load_mutated_validate_module(
+                '            if not isinstance(card_engine_build, dict) or card_engine_build.get("commit") != engine_commit:\n'
+                '                failures.append(f"{label} engineBuild.commit does not match its quality card")\n'
+            )
+            mutated_failures = mutated.validate_served_benchmarks(output)
+            self.assertFalse(
+                any(
+                    "engineBuild.commit does not match its quality card" in f
+                    for f in mutated_failures
+                ),
+                mutated_failures,
+            )
+
+    def test_served_ledger_f4_l8_speedx_cross_check_and_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output, quality_path, quality = self._build_site_and_quality(Path(directory))
+            ledger = self._real_served_ledger()
+            card_id = ledger["entries"][0]["cardId"]
+            for card in quality["cards"]:
+                if card["id"] == card_id:
+                    card["legible"]["benefit"]["speedX"] = 9.99
+            quality_path.write_text(json.dumps(quality), encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any(
+                    "result.ratio disagrees with its quality card's speedX by more than 3%" in f
+                    for f in failures
+                ),
+                failures,
+            )
+            mutated = self._load_mutated_validate_module(
+                "                if (\n"
+                "                    card_speed_x is None\n"
+                "                    or card_speed_x == 0\n"
+                "                    or abs(ratio / card_speed_x - 1) > SERVED_BENCHMARK_SPEEDX_TOLERANCE\n"
+                "                ):\n"
+                "                    failures.append(\n"
+                '                        f"{label} result.ratio disagrees with its quality card\'s speedX by more than 3%"\n'
+                "                    )\n"
+            )
+            mutated_failures = mutated.validate_served_benchmarks(output)
+            self.assertFalse(
+                any(
+                    "result.ratio disagrees with its quality card's speedX by more than 3%" in f
+                    for f in mutated_failures
+                ),
+                mutated_failures,
+            )
+
+    # -- F5: V3 whole-section scan (attribute values too) + delimited rate
+    #    matching. -------------------------------------------------------
+
+    def test_served_ledger_f5_v3_scans_attribute_values_for_ipv4(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            html_path = output / "benchmarks/index.html"
+            page = html_path.read_text(encoding="utf-8")
+            # Inject an IPv4 address into a NEW attribute value (never seen
+            # by `handle_data`, which only ever sees text nodes) inside the
+            # served-benchmarks section only -- appended after the existing
+            # `data-card-id` attribute's own closing quote, so its value is
+            # left intact and only the identity check stays green.
+            marker = 'data-card-id="qwen38-flash-next-iq-3p3bpw@m3ultra-v2696">'
+            self.assertIn(marker, page)
+            page = page.replace(
+                marker,
+                'data-card-id="qwen38-flash-next-iq-3p3bpw@m3ultra-v2696" data-leak="127.0.0.1">',
+                1,
+            )
+            html_path.write_text(page, encoding="utf-8")
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any("leaks a raw address or path" in f for f in failures), failures
+            )
+
+    def test_served_ledger_f5_rate_match_requires_the_delimited_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            html_path = output / "benchmarks/index.html"
+            page = html_path.read_text(encoding="utf-8")
+            self.assertIn("median 66.80 vs 56.36 tok/s", page)
+            # Break only the DELIMITED phrase (keep the bare numbers
+            # elsewhere on the page, e.g. in the row's own rerun commands is
+            # not applicable here since rates never appear there) -- a
+            # bare-substring check would miss this.
+            html_path.write_text(
+                page.replace("median 66.80 vs 56.36 tok/s", "median 66.80 and 56.36 tok/s"),
+                encoding="utf-8",
+            )
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(any("does not render its rates" in f for f in failures), failures)
+
+    # -- F6: packLabel allowlist -----------------------------------------
+
+    def test_served_ledger_f6_packlabel_allowlist_accepts_real_labels(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        self.assertEqual(ledger["entries"][0]["packLabel"], "3.3-bit pack")
+        self.assertEqual(ledger["entries"][1]["packLabel"], "mixed 4/8-bit pack")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            loaded = build_public_site.load_served_benchmarks(root, manifest)
+            self.assertEqual(loaded["entries"][0]["packLabel"], "3.3-bit pack")
+            self.assertEqual(loaded["entries"][1]["packLabel"], "mixed 4/8-bit pack")
+
+    def test_served_ledger_f6_packlabel_allowlist_refuses_non_pack_suffix(self) -> None:
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "pack at localhost:18494"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            with self.assertRaises(SystemExit) as context:
+                build_public_site.load_served_benchmarks(root, manifest)
+            self.assertIn("packLabel does not look like a pack label", str(context.exception))
+
+    def test_served_ledger_f6_packlabel_allowlist_does_not_refuse_a_bare_hostname(self) -> None:
+        # Documents the regex's actual behaviour (per review instruction):
+        # a dotted hostname WITHOUT a port, e.g. "studio.local pack", is
+        # NOT refused by this shape-only allowlist -- '.' is an allowed
+        # character and the string still ends in "pack". Only the
+        # marker scan (IPv4 / host shorthand / `<path>` / `~` / private and
+        # engine markers, checked FIRST) or a numeric port would catch a
+        # real host leak; this allowlist is a shape check, not a marker
+        # scan, and is not a substitute for it.
+        manifest = self._real_quality_manifest()
+        ledger = self._real_served_ledger()
+        ledger["entries"][0]["packLabel"] = "studio.local pack"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_served_ledger(root, ledger)
+            loaded = build_public_site.load_served_benchmarks(root, manifest)
+            self.assertEqual(loaded["entries"][0]["packLabel"], "studio.local pack")
+
+    def test_served_ledger_f6_packlabel_v2_matches_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            ledger_path = output / "benchmarks/served-benchmarks.json"
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            ledger["entries"][0]["packLabel"] = "pack at localhost:18494"
+            ledger_path.write_bytes(json.dumps(ledger).encode("utf-8"))
+            failures = validate_public_site.validate_served_benchmarks(output)
+            self.assertTrue(
+                any("packLabel does not look like a pack label" in f for f in failures), failures
+            )
+
+    # -- F9: rates render with exactly 2 decimals ------------------------
+
+    def test_served_ledger_f9_rates_render_with_two_decimals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "site"
+            build_public_site.build_site(REPOSITORY_ROOT, output)
+            page = (output / "benchmarks/index.html").read_text(encoding="utf-8")
+            ledger = self._real_served_ledger()
+            for entry in ledger["entries"]:
+                candidate = f'{float(entry["result"]["candidateDecodeTokS"]):.2f}'
+                reference = f'{float(entry["result"]["referenceDecodeTokS"]):.2f}'
+                self.assertIn(f"median {candidate} vs {reference} tok/s", page)
 
     # Two hand-maintained copies of the speedX/boundary.unmeasured
     # contradiction-prefix rule exist by design (the projection split, same

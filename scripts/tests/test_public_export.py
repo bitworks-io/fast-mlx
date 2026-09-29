@@ -252,9 +252,19 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # published Qwen3TemplateRenderTests.swift uses -- so no local path is baked in, and it skips
 # cleanly on any checkout (including CI) where that variable is unset. All of its assertions are
 # relational (length/prefix/equality over token arrays), never a hardcoded vocabulary ID.
+# 2026-09-29, 1001 -> 1002: adds site/served-benchmarks.json, the sealed served-engine benchmark
+# ledger for Lane 4(e) slice 1 (two entries, both a fast-mlx-owned `fastmlx bench` measurement of a
+# published quality-carded pack against its own 8-bit reference, on a serving engine identified only
+# by an opaque build label). Conscious decision to publish: the file was read in full and contains no
+# private host, IP, username, absolute machine-local path, competitor/engine product name, or
+# credential -- `scripts/build_public_site.load_served_benchmarks` and
+# `scripts/validate_public_site.validate_served_benchmarks` both fail-closed scan the whole
+# serialized entry (and every non-rerun field for a stray `--` token) before this file could ever
+# carry one. The two raw measurement rows this ledger's `rowSha256` commits to are NOT published
+# (see `docs/evidence/served-benchmark-rows/`, which `docs/` itself keeps out of this projection).
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1001,
-    "pathModeSha256": "87cf3a88311194dc157efa8c3cdd5ddb0ce128fe06020c3fb27e27b6850c9c88",
+    "pathCount": 1002,
+    "pathModeSha256": "c820eeba20f44b4a9a9b969e9368e8db5bdfaef41e155ddbfd7a6db70eb45eab",
 }
 
 

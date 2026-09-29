@@ -242,6 +242,127 @@ PUBLIC_PATH = re.compile(
     r"(?:[a-z0-9][a-z0-9.-]*/)*(?:[a-z0-9][a-z0-9.-]*/|[a-z0-9][a-z0-9.-]*\.(?:atom|html|json))"
 )
 
+# --- Served-engine benchmark ledger (site/served-benchmarks.json) ---------
+# A sealed, reviewed ledger of fast-mlx measurements made with `fastmlx
+# bench` against a serving engine identified by its build commit, not by
+# name (see docs/quality-card-schema-v1.md "Engine build" and the internal
+# ingest step, which is the only writer of a well-formed entry). Required
+# like the release catalog (`load_release_catalog`) --
+# never silently-optional like the quality-guide manifest -- because a
+# ledger entry makes a load-bearing claim (a pack's decode rate vs its
+# card's 8-bit reference) that must never be allowed to drift from the
+# quality card it cites.
+SERVED_BENCHMARK_POLICY = "reviewed-served-benchmarks-only"
+SERVED_BENCHMARK_CLAIM_BOUNDARY = "fast-mlx-owned-results-only"
+SERVED_BENCHMARK_TOP_KEYS = {
+    "schemaVersion",
+    "project",
+    "policy",
+    "claimBoundary",
+    "updatedAt",
+    "entries",
+}
+SERVED_BENCHMARK_ENTRY_KEYS = {
+    "id",
+    "measuredAt",
+    "cardId",
+    "packLabel",
+    "packRevision",
+    "hardwareClass",
+    "chip",
+    "engineBuild",
+    "harness",
+    "workload",
+    "serving",
+    "result",
+    "controls",
+    "rowSha256",
+    "rerun",
+}
+SERVED_BENCHMARK_ENGINE_BUILD_KEYS = {"commit"}
+# `combineCommit` names the public commit whose `scripts/fastmlx_bench.py`
+# actually produced the row's `ratio` via `--combine` -- NOT necessarily the
+# same commit as `publicCommit` (which names the harness that took the raw
+# MEASUREMENT). A `--combine` defect fixed after a measurement was taken
+# means the row had to be re-combined at a LATER commit than the one that
+# measured it; recording only `publicCommit` would silently misattribute
+# the combine step to a harness build that could not have produced this
+# ratio (see the internal ingest step's own module docstring, the
+# public-ancestry check on both commits).
+SERVED_BENCHMARK_HARNESS_KEYS = {"publicCommit", "combineCommit", "benchSha256", "promptSetSha256"}
+SERVED_BENCHMARK_WORKLOAD_KEYS = {
+    "promptSet",
+    "prompts",
+    "maxTokens",
+    "runs",
+    "warmup",
+    "temperature",
+    "completionTokens",
+}
+SERVED_BENCHMARK_SERVING_KEYS = {"contextTokens", "mtp", "drafter", "promptLookup"}
+# Slice 1 never publishes a serving toggle as "on" -- only whether it was
+# explicitly disabled (a captured `--no-*` flag) or left at the engine's own
+# default (the flag absent from the captured argv, never inferred further).
+SERVED_BENCHMARK_SERVING_TRISTATE = {"off", "engine-default"}
+SERVED_BENCHMARK_RESULT_KEYS = {
+    "candidateDecodeTokS",
+    "referenceDecodeTokS",
+    "ratio",
+    "candidatePasses",
+    "referencePasses",
+    "referenceDriftPct",
+}
+SERVED_BENCHMARK_CONTROLS = {
+    "tokens": "verified",
+    "owner": "verified",
+    "drift": "verified",
+    "magnitude": "plausible",
+    "anchor": "first-token",
+}
+SERVED_BENCHMARK_RERUN_KEYS = {"measure", "combine", "publicView"}
+SERVED_BENCHMARK_SHA256 = re.compile(r"[0-9a-f]{64}")
+SERVED_BENCHMARK_MEASURED_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+SERVED_BENCHMARK_RATE_FLOOR = 25.0
+SERVED_BENCHMARK_RATE_CEILING = 2000.0
+SERVED_BENCHMARK_DRIFT_CEILING_PCT = 5.0
+SERVED_BENCHMARK_RATIO_TOLERANCE = 5e-4
+SERVED_BENCHMARK_SPEEDX_TOLERANCE = 0.03
+SERVED_BENCHMARK_IPV4 = re.compile(r"(?<!\d)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?!\d)")
+# A packLabel allowlist: starts with a lowercase letter or digit, every
+# other character is a lowercase letter, digit, space, dot, slash, or
+# hyphen, and the label ends in the literal word "pack" (e.g. "3.3-bit
+# pack", "mixed 4/8-bit pack"). This is a SHAPE check, not a marker scan --
+# it runs in addition to, never instead of, `_served_benchmark_marker_violation`
+# (host shorthand, IPv4, `<path>`, `~`, private/engine markers), which is
+# checked first so its specific reason is reported for a packLabel that
+# carries one of those markers.
+SERVED_BENCHMARK_PACK_LABEL = re.compile(r"[a-z0-9][a-z0-9 ./-]{0,55}pack")
+# `--` flag NAMES a rerun string may carry (see the internal ingest step's
+# own module docstring for the full `fastmlx bench` CLI surface); the four
+# listener-identity flags (`--serve`, `--host`, `--port`, `--ctx-size`, the
+# model PATH itself) never appear in a rerun template -- a rerun string is an
+# operator INSTRUCTION, not a capture of the exact invocation that produced
+# this row.
+SERVED_BENCHMARK_RERUN_FLAG_NAMES = {
+    "base-url",
+    "model",
+    "expect-listener-pid",
+    "json",
+    "runs",
+    "warmup",
+    "max-tokens",
+    "temperature",
+    "combine",
+    "public-view",
+}
+# A rerun placeholder is a lowercase angle-bracketed name (e.g. `<pid>`), an
+# operator fills in before running the command; `<role>.json` (the redirect
+# target of the `measure` rerun) is the same shape with a literal `.json`
+# suffix, since the role -- not just the extension -- is still a placeholder.
+SERVED_BENCHMARK_RERUN_PLACEHOLDER = re.compile(r"<[a-z][a-z-]*>(?:\.json)?")
+SERVED_BENCHMARK_RERUN_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+SERVED_BENCHMARK_RERUN_FILENAME = re.compile(r"[a-z0-9-]+\.json")
+
 
 @dataclass(frozen=True)
 class Article:
@@ -1196,11 +1317,19 @@ def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
     """Load the optional public quality-card manifest (`fast-mlx-quality-card-v1`).
 
     The manifest is owned by a separate emitter (`scripts/emit_quality_card.py`).
-    Its absence is not a build failure: the quality-guide page is simply skipped,
-    exactly like an optional section. Presence is validated with a strict,
-    fail-closed schema (`validate_quality_card_document`) — an unknown schema,
-    verdict, provenance source, or a card missing a required field refuses the
-    build rather than rendering a partial or fabricated card.
+    This function's own absence-handling is unchanged: a missing manifest
+    returns `None` rather than raising, and the quality-guide page is simply
+    skipped, exactly like an optional section. Presence is validated with a
+    strict, fail-closed schema (`validate_quality_card_document`) — an
+    unknown schema, verdict, provenance source, or a card missing a required
+    field refuses the build rather than rendering a partial or fabricated
+    card.
+
+    A missing manifest is NO LONGER a no-op for the OVERALL build, though:
+    `load_served_benchmarks` (below) is required like the release catalog
+    and refuses (`L2`) when its `quality_manifest` argument is `None`, so a
+    missing manifest now fails the build one call later, at the served
+    ledger's own required load, rather than here.
     """
 
     manifest_path = repository_root / "site/quality-guides.json"
@@ -1209,6 +1338,304 @@ def load_quality_guides(repository_root: Path) -> Optional[Dict[str, object]]:
     if manifest_path.is_symlink() or not manifest_path.is_file():
         fail("site/quality-guides.json is present but not a regular file")
     return validate_quality_card_document(read_json(manifest_path), "site/quality-guides.json")
+
+
+def _served_benchmark_marker_violation(text: str) -> Optional[str]:
+    """Return a short reason `text` (any serialized fragment of a served-
+    benchmark entry) carries a marker that must never reach a published
+    entry, or `None` when it is clean. Neutralises this project's own binary
+    name before the third-party-engine scan -- the SAME order and the same
+    NUL-splice technique `fastmlx_bench.publishability_control` and
+    `validate_public_repository.validate_no_third_party_engine_marker` both
+    use (see either docstring for why an empty-string replacement would
+    manufacture a false match) -- so a positive-control occurrence of the
+    public token "fastmlx-serve" never trips this scan.
+    """
+    lowered = text.casefold()
+    for marker in PRIVATE_MARKERS:
+        if marker.casefold() in lowered:
+            return f"private marker {marker!r}"
+    neutralized = lowered.replace(
+        validate_public_repository.OWN_BINARY_NAME.casefold(), "\x00"
+    )
+    for marker in validate_public_repository.THIRD_PARTY_ENGINE_MARKERS:
+        if marker.casefold() in neutralized:
+            return "a third-party engine name"
+    if QUALITY_GUIDE_HOST_SHORTHAND.search(text):
+        return "the fleet host shorthand"
+    if SERVED_BENCHMARK_IPV4.search(text):
+        return "an IPv4 address"
+    if "<path>" in text:
+        return "a <path> placeholder"
+    if "~" in text:
+        return "a literal '~'"
+    return None
+
+
+def _served_benchmark_rerun_failures(key: str, value: object, label: str) -> List[str]:
+    """Accumulate-style shape check for one `rerun.<key>` string -- see the
+    served-ledger design notes section 3 (`I12`/`L12`): must start
+    `fastmlx bench `, every `--`-prefixed token must name an allowed flag,
+    and every remaining token must be a placeholder, an integer, the literal
+    `>`, or an `[a-z0-9-]+.json` filename -- never a raw path, host, or port.
+    """
+    failures: List[str] = []
+    if not isinstance(value, str) or not value.strip():
+        return [f"{label} rerun.{key} has an empty or non-string value"]
+    tokens = value.split(" ")
+    if len(tokens) < 3 or tokens[0] != "fastmlx" or tokens[1] != "bench":
+        return [f"{label} rerun.{key} does not start with 'fastmlx bench '"]
+    for token in tokens[2:]:
+        if token == ">":
+            continue
+        if token.startswith("--"):
+            if token[2:] not in SERVED_BENCHMARK_RERUN_FLAG_NAMES:
+                failures.append(f"{label} rerun.{key} has an unknown flag {token!r}")
+            continue
+        if (
+            SERVED_BENCHMARK_RERUN_PLACEHOLDER.fullmatch(token)
+            or SERVED_BENCHMARK_RERUN_NUMBER.fullmatch(token)
+            or SERVED_BENCHMARK_RERUN_FILENAME.fullmatch(token)
+        ):
+            continue
+        failures.append(f"{label} rerun.{key} has an unrecognised token {token!r}")
+    return failures
+
+
+def _served_benchmark_number(value: object) -> Optional[float]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return float(value)
+
+
+def validate_served_benchmark_entry(
+    raw_entry: object, cards_by_id: Dict[str, Dict[str, object]], label: str
+) -> Dict[str, object]:
+    """Validate ONE served-benchmark ledger entry against its own schema
+    (`SERVED_BENCHMARK_ENTRY_KEYS` and this function's own checks below)
+    and cross-check it against the quality card it cites (`cards_by_id`,
+    keyed by `cardId`). Shared, byte-identical code path for both the
+    build-time loader (`load_served_benchmarks`, below) and the internal
+    ingest step's own `I8` self-check -- an entry this function accepts is
+    guaranteed to pass the loader later, and an entry it
+    refuses can never reach `site/served-benchmarks.json` in the first
+    place. `fail()`s (SystemExit) on the FIRST violation, exactly like every
+    other loader in this module (see `load_release_catalog`).
+    """
+
+    entry = require_exact_keys(raw_entry, SERVED_BENCHMARK_ENTRY_KEYS, label)
+    identifier = require_text(entry, "id", label)
+    if not SLUG.fullmatch(identifier):
+        fail(f"{label} has an invalid id")
+    measured_at = require_text(entry, "measuredAt", label)
+    if not SERVED_BENCHMARK_MEASURED_AT.fullmatch(measured_at):
+        fail(f"{label} measuredAt is not a UTC Z timestamp")
+    card_id = require_text(entry, "cardId", label)
+    if not QUALITY_CARD_ID.fullmatch(card_id):
+        fail(f"{label} has an invalid cardId")
+    card = cards_by_id.get(card_id)
+    if card is None:
+        fail(f"{label} cardId {card_id!r} is not a published quality card")
+    pack_label = require_text(entry, "packLabel", label)
+    if len(pack_label) > 60:
+        fail(f"{label} packLabel exceeds 60 characters")
+    pack_revision = require_text(entry, "packRevision", label)
+    if not COMMIT_SHA.fullmatch(pack_revision):
+        fail(f"{label} packRevision is not a 40-hex revision")
+    card_model = card.get("model") if isinstance(card.get("model"), dict) else {}
+    if pack_revision != card_model.get("hfPin"):
+        fail(f"{label} packRevision does not match its quality card's hfPin")
+    hardware_class = require_text(entry, "hardwareClass", label)
+    if (
+        not QUALITY_CARD_HARDWARE_CLASS.fullmatch(hardware_class)
+        or hardware_class == QUALITY_CARD_HARDWARE_CLASS_SENTINEL
+    ):
+        fail(f"{label} hardwareClass is invalid")
+    card_config = card.get("config") if isinstance(card.get("config"), dict) else {}
+    chip = require_text(entry, "chip", label)
+    if (
+        hardware_class != card_config.get("hardwareClass")
+        or chip.lower().replace(" ", "-") != hardware_class
+    ):
+        fail(f"{label} hardwareClass does not match its quality card or chip")
+    engine_build = require_exact_keys(
+        entry.get("engineBuild"), SERVED_BENCHMARK_ENGINE_BUILD_KEYS, f"{label} engineBuild"
+    )
+    engine_commit = require_text(engine_build, "commit", f"{label} engineBuild")
+    if not QUALITY_CARD_ENGINE_BUILD_COMMIT.fullmatch(engine_commit):
+        fail(f"{label} engineBuild.commit is not a 40-hex sha")
+    card_provenance = card.get("provenance") if isinstance(card.get("provenance"), dict) else {}
+    card_engine_build = card_provenance.get("engineBuild")
+    if not isinstance(card_engine_build, dict) or card_engine_build.get("commit") != engine_commit:
+        fail(f"{label} engineBuild.commit does not match its quality card")
+    harness = require_exact_keys(
+        entry.get("harness"), SERVED_BENCHMARK_HARNESS_KEYS, f"{label} harness"
+    )
+    harness_commit = require_text(harness, "publicCommit", f"{label} harness")
+    if not COMMIT_SHA.fullmatch(harness_commit):
+        fail(f"{label} harness.publicCommit is not a 40-hex sha")
+    combine_commit = require_text(harness, "combineCommit", f"{label} harness")
+    if not COMMIT_SHA.fullmatch(combine_commit):
+        fail(f"{label} harness.combineCommit is not a 40-hex sha")
+    bench_sha = require_text(harness, "benchSha256", f"{label} harness")
+    if not SERVED_BENCHMARK_SHA256.fullmatch(bench_sha):
+        fail(f"{label} harness.benchSha256 is not a 64-hex sha256")
+    prompt_sha = require_text(harness, "promptSetSha256", f"{label} harness")
+    if not SERVED_BENCHMARK_SHA256.fullmatch(prompt_sha):
+        fail(f"{label} harness.promptSetSha256 is not a 64-hex sha256")
+    workload = require_exact_keys(
+        entry.get("workload"), SERVED_BENCHMARK_WORKLOAD_KEYS, f"{label} workload"
+    )
+    if workload.get("promptSet") != "default-3-prompt-set":
+        fail(f"{label} workload.promptSet must be default-3-prompt-set")
+    for int_key in ("prompts", "maxTokens", "runs", "warmup"):
+        value = workload.get(int_key)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            fail(f"{label} workload.{int_key} must be a non-negative int")
+    temperature = _served_benchmark_number(workload.get("temperature"))
+    if temperature is None or temperature < 0:
+        fail(f"{label} workload.temperature must be a non-negative number")
+    completion_tokens = workload.get("completionTokens")
+    if (
+        not isinstance(completion_tokens, list)
+        or len(completion_tokens) != 2
+        or not all(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0
+            for value in completion_tokens
+        )
+        or completion_tokens[0] > completion_tokens[1]
+    ):
+        fail(f"{label} workload.completionTokens must be a [min, max] pair")
+    serving = require_exact_keys(
+        entry.get("serving"), SERVED_BENCHMARK_SERVING_KEYS, f"{label} serving"
+    )
+    context_tokens = serving.get("contextTokens")
+    if not isinstance(context_tokens, int) or isinstance(context_tokens, bool) or context_tokens <= 0:
+        fail(f"{label} serving.contextTokens must be a positive int")
+    for key in ("mtp", "drafter", "promptLookup"):
+        if serving.get(key) not in SERVED_BENCHMARK_SERVING_TRISTATE:
+            fail(f"{label} serving.{key} is outside the allowed values")
+    result = require_exact_keys(
+        entry.get("result"), SERVED_BENCHMARK_RESULT_KEYS, f"{label} result"
+    )
+    candidate_rate = _served_benchmark_number(result.get("candidateDecodeTokS"))
+    reference_rate = _served_benchmark_number(result.get("referenceDecodeTokS"))
+    ratio = _served_benchmark_number(result.get("ratio"))
+    if candidate_rate is None or reference_rate is None or ratio is None:
+        fail(f"{label} result rates and ratio must be numeric")
+    if (
+        candidate_rate < SERVED_BENCHMARK_RATE_FLOOR
+        or candidate_rate > SERVED_BENCHMARK_RATE_CEILING
+        or reference_rate < SERVED_BENCHMARK_RATE_FLOOR
+        or reference_rate > SERVED_BENCHMARK_RATE_CEILING
+    ):
+        fail(f"{label} result rates are outside the plausible [25, 2000] tok/s range")
+    for key in ("candidatePasses", "referencePasses"):
+        value = result.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            fail(f"{label} result.{key} must be a positive int")
+    drift_pct = _served_benchmark_number(result.get("referenceDriftPct"))
+    if drift_pct is None or drift_pct < 0:
+        fail(f"{label} result.referenceDriftPct must be a non-negative number")
+    if drift_pct > SERVED_BENCHMARK_DRIFT_CEILING_PCT:
+        fail(f"{label} result.referenceDriftPct exceeds the 5% ceiling")
+    if reference_rate > 0 and abs(ratio - candidate_rate / reference_rate) > SERVED_BENCHMARK_RATIO_TOLERANCE:
+        fail(f"{label} result.ratio is inconsistent with its own candidate/reference rates")
+    card_benefit = (
+        card.get("legible", {}).get("benefit", {}) if isinstance(card.get("legible"), dict) else {}
+    )
+    card_speed_x = _served_benchmark_number(card_benefit.get("speedX"))
+    if card_speed_x is None or card_speed_x == 0 or abs(ratio / card_speed_x - 1) > SERVED_BENCHMARK_SPEEDX_TOLERANCE:
+        fail(f"{label} result.ratio disagrees with its quality card's speedX by more than 3%")
+    if entry.get("controls") != SERVED_BENCHMARK_CONTROLS:
+        fail(f"{label} controls must be exactly the reviewed-slice-1 control set")
+    row_sha = require_text(entry, "rowSha256", label)
+    if not SERVED_BENCHMARK_SHA256.fullmatch(row_sha):
+        fail(f"{label} rowSha256 is not a 64-hex sha256")
+    rerun = require_exact_keys(entry.get("rerun"), SERVED_BENCHMARK_RERUN_KEYS, f"{label} rerun")
+    rerun_failures: List[str] = []
+    for key in sorted(SERVED_BENCHMARK_RERUN_KEYS):
+        rerun_failures.extend(_served_benchmark_rerun_failures(key, rerun.get(key), label))
+    if rerun_failures:
+        fail(rerun_failures[0])
+    non_rerun = {key: value for key, value in entry.items() if key != "rerun"}
+    if "--" in json.dumps(non_rerun, ensure_ascii=False, sort_keys=True):
+        fail(f"{label} carries a raw '--' flag token outside rerun")
+    marker_reason = _served_benchmark_marker_violation(
+        json.dumps(entry, ensure_ascii=False, sort_keys=True)
+    )
+    if marker_reason is not None:
+        fail(f"{label} contains {marker_reason}")
+    # Checked AFTER the marker scan above (deliberately last): a packLabel
+    # that carries a private path, an engine name, the fleet host
+    # shorthand, an IPv4 address, or a `<path>` placeholder is refused by
+    # that marker-specific reason first; only a packLabel that is clean of
+    # every marker but still does not look like a pack label reaches this
+    # allowlist.
+    if not SERVED_BENCHMARK_PACK_LABEL.fullmatch(pack_label):
+        fail(f"{label} packLabel does not look like a pack label")
+    return entry
+
+
+def load_served_benchmarks(
+    repository_root: Path, quality_manifest: Optional[Dict[str, object]]
+) -> Dict[str, object]:
+    """Load the strict, sealed served-engine benchmark ledger
+    (`site/served-benchmarks.json`). Required like the release catalog --
+    never silently skipped -- because a ledger entry is a load-bearing claim
+    about a specific published quality card (see the module-level comment
+    above `SERVED_BENCHMARK_TOP_KEYS`). `quality_manifest` is the ALREADY-
+    validated return of `load_quality_guides`; its absence (`None`) is
+    itself a refusal (`L2`), since an entry can never be cross-checked
+    against a card that does not exist.
+    """
+
+    if quality_manifest is None:
+        fail("served ledger requires a quality-card manifest")
+    manifest_path = repository_root / "site/served-benchmarks.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        fail("site/served-benchmarks.json is missing, not a file, or a symlink")
+    catalog = require_exact_keys(
+        read_json(manifest_path), SERVED_BENCHMARK_TOP_KEYS, "site/served-benchmarks.json"
+    )
+    if catalog.get("schemaVersion") != 1:
+        fail("site/served-benchmarks.json must use schemaVersion 1")
+    if catalog.get("project") != "fast-mlx":
+        fail("served ledger project must remain fast-mlx")
+    if catalog.get("policy") != SERVED_BENCHMARK_POLICY:
+        fail(f"served ledger policy must remain {SERVED_BENCHMARK_POLICY}")
+    if catalog.get("claimBoundary") != SERVED_BENCHMARK_CLAIM_BOUNDARY:
+        fail(f"served ledger claim boundary must remain {SERVED_BENCHMARK_CLAIM_BOUNDARY}")
+    require_iso_date(catalog, "updatedAt", "site/served-benchmarks.json")
+    raw_entries = catalog.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        fail("served ledger must contain at least one entry")
+    cards = quality_manifest.get("cards") if isinstance(quality_manifest, dict) else None
+    cards_by_id = {
+        str(card["id"]): card for card in cards if isinstance(card, dict) and "id" in card
+    } if isinstance(cards, list) else {}
+    entries: List[Dict[str, object]] = []
+    seen_ids: set[str] = set()
+    seen_hashes: set[str] = set()
+    previous_measured_at: Optional[str] = None
+    for index, raw_entry in enumerate(raw_entries):
+        label = f"served benchmark entry {index}"
+        entry = validate_served_benchmark_entry(raw_entry, cards_by_id, label)
+        identifier = str(entry["id"])
+        row_sha = str(entry["rowSha256"])
+        if identifier in seen_ids:
+            fail("served ledger has a duplicate entry id")
+        if row_sha in seen_hashes:
+            fail("served ledger has a duplicate entry rowSha256")
+        seen_ids.add(identifier)
+        seen_hashes.add(row_sha)
+        measured_at = str(entry["measuredAt"])
+        if previous_measured_at is not None and measured_at >= previous_measured_at:
+            fail("served ledger entries are not newest-first")
+        previous_measured_at = measured_at
+        entries.append(entry)
+    catalog["entries"] = entries
+    return catalog
 
 
 def load_articles(repository_root: Path) -> List[Article]:
@@ -2263,7 +2690,11 @@ def render_capability_detail(capability: Dict[str, object]) -> str:
     )
 
 
-def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
+def render_benchmark_explorer(
+    highlights: Sequence[Dict[str, object]],
+    served: Sequence[Dict[str, object]] = (),
+    cards_by_id: Optional[Dict[str, Dict[str, object]]] = None,
+) -> str:
     status_by_id = {item[0]: item[1] for item in CAPABILITY_STATUS_DEFINITIONS}
 
     def options(values: Iterable[str], all_label: str) -> str:
@@ -2363,6 +2794,93 @@ def render_benchmark_explorer(highlights: Sequence[Dict[str, object]]) -> str:
             '</section>',
         ]
     )
+    if served:
+        cards = cards_by_id or {}
+        body.append(
+            '<section class="section shell" data-served-benchmarks aria-labelledby="served-benchmarks-heading">'
+        )
+        body.extend(
+            [
+                '<div class="section-heading"><p class="eyebrow">Served-engine ledger</p>'
+                '<h2 id="served-benchmarks-heading">fast-mlx quality-carded packs, measured on a served engine.</h2>'
+                '<p class="section-intro">Each row is a fast-mlx measurement, made with fastmlx bench, of a pack '
+                'that carries a published quality card, on a serving engine identified by its build commit, not '
+                'by name. The ratio compares the pack with its card’s 8-bit reference on the same host, build '
+                'and prompt set; it is not a comparison between engines.</p></div>',
+                '<div class="evidence-grid">',
+            ]
+        )
+        for entry in served:
+            card = cards.get(str(entry["cardId"]), {})
+            model = card.get("model", {}) if isinstance(card, dict) else {}
+            family = str(model.get("family", ""))
+            legible = card.get("legible", {}) if isinstance(card, dict) else {}
+            benefit = legible.get("benefit", {}) if isinstance(legible, dict) else {}
+            speed_x = benefit.get("speedX")
+            result = entry["result"]
+            serving = entry["serving"]
+            harness = entry["harness"]
+            workload = entry["workload"]
+            engine_commit = str(entry["engineBuild"]["commit"])
+            completion_tokens = workload["completionTokens"]
+            chip = str(entry["chip"])
+            candidate_rate_text = f'{float(result["candidateDecodeTokS"]):.2f}'
+            reference_rate_text = f'{float(result["referenceDecodeTokS"]):.2f}'
+            serving_text = (
+                f'{int(serving["contextTokens"]):,}-token context; '
+                f'MTP {serving["mtp"]}; drafter {serving["drafter"]}; '
+                f'prompt lookup {serving["promptLookup"]}'
+            )
+            harness_dd = (
+                f'measured with <code>{html.escape(str(harness["publicCommit"])[:8])}</code> '
+                f'(bench <code>{html.escape(str(harness["benchSha256"]))}</code>, '
+                f'prompts <code>{html.escape(str(harness["promptSetSha256"]))}</code>), '
+                f'combined with <code>{html.escape(str(harness["combineCommit"])[:8])}</code>'
+            )
+            scope_note = (
+                f'measured on {chip} at engine build {engine_commit[:8]}: median '
+                f'{candidate_rate_text} vs {reference_rate_text} tok/s against the 8-bit '
+                f'reference pack, concurrency 1; answers ended after {completion_tokens[0]}–'
+                f'{completion_tokens[1]} tokens; reference ran first and last and drifted '
+                f'{result["referenceDriftPct"]}%; holds for this host, build and prompt set only.'
+            )
+            body.extend(
+                [
+                    '<article class="evidence-card" data-served-benchmark="'
+                    + html.escape(str(entry["id"]), quote=True)
+                    + '" data-card-id="'
+                    + html.escape(str(entry["cardId"]), quote=True)
+                    + '">',
+                    f'<time datetime="{html.escape(str(entry["measuredAt"]), quote=True)}">'
+                    f'{html.escape(str(entry["measuredAt"]))}</time>',
+                    '<div class="metric">'
+                    + html.escape(f'{float(result["ratio"]):.3f}x')
+                    + '</div>',
+                    '<p class="metric-note">decode rate vs the 8-bit reference</p>',
+                    f'<h3>{html.escape(family)}, {html.escape(str(entry["packLabel"]))}</h3>',
+                    '<dl class="evidence-context">',
+                    f'<div><dt>Hardware</dt><dd>{html.escape(chip)}</dd></div>',
+                    f'<div><dt>Engine build</dt><dd><code>{html.escape(engine_commit[:8])}</code></dd></div>',
+                    f'<div><dt>Serving</dt><dd>{html.escape(serving_text)}</dd></div>',
+                    f'<div><dt>Harness</dt><dd>{harness_dd}</dd></div>',
+                    f'<div><dt>Row sha256</dt><dd><code>{html.escape(str(entry["rowSha256"]))}</code></dd></div>',
+                    '<div><dt>Quality card</dt><dd>'
+                    f'<a href="../quality/">{html.escape(str(entry["cardId"]))}</a> — card speedX '
+                    f'{html.escape(str(speed_x))}</dd></div>',
+                    '</dl>',
+                    f'<p class="scope-note">{html.escape(scope_note)}</p>',
+                    '<div class="evidence-rerun">',
+                ]
+            )
+            for key in ("measure", "combine", "publicView"):
+                body.append(f'<pre><code>{html.escape(str(entry["rerun"][key]))}</code></pre>')
+            body.extend(['</div>', '</article>'])
+        body.extend(
+            [
+                '</div>',
+                '</section>',
+            ]
+        )
     return "\n".join(body)
 
 
@@ -3062,6 +3580,12 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
     release_catalog = load_release_catalog(repository_root)
     quality_manifest = load_quality_guides(repository_root)
     quality_available = quality_manifest is not None
+    served_ledger = load_served_benchmarks(repository_root, quality_manifest)
+    served_cards_by_id: Dict[str, Dict[str, object]] = {
+        str(card["id"]): card
+        for card in quality_manifest["cards"]
+        if isinstance(card, dict) and "id" in card
+    }
     template = (repository_root / "site/templates/base.html").read_text(encoding="utf-8")
     assets = repository_root / "site/assets"
     validate_asset_tree(assets)
@@ -3182,7 +3706,9 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         for capability in capability_index["capabilities"]
     )
     benchmark_body = render_benchmark_explorer(
-        capability_index["performanceHighlights"]
+        capability_index["performanceHighlights"],
+        served_ledger["entries"],
+        served_cards_by_id,
     )
     write_page(
         output,
@@ -3197,6 +3723,11 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
             '<script src="../assets/benchmark-explorer.js" defer></script>',
             public_path="benchmarks/",
         ),
+    )
+    write_page(
+        output,
+        "benchmarks/served-benchmarks.json",
+        json.dumps(served_ledger, indent=2, ensure_ascii=False),
     )
     for highlight in capability_index["performanceHighlights"]:
         identifier = str(highlight["id"])
@@ -3373,6 +3904,7 @@ def build_site(repository_root: Path, output: Path) -> List[Article]:
         "- /benchmarks/: filterable reviewed performance evidence\n"
         + benchmark_detail_lines
         + "\n"
+        "- /benchmarks/served-benchmarks.json: machine-readable served-engine ledger\n"
         "- /releases/: reviewed public milestones and unchanged boundaries\n"
         + release_detail_lines
         + "\n"

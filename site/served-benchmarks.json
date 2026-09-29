@@ -1,0 +1,123 @@
+{
+  "schemaVersion": 1,
+  "project": "fast-mlx",
+  "policy": "reviewed-served-benchmarks-only",
+  "claimBoundary": "fast-mlx-owned-results-only",
+  "updatedAt": "2026-09-29",
+  "entries": [
+    {
+      "cardId": "qwen38-flash-next-iq-3p3bpw@m3ultra-v2696",
+      "chip": "Apple M3 Ultra",
+      "controls": {
+        "anchor": "first-token",
+        "drift": "verified",
+        "magnitude": "plausible",
+        "owner": "verified",
+        "tokens": "verified"
+      },
+      "engineBuild": {
+        "commit": "1745ffe89e4670f1e0c6de22c75a9875b27399de"
+      },
+      "hardwareClass": "apple-m3-ultra",
+      "harness": {
+        "benchSha256": "9e00f0519bfc9e8b1139a7ab2d68110df7533584145d61f1a263338b4b87209e",
+        "combineCommit": "c1b661334972c9220cda5aedd205a11e7048df3f",
+        "promptSetSha256": "dfc7eac33059118e6c2d32c1cde7ecd1241aa2a66d0eaec347cbbeb72ee258a1",
+        "publicCommit": "8cd16c986022a02bf49f1de1f127d641f20ba0b4"
+      },
+      "id": "qwen38-flash-next-iq-3p3bpw-m3ultra-2026-09-29",
+      "measuredAt": "2026-09-29T04:26:01Z",
+      "packLabel": "3.3-bit pack",
+      "packRevision": "2b7da62be0151a7932e4dfcab1d73c93ccf83f64",
+      "rerun": {
+        "combine": "fastmlx bench --combine reference-first.json candidate.json reference-last.json --json > combined.json",
+        "measure": "fastmlx bench --base-url <endpoint> --model <served-model-id> --expect-listener-pid <pid> --json --runs 3 --warmup 1 --max-tokens 256 --temperature 0 > <role>.json",
+        "publicView": "fastmlx bench --public-view combined.json"
+      },
+      "result": {
+        "candidateDecodeTokS": 66.8,
+        "candidatePasses": 3,
+        "ratio": 1.1852,
+        "referenceDecodeTokS": 56.36,
+        "referenceDriftPct": 0.09,
+        "referencePasses": 6
+      },
+      "rowSha256": "75d63faa38464f318ea371e7920c00fc6a3beeb9f779b80f98cc05b0f3bcec55",
+      "serving": {
+        "contextTokens": 262144,
+        "drafter": "off",
+        "mtp": "off",
+        "promptLookup": "off"
+      },
+      "workload": {
+        "completionTokens": [
+          56,
+          75
+        ],
+        "maxTokens": 256,
+        "promptSet": "default-3-prompt-set",
+        "prompts": 3,
+        "runs": 3,
+        "temperature": 0.0,
+        "warmup": 1
+      }
+    },
+    {
+      "cardId": "qwen38-flash-next-mixed-4-8bit@m3ultra-v2696",
+      "chip": "Apple M3 Ultra",
+      "controls": {
+        "anchor": "first-token",
+        "drift": "verified",
+        "magnitude": "plausible",
+        "owner": "verified",
+        "tokens": "verified"
+      },
+      "engineBuild": {
+        "commit": "1745ffe89e4670f1e0c6de22c75a9875b27399de"
+      },
+      "hardwareClass": "apple-m3-ultra",
+      "harness": {
+        "benchSha256": "9e00f0519bfc9e8b1139a7ab2d68110df7533584145d61f1a263338b4b87209e",
+        "combineCommit": "c1b661334972c9220cda5aedd205a11e7048df3f",
+        "promptSetSha256": "dfc7eac33059118e6c2d32c1cde7ecd1241aa2a66d0eaec347cbbeb72ee258a1",
+        "publicCommit": "8cd16c986022a02bf49f1de1f127d641f20ba0b4"
+      },
+      "id": "qwen38-flash-next-mixed-4-8bit-m3ultra-2026-09-29",
+      "measuredAt": "2026-09-29T04:25:28Z",
+      "packLabel": "mixed 4/8-bit pack",
+      "packRevision": "ef5b919d31534faa1997666f1a22d362cd6383cd",
+      "rerun": {
+        "combine": "fastmlx bench --combine reference-first.json candidate.json reference-last.json --json > combined.json",
+        "measure": "fastmlx bench --base-url <endpoint> --model <served-model-id> --expect-listener-pid <pid> --json --runs 3 --warmup 1 --max-tokens 256 --temperature 0 > <role>.json",
+        "publicView": "fastmlx bench --public-view combined.json"
+      },
+      "result": {
+        "candidateDecodeTokS": 67.39,
+        "candidatePasses": 3,
+        "ratio": 1.1957,
+        "referenceDecodeTokS": 56.36,
+        "referenceDriftPct": 0.09,
+        "referencePasses": 6
+      },
+      "rowSha256": "0e7b7dedeb6b2efce0df3012441ebf781b23f6f7d89b5682394c87f827213808",
+      "serving": {
+        "contextTokens": 262144,
+        "drafter": "off",
+        "mtp": "off",
+        "promptLookup": "off"
+      },
+      "workload": {
+        "completionTokens": [
+          57,
+          72
+        ],
+        "maxTokens": 256,
+        "promptSet": "default-3-prompt-set",
+        "prompts": 3,
+        "runs": 3,
+        "temperature": 0.0,
+        "warmup": 1
+      }
+    }
+  ]
+}

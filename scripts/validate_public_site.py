@@ -1190,6 +1190,121 @@ RELEASE_ENTRY_KEYS = {
     "sourceUrl",
 }
 
+# --- Served-engine benchmark ledger (V1-V3; mirrors build_public_site.py's
+# `load_served_benchmarks`/`validate_served_benchmark_entry`, a deliberate
+# separate copy -- see the "projection split" note on QUALITY_CARD_HARDWARE_CLASS
+# above for why this project never imports either sibling's schema). ---------
+SERVED_BENCHMARK_POLICY = "reviewed-served-benchmarks-only"
+SERVED_BENCHMARK_CLAIM_BOUNDARY = "fast-mlx-owned-results-only"
+SERVED_BENCHMARK_TOP_KEYS = {
+    "schemaVersion",
+    "project",
+    "policy",
+    "claimBoundary",
+    "updatedAt",
+    "entries",
+}
+SERVED_BENCHMARK_ENTRY_KEYS = {
+    "id",
+    "measuredAt",
+    "cardId",
+    "packLabel",
+    "packRevision",
+    "hardwareClass",
+    "chip",
+    "engineBuild",
+    "harness",
+    "workload",
+    "serving",
+    "result",
+    "controls",
+    "rowSha256",
+    "rerun",
+}
+SERVED_BENCHMARK_ENGINE_BUILD_KEYS = {"commit"}
+# `combineCommit` mirrors `build_public_site.SERVED_BENCHMARK_HARNESS_KEYS`
+# byte-for-byte -- see that constant's own comment for why it is a
+# SEPARATE commit from `publicCommit` (the harness that MEASURED the row
+# is not necessarily the harness whose `--combine` PRODUCED its ratio).
+SERVED_BENCHMARK_HARNESS_KEYS = {"publicCommit", "combineCommit", "benchSha256", "promptSetSha256"}
+SERVED_BENCHMARK_WORKLOAD_KEYS = {
+    "promptSet",
+    "prompts",
+    "maxTokens",
+    "runs",
+    "warmup",
+    "temperature",
+    "completionTokens",
+}
+SERVED_BENCHMARK_SERVING_KEYS = {"contextTokens", "mtp", "drafter", "promptLookup"}
+SERVED_BENCHMARK_SERVING_TRISTATE = {"off", "engine-default"}
+SERVED_BENCHMARK_RESULT_KEYS = {
+    "candidateDecodeTokS",
+    "referenceDecodeTokS",
+    "ratio",
+    "candidatePasses",
+    "referencePasses",
+    "referenceDriftPct",
+}
+SERVED_BENCHMARK_CONTROLS = {
+    "tokens": "verified",
+    "owner": "verified",
+    "drift": "verified",
+    "magnitude": "plausible",
+    "anchor": "first-token",
+}
+SERVED_BENCHMARK_RERUN_KEYS = {"measure", "combine", "publicView"}
+SERVED_BENCHMARK_SHA256 = re.compile(r"[0-9a-f]{64}")
+SERVED_BENCHMARK_MEASURED_AT = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+SERVED_BENCHMARK_RATE_FLOOR = 25.0
+SERVED_BENCHMARK_RATE_CEILING = 2000.0
+SERVED_BENCHMARK_DRIFT_CEILING_PCT = 5.0
+SERVED_BENCHMARK_RATIO_TOLERANCE = 5e-4
+SERVED_BENCHMARK_SPEEDX_TOLERANCE = 0.03
+SERVED_BENCHMARK_IPV4 = re.compile(r"(?<!\d)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?!\d)")
+# Mirrors `build_public_site.QUALITY_GUIDE_HOST_SHORTHAND` byte-for-byte --
+# a deliberate separate copy, same reason as every other QUALITY_CARD_*
+# duplication in this module.
+SERVED_BENCHMARK_HOST_SHORTHAND = re.compile(r"(?<![0-9])\.25[0-3](?![0-9])")
+# Mirrors `build_public_site.SERVED_BENCHMARK_PACK_LABEL` byte-for-byte --
+# see that constant's own comment for the allowlist shape and why it is
+# checked AFTER the marker scan below, not instead of it.
+SERVED_BENCHMARK_PACK_LABEL = re.compile(r"[a-z0-9][a-z0-9 ./-]{0,55}pack")
+SERVED_BENCHMARK_RERUN_FLAG_NAMES = {
+    "base-url",
+    "model",
+    "expect-listener-pid",
+    "json",
+    "runs",
+    "warmup",
+    "max-tokens",
+    "temperature",
+    "combine",
+    "public-view",
+}
+SERVED_BENCHMARK_RERUN_PLACEHOLDER = re.compile(r"<[a-z][a-z-]*>(?:\.json)?")
+SERVED_BENCHMARK_RERUN_NUMBER = re.compile(r"\d+(?:\.\d+)?")
+SERVED_BENCHMARK_RERUN_FILENAME = re.compile(r"[a-z0-9-]+\.json")
+# Sealed byte count + sha256 of the built `benchmarks/served-benchmarks.json`
+# (V1) -- derived with `python3 scripts/build_public_site.py --output` and
+# `shasum -a 256`, never transcribed from any other source.
+REVIEWED_SERVED_BENCHMARKS_BYTES = 4380
+REVIEWED_SERVED_BENCHMARKS_SHA256 = (
+    "e9b203488aa1db016f9939411dd706a6c9224517feb1d27dead3c0af0a36032a"
+)
+# (id, cardId) pairs in the exact newest-first order the reviewed ledger
+# renders them (V3) -- mirrors REVIEWED_RELEASE_IDENTITIES above.
+REVIEWED_SERVED_BENCHMARK_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "qwen38-flash-next-iq-3p3bpw-m3ultra-2026-09-29",
+        "qwen38-flash-next-iq-3p3bpw@m3ultra-v2696",
+    ),
+    (
+        "qwen38-flash-next-mixed-4-8bit-m3ultra-2026-09-29",
+        "qwen38-flash-next-mixed-4-8bit@m3ultra-v2696",
+    ),
+)
+
 
 class LinkCollector(html.parser.HTMLParser):
     def __init__(self) -> None:
@@ -4731,6 +4846,458 @@ class QualityCardCollector(html.parser.HTMLParser):
             self._current = None
 
 
+class ServedBenchmarkCollector(html.parser.HTMLParser):
+    """Collects each `<article data-served-benchmark="...">` block from
+    `benchmarks/index.html` -- mirrors `QualityCardCollector` above (same
+    shape, one flag renamed) for the served-engine ledger section (V3)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cards: List[Dict[str, object]] = []
+        self._current: Optional[Dict[str, object]] = None
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attributes = dict(attrs)
+        if tag == "article" and "data-served-benchmark" in attributes:
+            self._current = {
+                "id": attributes.get("data-served-benchmark"),
+                "cardId": attributes.get("data-card-id"),
+                "text_parts": [],
+            }
+
+    def handle_data(self, data: str) -> None:
+        if self._current is not None:
+            parts = self._current["text_parts"]
+            if isinstance(parts, list):
+                parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "article" and self._current is not None:
+            parts = self._current.pop("text_parts")
+            self._current["text"] = (
+                " ".join("".join(parts).split()) if isinstance(parts, list) else ""
+            )
+            self.cards.append(self._current)
+            self._current = None
+
+
+def _served_benchmark_marker_violation(text: str) -> Optional[str]:
+    """Accumulate-style twin of `build_public_site._served_benchmark_marker_violation`
+    -- see that function's docstring for the neutralise-then-scan order this
+    mirrors byte-for-byte."""
+
+    lowered = text.casefold()
+    for marker in PRIVATE_MARKERS:
+        if marker.casefold() in lowered:
+            return f"private marker {marker!r}"
+    neutralized = lowered.replace(
+        validate_public_repository.OWN_BINARY_NAME.casefold(), "\x00"
+    )
+    for marker in validate_public_repository.THIRD_PARTY_ENGINE_MARKERS:
+        if marker.casefold() in neutralized:
+            return "a third-party engine name"
+    if SERVED_BENCHMARK_HOST_SHORTHAND.search(text):
+        return "the fleet host shorthand"
+    if SERVED_BENCHMARK_IPV4.search(text):
+        return "an IPv4 address"
+    if "<path>" in text:
+        return "a <path> placeholder"
+    if "~" in text:
+        return "a literal '~'"
+    return None
+
+
+def _served_benchmark_rerun_failures(key: str, value: object, label: str) -> List[str]:
+    failures: List[str] = []
+    if not isinstance(value, str) or not value.strip():
+        return [f"{label} rerun.{key} has an empty or non-string value"]
+    tokens = value.split(" ")
+    if len(tokens) < 3 or tokens[0] != "fastmlx" or tokens[1] != "bench":
+        return [f"{label} rerun.{key} does not start with 'fastmlx bench '"]
+    for token in tokens[2:]:
+        if token == ">":
+            continue
+        if token.startswith("--"):
+            if token[2:] not in SERVED_BENCHMARK_RERUN_FLAG_NAMES:
+                failures.append(f"{label} rerun.{key} has an unknown flag {token!r}")
+            continue
+        if (
+            SERVED_BENCHMARK_RERUN_PLACEHOLDER.fullmatch(token)
+            or SERVED_BENCHMARK_RERUN_NUMBER.fullmatch(token)
+            or SERVED_BENCHMARK_RERUN_FILENAME.fullmatch(token)
+        ):
+            continue
+        failures.append(f"{label} rerun.{key} has an unrecognised token {token!r}")
+    return failures
+
+
+def _served_benchmark_number(value: object) -> Optional[float]:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return float(value)
+
+
+def _served_benchmark_entry_failures(
+    raw_entry: object, cards_by_id: Dict[str, Dict[str, object]], label: str
+) -> List[str]:
+    """Accumulate-style twin of
+    `build_public_site.validate_served_benchmark_entry` (`L3`-`L12`) -- see
+    that function's docstring for the full rule set this re-implements
+    against an already-BUILT `quality/index.json`, rather than the
+    in-process `quality_manifest` object the build-time loader has."""
+
+    failures: List[str] = []
+    failures.extend(key_failures(raw_entry, SERVED_BENCHMARK_ENTRY_KEYS, label))
+    if failures or not isinstance(raw_entry, dict):
+        return failures
+    entry = raw_entry
+
+    identifier = require_str(entry, "id", label, failures)
+    measured_at = require_str(entry, "measuredAt", label, failures)
+    if measured_at is not None and not SERVED_BENCHMARK_MEASURED_AT.fullmatch(measured_at):
+        failures.append(f"{label} measuredAt is not a UTC Z timestamp")
+    card_id = require_str(entry, "cardId", label, failures)
+    card: Optional[Dict[str, object]] = None
+    if card_id is not None:
+        if not QUALITY_CARD_ID.fullmatch(card_id):
+            failures.append(f"{label} has an invalid cardId")
+        card = cards_by_id.get(card_id)
+        if card is None:
+            failures.append(f"{label} cardId {card_id!r} is not a published quality card")
+    pack_label = require_str(entry, "packLabel", label, failures)
+    if pack_label is not None and len(pack_label) > 60:
+        failures.append(f"{label} packLabel exceeds 60 characters")
+    pack_revision = require_str(entry, "packRevision", label, failures)
+    if pack_revision is not None and not COMMIT_SHA.fullmatch(pack_revision):
+        failures.append(f"{label} packRevision is not a 40-hex revision")
+    hardware_class = require_str(entry, "hardwareClass", label, failures)
+    if hardware_class is not None and (
+        not QUALITY_CARD_HARDWARE_CLASS.fullmatch(hardware_class)
+        or hardware_class == QUALITY_CARD_HARDWARE_CLASS_SENTINEL
+    ):
+        failures.append(f"{label} hardwareClass is invalid")
+    chip = require_str(entry, "chip", label, failures)
+
+    if card is not None:
+        card_model = card.get("model") if isinstance(card.get("model"), dict) else {}
+        if pack_revision is not None and pack_revision != card_model.get("hfPin"):
+            failures.append(f"{label} packRevision does not match its quality card's hfPin")
+        card_config = card.get("config") if isinstance(card.get("config"), dict) else {}
+        if (
+            hardware_class is not None
+            and chip is not None
+            and (
+                hardware_class != card_config.get("hardwareClass")
+                or chip.lower().replace(" ", "-") != hardware_class
+            )
+        ):
+            failures.append(f"{label} hardwareClass does not match its quality card or chip")
+
+    failures.extend(
+        key_failures(entry.get("engineBuild"), SERVED_BENCHMARK_ENGINE_BUILD_KEYS, f"{label} engineBuild")
+    )
+    engine_commit: Optional[str] = None
+    if isinstance(entry.get("engineBuild"), dict):
+        engine_commit = require_str(entry["engineBuild"], "commit", f"{label} engineBuild", failures)
+        if engine_commit is not None and not QUALITY_CARD_ENGINE_BUILD_COMMIT.fullmatch(engine_commit):
+            failures.append(f"{label} engineBuild.commit is not a 40-hex sha")
+        if card is not None and engine_commit is not None:
+            card_provenance = card.get("provenance") if isinstance(card.get("provenance"), dict) else {}
+            card_engine_build = card_provenance.get("engineBuild")
+            if not isinstance(card_engine_build, dict) or card_engine_build.get("commit") != engine_commit:
+                failures.append(f"{label} engineBuild.commit does not match its quality card")
+
+    failures.extend(key_failures(entry.get("harness"), SERVED_BENCHMARK_HARNESS_KEYS, f"{label} harness"))
+    if isinstance(entry.get("harness"), dict):
+        harness = entry["harness"]
+        harness_commit = require_str(harness, "publicCommit", f"{label} harness", failures)
+        if harness_commit is not None and not COMMIT_SHA.fullmatch(harness_commit):
+            failures.append(f"{label} harness.publicCommit is not a 40-hex sha")
+        combine_commit = require_str(harness, "combineCommit", f"{label} harness", failures)
+        if combine_commit is not None and not COMMIT_SHA.fullmatch(combine_commit):
+            failures.append(f"{label} harness.combineCommit is not a 40-hex sha")
+        bench_sha = require_str(harness, "benchSha256", f"{label} harness", failures)
+        if bench_sha is not None and not SERVED_BENCHMARK_SHA256.fullmatch(bench_sha):
+            failures.append(f"{label} harness.benchSha256 is not a 64-hex sha256")
+        prompt_sha = require_str(harness, "promptSetSha256", f"{label} harness", failures)
+        if prompt_sha is not None and not SERVED_BENCHMARK_SHA256.fullmatch(prompt_sha):
+            failures.append(f"{label} harness.promptSetSha256 is not a 64-hex sha256")
+
+    failures.extend(key_failures(entry.get("workload"), SERVED_BENCHMARK_WORKLOAD_KEYS, f"{label} workload"))
+    completion_tokens_bounds: Optional[Tuple[int, int]] = None
+    if isinstance(entry.get("workload"), dict):
+        workload = entry["workload"]
+        if workload.get("promptSet") != "default-3-prompt-set":
+            failures.append(f"{label} workload.promptSet must be default-3-prompt-set")
+        for int_key in ("prompts", "maxTokens", "runs", "warmup"):
+            value = workload.get(int_key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                failures.append(f"{label} workload.{int_key} must be a non-negative int")
+        temperature = _served_benchmark_number(workload.get("temperature"))
+        if temperature is None or temperature < 0:
+            failures.append(f"{label} workload.temperature must be a non-negative number")
+        completion_tokens = workload.get("completionTokens")
+        if (
+            not isinstance(completion_tokens, list)
+            or len(completion_tokens) != 2
+            or not all(
+                isinstance(value, int) and not isinstance(value, bool) and value > 0
+                for value in completion_tokens
+            )
+            or completion_tokens[0] > completion_tokens[1]
+        ):
+            failures.append(f"{label} workload.completionTokens must be a [min, max] pair")
+        else:
+            completion_tokens_bounds = (completion_tokens[0], completion_tokens[1])
+
+    failures.extend(key_failures(entry.get("serving"), SERVED_BENCHMARK_SERVING_KEYS, f"{label} serving"))
+    if isinstance(entry.get("serving"), dict):
+        serving = entry["serving"]
+        context_tokens = serving.get("contextTokens")
+        if not isinstance(context_tokens, int) or isinstance(context_tokens, bool) or context_tokens <= 0:
+            failures.append(f"{label} serving.contextTokens must be a positive int")
+        for key in ("mtp", "drafter", "promptLookup"):
+            if serving.get(key) not in SERVED_BENCHMARK_SERVING_TRISTATE:
+                failures.append(f"{label} serving.{key} is outside the allowed values")
+
+    failures.extend(key_failures(entry.get("result"), SERVED_BENCHMARK_RESULT_KEYS, f"{label} result"))
+    if isinstance(entry.get("result"), dict):
+        result = entry["result"]
+        candidate_rate = _served_benchmark_number(result.get("candidateDecodeTokS"))
+        reference_rate = _served_benchmark_number(result.get("referenceDecodeTokS"))
+        ratio = _served_benchmark_number(result.get("ratio"))
+        if candidate_rate is None or reference_rate is None or ratio is None:
+            failures.append(f"{label} result rates and ratio must be numeric")
+        else:
+            if (
+                candidate_rate < SERVED_BENCHMARK_RATE_FLOOR
+                or candidate_rate > SERVED_BENCHMARK_RATE_CEILING
+                or reference_rate < SERVED_BENCHMARK_RATE_FLOOR
+                or reference_rate > SERVED_BENCHMARK_RATE_CEILING
+            ):
+                failures.append(f"{label} result rates are outside the plausible [25, 2000] tok/s range")
+            if reference_rate > 0 and abs(ratio - candidate_rate / reference_rate) > SERVED_BENCHMARK_RATIO_TOLERANCE:
+                failures.append(f"{label} result.ratio is inconsistent with its own candidate/reference rates")
+            if card is not None:
+                card_benefit = (
+                    card.get("legible", {}).get("benefit", {})
+                    if isinstance(card.get("legible"), dict)
+                    else {}
+                )
+                card_speed_x = _served_benchmark_number(card_benefit.get("speedX"))
+                if (
+                    card_speed_x is None
+                    or card_speed_x == 0
+                    or abs(ratio / card_speed_x - 1) > SERVED_BENCHMARK_SPEEDX_TOLERANCE
+                ):
+                    failures.append(
+                        f"{label} result.ratio disagrees with its quality card's speedX by more than 3%"
+                    )
+        for key in ("candidatePasses", "referencePasses"):
+            value = result.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                failures.append(f"{label} result.{key} must be a positive int")
+        drift_pct = _served_benchmark_number(result.get("referenceDriftPct"))
+        if drift_pct is None or drift_pct < 0:
+            failures.append(f"{label} result.referenceDriftPct must be a non-negative number")
+        elif drift_pct > SERVED_BENCHMARK_DRIFT_CEILING_PCT:
+            failures.append(f"{label} result.referenceDriftPct exceeds the 5% ceiling")
+
+    if entry.get("controls") != SERVED_BENCHMARK_CONTROLS:
+        failures.append(f"{label} controls must be exactly the reviewed-slice-1 control set")
+    row_sha = require_str(entry, "rowSha256", label, failures)
+    if row_sha is not None and not SERVED_BENCHMARK_SHA256.fullmatch(row_sha):
+        failures.append(f"{label} rowSha256 is not a 64-hex sha256")
+
+    failures.extend(key_failures(entry.get("rerun"), SERVED_BENCHMARK_RERUN_KEYS, f"{label} rerun"))
+    if isinstance(entry.get("rerun"), dict):
+        rerun = entry["rerun"]
+        for key in sorted(SERVED_BENCHMARK_RERUN_KEYS):
+            failures.extend(_served_benchmark_rerun_failures(key, rerun.get(key), label))
+
+    non_rerun = {key: value for key, value in entry.items() if key != "rerun"}
+    if "--" in json.dumps(non_rerun, ensure_ascii=False, sort_keys=True):
+        failures.append(f"{label} carries a raw '--' flag token outside rerun")
+    marker_reason = _served_benchmark_marker_violation(
+        json.dumps(entry, ensure_ascii=False, sort_keys=True)
+    )
+    if marker_reason is not None:
+        failures.append(f"{label} contains {marker_reason}")
+
+    # Checked after the marker scan above, same order as the fail-fast
+    # loader (`build_public_site.validate_served_benchmark_entry`): a
+    # packLabel that carries a marker is reported by that specific reason
+    # first; only a clean-but-malformed packLabel trips this allowlist.
+    if pack_label is not None and not SERVED_BENCHMARK_PACK_LABEL.fullmatch(pack_label):
+        failures.append(f"{label} packLabel does not look like a pack label")
+
+    if identifier is None:
+        pass
+    elif not SLUG.fullmatch(identifier):
+        failures.append(f"{label} has an invalid id")
+
+    return failures
+
+
+def validate_served_benchmarks(site: Path) -> List[str]:
+    """V1-V3 for the sealed served-engine benchmark ledger. `V1` pins the
+    exact built `benchmarks/served-benchmarks.json` bytes; `V2` re-derives
+    `L1`, `L3`-`L13` (accumulate style) against the built `quality/
+    index.json` (`L2` becomes "served ledger requires quality/index.json",
+    since this validator has no in-process `quality_manifest` object to
+    check `None`-ness of); `V3` checks the rendered `benchmarks/index.html`
+    section against the reviewed identity list.
+    """
+
+    failures: List[str] = []
+    ledger_path = site / "benchmarks/served-benchmarks.json"
+    if not ledger_path.is_file() or ledger_path.is_symlink():
+        return ["benchmarks/served-benchmarks.json is missing, not a file, or a symlink"]
+    raw = ledger_path.read_bytes()
+    if (
+        len(raw) != REVIEWED_SERVED_BENCHMARKS_BYTES
+        or hashlib.sha256(raw).hexdigest() != REVIEWED_SERVED_BENCHMARKS_SHA256
+    ):
+        failures.append(
+            "benchmarks/served-benchmarks.json does not match the reviewed served-benchmark ledger"
+        )
+    try:
+        ledger = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return failures + [f"invalid benchmarks/served-benchmarks.json: {exc}"]
+
+    failures.extend(key_failures(ledger, SERVED_BENCHMARK_TOP_KEYS, "benchmarks/served-benchmarks.json"))
+    if not isinstance(ledger, dict):
+        return failures
+    if ledger.get("schemaVersion") != 1:
+        failures.append("served ledger must use schemaVersion 1")
+    if ledger.get("project") != "fast-mlx":
+        failures.append("served ledger project must remain fast-mlx")
+    if ledger.get("policy") != SERVED_BENCHMARK_POLICY:
+        failures.append(f"served ledger policy must remain {SERVED_BENCHMARK_POLICY}")
+    if ledger.get("claimBoundary") != SERVED_BENCHMARK_CLAIM_BOUNDARY:
+        failures.append(f"served ledger claim boundary must remain {SERVED_BENCHMARK_CLAIM_BOUNDARY}")
+    require_str(ledger, "updatedAt", "benchmarks/served-benchmarks.json", failures)
+
+    quality_json_path = site / "quality/index.json"
+    if not quality_json_path.is_file() or quality_json_path.is_symlink():
+        failures.append("served ledger requires quality/index.json")
+        return failures
+    try:
+        quality_manifest = json.loads(quality_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        failures.append(f"served ledger requires quality/index.json: {exc}")
+        return failures
+    cards = quality_manifest.get("cards") if isinstance(quality_manifest, dict) else None
+    cards_by_id: Dict[str, Dict[str, object]] = {
+        str(card["id"]): card for card in cards if isinstance(card, dict) and "id" in card
+    } if isinstance(cards, list) else {}
+
+    raw_entries = ledger.get("entries")
+    if not isinstance(raw_entries, list) or not raw_entries:
+        failures.append("served ledger must contain at least one entry")
+        return failures
+
+    seen_ids: set = set()
+    seen_hashes: set = set()
+    previous_measured_at: Optional[str] = None
+    entries: List[Dict[str, object]] = []
+    for index, raw_entry in enumerate(raw_entries):
+        label = f"served benchmark entry {index}"
+        entry_failures = _served_benchmark_entry_failures(raw_entry, cards_by_id, label)
+        failures.extend(entry_failures)
+        if entry_failures or not isinstance(raw_entry, dict):
+            continue
+        entries.append(raw_entry)
+        identifier = str(raw_entry.get("id"))
+        row_sha = str(raw_entry.get("rowSha256"))
+        if identifier in seen_ids:
+            failures.append("served ledger has a duplicate entry id")
+        if row_sha in seen_hashes:
+            failures.append("served ledger has a duplicate entry rowSha256")
+        seen_ids.add(identifier)
+        seen_hashes.add(row_sha)
+        measured_at = str(raw_entry.get("measuredAt"))
+        if previous_measured_at is not None and measured_at >= previous_measured_at:
+            failures.append("served ledger entries are not newest-first")
+        previous_measured_at = measured_at
+
+    # V3: the rendered `benchmarks/index.html` section against the reviewed
+    # identity list -- only meaningful once the ledger itself is clean.
+    if failures:
+        return failures
+
+    benchmark_path = site / "benchmarks/index.html"
+    if not benchmark_path.is_file():
+        return failures + ["benchmarks/index.html is missing"]
+    collector = ServedBenchmarkCollector()
+    try:
+        collector.feed(benchmark_path.read_text(encoding="utf-8"))
+        collector.close()
+    except Exception as exc:
+        return failures + [f"cannot parse benchmarks/index.html for served benchmarks: {exc}"]
+
+    actual_identities = [(str(card.get("id")), str(card.get("cardId"))) for card in collector.cards]
+    if actual_identities != list(REVIEWED_SERVED_BENCHMARK_IDENTITIES):
+        failures.append("served-engine ledger identity mismatch in benchmarks/index.html")
+        return failures
+
+    # Whole-section scan for a raw address or path (V3): the WHOLE
+    # `data-served-benchmarks` section's HTML -- text AND attribute values,
+    # e.g. a `data-*` attribute or an `href` -- not just the per-article
+    # TEXT the collector above exposes (`handle_data` never sees attribute
+    # values, so a marker hiding in one would pass a text-only scan
+    # silently). This scan runs once, over the raw section markup, rather
+    # than per-article.
+    page_text = benchmark_path.read_text(encoding="utf-8")
+    section_match = re.search(
+        r'<section[^>]*\bdata-served-benchmarks\b[^>]*>.*?</section>', page_text, re.S
+    )
+    if section_match is None:
+        failures.append("benchmarks/index.html has no data-served-benchmarks section")
+        return failures
+    section_html = section_match.group(0)
+    if SERVED_BENCHMARK_IPV4.search(section_html) or "<path>" in section_html:
+        failures.append(
+            "served-engine ledger data-served-benchmarks section leaks a raw address or path"
+        )
+
+    by_id = {str(card.get("id")): card for card in collector.cards}
+    for entry in entries:
+        identifier = str(entry["id"])
+        rendered = by_id.get(identifier)
+        if rendered is None:
+            failures.append(f"served-engine ledger card {identifier!r} is not rendered")
+            continue
+        text = str(rendered.get("text", ""))
+        result = entry["result"]
+        ratio_text = f'{float(result["ratio"]):.3f}x'
+        if ratio_text not in text:
+            failures.append(f"served-engine ledger card {identifier!r} does not render its ratio")
+        # Delimited, not a bare substring: `str(rate)` alone could match
+        # part of an unrelated number elsewhere in the card's text (e.g. a
+        # sha256 fragment or a token count). Both rates are rendered with
+        # 2 decimals (see `build_public_site.render_benchmark_explorer`);
+        # match that exact rendering, joined by the same delimiters.
+        candidate_rate_text = f'{float(result["candidateDecodeTokS"]):.2f}'
+        reference_rate_text = f'{float(result["referenceDecodeTokS"]):.2f}'
+        rate_phrase = f'median {candidate_rate_text} vs {reference_rate_text} tok/s'
+        if rate_phrase not in text:
+            failures.append(f"served-engine ledger card {identifier!r} does not render its rates")
+        engine_commit = str(entry["engineBuild"]["commit"])
+        if f"engine build {engine_commit[:8]}" not in text:
+            failures.append(f"served-engine ledger card {identifier!r} does not render its engine build")
+        if str(entry["cardId"]) not in text:
+            failures.append(f"served-engine ledger card {identifier!r} does not render its cardId")
+        if str(entry["rowSha256"]) not in text:
+            failures.append(f"served-engine ledger card {identifier!r} does not render its rowSha256")
+        for key in ("measure", "combine", "publicView"):
+            if str(entry["rerun"][key]) not in text:
+                failures.append(f"served-engine ledger card {identifier!r} does not render its rerun.{key}")
+
+    return failures
+
+
 def _flag_transfer_failures(raw_flag_transfer: object, label: str) -> List[str]:
     """Accumulate-style mirror of
     `build_public_site._validate_config_flag_transfer` -- see its docstring
@@ -5347,7 +5914,7 @@ def validate_quality_guide_page(site: Path) -> List[str]:
 def validate_benchmark_detail_pages(site: Path) -> List[str]:
     failures: List[str] = []
     benchmark_root = site / "benchmarks"
-    expected_entries = {"index.html"} | {
+    expected_entries = {"index.html", "served-benchmarks.json"} | {
         str(highlight["id"]) for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
     }
     if benchmark_root.is_symlink() or not benchmark_root.is_dir():
@@ -5617,6 +6184,7 @@ def validate(site: Path) -> List[str]:
             for capability in REVIEWED_CAPABILITIES
         ],
         "benchmarks/index.html",
+        "benchmarks/served-benchmarks.json",
         *[
             f'benchmarks/{highlight["id"]}/index.html'
             for highlight in REVIEWED_BENCHMARK_HIGHLIGHTS
@@ -5658,6 +6226,7 @@ def validate(site: Path) -> List[str]:
     failures.extend(validate_status_navigation(site))
     failures.extend(validate_research_page(site))
     failures.extend(validate_quality_guide_page(site))
+    failures.extend(validate_served_benchmarks(site))
 
     expected_benchmark_cards = reviewed_benchmark_cards()
 
