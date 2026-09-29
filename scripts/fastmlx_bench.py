@@ -232,7 +232,15 @@ printed row, exit 1) unless: every input is itself a single-arm,
 non-ratio row of this module's own schema; every input arm carries
 ``passRates`` (a row from before commit 663980ac lacks it and cannot be
 combined); the two reference rows name the SAME model and the candidate
-names a DIFFERENT one; all three rows share the same ``boundary`` (they
+names a DIFFERENT one -- compared by the ``--model`` PATH parsed out of
+each row's own captured ``controls.flags.listenerCmdline`` (see
+``_listener_model_argument``) whenever all three rows carry a captured,
+parseable one, since the served engine's own reported display id
+(``arms[0].model``) is only the BASENAME of that path and two different
+model packs can share one basename (the two reference rows must still
+agree on the display id as well, fail-closed); only when any of the three lacks a
+parseable ``--model`` argv does this fall back to comparing that display
+id directly, as this mode always did before; all three rows share the same ``boundary`` (they
 were not measured under the same workload); every input's C-tokens is
 ``verified``; every input's C-owner is ``verified`` (a card-grade ratio
 needs every arm's socket owner proven, same as ratio mode); every
@@ -1662,6 +1670,39 @@ def _combine_owner_control(loaded: "Sequence[dict]") -> dict:
     }
 
 
+def _listener_model_argument(cmdline: "Optional[str]") -> Optional[str]:
+    """Extracts the ``--model`` argument's raw VALUE (never redacted, never
+    reduced to a basename) from one row's own captured
+    ``controls.flags.listenerCmdline`` string (see ``flags_control``), by
+    tokenizing with the same ``shlex.split`` call ``_combine_flags_control``
+    and ``_redact_listener_cmdline`` already use -- this module keeps
+    exactly one argv tokenizer; this function only adds a targeted lookup
+    over its output, it does not re-implement tokenizing. Recognises both
+    space-separated (``--model /path``) and ``=``-joined (``--model=/path``)
+    forms. Returns ``None`` -- never a partial or guessed value -- when
+    ``cmdline`` is not a non-empty string, fails to ``shlex.split``, or
+    carries no ``--model`` argument with a non-empty value at all: callers
+    (``run_combine``'s refusal 3) fall back to comparing the row's own
+    reported ``arms[0].model`` display id in that case, exactly as this
+    module did before this function existed.
+    """
+    if not isinstance(cmdline, str) or not cmdline:
+        return None
+    try:
+        tokens = shlex.split(cmdline)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        if token == "--model":
+            if index + 1 < len(tokens) and tokens[index + 1]:
+                return tokens[index + 1]
+            return None
+        if token.startswith("--model="):
+            value = token.partition("=")[2]
+            return value or None
+    return None
+
+
 def _combine_flags_control(loaded: "Sequence[dict]") -> dict:
     """Every input's C-flags must have captured an argv, AND the three
     captured argvs (split with ``shlex.split``) must have the same length
@@ -1817,17 +1858,66 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
 
     # 3: the two reference rows must name the SAME model; the candidate
     # must name a DIFFERENT one -- otherwise there is no meaningful ratio.
+    # The served engine's own reported display id (arms[0].model, above)
+    # is only the BASENAME of its --model directory, so two different
+    # packs at e.g. /x/flashnext-r8/pack and /x/flashnext-iq33/pack both
+    # report "pack" and this comparison would falsely refuse (see cycle
+    # 172's defect). Prefer the --model PATH parsed out of each row's own
+    # captured controls.flags.listenerCmdline (see
+    # _listener_model_argument, which reuses _combine_flags_control's own
+    # shlex.split tokenizer) whenever ALL THREE rows carry a captured,
+    # parseable one; fall back to the display-id comparison, exactly as
+    # this mode always did, when any one of the three does not (e.g. its
+    # flags control never captured an argv at all -- the later flags
+    # control check below will refuse that on its own terms if this
+    # comparison does not refuse first).
+    ref_first_cmdline = _nested_status(ref_first["row"], "controls", "flags", "listenerCmdline")
+    ref_last_cmdline = _nested_status(ref_last["row"], "controls", "flags", "listenerCmdline")
+    candidate_cmdline = _nested_status(
+        candidate_in["row"], "controls", "flags", "listenerCmdline"
+    )
+    ref_first_model_path = _listener_model_argument(ref_first_cmdline)
+    ref_last_model_path = _listener_model_argument(ref_last_cmdline)
+    candidate_model_path = _listener_model_argument(candidate_cmdline)
+    use_listener_model_path = (
+        ref_first_model_path is not None
+        and ref_last_model_path is not None
+        and candidate_model_path is not None
+    )
     if refusal_reason is None:
-        if ref_first_model != ref_last_model:
-            refusal_reason = (
-                "the two reference rows name different models "
-                f"({ref_first_model!r} vs {ref_last_model!r})"
-            )
-        elif candidate_model == ref_first_model:
-            refusal_reason = (
-                f"the candidate names the same model ({candidate_model!r}) "
-                "as the reference -- a ratio needs two different models"
-            )
+        if use_listener_model_path:
+            # The two references must agree on BOTH the path and the display
+            # id: a matching path whose served id changed between the two
+            # reference measurements is not provably the same model (fail
+            # closed). Only the candidate-vs-reference test uses the path
+            # alone, since a shared basename is exactly the case this fixes.
+            if (
+                ref_first_model_path != ref_last_model_path
+                or ref_first_model != ref_last_model
+            ):
+                refusal_reason = (
+                    "the two reference rows name different models "
+                    f"(listener --model {ref_first_model_path!r} vs "
+                    f"{ref_last_model_path!r}; "
+                    f"display ids {ref_first_model!r} vs {ref_last_model!r})"
+                )
+            elif candidate_model_path == ref_first_model_path:
+                refusal_reason = (
+                    f"the candidate names the same model (listener --model "
+                    f"{candidate_model_path!r}, display id {candidate_model!r}) "
+                    "as the reference -- a ratio needs two different models"
+                )
+        else:
+            if ref_first_model != ref_last_model:
+                refusal_reason = (
+                    "the two reference rows name different models "
+                    f"({ref_first_model!r} vs {ref_last_model!r})"
+                )
+            elif candidate_model == ref_first_model:
+                refusal_reason = (
+                    f"the candidate names the same model ({candidate_model!r}) "
+                    "as the reference -- a ratio needs two different models"
+                )
 
     # 4: all three rows must share the same boundary (the same workload) --
     # a ratio combined across differing workloads is not one measurement.

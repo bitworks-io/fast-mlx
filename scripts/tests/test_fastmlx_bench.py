@@ -1882,9 +1882,127 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIn("different models", stderr)
 
     # -- Refusal 3b: the candidate names the same model as the reference.
+    # With no parseable listener --model argv on any row, refusal 3 falls
+    # back to the display id (the path comparison is covered by the
+    # listener-path tests below). Refusal 3 fires before the flags control.
     def test_combine_refuses_candidate_naming_the_same_model_as_the_reference(self):
         trio = self._combine_baseline()
         trio["candidate"]["arms"][0]["model"] = self._COMBINE_REF_MODEL
+        for key in ("ref_first", "ref_last", "candidate"):
+            trio[key]["controls"]["flags"]["listenerCmdline"] = "fastmlx-serve --port 8080"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("same model", stderr)
+
+    # -- Cycle 172 defect fix: refusal 3 must compare the --model PATH
+    # parsed out of each row's own captured listenerCmdline, not the
+    # served display id (arms[0].model) -- that display id is only the
+    # BASENAME of the --model directory, so two different packs sharing a
+    # basename (e.g. .../flashnext-r8/pack and .../flashnext-iq33/pack,
+    # both reported as "pack") must still combine.
+    def test_combine_succeeds_when_display_ids_match_but_listener_paths_differ(self):
+        trio = {
+            "ref_first": _combine_fixture_row(
+                "pack", [100.0, 110.0],
+                listener_cmdline=self._combine_cmdline("/x/flashnext-r8/pack"),
+            ),
+            "ref_last": _combine_fixture_row(
+                "pack", [100.0, 110.0],
+                listener_cmdline=self._combine_cmdline("/x/flashnext-r8/pack"),
+            ),
+            "candidate": _combine_fixture_row(
+                "pack", [200.0, 210.0, 205.0],
+                listener_cmdline=self._combine_cmdline("/x/flashnext-iq33/pack"),
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertIsNotNone(doc["ratio"])
+
+    def test_combine_refuses_when_candidate_listener_path_equals_reference_path(self):
+        # Display ids DIFFER (reference-model vs candidate-model), so the
+        # OLD id-only comparison would have let this combine succeed --
+        # the fix must still refuse it because the listener --model PATH
+        # is identical between the candidate and the reference.
+        shared_cmdline = self._combine_cmdline("/x/shared/pack")
+        trio = {
+            "ref_first": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, [100.0, 110.0], listener_cmdline=shared_cmdline,
+            ),
+            "ref_last": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, [100.0, 110.0], listener_cmdline=shared_cmdline,
+            ),
+            "candidate": _combine_fixture_row(
+                self._COMBINE_CAND_MODEL, [200.0, 210.0, 205.0], listener_cmdline=shared_cmdline,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("same model", stderr)
+
+    def test_combine_refuses_when_reference_listener_paths_differ_despite_matching_id(self):
+        # Both reference rows report the SAME display id ("pack"), but
+        # their listener --model paths differ -- the path comparison must
+        # still refuse this as "different models".
+        trio = {
+            "ref_first": _combine_fixture_row(
+                "pack", [100.0, 110.0],
+                listener_cmdline=self._combine_cmdline("/x/ref1/pack"),
+            ),
+            "ref_last": _combine_fixture_row(
+                "pack", [100.0, 110.0],
+                listener_cmdline=self._combine_cmdline("/x/ref2/pack"),
+            ),
+            "candidate": _combine_fixture_row(
+                "candidate-id", [200.0, 210.0, 205.0],
+                listener_cmdline=self._combine_cmdline("/x/candidate/pack"),
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("different models", stderr)
+
+    def test_combine_falls_back_to_display_id_when_a_cmdline_was_not_captured(self):
+        # The candidate's flags control never captured an argv at all, so
+        # _listener_model_argument can yield no --model path for all three
+        # rows -- refusal 3 must fall back to comparing arms[0].model,
+        # exactly as it did before this fix. The candidate is deliberately
+        # given the SAME display id as the reference so this fallback
+        # comparison itself refuses ("same model") -- that refusal is set
+        # BEFORE the later flags control runs (see run_combine's ordering),
+        # so it fires and reports first even though the flags control
+        # would ALSO have refused this trio (a missing captured argv) on
+        # its own, separate terms. This genuinely exercises the id-based
+        # fallback branch rather than merely reaching a refusal that could
+        # have come from either check.
+        ref_cmdline = self._combine_cmdline("/x/ref/pack")
+        trio = {
+            "ref_first": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, [100.0, 110.0], listener_cmdline=ref_cmdline,
+            ),
+            "ref_last": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, [100.0, 110.0], listener_cmdline=ref_cmdline,
+            ),
+            "candidate": _combine_fixture_row(
+                self._COMBINE_REF_MODEL, [200.0, 210.0, 205.0],
+                flags_status="capture_failed",
+            ),
+        }
         with tempfile.TemporaryDirectory() as tmp_dir:
             paths = self._write_combine_trio(tmp_dir, trio)
             code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
