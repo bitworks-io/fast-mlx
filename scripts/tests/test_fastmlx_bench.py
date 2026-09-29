@@ -334,6 +334,18 @@ def _reading_json(decode_tok_s, measurable=True, token_source=None):
     }
 
 
+# A stable, matching harness fixture -- every _combine_fixture_row() call
+# shares this by default so a --combine trio built from three separate
+# calls is harness-consistent unless a test deliberately overrides it (see
+# harness-mismatch/missing tests below). Real 64-hex-char shape (never a
+# short placeholder) so the publishability sweep is exercised against the
+# actual shape a real hash has, not a stand-in that could never trip it.
+_DEFAULT_FIXTURE_HARNESS = {
+    "benchSha256": "1" * 64,
+    "promptSetSha256": "2" * 64,
+}
+
+
 def _combine_fixture_row(
     model,
     pass_rates,
@@ -349,6 +361,12 @@ def _combine_fixture_row(
     warmup_discarded=1,
     include_pass_rates=True,
     median=None,
+    # "__default__" -> the shared _DEFAULT_FIXTURE_HARNESS (so three
+    # separately-built fixture rows agree by default); an explicit dict ->
+    # that exact harness (for mismatch tests); ``None`` -> the "harness"
+    # key is OMITTED entirely, simulating a v2 row written before this
+    # field existed (for the missing-harness refusal test).
+    harness="__default__",
 ):
     """One single-arm ``--json`` row, in the exact shape ``run_bench``
     itself prints -- a --combine input file is nothing but this, written
@@ -365,7 +383,7 @@ def _combine_fixture_row(
     }
     if include_pass_rates:
         arm["passRates"] = list(pass_rates) if pass_rates is not None else []
-    return {
+    row = {
         "schema": schema if schema is not None else FASTMLX_BENCH.SCHEMA,
         "generatedAt": "2026-01-01T00:00:00Z",
         "baseUrl": "http://127.0.0.1:9999",
@@ -405,6 +423,11 @@ def _combine_fixture_row(
             },
         },
     }
+    if harness == "__default__":
+        row["harness"] = dict(_DEFAULT_FIXTURE_HARNESS)
+    elif harness is not None:
+        row["harness"] = harness
+    return row
 
 
 def _write_json_file(directory, name: str, obj) -> str:
@@ -1439,6 +1462,50 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIn(f"chars={expected_chars}", boundary)
 
     # ------------------------------------------------------------------
+    # harness: WHICH harness revision and WHICH prompt set produced a row.
+    # See module docstring's "harness" paragraph.
+    # ------------------------------------------------------------------
+    def test_harness_bench_sha256_and_prompt_set_sha256_match_what_was_sent(self):
+        captured_bodies: list = []
+        base_url = self.start(
+            make_body_capturing_stream(3, completion_tokens=11, captured_bodies=captured_bodies)
+        )
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10", "--json",
+        ]
+        code, stdout, _ = self._run_main(argv)
+        self.assertEqual(code, 0)
+        doc = json.loads(stdout)
+
+        expected_bench_sha256 = hashlib.sha256(BENCH_PATH.read_bytes()).hexdigest()
+        self.assertEqual(doc["harness"]["benchSha256"], expected_bench_sha256)
+
+        # The prompt set actually SENT to the server, captured server-side,
+        # in the exact order it was sent (one request per prompt, runs=1,
+        # warmup=0 -- so exactly len(DEFAULT_PROMPTS) requests).
+        prompts_sent = [body["messages"][0]["content"] for body in captured_bodies]
+        self.assertEqual(prompts_sent, list(FASTMLX_BENCH.DEFAULT_PROMPTS))
+        expected_prompt_set_sha256 = hashlib.sha256(
+            json.dumps(prompts_sent, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        self.assertEqual(doc["harness"]["promptSetSha256"], expected_prompt_set_sha256)
+
+    def test_harness_prompt_set_sha256_differs_for_different_prompt_sets(self):
+        base_url = self.start(make_simple_stream(3, completion_tokens=11))
+        common_argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10", "--json",
+        ]
+        code_a, stdout_a, _ = self._run_main(common_argv + ["--prompt", "prompt set A"])
+        code_b, stdout_b, _ = self._run_main(common_argv + ["--prompt", "prompt set B"])
+        self.assertEqual(code_a, 0)
+        self.assertEqual(code_b, 0)
+        hash_a = json.loads(stdout_a)["harness"]["promptSetSha256"]
+        hash_b = json.loads(stdout_b)["harness"]["promptSetSha256"]
+        self.assertNotEqual(hash_a, hash_b)
+
+    # ------------------------------------------------------------------
     # publishability_control: a whole-row, fail-closed publishability
     # verdict. Every forbidden string below is built by CONCATENATION,
     # never as a literal -- this test file is itself publicly projected,
@@ -1919,6 +1986,53 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIn(FASTMLX_BENCH.SCHEMA, stderr)
         self.assertIn("fastmlx-bench-row-v1", stderr)
 
+    # -- harness: --combine refuses an input row with no harness at all
+    # (predates the field).
+    def test_combine_refuses_a_row_with_no_harness(self):
+        trio = self._combine_baseline()
+        del trio["candidate"]["harness"]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("predate harness identity", stderr)
+
+    # -- harness: --combine refuses mismatched benchSha256 across inputs,
+    # naming the field and both values' first 12 hex chars.
+    def test_combine_refuses_mismatched_bench_sha256(self):
+        trio = self._combine_baseline()
+        mismatched = dict(trio["candidate"]["harness"])
+        mismatched["benchSha256"] = "f" * 64
+        trio["candidate"]["harness"] = mismatched
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("benchSha256", stderr)
+        self.assertIn(_DEFAULT_FIXTURE_HARNESS["benchSha256"][:12], stderr)
+        self.assertIn(("f" * 64)[:12], stderr)
+
+    # -- harness: --combine refuses mismatched promptSetSha256 across
+    # inputs, naming the field and both values' first 12 hex chars.
+    def test_combine_refuses_mismatched_prompt_set_sha256(self):
+        trio = self._combine_baseline()
+        mismatched = dict(trio["candidate"]["harness"])
+        mismatched["promptSetSha256"] = "e" * 64
+        trio["candidate"]["harness"] = mismatched
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("promptSetSha256", stderr)
+        self.assertIn(_DEFAULT_FIXTURE_HARNESS["promptSetSha256"][:12], stderr)
+        self.assertIn(("e" * 64)[:12], stderr)
+
     # -- Regression: a reading's ttftS of null (an unmeasurable reading --
     # see _consume_sse_stream) must round-trip through --combine as null,
     # never silently coerced to 0.0 (which would republish an unmeasured
@@ -1989,6 +2103,17 @@ class FastmlxBenchTestCase(unittest.TestCase):
                 expected_sha256 = hashlib.sha256(Path(path).read_bytes()).hexdigest()
                 self.assertEqual(entry["sha256"], expected_sha256)
 
+    # -- harness: --combine of three matching-harness rows succeeds and
+    # the combined output row carries that shared harness.
+    def test_combine_of_matching_harness_rows_carries_the_shared_harness(self):
+        trio = self._combine_baseline()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["harness"], _DEFAULT_FIXTURE_HARNESS)
+
     # -- Happy path: exit 0, --json.
     def test_combine_happy_path_exits_0_with_json(self):
         trio = self._combine_baseline()
@@ -2046,6 +2171,24 @@ class FastmlxBenchTestCase(unittest.TestCase):
         listener_flags = flags["listenerFlags"]
         for expected in ("--ctx-size", "262144", "--no-mtp", "--no-pld", "--no-drafter"):
             self.assertIn(expected, listener_flags)
+
+    # -- harness: --public-view keeps harness unchanged, and the
+    # recomputed publishability verdict for a real-shape row WITH a
+    # harness object added is still "publishable" -- a 64-hex-char string
+    # must not trip the marker sweep.
+    def test_public_view_keeps_harness_and_stays_publishable(self):
+        engine_bin = "/" + "Users/" + "operator/bin/" + ("mlx" + "-serve")
+        model_path = "/" + "Users/" + "operator/models/candidate-pack"
+        cmdline = f"{engine_bin} --model {model_path} --ctx-size 262144"
+        row = _combine_fixture_row("candidate", [123.4], listener_cmdline=cmdline)
+        self.assertEqual(row["harness"], _DEFAULT_FIXTURE_HARNESS)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["harness"], row["harness"])
+        self.assertEqual(doc["publishable"]["status"], "publishable")
 
     def test_public_view_leaves_everything_else_deep_equal(self):
         cmdline = "fastmlx-serve --model /models/x --port 8080"

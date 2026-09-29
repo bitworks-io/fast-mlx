@@ -179,6 +179,28 @@ a row measured over the LAN is a perfectly valid measurement, only not a
 publishable one; see the five controls above for what can actually void a
 run.
 
+Every row also carries a top-level ``harness`` object binding it to the
+exact code and workload that produced it -- so a future public ledger can
+bind a number to a reproducible run: ``benchSha256`` is the sha256 of this
+running ``fastmlx_bench.py`` file's own bytes, read via
+``Path(__file__).resolve().read_bytes()`` (``null``, never a crash, if the
+file cannot be read), and ``promptSetSha256`` is the sha256 of the exact
+ordered list of prompts as sent to the server -- the default 3-prompt set,
+or whatever ``--prompt`` replaced it with -- serialized deterministically
+as ``json.dumps(prompts, ensure_ascii=False, separators=(",", ":"))``
+before hashing. A ``fastmlx-bench-row-v2`` row written before this field
+existed carries no ``harness`` at all (or a ``null``/incomplete one);
+``--combine`` REFUSES such a row -- a card-grade ratio needs every input
+bound to a known, reproducible harness revision and prompt set, and a row
+from before this field existed cannot make that claim. ``--combine`` also
+refuses when the three inputs' ``harness`` objects disagree in either
+field, naming which field and the first 12 hex characters of each
+differing value; the combined output row carries that one shared
+``harness`` object, unchanged. ``--public-view`` leaves ``harness``
+untouched -- it identifies the CODE and the WORKLOAD, never anything about
+the measuring operator's own machine, so it is not something that mode's
+redaction needs to touch.
+
 ``--combine REF_FIRST.json CANDIDATE.json REF_LAST.json`` is a SEPARATE
 mode for engines that hold one model per process, where a single
 ``--base-url`` cannot serve both the candidate and the reference at once
@@ -1238,6 +1260,34 @@ def _boundary(args: argparse.Namespace, prompts: Sequence[str], prompt_is_defaul
     return boundary
 
 
+def _harness_identity(prompts: Sequence[str]) -> dict:
+    """Binds a row to WHICH harness code and WHICH prompt set produced it
+    (see module docstring's ``harness`` paragraph): ``benchSha256`` is the
+    sha256 of this running ``fastmlx_bench.py`` file's own bytes, read via
+    ``Path(__file__).resolve().read_bytes()`` -- ``None`` (never a crash of
+    the measurement) if the file cannot be read for any reason. Note this
+    module is normally loaded via ``importlib.util.module_from_spec`` (see
+    ``Reading``'s own docstring), so ``__file__`` still resolves to this
+    module's own path on disk either way. ``promptSetSha256`` is the
+    sha256 of ``prompts`` -- the EXACT ordered list of prompts as sent to
+    the server for this row -- serialized deterministically via
+    ``json.dumps(list(prompts), ensure_ascii=False, separators=(",",
+    ":"))`` before hashing, so two prompt sets that differ only in order or
+    content hash to different values (see this module's own test
+    coverage).
+    """
+    try:
+        bench_bytes = Path(__file__).resolve().read_bytes()
+        bench_sha256: Optional[str] = hashlib.sha256(bench_bytes).hexdigest()
+    except OSError:
+        bench_sha256 = None
+    prompt_set_bytes = json.dumps(
+        list(prompts), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    prompt_set_sha256 = hashlib.sha256(prompt_set_bytes).hexdigest()
+    return {"benchSha256": bench_sha256, "promptSetSha256": prompt_set_sha256}
+
+
 def _combine_reference_bookends(
     reference_model: Optional[str], first_arm: ArmResult, last_arm: ArmResult
 ) -> ArmResult:
@@ -1360,6 +1410,7 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
         "generatedAt": _utc_now_iso(),
         "baseUrl": args.base_url,
         "boundary": _boundary(args, prompts, prompt_is_default),
+        "harness": _harness_identity(prompts),
         "arms": [arm.to_json() for arm in arms],
         "ratio": ratio,
         "controls": {
@@ -1498,6 +1549,76 @@ def _nested_status(row, *keys) -> Optional[str]:
             return None
         current = current.get(key)
     return current
+
+
+def _combine_harness_control(loaded: "Sequence[dict]") -> dict:
+    """Every --combine input row must carry a ``harness`` object whose
+    ``benchSha256`` and ``promptSetSha256`` are non-empty strings,
+    IDENTICAL across all three inputs -- see module docstring's
+    ``harness`` paragraph. A missing/``null``/incomplete ``harness`` on
+    any input REFUSES (a row from before this field existed cannot claim a
+    known harness revision or prompt set); a value that disagrees between
+    inputs REFUSES naming the differing field and the first 12 hex
+    characters of the two disagreeing values (never the full hash -- a
+    12-char prefix is enough for an operator to tell which files disagree
+    without this reason growing into a second copy of the hash). On
+    success, returns the one shared ``harness`` object the combined output
+    row carries forward unchanged.
+    """
+    per_role_harness = {
+        role: (entry["row"].get("harness") if isinstance(entry["row"], dict) else None)
+        for role, entry in zip(_COMBINE_ROLES, loaded)
+    }
+
+    def _is_valid(harness) -> bool:
+        return (
+            isinstance(harness, dict)
+            and isinstance(harness.get("benchSha256"), str)
+            and harness.get("benchSha256")
+            and isinstance(harness.get("promptSetSha256"), str)
+            and harness.get("promptSetSha256")
+        )
+
+    missing_roles = [role for role, harness in per_role_harness.items() if not _is_valid(harness)]
+    if missing_roles:
+        return {
+            "status": "unknown",
+            "perRole": per_role_harness,
+            "reason": (
+                "input row(s) "
+                + ", ".join(missing_roles)
+                + " predate harness identity (or their harness is unknown) -- "
+                "a row without a benchSha256/promptSetSha256 cannot be bound "
+                "to a reproducible run"
+            ),
+        }
+
+    baseline_role = _COMBINE_ROLES[0]
+    for field in ("benchSha256", "promptSetSha256"):
+        baseline_value = per_role_harness[baseline_role][field]
+        for role in _COMBINE_ROLES[1:]:
+            value = per_role_harness[role][field]
+            if value != baseline_value:
+                return {
+                    "status": "mismatch",
+                    "perRole": per_role_harness,
+                    "reason": (
+                        f"input rows have different {field}: "
+                        f"{baseline_role}={baseline_value[:12]} vs "
+                        f"{role}={value[:12]}"
+                    ),
+                }
+
+    shared = per_role_harness[baseline_role]
+    return {
+        "status": "verified",
+        "perRole": per_role_harness,
+        "harness": {
+            "benchSha256": shared["benchSha256"],
+            "promptSetSha256": shared["promptSetSha256"],
+        },
+        "reason": None,
+    }
 
 
 def _combine_tokens_control(loaded: "Sequence[dict]") -> dict:
@@ -1719,6 +1840,10 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             repr(b) for b in sorted(str(b) for b in boundaries)
         )
 
+    harness_check = _combine_harness_control(loaded)
+    if refusal_reason is None and harness_check["status"] != "verified":
+        refusal_reason = harness_check["reason"]
+
     tokens = _combine_tokens_control(loaded)
     if refusal_reason is None and tokens["status"] != "verified":
         refusal_reason = tokens["reason"]
@@ -1769,6 +1894,7 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
         "boundary": (
             candidate_in["row"].get("boundary") if isinstance(candidate_in["row"], dict) else None
         ),
+        "harness": harness_check.get("harness"),
         "arms": [candidate_arm.to_json(), reference_arm.to_json()],
         "ratio": ratio,
         "controls": {
