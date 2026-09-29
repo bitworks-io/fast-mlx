@@ -48,6 +48,19 @@ must depress TTFT, not decodeTokS, or a slow-to-first-token server would
 look like a slow-DECODING one, which is a different (and differently
 actionable) fact.
 
+Both TTFT and the decode interval anchor on the first TOKEN-BEARING SSE
+event -- one whose ``choices[0].delta`` carries a non-empty ``content``,
+``reasoning_content``, or ``reasoning`` string -- never on the first SSE
+event of ANY kind. A real served engine has been observed to emit a
+role-only preamble (``delta: {"role": "assistant"}``) roughly 0.5 ms after
+the request; anchoring on that (the old behavior) folded the whole prefill
+stall, plus the true first token, into the decode interval instead of into
+TTFT -- exactly the misattribution the paragraph above says must never
+happen. Rows measured before this fix (``schema`` ``fastmlx-bench-row-v1``)
+used that old, any-event anchor and are not comparable to rows using the
+new one (``fastmlx-bench-row-v2``); ``--combine`` and ``--public-view``
+both refuse a non-v2 input row for this reason.
+
 --warmup N runs N passes per arm measurement and DISCARDS them before
 the measured passes begin. A server's first pass after a cold start can
 read far below its steady rate (a real run of this command read ~260
@@ -279,7 +292,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence
 
 
-SCHEMA = "fastmlx-bench-row-v1"
+SCHEMA = "fastmlx-bench-row-v2"
 
 TOKEN_SOURCE_USAGE = "usage.completion_tokens"
 TOKEN_SOURCE_SSE_COUNT = "sse_chunk_count"
@@ -373,7 +386,7 @@ class Reading:
     def __init__(
         self,
         decode_tok_s: Optional[float],
-        ttft_s: float,
+        ttft_s: Optional[float],
         completion_tokens: int,
         token_source: str,
         measurable: bool,
@@ -453,27 +466,53 @@ class ArmResult:
         }
 
 
+def _is_token_bearing_event(event: dict) -> bool:
+    """True iff this SSE event's ``choices[0].delta`` carries a NON-EMPTY
+    ``content``, ``reasoning_content``, or ``reasoning`` string -- the
+    definition of a "token-bearing event" the module docstring's TTFT/
+    decode-interval discussion refers to. A role-only preamble (``delta:
+    {"role": "assistant"}``), an empty-string content delta, and a
+    usage-only bookkeeping event are all, deliberately, NOT token-bearing:
+    a real served engine has been observed to emit exactly the first of
+    those roughly 0.5 ms after the request, and anchoring on it folded the
+    whole prefill stall into the decode interval instead of into TTFT (see
+    module docstring).
+    """
+    choices = event.get("choices") or []
+    if not choices:
+        return False
+    delta = choices[0].get("delta") or {}
+    for key in ("content", "reasoning_content", "reasoning"):
+        value = delta.get(key)
+        if isinstance(value, str) and value != "":
+            return True
+    return False
+
+
 def _consume_sse_stream(response, t_request_sent: float) -> Reading:
     """Reads one streamed ``/v1/chat/completions`` response to a
     ``Reading``.
 
-    ``t_first_chunk`` is the arrival of the FIRST SSE data event of any
-    kind (content or usage-only) -- this marks the start of the decode
-    interval and anchors TTFT. ``t_last_chunk`` tracks only the LAST
-    CONTENT-bearing event (a trailing usage-only bookkeeping chunk, or a
-    long gap before it, must never inflate the decode interval -- see
+    ``t_first_chunk`` is the arrival of the FIRST TOKEN-BEARING SSE event
+    (see ``_is_token_bearing_event``) -- this marks the start of the
+    decode interval and anchors TTFT. A role-only preamble or an
+    empty-string content delta arriving before it is IGNORED for both
+    purposes -- see module docstring for why. ``t_last_chunk`` tracks only
+    the LAST token-bearing event (a trailing usage-only bookkeeping chunk,
+    or a long gap before it, must never inflate the decode interval -- see
     C-tokens' ``- 1`` rationale in the module docstring).
 
     ``completion_tokens``/``token_source`` prefer the server's own
     ``usage.completion_tokens`` the instant any SSE event carries a
     non-null ``usage`` object; only when the stream never carries one at
-    all does this fall back to the raw content-chunk count, marked
+    all does this fall back to the token-bearing-chunk count, marked
     ``sse_chunk_count`` (UNVERIFIED -- see C-tokens).
     """
     t_first_chunk: Optional[float] = None
     t_last_chunk: Optional[float] = None
     chunk_count = 0
     usage_completion_tokens: Optional[int] = None
+    saw_any_data_event = False
     while True:
         raw_line = response.readline()
         if not raw_line:
@@ -489,29 +528,44 @@ def _consume_sse_stream(response, t_request_sent: float) -> Reading:
             event = json.loads(payload)
         except json.JSONDecodeError:
             continue
-        if t_first_chunk is None:
-            t_first_chunk = arrival
-        choices = event.get("choices") or []
-        has_content = bool(choices) and choices[0].get("delta", {}).get("content") is not None
-        if has_content:
-            chunk_count += 1
+        saw_any_data_event = True
+        if _is_token_bearing_event(event):
+            if t_first_chunk is None:
+                t_first_chunk = arrival
             t_last_chunk = arrival
+            chunk_count += 1
         usage = event.get("usage")
         if usage is not None and usage.get("completion_tokens") is not None:
             usage_completion_tokens = usage["completion_tokens"]
-    if t_first_chunk is None:
+    if not saw_any_data_event:
         raise BenchError("no SSE data chunks received before the stream ended")
-    if t_last_chunk is None:
-        # No content-bearing chunk ever arrived (e.g. an immediate
-        # usage-only reply): there is no decode interval to measure at
-        # all, not a zero-length one masquerading as a real measurement.
-        t_last_chunk = t_first_chunk
     if usage_completion_tokens is not None:
         completion_tokens = usage_completion_tokens
         token_source = TOKEN_SOURCE_USAGE
     else:
         completion_tokens = chunk_count
         token_source = TOKEN_SOURCE_SSE_COUNT
+    if t_first_chunk is None:
+        # Data events arrived (so the BenchError above did not fire), but
+        # NONE was token-bearing -- e.g. only a role preamble and/or
+        # usage-only bookkeeping chunks. There is no token arrival to
+        # anchor TTFT OR the decode interval on, so BOTH are unmeasurable;
+        # ttft_s must NOT fall back to a preamble's arrival time (that is
+        # exactly the defect this anchor change fixes -- see module
+        # docstring).
+        return Reading(
+            decode_tok_s=None,
+            ttft_s=None,
+            completion_tokens=completion_tokens,
+            token_source=token_source,
+            measurable=False,
+            unmeasurable_reason=(
+                "decode interval unmeasurable: no token-bearing SSE event "
+                "arrived (only role-only/empty-content/usage-only events, "
+                "if any)"
+            ),
+            elapsed_s=0.0,
+        )
     elapsed = max(t_last_chunk - t_first_chunk, 0.0)
     numerator = max(completion_tokens - 1, 0)
     # MEASURABLE only if BOTH conditions hold -- see module docstring's
@@ -1401,7 +1455,13 @@ def _reading_from_json(data) -> Reading:
         data = {}
     return Reading(
         decode_tok_s=data.get("decodeTokS"),
-        ttft_s=data.get("ttftS") or 0.0,
+        # No ``or 0.0`` fallback: ``ttftS`` is legitimately ``None`` on an
+        # unmeasurable reading (see ``_consume_sse_stream``) since the
+        # anchor-fix -- silently coercing that to 0.0 here would republish
+        # an unmeasured TTFT as a measured, zero-latency one the next time
+        # this reading round-trips through ``--combine``'s own
+        # ``ArmResult.to_json``.
+        ttft_s=data.get("ttftS"),
         completion_tokens=data.get("completionTokens") or 0,
         token_source=data.get("tokenSource"),
         measurable=bool(data.get("measurable")),
@@ -1836,6 +1896,18 @@ def run_public_view(path: str) -> "tuple[int, Optional[dict]]":
         return 1, None
     if not isinstance(row, dict):
         print(f"fastmlx bench: --public-view: {path} is not a JSON object", file=sys.stderr)
+        return 1, None
+    if row.get("schema") != SCHEMA:
+        # Same reasoning as --combine's own strict schema check (see
+        # module docstring's TTFT-anchor paragraph): a row measured under
+        # an older anchor is not comparable, and a redacted VIEW of a
+        # not-comparable row is still not comparable, so this mode must
+        # refuse just as hard as --combine does.
+        print(
+            f"fastmlx bench: --public-view: {path} is not a row of schema "
+            f"{SCHEMA!r} (got schema={row.get('schema')!r})",
+            file=sys.stderr,
+        )
         return 1, None
 
     view = copy.deepcopy(row)

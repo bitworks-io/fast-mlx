@@ -176,6 +176,67 @@ def make_stalled_then_fast_stream(
     return fn
 
 
+def make_preamble_then_stalled_stream(
+    preamble_events: list, content_chunks: int, completion_tokens: int, stall_seconds: float
+):
+    """A responder: writes every one of ``preamble_events`` back-to-back
+    immediately (no sleep at all -- these are NOT token-bearing, e.g. a
+    role-only or empty-content delta), THEN a single real stall of
+    ``stall_seconds``, THEN every remaining content-bearing chunk written
+    back-to-back with no sleep at all (the same idiom as
+    ``make_stalled_then_fast_stream``, deliberately avoiding many small
+    inter-chunk sleeps -- this sandbox's ``time.sleep`` has been observed
+    to overshoot a 5ms request by ~15-20x, which would make repeated small
+    sleeps compound into an unreliable, jitter-dominated total; see module
+    docstring). Proves the decode interval anchors on the first
+    TOKEN-BEARING event, never on an earlier non-token-bearing preamble.
+    """
+
+    def fn(handler):
+        _send_stream_headers(handler)
+        for event in preamble_events:
+            _write_sse(handler, event)
+        time.sleep(stall_seconds)
+        for i in range(content_chunks):
+            _write_sse(handler, _content_event(f"tok{i}"))
+        _write_sse(handler, _usage_event(completion_tokens))
+        _write_done(handler)
+
+    return fn
+
+
+def make_reasoning_then_content_stream(
+    reasoning_chunks: int, content_chunks: int, completion_tokens: int, stall_seconds: float
+):
+    """A responder: ``reasoning_chunks`` non-empty ``reasoning_content``
+    deltas flushed back-to-back immediately, THEN a real stall of
+    ``stall_seconds``, THEN ``content_chunks`` ordinary ``content`` deltas
+    flushed back-to-back, then a usage event, then [DONE]. Proves the
+    FIRST token-bearing event anchors TTFT/the decode interval even when
+    it is a ``reasoning_content`` delta arriving well before any
+    ``content`` delta.
+    """
+
+    def fn(handler):
+        _send_stream_headers(handler)
+        for i in range(reasoning_chunks):
+            _write_sse(
+                handler,
+                {
+                    "choices": [
+                        {"index": 0, "delta": {"reasoning_content": f"r{i}"}, "finish_reason": None}
+                    ]
+                },
+            )
+        time.sleep(stall_seconds)
+        for i in range(content_chunks):
+            _write_sse(handler, _content_event(f"tok{i}"))
+        _write_sse(handler, _usage_event(completion_tokens))
+        _write_done(handler)
+
+    return fn
+
+
 def make_call_indexed_stream(
     slow_until_call: int,
     content_chunks: int = 3,
@@ -537,6 +598,111 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertGreater(reading.decode_tok_s, 50.0)
 
     # ------------------------------------------------------------------
+    # Defect (this cycle): a role-only preamble must NOT anchor TTFT or
+    # the decode interval -- only the first TOKEN-BEARING event may.
+    # ------------------------------------------------------------------
+    def test_role_only_preamble_excluded_from_ttft_and_decode_interval(self):
+        stall_seconds = 0.4
+        completion_tokens = 20
+        role_preamble = {
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+        }
+        base_url = self.start(
+            make_preamble_then_stalled_stream(
+                [role_preamble], completion_tokens, completion_tokens, stall_seconds
+            )
+        )
+        reading = FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=64, timeout=10
+        )
+        # TTFT must reflect (at least) the stall -- the role preamble
+        # arrived near-instantly, well before it.
+        self.assertGreaterEqual(reading.ttft_s, stall_seconds * 0.9)
+        # The decode interval must exclude the stall: every content chunk
+        # was flushed back-to-back with no sleep at all AFTER the stall,
+        # so the true elapsed span is a small fraction of stall_seconds --
+        # under the OLD (any-event) anchor, t_first_chunk would be the
+        # preamble's own near-instant arrival, and elapsed would instead
+        # be ~stall_seconds (failing this bound).
+        self.assertLess(reading.elapsed_s, stall_seconds)
+        self.assertTrue(reading.measurable)
+        # Anti-vacuity: under the old anchor, decodeTokS would divide by
+        # roughly stall_seconds instead of the tiny true elapsed span --
+        # implausibly slow relative to a back-to-back local flush.
+        leaked_rate_bound = (completion_tokens - 1) / stall_seconds
+        self.assertGreater(reading.decode_tok_s, leaked_rate_bound * 5)
+
+    # ------------------------------------------------------------------
+    # Same defect, empty-string content delta preamble instead of a
+    # role-only one -- content="" must be treated as non-token-bearing.
+    # ------------------------------------------------------------------
+    def test_empty_content_preamble_excluded_from_ttft_and_decode_interval(self):
+        stall_seconds = 0.4
+        completion_tokens = 20
+        empty_content_preamble = _content_event("")
+        base_url = self.start(
+            make_preamble_then_stalled_stream(
+                [empty_content_preamble], completion_tokens, completion_tokens, stall_seconds
+            )
+        )
+        reading = FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=64, timeout=10
+        )
+        self.assertGreaterEqual(reading.ttft_s, stall_seconds * 0.9)
+        self.assertLess(reading.elapsed_s, stall_seconds)
+        self.assertTrue(reading.measurable)
+        leaked_rate_bound = (completion_tokens - 1) / stall_seconds
+        self.assertGreater(reading.decode_tok_s, leaked_rate_bound * 5)
+
+    # ------------------------------------------------------------------
+    # A reasoning_content delta IS token-bearing and must anchor TTFT even
+    # when it arrives well before any ordinary content delta.
+    # ------------------------------------------------------------------
+    def test_reasoning_content_delta_anchors_ttft_before_content_deltas(self):
+        stall_seconds = 0.4
+        reasoning_chunks = 3
+        content_chunks = 5
+        completion_tokens = reasoning_chunks + content_chunks
+        base_url = self.start(
+            make_reasoning_then_content_stream(
+                reasoning_chunks, content_chunks, completion_tokens, stall_seconds
+            )
+        )
+        reading = FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=64, timeout=10
+        )
+        # TTFT must reflect the FIRST reasoning_content delta's
+        # near-immediate arrival, NOT the later content delta's arrival
+        # after the stall -- if reasoning_content were (wrongly) excluded
+        # from the token-bearing set, ttft_s would instead be
+        # >= 0.9 * stall_seconds.
+        self.assertLess(reading.ttft_s, stall_seconds * 0.5)
+        self.assertTrue(reading.measurable)
+
+    # ------------------------------------------------------------------
+    # Data events arrived, but none was token-bearing: unmeasurable, and
+    # ttft_s must be None -- NOT a fallback to the (non-token-bearing)
+    # preamble's own arrival time.
+    # ------------------------------------------------------------------
+    def test_no_token_bearing_event_is_unmeasurable_with_null_ttft(self):
+        base_url = self.start(make_simple_stream(0, completion_tokens=5))
+        reading = FASTMLX_BENCH.stream_chat_completion(
+            base_url, "candidate", "hi", max_tokens=32, timeout=10
+        )
+        self.assertFalse(reading.measurable)
+        self.assertIsNone(reading.decode_tok_s)
+        self.assertIsNone(reading.ttft_s)
+        self.assertTrue(reading.unmeasurable_reason)
+        self.assertIn("no token-bearing", reading.unmeasurable_reason)
+
+        # The reading still serializes -- ttftS becomes JSON null, never an
+        # exception or a silently-substituted number.
+        payload = reading.to_json()
+        self.assertIsNone(payload["ttftS"])
+        serialized = json.dumps(payload)
+        self.assertIn('"ttftS": null', serialized)
+
+    # ------------------------------------------------------------------
     # Defect 1: a single-token (or otherwise zero-width) decode interval
     # is UNMEASURABLE, never reported as a measured 0.0 -- see the module
     # docstring's "unreachable/unmeasurable is not zero" rule.
@@ -752,7 +918,7 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stdout.count("\n"), 1)
         doc = json.loads(stdout)
-        self.assertEqual(doc["schema"], "fastmlx-bench-row-v1")
+        self.assertEqual(doc["schema"], "fastmlx-bench-row-v2")
         self.assertIn("boundary", doc)
         self.assertIn("maxTokens", doc["boundary"])
         self.assertIn("runs", doc["boundary"])
@@ -1282,7 +1448,7 @@ class FastmlxBenchTestCase(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_publishability_clean_row_is_publishable(self):
         row = {
-            "schema": "fastmlx-bench-row-v1",
+            "schema": "fastmlx-bench-row-v2",
             "baseUrl": "http://127.0.0.1:8080",
             "boundary": "chip=Apple M3 Ultra (arm64)",
             "controls": {"flags": {"listenerCmdline": None}},
@@ -1738,6 +1904,47 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIsNone(doc["ratio"])
         self.assertIn("no measurable decode-rate median", stderr)
 
+    # -- Refusal: a v1-schema input row (measured under the old, any-event
+    # TTFT/decode-interval anchor) is not comparable to a v2 row and must
+    # be refused, with the reason naming the schema.
+    def test_combine_refuses_a_v1_schema_row(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["schema"] = "fastmlx-bench-row-v1"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn(FASTMLX_BENCH.SCHEMA, stderr)
+        self.assertIn("fastmlx-bench-row-v1", stderr)
+
+    # -- Regression: a reading's ttftS of null (an unmeasurable reading --
+    # see _consume_sse_stream) must round-trip through --combine as null,
+    # never silently coerced to 0.0 (which would republish an unmeasured
+    # TTFT as a measured, zero-latency one).
+    def test_combine_preserves_null_ttft_on_an_unmeasurable_reading(self):
+        trio = self._combine_baseline()
+        trio["candidate"]["arms"][0]["readings"] = [
+            {
+                "decodeTokS": None,
+                "ttftS": None,
+                "completionTokens": 5,
+                "tokenSource": FASTMLX_BENCH.TOKEN_SOURCE_USAGE,
+                "measurable": False,
+                "unmeasurableReason": (
+                    "decode interval unmeasurable: no token-bearing SSE event arrived"
+                ),
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        candidate_arm = next(a for a in doc["arms"] if a["model"] == self._COMBINE_CAND_MODEL)
+        self.assertIsNone(candidate_arm["readings"][0]["ttftS"])
+
     # -- Usage errors: exit 64, not 1 -- --combine measures nothing of its
     # own, so a measurement flag alongside it is a USAGE error.
     def test_combine_and_base_url_exits_64(self):
@@ -1920,6 +2127,19 @@ class FastmlxBenchTestCase(unittest.TestCase):
                 self.assertIn(expected_class, stderr)
                 self.assertIn("withheld_marker_present", stderr)
                 self.assertNotIn(marker_text, stderr)
+
+    def test_public_view_refuses_a_v1_schema_row(self):
+        cmdline = "fastmlx-serve --model /models/candidate --port 8080"
+        row = _combine_fixture_row(
+            "candidate", [100.0], listener_cmdline=cmdline, schema="fastmlx-bench-row-v1"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn(FASTMLX_BENCH.SCHEMA, stderr)
+        self.assertIn("fastmlx-bench-row-v1", stderr)
 
     def test_public_view_sweep_unavailable_refuses(self):
         cmdline = "fastmlx-serve --model /models/candidate --port 8080"
