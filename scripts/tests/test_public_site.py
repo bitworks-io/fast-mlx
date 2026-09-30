@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+import xml.sax.saxutils
 from pathlib import Path
 from unittest import mock
 
@@ -302,19 +303,23 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-5",
-                "title": "Publish v0.1.5: the quality verdict reaches the client",
-                "publishedAt": "2026-09-27T05:11:57Z",
+                "id": "tagged-distribution-v0-1-6",
+                "title": "Publish v0.1.6: bench rows name what produced them",
+                "publishedAt": "2026-09-30T03:06:22Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.5 arm64 macOS distribution, in which fastmlx "
-                    "serve --front-port names the quality verdict that admitted the "
-                    "pack on every response, a pack may carry several quality cards "
-                    "with a NO_GO card always taking precedence, a duplicated or "
-                    "malformed card can no longer disarm the quality gate, and the "
-                    "safetensors sizer explains why it refuses a Hugging Face cache "
-                    "snapshot."
+                    "Publishes the v0.1.6 arm64 macOS distribution, in which fastmlx "
+                    "bench times first-token latency and decode from the first "
+                    "streamed event that carries text rather than a role-only "
+                    "preamble, every bench row records the hashes of the bench "
+                    "script and prompt set that produced it, fastmlx bench "
+                    "--combine joins three separately measured arms into one "
+                    "ratio row, fastmlx bench --public-view prints a row only "
+                    "after removing paths, the listener's host and port, and the "
+                    "base URL, a quality card whose verdict serve cannot read is "
+                    "announced rather than passing silently, and a card with a "
+                    "malformed model field no longer crashes serve."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -323,7 +328,7 @@ class PublicSiteTests(unittest.TestCase):
                     "host-qualification, deployment, or production-promotion claim "
                     "follows."
                 ),
-                "publicCommit": "8dcd8b9244841514c640131f1d363ab8b00f65d8",
+                "publicCommit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -340,6 +345,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
                 "8dcd8b9244841514c640131f1d363ab8b00f65d8",
                 "2538456a936cefbe0c624d15f4e038fac9158102",
                 "f418b8e47b35ff030485bd2878ad5dad63be31fd",
@@ -525,7 +531,9 @@ class PublicSiteTests(unittest.TestCase):
                 page,
             )
             self.assertIn(latest["title"], page)
-            self.assertIn(latest["summary"], page)
+            # The page HTML-escapes text (an apostrophe renders as &#x27;), so
+            # the expectation is the rendered form, not the raw ledger string.
+            self.assertIn(html.escape(latest["summary"]), page)
             self.assertIn(latest["scope"], page)
             self.assertIn(latest["publishedAt"][:10], page)
             self.assertIn(
@@ -1508,9 +1516,17 @@ class PublicSiteTests(unittest.TestCase):
             ):
                 path = output / relative
                 page = path.read_text(encoding="utf-8")
-                self.assertIn(original_summary, page)
+                # Match each file's own rendering of the summary: HTML pages
+                # escape quotes too (html.escape), the Atom feed escapes only
+                # &, < and > (ElementTree text).
+                render = (
+                    html.escape
+                    if relative.endswith(".html")
+                    else xml.sax.saxutils.escape
+                )
+                self.assertIn(render(original_summary), page)
                 path.write_text(
-                    page.replace(original_summary, changed_summary, 1),
+                    page.replace(render(original_summary), render(changed_summary), 1),
                     encoding="utf-8",
                 )
 
