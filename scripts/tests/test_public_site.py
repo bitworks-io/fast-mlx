@@ -6928,6 +6928,10 @@ class PublicSiteTests(unittest.TestCase):
         # differs from the @m5 card's because the two rows were measured on different hosts --
         # that is the point of the pin, so they are listed separately rather than shared.
         "qwen3-0p6b-4bit@m3ultra": "a1f002a00d452a0abf662f7174cae0ae25873b85",
+        # Added 2026-09-30 (cycle 179): the two consumer-class Qwen3-8B cards, both measured
+        # on the v0.1.6 release binary (source_commit ee227419) on a 24 GiB M5.
+        "qwen3-8b-4bit@m5": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
+        "qwen3-8b-6bit@m5": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
     }
 
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:

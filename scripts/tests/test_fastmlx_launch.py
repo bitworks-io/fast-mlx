@@ -4459,16 +4459,16 @@ class RealShippedManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(
             len(cards),
-            10,
-            f"expected exactly 10 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
+            12,
+            f"expected exactly 12 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
         )
         no_go_ids = sorted(
             card.get("id") for card in cards if card.get("verdict") == "NO_GO"
         )
         self.assertEqual(
             len(no_go_ids),
-            8,
-            f"expected exactly 8 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
+            10,
+            f"expected exactly 10 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
             f"got {len(no_go_ids)}: {no_go_ids}",
         )
 

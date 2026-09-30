@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-28T09:09:17Z",
+  "generatedAt": "2026-09-30T13:00:33Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -766,6 +766,166 @@
         "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
         "unmeasured": [
           "perplexity delta"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-8b-4bit@m5",
+      "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-4bit",
+        "hfPin": "545dc425"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m5",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 6.24% top-1 disagreement (93.76% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 16 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 16,
+          "top1AgreementPct": 93.7598
+        },
+        "regressionFocus": "step-by-step reasoning and list generation drift most (8.3-8.5% next-word drift); technical explanations drift least (3.9%)",
+        "example": {
+          "status": "measured",
+          "prompt": "explain how a Bloom filter works,",
+          "referenceOutput": " right",
+          "configOutput": " especially",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026explain how a Bloom filter works,', the peer pack picks ' right' and this pack picks ' especially'."
+        },
+        "benefit": {
+          "fit": "4.3 GB on disk; served at 4.7 GB MLX peak with 4096 context on a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 10240,
+        "disagreements": 639,
+        "disagreement_rate": 0.06240234375,
+        "tier": "NOTICEABLE",
+        "wilson_lo": 0.057879478496583835,
+        "wilson_hi": 0.06725340880683447,
+        "tv_lower_bound_median": 0.0008732107969615099,
+        "tv_lower_bound_p95": 0.31862037232232987,
+        "tv_lower_bound_raw_min": -1.7890460937142194e-06,
+        "kl_lower_bound_median_nats": 0.00041862628335370255,
+        "kl_lower_bound_p95_nats": 0.32325223689326155
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M5 / 24 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "peer-divergence-qwen3-8b-4bit-vs-8bit-2026-09-30.json",
+        "measuredAt": "2026-09-30T12:38:31Z",
+        "engineBuild": {
+          "commit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d"
+        }
+      },
+      "boundary": {
+        "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-8b-6bit@m5",
+      "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-6bit",
+        "hfPin": "35a99712"
+      },
+      "config": {
+        "quant": {
+          "bits": 6,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m5",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 1.58% top-1 disagreement (98.42% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 63 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 63,
+          "top1AgreementPct": 98.418
+        },
+        "regressionFocus": "list generation drifts most (2.2% next-word drift); technical explanations drift least (0.7%)",
+        "example": {
+          "status": "measured",
+          "prompt": "and what happens when the cache",
+          "referenceOutput": " becomes",
+          "configOutput": " is",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026and what happens when the cache', the peer pack picks ' becomes' and this pack picks ' is'."
+        },
+        "benefit": {
+          "fit": "6.2 GB on disk; served at 6.8 GB MLX peak with 4096 context on a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 10240,
+        "disagreements": 162,
+        "disagreement_rate": 0.0158203125,
+        "tier": "NEGLIGIBLE",
+        "wilson_lo": 0.013578710068953394,
+        "wilson_hi": 0.01842505142409458,
+        "tv_lower_bound_median": 0.00010720409079012505,
+        "tv_lower_bound_p95": 0.09836660000785023,
+        "tv_lower_bound_raw_min": -1.9254409648894466e-06,
+        "kl_lower_bound_median_nats": 2.452076186024249e-05,
+        "kl_lower_bound_p95_nats": 0.030298510534202693
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M5 / 24 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "peer-divergence-qwen3-8b-6bit-vs-8bit-2026-09-30.json",
+        "measuredAt": "2026-09-30T12:59:32Z",
+        "engineBuild": {
+          "commit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d"
+        }
+      },
+      "boundary": {
+        "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
         ]
       }
     }
