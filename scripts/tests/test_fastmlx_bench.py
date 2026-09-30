@@ -38,6 +38,13 @@ from pathlib import Path
 from unittest import mock
 
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parents[1])
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+import build_public_site  # noqa: E402
+
+
 BENCH_PATH = Path(__file__).resolve().parents[1] / "fastmlx_bench.py"
 _SPEC = importlib.util.spec_from_file_location("fastmlx_bench", BENCH_PATH)
 assert _SPEC is not None and _SPEC.loader is not None
@@ -1514,9 +1521,14 @@ class FastmlxBenchTestCase(unittest.TestCase):
     # module's own PRIVATE_MARKERS handling).
     # ------------------------------------------------------------------
     def test_publishability_clean_row_is_publishable(self):
+        # baseUrl is null here (the same shape a --combine output row, or
+        # an already-redacted --public-view row, carries) -- a raw
+        # baseUrl naming a host address is its own marker class (see
+        # test_publishability_host_address_class_* below), so this
+        # "nothing to withhold" fixture must not carry one.
         row = {
             "schema": "fastmlx-bench-row-v2",
-            "baseUrl": "http://127.0.0.1:8080",
+            "baseUrl": None,
             "boundary": "chip=Apple M3 Ultra (arm64)",
             "controls": {"flags": {"listenerCmdline": None}},
         }
@@ -1530,7 +1542,15 @@ class FastmlxBenchTestCase(unittest.TestCase):
         row = {"baseUrl": f"http://{private_ip}:8080"}
         verdict = FASTMLX_BENCH.publishability_control(row)
         self.assertEqual(verdict["status"], "withheld_marker_present")
-        self.assertEqual(verdict["markerClasses"], ["private-network-address"])
+        # A private-range (RFC 1918 class C) address trips BOTH the
+        # private-network-address marker (a substring match on its
+        # first two octets) and the built-in
+        # host-address class (any IPv4 literal, or 'localhost') -- see
+        # test_publishability_host_address_class_* below for that class
+        # in isolation.
+        self.assertEqual(
+            verdict["markerClasses"], ["host-address", "private-network-address"]
+        )
         self.assertIsNotNone(verdict["reason"])
 
     def test_publishability_absolute_user_path_in_listener_cmdline_is_withheld(self):
@@ -1550,7 +1570,15 @@ class FastmlxBenchTestCase(unittest.TestCase):
         code, stdout, _ = self._run_main(argv)
         doc = json.loads(stdout)
         self.assertEqual(doc["publishable"]["status"], "withheld_marker_present")
-        self.assertEqual(doc["publishable"]["markerClasses"], ["internal-host-account"])
+        # This is a REAL (raw, un-redacted) row: its own baseUrl is a real
+        # loopback address (see self.start()), so the built-in
+        # host-address class fires alongside the host-label marker -- a
+        # raw row honestly reporting withheld for its own host address is
+        # the intended behavior (see module docstring); --public-view is
+        # the documented route to a row without one.
+        self.assertEqual(
+            doc["publishable"]["markerClasses"], ["host-address", "internal-host-account"]
+        )
 
     def test_publishability_own_binary_name_alone_is_publishable(self):
         own_binary = "fastmlx" + "-serve"
@@ -1722,11 +1750,18 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_publishable_line_appears_in_text_output(self):
+        # A raw (un-redacted) row's own baseUrl is a real loopback address
+        # (see self.start()), so the built-in host-address class withholds
+        # it -- a raw row honestly reporting withheld for its own host
+        # address is intended (see module docstring); this test now checks
+        # that outcome renders, not "publishable" (--public-view is the
+        # documented route to an actually-publishable row).
         base_url = self.start(make_simple_stream(3, completion_tokens=11, inter_chunk_sleep=0.0))
         argv = ["--base-url", base_url, "--model", "candidate", "--runs", "1", "--timeout", "10"]
         code, stdout, _ = self._run_main(argv)
         self.assertEqual(code, 0)
-        self.assertIn("publishable: publishable", stdout)
+        self.assertIn("publishable: withheld_marker_present", stdout)
+        self.assertIn("host-address", stdout)
 
     # ------------------------------------------------------------------
     # --combine: three separately-measured single-arm rows -> one ratio
@@ -2350,23 +2385,26 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertEqual(
             set(listener_flags.keys()), {"referenceFirst", "candidate", "referenceLast"}
         )
-        self.assertEqual(
-            listener_flags["referenceFirst"], ["--model", "<path>", "--port", "8080"]
-        )
-        self.assertEqual(
-            listener_flags["candidate"], ["--model", "<path>", "--port", "8080"]
-        )
-        self.assertEqual(
-            listener_flags["referenceLast"], ["--model", "<path>", "--port", "8080"]
-        )
+        # --port (and its value) is now dropped from every role's
+        # listenerFlags -- see module docstring's --public-view section --
+        # so only the redacted --model survives from each fixture's
+        # default "fastmlx-serve --model <path> --port 8080" cmdline.
+        self.assertEqual(listener_flags["referenceFirst"], ["--model", "<path>"])
+        self.assertEqual(listener_flags["candidate"], ["--model", "<path>"])
+        self.assertEqual(listener_flags["referenceLast"], ["--model", "<path>"])
 
     def test_public_view_residual_marker_exits_1_no_stdout(self):
         cmdline = "fastmlx-serve --model /models/candidate --port 8080"
         base_row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
 
+        # Placed in ``boundary``, not ``baseUrl`` -- a non-null baseUrl is
+        # now itself replaced with the literal "<url>" by --public-view's
+        # own redaction (see module docstring), so a marker planted there
+        # would never survive to be this residual-marker case; boundary is
+        # not touched by any redaction, so a marker planted there does.
         private_ip = "192" + ".168.1.5"
         row_with_ip = copy.deepcopy(base_row)
-        row_with_ip["baseUrl"] = f"http://{private_ip}:8080"
+        row_with_ip["boundary"] = row_with_ip["boundary"] + f"; note={private_ip}"
 
         host_label_marker = "llm" + "bench-box3"
         row_with_host_label = copy.deepcopy(base_row)
@@ -2388,6 +2426,122 @@ class FastmlxBenchTestCase(unittest.TestCase):
                 self.assertIn(expected_class, stderr)
                 self.assertIn("withheld_marker_present", stderr)
                 self.assertNotIn(marker_text, stderr)
+
+    # ------------------------------------------------------------------
+    # --host/--port dropping and baseUrl redaction: a --public-view row
+    # must never carry the listener's own bind address, whether that
+    # address is a `--host`/`--port` listener flag or the row's own
+    # top-level `baseUrl` -- see module docstring's --public-view section
+    # and the built-in host-address class in publishability_control.
+    # ------------------------------------------------------------------
+    def test_public_view_drops_host_port_tokens_and_keeps_other_flags_in_order(self):
+        # T1: a combined row (per-role listenerCmdline dict) whose three
+        # roles carry `--host`/`--port` in the ordinary space-separated
+        # form, except `candidate`, which uses the single-token
+        # `--host=value` form -- both shapes must be dropped, leaving
+        # every other flag in its original order and no IPv4/--host/
+        # --port token behind.
+        common_ip = "127.0.0.1"
+        role_ip = "192" + ".168.1.9"
+        listener_cmdline = {
+            "referenceFirst": (
+                f"fastmlx-serve --model /models/reference --log-level info "
+                f"--host {common_ip} --port 18494 --ctx-size 4096 --no-mtp"
+            ),
+            "candidate": (
+                f"fastmlx-serve --model /models/candidate --log-level info "
+                f"--host={role_ip} --port 18494 --ctx-size 4096 --no-mtp"
+            ),
+            "referenceLast": (
+                f"fastmlx-serve --model /models/reference --log-level info "
+                f"--host {common_ip} --port 18494 --ctx-size 4096 --no-mtp"
+            ),
+        }
+        row = {
+            "schema": FASTMLX_BENCH.SCHEMA,
+            "baseUrl": None,
+            "boundary": "chip=Apple M3 Ultra (arm64)",
+            "controls": {"flags": {"listenerCmdline": listener_cmdline}},
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        listener_flags = doc["controls"]["flags"]["listenerFlags"]
+        expected = ["--model", "<path>", "--log-level", "info", "--ctx-size", "4096", "--no-mtp"]
+        for role in ("referenceFirst", "candidate", "referenceLast"):
+            with self.subTest(role=role):
+                tokens = listener_flags[role]
+                self.assertEqual(tokens, expected)
+                self.assertNotIn("--host", tokens)
+                self.assertNotIn("--port", tokens)
+                joined = " ".join(tokens)
+                self.assertNotRegex(joined, r"\d{1,3}(\.\d{1,3}){3}")
+        self.assertEqual(doc["publishable"]["status"], "publishable")
+
+    def test_public_view_redacts_single_run_base_url_to_literal(self):
+        # T2: a single-run row's own top-level baseUrl is replaced with the
+        # literal "<url>" (never left carrying the measuring host).
+        cmdline = "fastmlx-serve --model /models/candidate --ctx-size 4096"
+        row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
+        self.assertEqual(row["baseUrl"], "http://127.0.0.1:9999")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["baseUrl"], "<url>")
+        self.assertEqual(doc["publishable"]["status"], "publishable")
+
+    def test_publishability_host_address_class_withholds_ipv4_without_leaking_it(self):
+        # T3: an IPv4 literal anywhere in the row (here, boundary -- not a
+        # field any redaction touches) is its own built-in class, never
+        # sourced from the imported marker file, and is never echoed back.
+        ip = "203" + ".0.113.42"
+        row = {"boundary": f"chip=Apple M3 Ultra (arm64); note={ip}"}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "withheld_marker_present")
+        self.assertEqual(verdict["markerClasses"], ["host-address"])
+        self.assertNotIn(ip, verdict["reason"] or "")
+        self.assertNotIn(ip, json.dumps(verdict))
+
+    def test_publishability_host_address_class_withholds_localhost_case_insensitively(self):
+        # T3 (localhost half): same class, a 'LOCALHOST' literal.
+        row = {"boundary": "chip=Apple M3 Ultra (arm64); note=LOCALHOST"}
+        verdict = FASTMLX_BENCH.publishability_control(row)
+        self.assertEqual(verdict["status"], "withheld_marker_present")
+        self.assertEqual(verdict["markerClasses"], ["host-address"])
+        self.assertNotIn("LOCALHOST", verdict["reason"] or "")
+        self.assertNotIn("LOCALHOST", json.dumps(verdict))
+
+    def test_public_view_refuses_when_ipv4_survives_redaction_in_boundary(self):
+        # T4: an IPv4 literal in a field --public-view's own redaction
+        # never touches (boundary) survives into the recomputed verdict
+        # and refuses -- exit 1, no row printed.
+        cmdline = "fastmlx-serve --model /models/candidate --ctx-size 4096"
+        ip = "203" + ".0.113.77"
+        row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
+        row["boundary"] = row["boundary"] + f"; note={ip}"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("host-address", stderr)
+        self.assertIn("withheld_marker_present", stderr)
+        self.assertNotIn(ip, stderr)
+
+    def test_ipv4_pattern_matches_build_public_site_ledger_row_pattern(self):
+        # T5 (parity pin): the bench module's own IPv4 pattern string must
+        # stay byte-identical to build_public_site's served-benchmark
+        # ledger-row check -- a row this module calls "publishable" can
+        # never be one that check would refuse for carrying a host
+        # address.
+        self.assertEqual(
+            FASTMLX_BENCH._HOST_ADDRESS_IPV4_RE.pattern,
+            build_public_site.SERVED_BENCHMARK_LEDGER_ROW_IPV4.pattern,
+        )
 
     def test_public_view_refuses_a_v1_schema_row(self):
         cmdline = "fastmlx-serve --model /models/candidate --port 8080"

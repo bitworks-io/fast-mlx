@@ -174,10 +174,21 @@ actually present, exactly the trap ``scripts/validate_public_repository.py``
 already fixed for the same reason (see its ``_neutralize_own_binary_name``,
 which this mirrors). A row naming only its own binary is still
 ``publishable``, while a row naming any bare third-party engine name is
-not. The verdict is metadata and NEVER changes the process exit code --
-a row measured over the LAN is a perfectly valid measurement, only not a
-publishable one; see the five controls above for what can actually void a
-run.
+not. ``publishability_control`` also carries its own BUILT-IN
+host-address class -- never sourced from the imported marker file, so it
+applies even when that file is absent -- labelled ``host-address``: the
+row is withheld if its serialized JSON matches an IPv4 literal (the
+pattern ``\\b\\d{1,3}(\\.\\d{1,3}){3}\\b``, byte-identical to
+``scripts/build_public_site.py``'s own
+``SERVED_BENCHMARK_LEDGER_ROW_IPV4``) or contains ``localhost``
+case-insensitively. This is why an ordinary, un-redacted row measured
+against a loopback or LAN ``--base-url`` now honestly reports
+``withheld_marker_present`` -- ``--public-view`` (below) is the
+documented route to a row whose host address has actually been removed,
+never a raw row. The verdict is metadata and NEVER changes the process
+exit code -- a row measured over the LAN is a perfectly valid measurement,
+only not a publishable one; see the five controls above for what can
+actually void a run.
 
 Every row also carries a top-level ``harness`` object binding it to the
 exact code and workload that produced it -- so a future public ledger can
@@ -279,7 +290,18 @@ the decision doc this implements
 warns against. Every remaining token that carries a filesystem path
 (contains ``/``, starts with ``~``, or is a ``--key=value`` pair whose
 value does) is replaced with ``<path>`` (or ``--key=<path>``); every
-other token (a bare flag, or a numeric/short value) is left as-is.
+other token (a bare flag, or a numeric/short value) is left as-is. Every
+``--host``/``--port`` flag (together with its following value) and every
+``--host=V``/``--port=V`` single token is additionally DROPPED entirely
+from each redacted ``listenerFlags`` list (single-run list or per-role
+dict) -- the same rule ``scripts/served_benchmark_entry.py``'s own
+``_drop_host_port`` applies, reimplemented here (never imported) since
+this module is shipped standalone and stays stdlib-only. A non-``null``
+top-level ``baseUrl`` is replaced with the literal string ``"<url>"``
+(a ``null`` ``baseUrl``, as every ``--combine`` output row already
+carries, is left ``null``) -- a raw ``baseUrl`` always names the
+measuring host, which the built-in host-address class above would
+otherwise withhold the view for.
 ``controls.flags.status`` becomes ``"captured_redacted"`` -- a row in
 that state can no longer be given to ``--combine``, whose one-position
 argv comparison needs the raw, unredacted argv (see
@@ -309,6 +331,7 @@ import importlib.util
 import itertools
 import json
 import platform
+import re
 import shlex
 import statistics
 import subprocess
@@ -1090,6 +1113,17 @@ _MARKER_CLASS_LABELS: dict = {
 # for under this ONE shared label, never the matched marker itself.
 _THIRD_PARTY_ENGINE_CLASS_LABEL = "third-party-engine-name"
 
+# The host-address class is BUILT IN -- never sourced from the imported
+# marker file, so it fires even when that sibling is absent -- because it
+# is a regex/substring class, not a discrete marker literal. The IPv4
+# pattern string is byte-identical to ``scripts/build_public_site.py``'s
+# own ``SERVED_BENCHMARK_LEDGER_ROW_IPV4`` (a parity pin: see
+# ``scripts/tests/test_fastmlx_bench.py``) so a row this module calls
+# "publishable" can never be one ``build_public_site``'s own served-
+# benchmark ledger ingest would refuse for carrying a host address.
+_HOST_ADDRESS_IPV4_RE = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}\b")
+_HOST_ADDRESS_CLASS_LABEL = "host-address"
+
 
 def _load_marker_source() -> "Optional[tuple]":
     """Loads ``PRIVATE_MARKERS``, ``THIRD_PARTY_ENGINE_MARKERS``, and
@@ -1184,6 +1218,13 @@ def publishability_control(row: dict) -> dict:
     for marker_lower, label in labeled_markers.items():
         if marker_lower in text:
             hit_classes.add(label)
+    # Built-in host-address class (see the constants above): an IPv4
+    # literal or a 'localhost' literal anywhere in the row's own text --
+    # ``text`` is already casefolded, so this also catches 'LOCALHOST'.
+    # Never sourced from the imported marker file, so it applies even when
+    # ``_load_marker_source`` would otherwise have refused.
+    if _HOST_ADDRESS_IPV4_RE.search(text) or "localhost" in text:
+        hit_classes.add(_HOST_ADDRESS_CLASS_LABEL)
     # Own-binary exception: neutralise this project's own binary name with a
     # NUL byte BEFORE scanning for the third-party engine names it happens
     # to contain one of as a substring (order matters -- see module
@@ -2015,6 +2056,33 @@ def _looks_like_path(value: str) -> bool:
     return "/" in value or value.startswith("~")
 
 
+def _drop_host_port(tokens: "List[str]") -> "List[str]":
+    """Drops every ``--host``/``--port`` flag together with its following
+    value, and every ``--host=value``/``--port=value`` single token, from
+    an already-tokenized argv list -- mirrors
+    ``scripts/served_benchmark_entry.py``'s own ``_drop_host_port`` rule,
+    reimplemented here (never imported) because this module is shipped
+    standalone and stays stdlib-only. Applied to a redacted
+    ``listenerFlags`` list (see ``_public_view_redact_flags``) so a
+    ``--public-view`` row never carries the listener's own bind address --
+    the built-in host-address class in ``publishability_control`` would
+    otherwise withhold it.
+    """
+    dropped: "List[str]" = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("--host", "--port"):
+            index += 2
+            continue
+        if token.startswith("--host=") or token.startswith("--port="):
+            index += 1
+            continue
+        dropped.append(token)
+        index += 1
+    return dropped
+
+
 def _redact_token(token: str) -> str:
     """Redacts one already-tokenized argv entry (never argv[0] -- callers
     must drop that themselves; see ``_redact_listener_cmdline``): a
@@ -2061,8 +2129,10 @@ def _public_view_redact_flags(flags: dict) -> "Optional[dict]":
     replaces ``listenerCmdline`` -- a string in a single-run row, or a
     per-role dict of strings in a ``--combine`` output row (see
     ``_combine_flags_control``) -- with ``listenerFlags`` in the matching
-    shape, and sets ``status`` to ``"captured_redacted"``. Returns
-    ``None`` when ANY cmdline in play is missing or fails to parse (see
+    shape, and sets ``status`` to ``"captured_redacted"``. Every resulting
+    token list ALSO has its ``--host``/``--port`` tokens dropped (see
+    ``_drop_host_port``) before assignment. Returns ``None`` when ANY
+    cmdline in play is missing or fails to parse (see
     ``_redact_listener_cmdline``) -- ``run_public_view`` turns that into a
     whole-view refusal, never a partially-redacted row.
     """
@@ -2074,7 +2144,7 @@ def _public_view_redact_flags(flags: dict) -> "Optional[dict]":
             tokens = _redact_listener_cmdline(value)
             if tokens is None:
                 return None
-            per_role_tokens[role] = tokens
+            per_role_tokens[role] = _drop_host_port(tokens)
         new_flags.pop("listenerCmdline", None)
         new_flags["listenerFlags"] = per_role_tokens
     else:
@@ -2082,7 +2152,7 @@ def _public_view_redact_flags(flags: dict) -> "Optional[dict]":
         if tokens is None:
             return None
         new_flags.pop("listenerCmdline", None)
-        new_flags["listenerFlags"] = tokens
+        new_flags["listenerFlags"] = _drop_host_port(tokens)
     new_flags["status"] = "captured_redacted"
     return new_flags
 
@@ -2128,6 +2198,14 @@ def run_public_view(path: str) -> "tuple[int, Optional[dict]]":
 
     view = copy.deepcopy(row)
     view.pop("publishable", None)
+
+    # A non-null top-level baseUrl always names the measuring host (see
+    # module docstring's --public-view section) -- replace it with the
+    # literal string "<url>" the same way listenerFlags tokens are
+    # redacted to "<path>"; a --combine output row's baseUrl is already
+    # null and stays that way.
+    if view.get("baseUrl") is not None:
+        view["baseUrl"] = "<url>"
 
     controls = view.get("controls")
     flags = controls.get("flags") if isinstance(controls, dict) else None
