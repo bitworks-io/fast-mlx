@@ -74,9 +74,9 @@ class PublicStatusPageTests(unittest.TestCase):
                 "acquisition, or publication authority",
                 page,
             )
-            self.assertIn(latest["title"], page)
-            self.assertIn(latest["summary"], page)
-            self.assertIn(latest["scope"], page)
+            self.assertIn(html.escape(latest["title"]), page)
+            self.assertIn(html.escape(latest["summary"]), page)
+            self.assertIn(html.escape(latest["scope"]), page)
             self.assertIn(latest["publishedAt"], page)
             self.assertIn(boundary["label"], page)
             self.assertIn(boundary["summary"], page)

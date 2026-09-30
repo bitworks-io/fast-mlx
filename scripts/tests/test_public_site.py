@@ -530,11 +530,11 @@ class PublicSiteTests(unittest.TestCase):
                 + '" data-boundary-state="gated"',
                 page,
             )
-            self.assertIn(latest["title"], page)
+            self.assertIn(html.escape(latest["title"]), page)
             # The page HTML-escapes text (an apostrophe renders as &#x27;), so
             # the expectation is the rendered form, not the raw ledger string.
             self.assertIn(html.escape(latest["summary"]), page)
-            self.assertIn(latest["scope"], page)
+            self.assertIn(html.escape(latest["scope"]), page)
             self.assertIn(latest["publishedAt"][:10], page)
             self.assertIn(
                 'href="releases/' + latest["id"] + '/"', page
