@@ -28,6 +28,15 @@ that sets it once covers whichever sizer ends up on the command line). A
 KV-cache reserve given by neither the flag nor the environment variable
 is a usage error (exit 64), never a silent zero default.
 
+The KV-cache reserve is a flat GiB figure, not a physical KV-cache size:
+it must cover the KV cache PLUS the serving engine's context-dependent
+overhead (activations, scratch, and prefix cache). On the served engine
+this project measured, the wired peak at about 260k prompt tokens ran
+about 9 GiB beyond weights plus physical KV, so a value that covers only
+the physical KV size can yield an optimistic GREEN at long context. The
+convention for this project's published fit lines is 16 GiB at 262,144
+context and 8 GiB at 65,536; size yours for the pack and context you serve.
+
 GREEN is a memory verdict only, not a loadability verdict: this binary
 never inspects, refuses on, or reasons about which tensor dtypes or
 operators a serving engine implements, so a pack can be fit-GREEN here
@@ -625,7 +634,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "the KV-cache reserve to add to weight bytes, in GiB (required: "
             f"pass this flag or set {_GGUF.ENV_KV_RESERVE_GIB}; never "
-            "silently defaults to zero)"
+            "silently defaults to zero). It must cover the KV cache PLUS the "
+            "engine's context-dependent overhead (activations, scratch, "
+            "prefix cache), not only the physical KV size: on the served "
+            "engine this project measured, the peak at about 260k tokens ran "
+            "about 9 GiB beyond weights plus physical KV, so a physical-KV-only "
+            "value can give an optimistic verdict at long context. Convention "
+            "for this project's published fit lines: 16 GiB at 262,144 "
+            "context, 8 GiB at 65,536"
         ),
     )
     parser.add_argument(

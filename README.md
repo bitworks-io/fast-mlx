@@ -294,7 +294,7 @@ about the engine you should confirm against a measured peak before relying on it
 
 ```sh
 python3 scripts/fastmlx.py serve --model-path ./models/some-mlx-pack --context 262144 \
-  --fit-check-bin scripts/fastmlx_safetensors_fit.py --fit-check-arg=--kv-reserve-gib --fit-check-arg=8 \
+  --fit-check-bin scripts/fastmlx_safetensors_fit.py --fit-check-arg=--kv-reserve-gib --fit-check-arg=16 \
   --fit-check-arg=--mmap-side-file --fit-check-arg=ngram_table.bin \
   --engine-profile <your engine profile>
 ```
@@ -338,8 +338,13 @@ release tarball. For a pack that carries no memory-mapped n-gram table, use the 
 The `8` in this profile's `--kv-reserve-gib 8` is an example value only, not a default that fits
 every deployment: the sizer adds a flat KV-cache reserve on top of resident weight bytes and does
 no context-length scaling, so you must size it yourself for both the pack you are serving and the
-`--context` you actually serve it at. To override it for one invocation without editing the
-profile file, append `--fit-check-arg=--kv-reserve-gib --fit-check-arg=N` to the `serve`/
+`--context` you actually serve it at. The reserve must cover the KV cache plus the engine's
+context-dependent overhead (activations, scratch, and prefix cache), not only the physical KV size:
+on the served engine this project measured, the wired peak at about 260k prompt tokens ran about
+9 GiB beyond weights plus physical KV, so a physical-KV-only value can give an optimistic GREEN at
+long context. This project's published fit lines use 16 GiB at 262,144 context and 8 GiB at
+65,536. To override it for one invocation without editing the profile file, append
+`--fit-check-arg=--kv-reserve-gib --fit-check-arg=N` to the `serve`/
 `recommend` command line — the invocation's own `--fit-check-arg`s are appended after the
 profile's `fitCheck.args` (see precedence above), and the sizer keeps only the LAST
 `--kv-reserve-gib` value it sees when the flag is repeated, so your override wins. The

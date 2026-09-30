@@ -51,6 +51,97 @@ class HeadMetadataCollector(html.parser.HTMLParser):
                 self.properties.setdefault(name, []).append(content)
 
 
+# Pinned output of the teacher emitter (`scripts/emit_quality_card_teacher.py`,
+# which is not projected) for a synthetic 2000-row PASS cell. The measured-PASS
+# tests below use this sample instead of importing the emitter, so this file
+# runs unchanged in the public tree. A dev-only test in
+# scripts/tests/test_emit_quality_card_teacher.py keeps it in sync with the
+# emitter's real output.
+TEACHER_PASS_CARD_SAMPLE = json.loads(
+    r'''
+{
+    "id": "qwen3-8b-6bit@m5",
+    "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-6bit",
+        "hfPin": "0123456789abcdef0123456789abcdef01234567"
+    },
+    "config": {
+        "quant": null,
+        "enhancement": "none",
+        "hardwareClass": "apple-m5"
+    },
+    "verdict": "PASS",
+    "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "Near-lossless, default-eligible: top-1 100.00% (95% Wilson lower 99.81%), pooled teacher-forced ppl delta 0.0100% (bounds 0.0021% to 0.0179%) against the full-precision (BF16) build"
+    },
+    "legible": {
+        "tier": "Near-lossless",
+        "headline": "Every observed position (2000) agreed with what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build Qwen/Qwen3-8B@89abcdef0123, over the reference's own greedy trajectory on corpus corpus-digest-abc123).",
+        "nextWordDrift": {
+            "oneInK": null,
+            "top1AgreementPct": 100.0
+        },
+        "regressionFocus": "long-context retrieval and code",
+        "example": {
+            "status": "pending",
+            "prompt": null,
+            "referenceOutput": null,
+            "configOutput": null,
+            "note": "extract a real disagreement from the peer-divergence cell's raw observations corresponding to cell.json"
+        },
+        "benefit": {
+            "fit": null,
+            "speedX": null,
+            "speedXStatus": "not-measured-on-this-engine"
+        }
+    },
+    "rawMetrics": {
+        "top1AgreementPct": 100.0,
+        "top1WilsonLowerPct": 99.8083,
+        "top1WilsonUpperPct": 100.0,
+        "pplDeltaPct": 0.010001,
+        "pplDeltaUpperPct": 0.017853,
+        "pplDeltaLowerPct": 0.002148,
+        "pplDeltaIsLowerBound": false,
+        "roundingBound": 7.8515625e-05,
+        "unobservedLogprobs": 0,
+        "positions": 2000,
+        "disagreements": 0,
+        "candidatePpl": 1.0101511771512957,
+        "referencePpl": 1.010050167084168,
+        "referenceRepo": "Qwen/Qwen3-8B",
+        "referenceHfPin": "89abcdef0123456789abcdef0123456789abcdef",
+        "referencePrecision": "bf16"
+    },
+    "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build Qwen/Qwen3-8B@89abcdef0123, over the reference's own greedy trajectory on corpus corpus-digest-abc123",
+        "confound": "Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M5 24 GiB / macOS 26",
+        "harnessGitSHA": null,
+        "corpusId": "corpus-digest-abc123",
+        "sourceVerdict": "cell.json",
+        "measuredAt": "2026-09-30T23:11:41Z",
+        "engineBuild": {
+            "commit": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+    },
+    "boundary": {
+        "scope": "serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+            "decode throughput (speedX)",
+            "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+    }
+}
+'''
+)
+
+
 class PublicSiteTests(unittest.TestCase):
     @staticmethod
     def capability_manifest() -> dict[str, object]:
@@ -5388,6 +5479,203 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(len(validated["cards"]), 4)
         failures = validate_public_site.validate_quality_guide_manifest(manifest)
         self.assertEqual(failures, [])
+
+    # ------------------------------------------------------------------
+    # Measured-PASS rule: a card whose provenance.source is
+    # "fast-mlx-measured" AND whose verdict is PASS must carry the
+    # Near-lossless evidence (see "PASS authoring (teacher path)" in
+    # docs/quality-card-schema-v1.md). Scoped to fast-mlx-measured cards:
+    # the fixture's vendor-reported PASS card (Noticeable, default false, no
+    # top-1/ppl) must keep validating.
+    # ------------------------------------------------------------------
+    @classmethod
+    def teacher_pass_card(cls) -> dict[str, object]:
+        """A PASS card as the teacher emitter builds it, from the pinned sample.
+
+        `TEACHER_PASS_CARD_SAMPLE` is the emitter's output (not imported here:
+        `emit_quality_card_teacher` is not projected into the public tree); a
+        dev-only test in test_emit_quality_card_teacher.py keeps it in sync.
+        """
+        card = copy.deepcopy(TEACHER_PASS_CARD_SAMPLE)
+        assert card["verdict"] == "PASS" and card["provenance"]["source"] == "fast-mlx-measured"
+        return card
+
+    def measured_pass_manifest(self, mutate=None) -> dict[str, object]:
+        card = self.teacher_pass_card()
+        if mutate is not None:
+            mutate(card)
+        manifest = self.quality_guide_manifest()
+        manifest["cards"] = [card]
+        return manifest
+
+    def assert_measured_pass_rejected(self, mutate, needle: str) -> None:
+        manifest = self.measured_pass_manifest(mutate)
+        with self.assertRaises(SystemExit) as raised:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        message = str(raised.exception)
+        self.assertIn(needle, message)
+        self.assertIn("qwen3-8b-6bit@m5", message)
+
+    def test_measured_pass_card_from_teacher_emitter_is_accepted(self) -> None:
+        manifest = self.measured_pass_manifest()
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 1)
+
+    def test_measured_pass_rejects_top1_below_99(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["rawMetrics"].__setitem__("top1AgreementPct", 98.5),
+            "rawMetrics.top1AgreementPct",
+        )
+
+    def test_measured_pass_rejects_non_numeric_top1(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["rawMetrics"].__setitem__("top1AgreementPct", "99.5%"),
+            "rawMetrics.top1AgreementPct",
+        )
+
+    def test_measured_pass_rejects_ppl_delta_above_one_percent(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["rawMetrics"].__setitem__("pplDeltaPct", 1.2),
+            "rawMetrics.pplDeltaPct",
+        )
+
+    def test_measured_pass_rejects_ppl_delta_upper_above_one_percent(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["rawMetrics"].__setitem__("pplDeltaUpperPct", 1.3),
+            "rawMetrics.pplDeltaUpperPct",
+        )
+
+    def test_measured_pass_rejects_unbounded_ppl_delta_upper(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["rawMetrics"].__setitem__("pplDeltaUpperPct", None),
+            "rawMetrics.pplDeltaUpperPct",
+        )
+
+    def test_measured_pass_rejects_admission_default_false(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["admission"].__setitem__("default", False),
+            "admission.default",
+        )
+
+    def test_measured_pass_rejects_noticeable_tier(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["legible"].__setitem__("tier", "Noticeable"),
+            "legible.tier",
+        )
+
+    def test_measured_pass_rejects_null_next_word_drift(self) -> None:
+        def mutate(card: dict[str, object]) -> None:
+            card["legible"]["tier"] = "Unquantified"  # satisfy the pre-existing null-drift rule
+            card["legible"]["nextWordDrift"] = None
+
+        manifest = self.measured_pass_manifest(mutate)
+        with self.assertRaises(SystemExit) as raised:
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        # The pre-existing "null drift requires Unquantified; Unquantified requires
+        # NO_GO" rules already refuse this earlier than the measured-PASS rule,
+        # so only the refusal (not its wording) is pinned here.
+        self.assertTrue(str(raised.exception))
+
+    def test_measured_pass_rule_does_not_apply_to_vendor_reported_pass_card(self) -> None:
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][2]
+        self.assertEqual(card["verdict"], "PASS")
+        self.assertEqual(card["provenance"]["source"], "vendor-reported")
+        self.assertEqual(card["legible"]["tier"], "Noticeable")
+        self.assertIs(card["admission"]["default"], False)
+        self.assertNotIn("top1AgreementPct", card["rawMetrics"])
+        validated = build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(len(validated["cards"]), 4)
+
+    def test_measured_non_pass_cards_are_not_subject_to_the_pass_rule(self) -> None:
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][0]
+        self.assertEqual(card["verdict"], "NO_GO")
+        self.assertEqual(card["provenance"]["source"], "fast-mlx-measured")
+        build_public_site.validate_quality_card_document(manifest, "test manifest")
+
+    # Mirror-validator parity for the measured-PASS rule: the same
+    # mutations must be refused by validate_public_site.validate_quality_guide_manifest,
+    # naming the card id and the violated condition.
+    def assert_measured_pass_rejected_by_mirror(self, mutate, needle: str) -> None:
+        manifest = self.measured_pass_manifest(mutate)
+        with self.assertRaises(SystemExit):
+            build_public_site.validate_quality_card_document(
+                self.measured_pass_manifest(mutate), "test manifest"
+            )
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        matching = [f for f in failures if needle in f]
+        self.assertTrue(matching, failures)
+        self.assertIn("qwen3-8b-6bit@m5", matching[0])
+
+    def test_mirror_accepts_teacher_emitted_measured_pass_card(self) -> None:
+        manifest = self.measured_pass_manifest()
+        build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
+
+    def test_mirror_accepts_vendor_reported_pass_card(self) -> None:
+        manifest = self.quality_guide_manifest()
+        card = manifest["cards"][2]
+        self.assertEqual(card["verdict"], "PASS")
+        self.assertEqual(card["provenance"]["source"], "vendor-reported")
+        self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
+
+    def test_mirror_rejects_measured_pass_top1_below_99(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["rawMetrics"].__setitem__("top1AgreementPct", 98.5),
+            "rawMetrics.top1AgreementPct",
+        )
+
+    def test_mirror_rejects_measured_pass_non_numeric_top1(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["rawMetrics"].__setitem__("top1AgreementPct", "99.5%"),
+            "rawMetrics.top1AgreementPct",
+        )
+
+    def test_mirror_rejects_measured_pass_ppl_delta_above_one_percent(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["rawMetrics"].__setitem__("pplDeltaPct", 1.2),
+            "rawMetrics.pplDeltaPct",
+        )
+
+    def test_mirror_rejects_measured_pass_ppl_delta_upper_above_one_percent(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["rawMetrics"].__setitem__("pplDeltaUpperPct", 1.3),
+            "rawMetrics.pplDeltaUpperPct",
+        )
+
+    def test_mirror_rejects_measured_pass_unbounded_ppl_delta_upper(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["rawMetrics"].__setitem__("pplDeltaUpperPct", None),
+            "rawMetrics.pplDeltaUpperPct",
+        )
+
+    def test_mirror_rejects_measured_pass_admission_default_false(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["admission"].__setitem__("default", False),
+            "admission.default",
+        )
+
+    def test_mirror_rejects_measured_pass_noticeable_tier(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["legible"].__setitem__("tier", "Noticeable"),
+            "legible.tier",
+        )
+
+    def test_mirror_rejects_measured_pass_null_next_word_drift(self) -> None:
+        def mutate(card: dict[str, object]) -> None:
+            card["legible"]["nextWordDrift"] = None
+
+        manifest = self.measured_pass_manifest(mutate)
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(any("nextWordDrift" in f for f in failures), failures)
+        self.assertTrue(any("qwen3-8b-6bit@m5" in f for f in failures), failures)
+
+    def test_mirror_measured_pass_rule_skips_measured_non_pass_card(self) -> None:
+        manifest = self.quality_guide_manifest()
+        self.assertEqual(manifest["cards"][0]["verdict"], "NO_GO")
+        self.assertEqual(manifest["cards"][0]["provenance"]["source"], "fast-mlx-measured")
+        self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
 
     def test_secondary_validator_accepts_real_quality_guide_manifest(self) -> None:
         loaded = build_public_site.load_quality_guides(REPOSITORY_ROOT)

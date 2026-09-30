@@ -6285,5 +6285,125 @@ class MalformedCardServeEndToEndTestCase(FastmlxLaunchTestCase):
         self.assertIn(malformed_no_go_id, stderr)
 
 
+TEACHER_PASS_CARD_ID = "teacher-near-lossless@test"
+TEACHER_PASS_REPO = "example/TeacherNearLosslessModel"
+
+
+def teacher_pass_card() -> dict:
+    """The card shape scripts/emit_quality_card_teacher.py authors for a
+    Near-lossless PASS: default-admitting, measured (fast-mlx-measured),
+    carded against the full-precision (BF16) build."""
+    return {
+        "id": TEACHER_PASS_CARD_ID,
+        "model": {
+            "family": "TeacherFamily",
+            "repo": TEACHER_PASS_REPO,
+            "hfPin": "0123456789abcdef0123456789abcdef01234567",
+        },
+        "config": {"quant": None, "enhancement": "none", "hardwareClass": "apple-m5"},
+        "verdict": "PASS",
+        "admission": {
+            "default": True,
+            "optIn": True,
+            "reason": "Near-lossless, default-eligible: top-1 99.80% against the full-precision (BF16) build",
+        },
+        "legible": {
+            "tier": "Near-lossless",
+            "headline": (
+                "About 1 word in 500 differs from what the full-precision (BF16) build would say."
+            ),
+            "nextWordDrift": {"oneInK": 500, "top1AgreementPct": 99.8},
+            "regressionFocus": "long-context retrieval",
+            "example": {
+                "status": "pending",
+                "prompt": None,
+                "referenceOutput": None,
+                "configOutput": None,
+                "note": "pending",
+            },
+            "benefit": {"fit": None, "speedX": None, "speedXStatus": "not-measured-on-this-engine"},
+        },
+        "rawMetrics": {"top1AgreementPct": 99.8, "pplDeltaPct": 0.12},
+        "provenance": {"source": "fast-mlx-measured", "vendor": None},
+    }
+
+
+class TeacherPassCardAdmissionTestCase(unittest.TestCase):
+    """A Near-lossless PASS card (teacher path) admits silently by default and
+    `fastmlx recommend` presents it as measured/carded, never as uncarded.
+
+    Borrows FastmlxLaunchTestCase's fixtures WITHOUT inheriting (and thereby
+    re-running) its ~70 tests."""
+
+    base_args = FastmlxLaunchTestCase.base_args
+    run_main = FastmlxLaunchTestCase.run_main
+
+    def setUp(self):
+        FastmlxLaunchTestCase.setUp(self)
+        manifest = fixture_manifest()
+        manifest["cards"].append(teacher_pass_card())
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_decide_admission_admits_without_opt_in(self):
+        outcome, message = FASTMLX_LAUNCH.decide_admission(teacher_pass_card(), opted_in=False)
+        self.assertEqual((outcome, message), ("admit", None))
+
+    def test_serve_admits_silently_without_accept_quality(self):
+        argv = self.base_args(
+            **{"--model-repo": TEACHER_PASS_REPO, "--context": "2048"}
+        ) + ["--dry-run"]
+        self.assertNotIn("--accept-quality", argv)
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, "a silent admit prints only the plan, no quality-flag line")
+        plan = json.loads(lines[0])
+        self.assertEqual(plan["admission"], "admit")
+        self.assertEqual(plan["card"]["id"], TEACHER_PASS_CARD_ID)
+        self.assertNotIn("accept-quality", stderr)
+        self.assertNotIn("quality", stderr.lower().replace("quality_cards", ""))
+
+    def test_recommend_presents_it_as_measured_carded_not_uncarded(self):
+        recommend_path = LAUNCH_PATH.parent / "fastmlx_recommend.py"
+        spec = importlib.util.spec_from_file_location("fastmlx_recommend_teacher_test", recommend_path)
+        assert spec is not None and spec.loader is not None
+        recommend = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(recommend)
+
+        write_pull_receipt(self.model_dir, repo_id=TEACHER_PASS_REPO, revision="e" * 40)
+        argv = [
+            "recommend",
+            "--quality-cards", str(self.manifest_path),
+            "--model-path", str(self.model_dir),
+            "--fit-check-bin", str(self.green_fit_bin),
+        ]
+
+        def run(extra):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as ctx:
+                    recommend.main(argv + extra)
+            return ctx.exception.code, stdout.getvalue()
+
+        code, out = run(["--json"])
+        self.assertEqual(code, 0)
+        rows = json.loads(out)["rows"]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["status"], "recommended")
+        self.assertNotEqual(row["status"], "uncarded")
+        self.assertEqual(row["card"]["id"], TEACHER_PASS_CARD_ID)
+        self.assertEqual(row["card"]["verdict"], "PASS")
+        self.assertEqual(row["card"]["tier"], "Near-lossless")
+        self.assertEqual(row["card"]["top1AgreementPct"], 99.8)
+        self.assertIsNone(row["accept_quality_flag"])
+
+        code, text = run([])
+        self.assertEqual(code, 0)
+        self.assertIn(f"card={TEACHER_PASS_CARD_ID} verdict=PASS tier=Near-lossless", text)
+        self.assertIn("top1=99.8%", text)
+        self.assertNotIn("uncarded", text)
+
+
 if __name__ == "__main__":
     unittest.main()

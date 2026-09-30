@@ -13,6 +13,7 @@ import datetime as dt
 import hashlib
 import html
 import json
+import math
 import os
 import posixpath
 import re
@@ -1288,6 +1289,48 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
         confound = provenance.get("confound")
         if confound is not None and (not isinstance(confound, str) or not confound.strip()):
             fail(f"{card_label} provenance.confound must be a non-empty string or null")
+
+        # Measured-PASS rule. SCOPED to provenance.source == "fast-mlx-measured":
+        # a PASS card that fast-mlx itself measured must carry the evidence for
+        # the Near-lossless claim and be default-admitting (mirrors
+        # scripts/emit_quality_card_teacher.py `pass_card_violations`; see
+        # "PASS authoring (teacher path)" in docs/quality-card-schema-v1.md).
+        # It is deliberately NOT applied to vendor-reported / modeled PASS
+        # cards: scripts/tests/fixtures/quality-guides.sample.json ships a
+        # vendor-reported PASS card (Noticeable, admission.default false, no
+        # top-1/ppl) that must keep validating, which is also why the
+        # one-sided `default` rule above stays permanent for other sources.
+        if verdict == "PASS" and source == "fast-mlx-measured":
+            measured_pass_label = f"{card_label} (card id {identifier!r}) fast-mlx-measured PASS"
+
+            def measured_number(key: str) -> Optional[float]:
+                value = raw_metrics.get(key)
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    return None
+                return float(value) if math.isfinite(value) else None
+
+            if tier != "Near-lossless":
+                fail(f"{measured_pass_label} requires legible.tier 'Near-lossless', got {tier!r}")
+            if legible.get("nextWordDrift") is None:
+                fail(f"{measured_pass_label} requires a non-null legible.nextWordDrift")
+            top1 = measured_number("top1AgreementPct")
+            if top1 is None or top1 < 99.0:
+                fail(
+                    f"{measured_pass_label} requires numeric rawMetrics.top1AgreementPct >= 99, "
+                    f"got {raw_metrics.get('top1AgreementPct')!r}"
+                )
+            for ppl_key in ("pplDeltaPct", "pplDeltaUpperPct"):
+                ppl_value = measured_number(ppl_key)
+                if ppl_value is None or ppl_value > 1.0:
+                    fail(
+                        f"{measured_pass_label} requires numeric rawMetrics.{ppl_key} <= 1, "
+                        f"got {raw_metrics.get(ppl_key)!r}"
+                    )
+            if admission["default"] is not True:
+                fail(
+                    f"{measured_pass_label} requires admission.default true, "
+                    f"got {admission['default']!r}"
+                )
 
         boundary = require_exact_keys(
             card.get("boundary"), {"scope", "unmeasured"}, f"{card_label} boundary"

@@ -8,6 +8,7 @@ import datetime as dt
 import hashlib
 import html.parser
 import json
+import math
 import posixpath
 import re
 import sys
@@ -5802,6 +5803,58 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                     dt.datetime.fromisoformat(measured_at.replace("Z", "+00:00"))
                 except ValueError:
                     failures.append(f"{label} provenance measuredAt is not an ISO-8601 timestamp")
+
+        # Measured-PASS rule, mirroring
+        # `build_public_site.validate_quality_card_document`'s identical
+        # check (and scripts/emit_quality_card_teacher.py
+        # `pass_card_violations`). SCOPED to provenance.source ==
+        # "fast-mlx-measured": the vendor-reported PASS card in
+        # scripts/tests/fixtures/quality-guides.sample.json (Noticeable,
+        # admission.default false, no top-1/ppl) must keep validating.
+        # Every input is re-read defensively here because the locals above
+        # are only bound when their containers are well-formed dicts.
+        if (
+            verdict == "PASS"
+            and isinstance(provenance, dict)
+            and provenance.get("source") == "fast-mlx-measured"
+        ):
+            measured_label = f"{label} (card id {identifier!r}) fast-mlx-measured PASS"
+            measured_legible = legible if isinstance(legible, dict) else {}
+            measured_metrics = raw_metrics if isinstance(raw_metrics, dict) else {}
+            measured_admission = admission if isinstance(admission, dict) else {}
+
+            def measured_number(key: str) -> Optional[float]:
+                number = measured_metrics.get(key)
+                if isinstance(number, bool) or not isinstance(number, (int, float)):
+                    return None
+                return float(number) if math.isfinite(number) else None
+
+            measured_tier = measured_legible.get("tier")
+            if measured_tier != "Near-lossless":
+                failures.append(
+                    f"{measured_label} requires legible.tier 'Near-lossless', "
+                    f"got {measured_tier!r}"
+                )
+            if measured_legible.get("nextWordDrift") is None:
+                failures.append(f"{measured_label} requires a non-null legible.nextWordDrift")
+            measured_top1 = measured_number("top1AgreementPct")
+            if measured_top1 is None or measured_top1 < 99.0:
+                failures.append(
+                    f"{measured_label} requires numeric rawMetrics.top1AgreementPct >= 99, "
+                    f"got {measured_metrics.get('top1AgreementPct')!r}"
+                )
+            for ppl_key in ("pplDeltaPct", "pplDeltaUpperPct"):
+                ppl_value = measured_number(ppl_key)
+                if ppl_value is None or ppl_value > 1.0:
+                    failures.append(
+                        f"{measured_label} requires numeric rawMetrics.{ppl_key} <= 1, "
+                        f"got {measured_metrics.get(ppl_key)!r}"
+                    )
+            if measured_admission.get("default") is not True:
+                failures.append(
+                    f"{measured_label} requires admission.default true, "
+                    f"got {measured_admission.get('default')!r}"
+                )
 
         boundary = card.get("boundary")
         failures.extend(key_failures(boundary, {"scope", "unmeasured"}, f"{label} boundary"))
