@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-09-30T13:00:33Z",
+  "generatedAt": "2026-10-01T01:54:24Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -926,6 +926,90 @@
         "unmeasured": [
           "perplexity delta",
           "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-8b-8bit@m3ultra",
+      "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-8bit",
+        "hfPin": "48a0b75b"
+      },
+      "config": {
+        "quant": {
+          "bits": 8,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "PASS",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "Near-lossless, default-eligible: top-1 99.20% (95% Wilson lower 99.01%), pooled teacher-forced ppl delta 0.1519% (bounds 0.0670% to 0.2368%) against the full-precision (BF16) build"
+      },
+      "legible": {
+        "tier": "Near-lossless",
+        "headline": "About 1 word in 125 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-8B-bf16@85dd0f16, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 125,
+          "top1AgreementPct": 99.1992
+        },
+        "regressionFocus": "list generation drifts most (1.2% next-word drift); code explanations drift least (0.3%). Drift grows with depth: tokens 1-32 of each answer agree 99.63%, tokens 33-64 agree 98.77%",
+        "example": {
+          "status": "measured",
+          "prompt": "They are databases that are stored in",
+          "referenceOutput": " multiple",
+          "configOutput": " different",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026They are databases that are stored in', the BF16 build picks ' multiple' and this pack picks ' different'."
+        },
+        "benefit": {
+          "fit": "8.1 GB on disk; served at 8.8 GB MLX peak with 4096 context (measured on the M3 Ultra host)",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 99.1992,
+        "top1WilsonLowerPct": 99.0072,
+        "top1WilsonUpperPct": 99.3543,
+        "pplDeltaPct": 0.151871,
+        "pplDeltaUpperPct": 0.236846,
+        "pplDeltaLowerPct": 0.066968,
+        "pplDeltaIsLowerBound": false,
+        "roundingBound": 0.0008480997770675458,
+        "unobservedLogprobs": 0,
+        "positions": 10240,
+        "disagreements": 82,
+        "candidatePpl": 1.1155142969580942,
+        "referencePpl": 1.1138227209843066,
+        "referenceRepo": "mlx-community/Qwen3-8B-bf16",
+        "referenceHfPin": "85dd0f16",
+        "referencePrecision": "bf16"
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-8B-bf16@85dd0f16, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. Short-context result: the 95% Wilson lower bound on top-1 agreement (99.007%) clears the 99% line by 0.007 points, and agreement falls with depth (98.77% over tokens 33-64, Wilson [98.43%, 99.04%]), so longer generations may drift more than this card's headline. Measured on the M3 Ultra only. Rig run_peer_divergence_cell.py sha256 01a5bbcf6c866c70\u2026, emitter emit_quality_card_teacher.py sha256 2b9c8d5ac65c552d\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-K8.json",
+        "measuredAt": "2026-10-01T01:47:53Z",
+        "engineBuild": {
+          "commit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only (not measured on M5 or any other class); short-context only: 64 new tokens per prompt, 160 prompts, 4096 served context",
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
         ]
       }
     }

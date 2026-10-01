@@ -4648,8 +4648,10 @@ class PublicSiteTests(unittest.TestCase):
             card_id = str(card["id"])
             fragment = self.quality_card_fragment(page, card_id)
             for entry in card["boundary"]["unmeasured"]:
+                # The page is rendered HTML, so compare the escaped entry: the teacher
+                # emitter's fixed entry carries an apostrophe, rendered as &#x27;.
                 self.assertIn(
-                    entry,
+                    html.escape(entry),
                     fragment,
                     f"quality card {card_id!r} does not render boundary.unmeasured "
                     f"entry {entry!r}",
@@ -7220,6 +7222,9 @@ class PublicSiteTests(unittest.TestCase):
         # on the v0.1.6 release binary (source_commit ee227419) on a 24 GiB M5.
         "qwen3-8b-4bit@m5": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
         "qwen3-8b-6bit@m5": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
+        # Added 2026-10-01 (cycle 182): the first PASS card, Qwen3-8B 8-bit vs its BF16 build,
+        # measured on the M3 Ultra with the same v0.1.6 release binary.
+        "qwen3-8b-8bit@m3ultra": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
     }
 
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:

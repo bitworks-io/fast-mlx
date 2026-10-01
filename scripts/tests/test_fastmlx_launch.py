@@ -4437,7 +4437,7 @@ class RealShippedManifestTestCase(unittest.TestCase):
     """
 
     # P3a: the structural pin. Hand-derived from site/quality-guides.json
-    # by inspection -- schema string, exactly 10 cards, exactly 8 NO_GO
+    # by inspection -- schema string, exactly 13 cards, exactly 10 NO_GO, exactly 1 PASS
     # (updated when qwen38-flash-next-iq-3p3bpw@m3ultra-v2696, a sibling
     # NO_GO card re-measured on served-engine build 1745ffe8, was added
     # alongside the pre-existing qwen38-flash-next-iq-3p3bpw@m3ultra card;
@@ -4459,8 +4459,8 @@ class RealShippedManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(
             len(cards),
-            12,
-            f"expected exactly 12 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
+            13,
+            f"expected exactly 13 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
         )
         no_go_ids = sorted(
             card.get("id") for card in cards if card.get("verdict") == "NO_GO"
@@ -4470,6 +4470,17 @@ class RealShippedManifestTestCase(unittest.TestCase):
             10,
             f"expected exactly 10 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
             f"got {len(no_go_ids)}: {no_go_ids}",
+        )
+        # Added 2026-10-01 (cycle 182): the first measured PASS card, the Qwen3-8B 8-bit pack
+        # against its BF16 build on the M3 Ultra. Pinned by id so a second PASS, or this one
+        # silently changing verdict, goes RED here.
+        pass_ids = sorted(
+            card.get("id") for card in cards if card.get("verdict") == "PASS"
+        )
+        self.assertEqual(
+            pass_ids,
+            ["qwen3-8b-8bit@m3ultra"],
+            f"unexpected PASS cards in {REAL_QUALITY_GUIDES_PATH}: {pass_ids}",
         )
 
     # P3b: the installed-base non-ambiguity control. This repo/pin
