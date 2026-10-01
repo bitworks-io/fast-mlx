@@ -555,8 +555,9 @@ process bound to loopback only, and runs a small reverse proxy of its own in fro
 and body passes through unchanged (only `Host` and hop-by-hop headers are rewritten; see below), and
 every response gains a fixed set of `X-FastMLX-*` headers computed once from the same admission plan `--dry-run`
 prints: `X-FastMLX-Admission`, `X-FastMLX-Card`, `X-FastMLX-Fit`, `X-FastMLX-Residency`,
-`X-FastMLX-Engine-Build`, `X-FastMLX-MTP`, `X-FastMLX-Quality-Verdict`, and a per-request
-`X-FastMLX-Request-Id`. `GET /fastmlx/provenance` is answered by the proxy itself with the same
+`X-FastMLX-Engine-Build`, `X-FastMLX-MTP`, `X-FastMLX-Quality-Verdict`,
+`X-FastMLX-Quality-Measured-Tokens`, and a per-request `X-FastMLX-Request-Id` (plus
+`X-FastMLX-Quality-Generation-Scope` on completion requests; see below). `GET /fastmlx/provenance` is answered by the proxy itself with the same
 plan summary as JSON, never the raw argv or a model path.
 
 ```sh
@@ -588,6 +589,20 @@ because both are called "verdict" in their own context. `X-FastMLX-Admission` do
 outcome `admit`, so a client reading `X-FastMLX-Admission` alone cannot tell an `EXACT`-verified pack
 from a merely `PASS`-measured one — `X-FastMLX-Quality-Verdict` is the header that answers that
 question.
+
+`X-FastMLX-Quality-Measured-Tokens` is the generation length the card measured
+(`boundary.measuredNewTokens`, an integer >= 1), or `unstated` when the card does not carry a valid
+value. On `POST /v1/chat/completions` and `POST /v1/completions` only, the proxy also sets
+`X-FastMLX-Quality-Generation-Scope` by comparing the request's own generation limit
+(`max_completion_tokens` if present and non-null, else `max_tokens`) with that number: `within`
+(limit <= measured; equal counts as within), `beyond` (limit > measured), `unbounded` (no limit, or
+`null`), `unknown` (the body is not a JSON object, or the limit is not an integer >= 1), or
+`unstated` (the card has no measured length; this wins over the others). A client that sends no
+`max_tokens` therefore sees `unbounded`, not `within`. The scope compares generation length only,
+never context (prompt) length, and the request body is forwarded byte-for-byte unchanged. The same
+number is `qualityMeasuredNewTokens` (integer or `null`) in `GET /fastmlx/provenance`. At launch,
+`fastmlx_launch=quality_scope card=<id> measured_new_tokens=<n>` is printed to stderr as its own line
+(only when the admitted card states a value); the `fastmlx_launch=admitted` line is unchanged.
 
 Measured cost (2026-09-19, one M3 Ultra 256 GB host, in front of the served engine with the
 `qwen38-flash-next-mixed-4-8bit@m3ultra` pack, greedy, streaming, 128-token replies, 20 prompts, each

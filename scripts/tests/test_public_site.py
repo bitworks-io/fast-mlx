@@ -132,6 +132,7 @@ TEACHER_PASS_CARD_SAMPLE = json.loads(
     },
     "boundary": {
         "scope": "serving-admission quality signal for THIS build on THIS hardware class",
+        "measuredNewTokens": 64,
         "unmeasured": [
             "decode throughput (speedX)",
             "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
@@ -5596,6 +5597,72 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(card["provenance"]["source"], "fast-mlx-measured")
         build_public_site.validate_quality_card_document(manifest, "test manifest")
 
+    # boundary.measuredNewTokens: the generation length a card was measured
+    # over. Required (integer >= 1, never a bool) on a fast-mlx-measured PASS
+    # card, optional on every other card.
+    def test_measured_pass_card_requires_measured_new_tokens(self) -> None:
+        self.assert_measured_pass_rejected(
+            lambda card: card["boundary"].pop("measuredNewTokens"),
+            "boundary.measuredNewTokens",
+        )
+
+    def test_measured_new_tokens_rejects_zero_negative_bool_string(self) -> None:
+        for bad in (0, -1, True, False, "64", 64.0, 1.5, None):
+            with self.subTest(bad=bad):
+                self.assert_measured_pass_rejected(
+                    lambda card, bad=bad: card["boundary"].__setitem__("measuredNewTokens", bad),
+                    "boundary.measuredNewTokens",
+                )
+
+    def test_measured_new_tokens_accepts_one_and_large_integers(self) -> None:
+        for good in (1, 64, 100000):
+            with self.subTest(good=good):
+                manifest = self.measured_pass_manifest(
+                    lambda card, good=good: card["boundary"].__setitem__("measuredNewTokens", good)
+                )
+                build_public_site.validate_quality_card_document(manifest, "test manifest")
+                self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
+
+    def test_non_pass_card_may_omit_measured_new_tokens(self) -> None:
+        manifest = self.quality_guide_manifest()
+        for card in manifest["cards"]:
+            self.assertNotIn("measuredNewTokens", card["boundary"])
+        build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
+
+    def test_non_pass_card_may_carry_valid_measured_new_tokens_but_not_a_bad_one(self) -> None:
+        manifest = self.quality_guide_manifest()
+        manifest["cards"][0]["boundary"]["measuredNewTokens"] = 128
+        build_public_site.validate_quality_card_document(manifest, "test manifest")
+        self.assertEqual(validate_public_site.validate_quality_guide_manifest(manifest), [])
+        for bad in (0, -5, True, "128"):
+            with self.subTest(bad=bad):
+                bad_manifest = self.quality_guide_manifest()
+                bad_manifest["cards"][0]["boundary"]["measuredNewTokens"] = bad
+                with self.assertRaises(SystemExit) as raised:
+                    build_public_site.validate_quality_card_document(bad_manifest, "test manifest")
+                self.assertIn("boundary.measuredNewTokens", str(raised.exception))
+                failures = validate_public_site.validate_quality_guide_manifest(bad_manifest)
+                self.assertTrue(any("boundary.measuredNewTokens" in f for f in failures), failures)
+
+    def test_boundary_still_rejects_unknown_keys_alongside_measured_new_tokens(self) -> None:
+        manifest = self.measured_pass_manifest(
+            lambda card: card["boundary"].__setitem__("somethingElse", 1)
+        )
+        with self.assertRaises(SystemExit):
+            build_public_site.validate_quality_card_document(manifest, "test manifest")
+        failures = validate_public_site.validate_quality_guide_manifest(manifest)
+        self.assertTrue(any("boundary" in f and "keys differ" in f for f in failures), failures)
+
+    def test_quality_guide_renders_measured_new_tokens_escaped_and_only_when_present(self) -> None:
+        card = self.teacher_pass_card()
+        card["boundary"]["measuredNewTokens"] = 64
+        rendered = build_public_site.render_quality_guide([card])
+        self.assertIn("Measured over:</strong> 64 generated tokens per prompt", rendered)
+        no_field = self.teacher_pass_card()
+        del no_field["boundary"]["measuredNewTokens"]
+        self.assertNotIn("Measured over", build_public_site.render_quality_guide([no_field]))
+
     # Mirror-validator parity for the measured-PASS rule: the same
     # mutations must be refused by validate_public_site.validate_quality_guide_manifest,
     # naming the card id and the violated condition.
@@ -5672,6 +5739,20 @@ class PublicSiteTests(unittest.TestCase):
         failures = validate_public_site.validate_quality_guide_manifest(manifest)
         self.assertTrue(any("nextWordDrift" in f for f in failures), failures)
         self.assertTrue(any("qwen3-8b-6bit@m5" in f for f in failures), failures)
+
+    def test_mirror_rejects_measured_pass_without_measured_new_tokens(self) -> None:
+        self.assert_measured_pass_rejected_by_mirror(
+            lambda card: card["boundary"].pop("measuredNewTokens"),
+            "boundary.measuredNewTokens",
+        )
+
+    def test_mirror_rejects_measured_pass_bad_measured_new_tokens(self) -> None:
+        for bad in (0, -1, True, False, "64", 64.0, None):
+            with self.subTest(bad=bad):
+                self.assert_measured_pass_rejected_by_mirror(
+                    lambda card, bad=bad: card["boundary"].__setitem__("measuredNewTokens", bad),
+                    "boundary.measuredNewTokens",
+                )
 
     def test_mirror_measured_pass_rule_skips_measured_non_pass_card(self) -> None:
         manifest = self.quality_guide_manifest()

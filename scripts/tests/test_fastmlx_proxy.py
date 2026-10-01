@@ -723,6 +723,7 @@ class ProxyRoundTripTests(unittest.TestCase):
             "x-fastmlx-engine-build",
             "x-fastmlx-mtp",
             "x-fastmlx-quality-verdict",
+            "x-fastmlx-quality-measured-tokens",
             "x-fastmlx-request-id",
         }
         self.assertEqual(actual, expected)
@@ -757,6 +758,206 @@ class ProxyRoundTripTests(unittest.TestCase):
 
         values = resp.msg.get_all("X-FastMLX-Quality-Verdict")
         self.assertEqual(values, ["NO_GO"])
+
+
+def _scope_plan(measured_new_tokens=64, present=True) -> dict:
+    boundary = {"host": "m3ultra"}
+    if present:
+        boundary["measuredNewTokens"] = measured_new_tokens
+    return {**FIXTURE_PLAN, "card": {**FIXTURE_PLAN["card"], "boundary": boundary}}
+
+
+class ProxyGenerationScopeTests(unittest.TestCase):
+    """``X-FastMLX-Quality-Measured-Tokens`` (static) and
+    ``X-FastMLX-Quality-Generation-Scope`` (per request, POST
+    ``/v1/chat/completions`` and ``/v1/completions`` only)."""
+
+    SCOPE = "X-FastMLX-Quality-Generation-Scope"
+    MEASURED = "X-FastMLX-Quality-Measured-Tokens"
+
+    def setUp(self):
+        self._servers = []
+        self.received = []
+        self.addCleanup(self._stop_all)
+
+    def _stop_all(self):
+        for server in self._servers:
+            stop_server(server)
+
+    def _start(self, plan, upstream_extra_headers=()):
+        def responder(handler):
+            self.received.append(_read_request_body(handler))
+            payload = b"ok"
+            handler.send_response(200)
+            for name, value in upstream_extra_headers:
+                handler.send_header(name, value)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        upstream = start_fake_upstream(responder)
+        self._servers.append(upstream)
+        proxy = start_proxy(plan, "127.0.0.1", upstream.server_address[1])
+        self._servers.append(proxy)
+        return proxy
+
+    def _request(self, proxy, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request(method, path, body=body, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp
+
+    def _scope_for(self, plan, payload, path="/v1/chat/completions"):
+        proxy = self._start(plan)
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        resp = self._request(proxy, "POST", path, body)
+        self.assertEqual(resp.status, 200)
+        return resp.getheader(self.SCOPE)
+
+    def test_static_measured_tokens_header(self):
+        proxy = self._start(_scope_plan(64))
+        resp = self._request(proxy, "GET", "/v1/models")
+        self.assertEqual(resp.getheader(self.MEASURED), "64")
+        proxy2 = self._start(_scope_plan(present=False))
+        resp = self._request(proxy2, "GET", "/v1/models")
+        self.assertEqual(resp.getheader(self.MEASURED), "unstated")
+
+    def test_generation_scope_within_beyond_unbounded(self):
+        plan = _scope_plan(64)
+        self.assertEqual(self._scope_for(plan, {"max_tokens": 10}), "within")
+        self.assertEqual(self._scope_for(plan, {"max_tokens": 64}), "within")  # boundary
+        self.assertEqual(self._scope_for(plan, {"max_tokens": 65}), "beyond")
+        self.assertEqual(self._scope_for(plan, {"messages": []}), "unbounded")
+        self.assertEqual(self._scope_for(plan, {"max_tokens": None}), "unbounded")
+        self.assertEqual(
+            self._scope_for(plan, {"max_tokens": 64}, path="/v1/completions"), "within"
+        )
+        self.assertEqual(
+            self._scope_for(plan, {"max_tokens": 65}, path="/v1/completions"), "beyond"
+        )
+
+    def test_nonpositive_limit_is_unknown(self):
+        plan = _scope_plan(64)
+        self.assertEqual(self._scope_for(plan, {"max_tokens": 0}), "unknown")
+        self.assertEqual(self._scope_for(plan, {"max_tokens": -5}), "unknown")
+
+    def test_max_completion_tokens_precedence(self):
+        plan = _scope_plan(64)
+        # max_completion_tokens wins when present and non-null, either direction.
+        self.assertEqual(
+            self._scope_for(plan, {"max_completion_tokens": 10, "max_tokens": 999}), "within"
+        )
+        self.assertEqual(
+            self._scope_for(plan, {"max_completion_tokens": 999, "max_tokens": 10}), "beyond"
+        )
+        # Present-but-null max_completion_tokens falls through to max_tokens.
+        self.assertEqual(
+            self._scope_for(plan, {"max_completion_tokens": None, "max_tokens": 999}), "beyond"
+        )
+        self.assertEqual(
+            self._scope_for(plan, {"max_completion_tokens": None, "max_tokens": 10}), "within"
+        )
+        self.assertEqual(
+            self._scope_for(plan, {"max_completion_tokens": None, "max_tokens": None}),
+            "unbounded",
+        )
+        # A bad (non-int) max_completion_tokens is NOT masked by a good max_tokens.
+        self.assertEqual(
+            self._scope_for(plan, {"max_completion_tokens": "10", "max_tokens": 10}), "unknown"
+        )
+
+    def test_malformed_json_scope_unknown_body_forwarded_unchanged(self):
+        plan = _scope_plan(64)
+        for raw in (b"{not json", b"[1, 2, 3]", b'"just a string"', b"\xff\xfe", b"   "):
+            self.received.clear()
+            self.assertEqual(self._scope_for(plan, raw), "unknown", raw)
+            self.assertEqual(self.received, [raw])
+
+    def test_valid_json_body_forwarded_byte_identical(self):
+        # Odd spacing / key order / unicode escapes survive: no re-serialization.
+        raw = b'{ "max_tokens" :   70 ,\n "messages":[{"content":"\\u00e9  x"}] }'
+        plan = _scope_plan(64)
+        self.assertEqual(self._scope_for(plan, raw), "beyond")
+        self.assertEqual(self.received, [raw])
+
+    def test_bool_measured_tokens_is_unstated(self):
+        for bad in (True, False, 0, -3, 1.5, "64", None):
+            plan = _scope_plan(bad)
+            proxy = self._start(plan)
+            resp = self._request(
+                proxy, "POST", "/v1/chat/completions", json.dumps({"max_tokens": 5}).encode()
+            )
+            self.assertEqual(resp.getheader(self.SCOPE), "unstated", bad)
+            self.assertEqual(resp.getheader(self.MEASURED), "unstated", bad)
+            self.assertIsNone(
+                FASTMLX_PROXY.build_provenance_body(plan)["qualityMeasuredNewTokens"], bad
+            )
+
+    def test_unstated_takes_priority_over_unknown(self):
+        plan = _scope_plan(present=False)
+        self.assertEqual(self._scope_for(plan, b"{not json"), "unstated")
+
+    def test_bool_or_float_limit_is_unknown(self):
+        plan = _scope_plan(64)
+        for bad in (True, False, 10.0, 1.5, "10", [10], {"n": 1}):
+            self.assertEqual(self._scope_for(plan, {"max_tokens": bad}), "unknown", bad)
+            self.assertEqual(
+                self._scope_for(plan, {"max_completion_tokens": bad}), "unknown", bad
+            )
+
+    def test_scope_header_absent_on_other_routes(self):
+        proxy = self._start(_scope_plan(64))
+        body = json.dumps({"max_tokens": 5}).encode("utf-8")
+        for method, path in (
+            ("GET", "/v1/chat/completions"),
+            ("GET", "/v1/models"),
+            ("POST", "/v1/embeddings"),
+            ("POST", "/v1/chat/completions/extra"),
+            ("PUT", "/v1/chat/completions"),
+        ):
+            resp = self._request(proxy, method, path, body if method != "GET" else None)
+            self.assertIsNone(resp.getheader(self.SCOPE), (method, path))
+            self.assertEqual(resp.getheader(self.MEASURED), "64")
+        resp = self._request(proxy, "GET", "/fastmlx/provenance")
+        self.assertIsNone(resp.getheader(self.SCOPE))
+
+    def test_scope_header_with_query_string(self):
+        proxy = self._start(_scope_plan(64))
+        resp = self._request(
+            proxy, "POST", "/v1/chat/completions?x=1", json.dumps({"max_tokens": 9}).encode()
+        )
+        self.assertEqual(resp.getheader(self.SCOPE), "within")
+
+    def test_upstream_scope_header_stripped(self):
+        spoof = (
+            (self.SCOPE, "within"),
+            (self.MEASURED, "9999"),
+        )
+        proxy = self._start(_scope_plan(64), upstream_extra_headers=spoof)
+        resp = self._request(
+            proxy, "POST", "/v1/chat/completions", json.dumps({"max_tokens": 999}).encode()
+        )
+        self.assertEqual(resp.msg.get_all(self.SCOPE), ["beyond"])
+        self.assertEqual(resp.msg.get_all(self.MEASURED), ["64"])
+        # A route that gets no scope header must not leak the spoofed one either.
+        resp = self._request(proxy, "GET", "/v1/models")
+        self.assertIsNone(resp.getheader(self.SCOPE))
+
+    def test_provenance_body_carries_measured_new_tokens(self):
+        self.assertEqual(
+            FASTMLX_PROXY.build_provenance_body(_scope_plan(64))["qualityMeasuredNewTokens"], 64
+        )
+        self.assertIsNone(
+            FASTMLX_PROXY.build_provenance_body(FIXTURE_PLAN)["qualityMeasuredNewTokens"]
+        )
+        proxy = self._start(_scope_plan(64))
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=5)
+        conn.request("GET", "/fastmlx/provenance")
+        body = json.loads(conn.getresponse().read())
+        conn.close()
+        self.assertEqual(body["qualityMeasuredNewTokens"], 64)
 
 
 class DecodeQualityVerdictTestCase(unittest.TestCase):
@@ -4331,10 +4532,13 @@ class ProxySaturationSnapshotTests(unittest.TestCase):
                 # intentional, tracked addition, unlike the saturation/peer
                 # fields this test guards against below.
                 "qualityVerdict",
+                # Added by the measured-generation-length increment.
+                "qualityMeasuredNewTokens",
             },
             "the provenance body's key set must stay byte-unchanged by "
-            "THIS (saturation-snapshot) increment -- qualityVerdict is the "
-            "one intentional exception, added by a separate increment",
+            "THIS (saturation-snapshot) increment -- qualityVerdict and "
+            "qualityMeasuredNewTokens are the intentional exceptions, "
+            "added by separate increments",
         )
         for forbidden in (
             "peer", "top_slots", "distinct_peer_hosts", "slots_reported",

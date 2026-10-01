@@ -3079,6 +3079,16 @@ def _run_serve(args, passthrough_args: list) -> int:
     if front_mode:
         admitted_line += f" front={args.front_host}:{args.front_port}"
     print(admitted_line, file=sys.stderr)
+    # A SEPARATE line (never a field on the fixed-arity `admitted` line
+    # above), printed only when the admitted card states the generation
+    # length it measured.
+    measured_new_tokens = fastmlx_proxy.card_measured_new_tokens(card)
+    if measured_new_tokens is not None:
+        print(
+            f"fastmlx_launch=quality_scope card={card.get('id')} "
+            f"measured_new_tokens={measured_new_tokens}",
+            file=sys.stderr,
+        )
 
     if front_mode:
         return _run_front_mode(

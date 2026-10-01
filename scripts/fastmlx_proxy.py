@@ -378,6 +378,72 @@ def decode_quality_verdict(card: Optional[dict]) -> str:
     return "UNMEASURED"
 
 
+def card_measured_new_tokens(card: Optional[dict]) -> Optional[int]:
+    """``card["boundary"]["measuredNewTokens"]`` when it is a valid value --
+    a strict ``int`` >= 1, never a ``bool`` (``True`` is an ``int`` in
+    Python and would otherwise read as 1) -- else ``None`` ("unstated").
+    Every other shape (no card, non-dict card/boundary, absent key, bool,
+    float, string, zero, negative) is "unstated"; this never raises. The
+    launcher's ``fastmlx_launch=quality_scope`` line and this proxy's header
+    and body field all route through this one reader.
+    """
+    if not isinstance(card, dict):
+        return None
+    boundary = card.get("boundary")
+    if not isinstance(boundary, dict):
+        return None
+    value = boundary.get("measuredNewTokens")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+# Routes (POST only) that get the per-request generation-scope header.
+_GENERATION_SCOPE_PATHS = frozenset({"/v1/chat/completions", "/v1/completions"})
+_GENERATION_SCOPE_HEADER = "X-FastMLX-Quality-Generation-Scope"
+
+
+def classify_generation_scope(measured_new_tokens: Optional[int], body: bytes) -> str:
+    """Whether one request's generation limit is inside what the card
+    measured. Compares GENERATION length only -- nothing about context
+    (prompt) length is checked. Read-only: ``body`` is parsed here, never
+    modified or re-serialized, and this never raises.
+
+    Limit selection: ``max_completion_tokens`` if the key is present AND
+    non-null, else ``max_tokens`` (so a present-but-null
+    ``max_completion_tokens`` falls through to ``max_tokens``; a present
+    non-null bad ``max_completion_tokens`` is NOT masked by a good
+    ``max_tokens``).
+
+    Values, in priority order:
+
+    - ``unstated``: the card has no valid ``measuredNewTokens``.
+    - ``unknown``: the body is not valid UTF-8 JSON, is not a JSON object,
+      or the limit is not a strict ``int`` (a bool, float, string, list,
+      ... counts as non-int), or is an int ``<= 0``.
+    - ``unbounded``: no limit key, or the selected limit is ``null``. A
+      client that sends no ``max_tokens`` therefore reads ``unbounded``.
+    - ``within``: limit <= measuredNewTokens (equality is ``within``).
+    - ``beyond``: limit > measuredNewTokens.
+    """
+    if measured_new_tokens is None:
+        return "unstated"
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return "unknown"
+    if not isinstance(parsed, dict):
+        return "unknown"
+    limit = parsed.get("max_completion_tokens")
+    if limit is None:
+        limit = parsed.get("max_tokens")
+    if limit is None:
+        return "unbounded"
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return "unknown"
+    return "within" if limit <= measured_new_tokens else "beyond"
+
+
 def build_provenance_headers(plan: dict) -> List[Tuple[str, str]]:
     """The fixed set of ``X-FastMLX-*`` headers computed ONCE from ``plan``
     (the same dict ``fastmlx_launch._run_serve`` builds) and attached to
@@ -395,6 +461,8 @@ def build_provenance_headers(plan: dict) -> List[Tuple[str, str]]:
     build_value = build_status if build_status is not None else "unrecorded"
     if build_commit:
         build_value = f"{build_value}; commit={build_commit}"
+
+    measured = card_measured_new_tokens(card)
 
     mtp = plan.get("mtp") or {}
     mtp_status = mtp.get("status")
@@ -419,6 +487,13 @@ def build_provenance_headers(plan: dict) -> List[Tuple[str, str]]:
         # entirely different thing. Do not rename this header to collide
         # with that name.
         ("X-FastMLX-Quality-Verdict", decode_quality_verdict(card)),
+        # The generation length the card measured (static, from the card);
+        # the per-request X-FastMLX-Quality-Generation-Scope header compares
+        # a request's own limit against this.
+        (
+            "X-FastMLX-Quality-Measured-Tokens",
+            "unstated" if measured is None else str(measured),
+        ),
     ]
     return [(name, _sanitize_header_value(value)) for name, value in headers]
 
@@ -451,6 +526,7 @@ def build_provenance_body(plan: dict) -> dict:
         "mtp": plan.get("mtp"),
         "front": plan.get("front"),
         "qualityVerdict": decode_quality_verdict(card),
+        "qualityMeasuredNewTokens": card_measured_new_tokens(card),
     }
 
 
@@ -782,6 +858,10 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
         started = time.monotonic()
         parsed = urlsplit(self.path)
         path_only = parsed.path
+        # Per-request header value, set below once the body is buffered and
+        # only for POST on a generation route; reset here so a reused handler
+        # can never carry a previous request's value.
+        self._generation_scope = None
 
         if self.command == "GET" and path_only == "/fastmlx/provenance":
             bytes_out = self._serve_provenance(request_id)
@@ -841,6 +921,13 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
             self._log(request_id, self.command, path_only, 413, 0.0, bytes_out, False, None)
             return
         body = self.rfile.read(content_length) if content_length else b""
+        if self.command == "POST" and path_only in _GENERATION_SCOPE_PATHS:
+            try:
+                self._generation_scope = classify_generation_scope(
+                    card_measured_new_tokens(self.server.plan.get("card")), body
+                )
+            except Exception:  # never let scope reporting break forwarding
+                self._generation_scope = "unknown"
 
         # Sent via ``putrequest``/``putheader`` below (never a ``dict(...)``,
         # which would collapse duplicate header names into one) -- ``Host``
@@ -929,9 +1016,13 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
 
     # -- response helpers ---------------------------------------------------
     def _provenance_headers_with_request_id(self, request_id: str) -> List[Tuple[str, str]]:
-        return list(self.server.provenance_headers) + [
+        headers = list(self.server.provenance_headers) + [
             ("X-FastMLX-Request-Id", _sanitize_header_value(request_id))
         ]
+        scope = getattr(self, "_generation_scope", None)
+        if scope is not None:
+            headers.append((_GENERATION_SCOPE_HEADER, scope))
+        return headers
 
     def _serve_provenance(self, request_id: str) -> int:
         body = json.dumps(self.server.provenance_body).encode("utf-8")

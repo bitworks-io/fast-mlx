@@ -1331,11 +1331,28 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
                     f"{measured_pass_label} requires admission.default true, "
                     f"got {admission['default']!r}"
                 )
+            boundary_for_pass = card.get("boundary")
+            if not isinstance(boundary_for_pass, dict) or "measuredNewTokens" not in boundary_for_pass:
+                fail(f"{measured_pass_label} requires boundary.measuredNewTokens")
 
-        boundary = require_exact_keys(
-            card.get("boundary"), {"scope", "unmeasured"}, f"{card_label} boundary"
-        )
+        # boundary.measuredNewTokens (optional; required on a fast-mlx-measured
+        # PASS card above): the generation length the card was measured over.
+        # An integer >= 1; `type(...) is int` excludes bool (an int subclass).
+        # Mirrored by scripts/validate_public_site.py.
+        boundary_raw = card.get("boundary")
+        boundary_keys = {"scope", "unmeasured"}
+        if isinstance(boundary_raw, dict) and "measuredNewTokens" in boundary_raw:
+            boundary_keys = boundary_keys | {"measuredNewTokens"}
+        boundary = require_exact_keys(boundary_raw, boundary_keys, f"{card_label} boundary")
         require_text(boundary, "scope", f"{card_label} boundary")
+        if "measuredNewTokens" in boundary:
+            measured_new_tokens = boundary["measuredNewTokens"]
+            if type(measured_new_tokens) is not int or measured_new_tokens < 1:
+                fail(
+                    f"{card_label} (card id {identifier!r}) boundary.measuredNewTokens "
+                    f"must be an integer >= 1, "
+                    f"got {measured_new_tokens!r}"
+                )
         unmeasured = boundary.get("unmeasured")
         if not isinstance(unmeasured, list) or any(
             not isinstance(item, str) or not item.strip() for item in unmeasured
@@ -3458,6 +3475,13 @@ def render_quality_guide(cards: Sequence[Dict[str, object]]) -> str:
         body.append(
             f'<p class="scope-note"><strong>Boundary:</strong> {html.escape(str(boundary["scope"]))}</p>'
         )
+        measured_new_tokens = boundary.get("measuredNewTokens")
+        if measured_new_tokens is not None:
+            body.append(
+                '<p class="scope-note quality-measured-tokens"><strong>Measured over:</strong> '
+                f"{html.escape(str(measured_new_tokens))} generated tokens per prompt; "
+                "longer generations are outside what this card measured.</p>"
+            )
         body.extend(
             [
                 '<p class="scope-note quality-unmeasured-label"><strong>Not measured:</strong></p>',

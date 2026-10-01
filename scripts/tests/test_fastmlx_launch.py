@@ -338,6 +338,9 @@ sys.exit(0)
 """
 
 
+_ABSENT = object()
+
+
 class FastmlxLaunchTestCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1471,6 +1474,76 @@ class FastmlxLaunchTestCase(unittest.TestCase):
         ]
         self.assertEqual(len(admitted_lines), 1, result.stderr)
         self.assertEqual(admitted_lines[0], expected_line)
+
+    # ------------------------------------------------------------------
+    # `boundary.measuredNewTokens`: the launcher accepts the optional key
+    # (it never validated boundary keys) and reports it on a SEPARATE
+    # `fastmlx_launch=quality_scope` line; the `admitted` line keeps its
+    # fixed field count.
+    # ------------------------------------------------------------------
+    def _run_real_launch_with_pass_boundary(self, boundary):
+        manifest = fixture_manifest()
+        for card in manifest["cards"]:
+            if card["id"] == PASS_CARD_ID and boundary is not _ABSENT:
+                card["boundary"] = boundary
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        env = dict(os.environ)
+        env["FAKE_ENGINE_CAPTURE_PATH"] = str(self.root / "captured-argv.json")
+        argv = [sys.executable, str(LAUNCH_PATH)] + self.base_args(
+            **{"--context": "2048", "--model-repo": PASS_REPO}
+        )
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stderr
+
+    def test_admitted_line_arity_unchanged_with_scope_card(self):
+        with_field = self._run_real_launch_with_pass_boundary(
+            {"host": "m3ultra", "measuredNewTokens": 64}
+        )
+        without_field = self._run_real_launch_with_pass_boundary(_ABSENT)
+
+        def admitted(stderr):
+            lines = [l for l in stderr.splitlines() if l.startswith("fastmlx_launch=admitted")]
+            self.assertEqual(len(lines), 1, stderr)
+            return lines[0]
+
+        self.assertEqual(admitted(with_field), admitted(without_field))
+        self.assertEqual(len(admitted(with_field).split()), 9)
+        self.assertNotIn("measured_new_tokens", admitted(with_field))
+
+    def test_quality_scope_line_only_when_card_has_field(self):
+        stderr = self._run_real_launch_with_pass_boundary({"measuredNewTokens": 64})
+        scope_lines = [
+            l for l in stderr.splitlines() if l.startswith("fastmlx_launch=quality_scope")
+        ]
+        self.assertEqual(
+            scope_lines,
+            [f"fastmlx_launch=quality_scope card={PASS_CARD_ID} measured_new_tokens=64"],
+        )
+        for boundary in (
+            _ABSENT,
+            {},
+            {"host": "m3ultra"},
+            {"measuredNewTokens": True},
+            {"measuredNewTokens": 0},
+            {"measuredNewTokens": -1},
+            {"measuredNewTokens": 64.0},
+            {"measuredNewTokens": "64"},
+            {"measuredNewTokens": None},
+            "prose boundary",
+        ):
+            stderr = self._run_real_launch_with_pass_boundary(boundary)
+            self.assertNotIn("quality_scope", stderr, boundary)
+            # ...and the card is still admitted (no strict boundary-key refusal).
+            self.assertIn("fastmlx_launch=admitted", stderr)
+
+    def test_quality_scope_line_absent_for_uncarded_launch(self):
+        env = dict(os.environ)
+        env["FAKE_ENGINE_CAPTURE_PATH"] = str(self.root / "captured-argv.json")
+        argv = [sys.executable, str(LAUNCH_PATH)] + self.base_args(**{"--context": "2048"})
+        result = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("quality_scope", result.stderr)
 
     # ------------------------------------------------------------------
     # A public card with model.repo == null, identified only by an hfPin

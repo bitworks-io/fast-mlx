@@ -1007,6 +1007,7 @@
       },
       "boundary": {
         "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only (not measured on M5 or any other class); short-context only: near-lossless rests on 64 new tokens per prompt (160 prompts, 4096 served context), clearing 99% by 0.007 points; over 256 new tokens it is not established (top-1 98.98%, Wilson [98.87%, 99.07%]; tokens 129-256 98.80%)",
+        "measuredNewTokens": 64,
         "unmeasured": [
           "decode throughput (speedX)",
           "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"

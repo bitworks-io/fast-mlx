@@ -5857,9 +5857,34 @@ def validate_quality_guide_manifest(value: object) -> List[str]:
                 )
 
         boundary = card.get("boundary")
-        failures.extend(key_failures(boundary, {"scope", "unmeasured"}, f"{label} boundary"))
+        # boundary.measuredNewTokens mirrors
+        # `build_public_site.validate_quality_card_document`: optional, but
+        # required on a fast-mlx-measured PASS card; an integer >= 1 and never
+        # a bool (`type(...) is int` excludes bool, an int subclass).
+        boundary_keys = {"scope", "unmeasured"}
+        if isinstance(boundary, dict) and "measuredNewTokens" in boundary:
+            boundary_keys = boundary_keys | {"measuredNewTokens"}
+        failures.extend(key_failures(boundary, boundary_keys, f"{label} boundary"))
+        if (
+            verdict == "PASS"
+            and isinstance(provenance, dict)
+            and provenance.get("source") == "fast-mlx-measured"
+            and not (isinstance(boundary, dict) and "measuredNewTokens" in boundary)
+        ):
+            failures.append(
+                f"{label} (card id {identifier!r}) fast-mlx-measured PASS "
+                "requires boundary.measuredNewTokens"
+            )
         if isinstance(boundary, dict):
             require_str(boundary, "scope", f"{label} boundary", failures)
+            if "measuredNewTokens" in boundary:
+                measured_new_tokens = boundary["measuredNewTokens"]
+                if type(measured_new_tokens) is not int or measured_new_tokens < 1:
+                    failures.append(
+                        f"{label} (card id {identifier!r}) boundary.measuredNewTokens "
+                        f"must be an integer >= 1, "
+                        f"got {measured_new_tokens!r}"
+                    )
             unmeasured = boundary.get("unmeasured")
             if not isinstance(unmeasured, list) or any(
                 not isinstance(item, str) or not item.strip() for item in unmeasured
