@@ -959,7 +959,7 @@
           "oneInK": 125,
           "top1AgreementPct": 99.1992
         },
-        "regressionFocus": "list generation drifts most (1.2% next-word drift); code explanations drift least (0.3%). Drift grows with depth: tokens 1-32 of each answer agree 99.63%, tokens 33-64 agree 98.77%",
+        "regressionFocus": "list generation drifts most (1.2% next-word drift); code explanations drift least (0.3%). Drift grows with depth: tokens 1-32 of each answer agree 99.63%, tokens 33-64 agree 98.77%. A 256-token re-run found tokens 129-256 agree 98.80%, below the 99% line",
         "example": {
           "status": "measured",
           "prompt": "They are databases that are stored in",
@@ -995,7 +995,7 @@
         "source": "fast-mlx-measured",
         "vendor": null,
         "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-8B-bf16@85dd0f16, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
-        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. Short-context result: the 95% Wilson lower bound on top-1 agreement (99.007%) clears the 99% line by 0.007 points, and agreement falls with depth (98.77% over tokens 33-64, Wilson [98.43%, 99.04%]), so longer generations may drift more than this card's headline. Measured on the M3 Ultra only. Rig run_peer_divergence_cell.py sha256 01a5bbcf6c866c70\u2026, emitter emit_quality_card_teacher.py sha256 2b9c8d5ac65c552d\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. Short-context result: the 95% Wilson lower bound on top-1 agreement (99.007%) clears the 99% line by 0.007 points, and agreement falls with depth (98.77% over tokens 33-64, Wilson [98.43%, 99.04%]). A 256-token re-run on the same build, host and corpus (2026-10-01) reproduced 99.19% over tokens 1-64 (Wilson [98.99%, 99.35%], on the 154 prompts it kept) and found 99.11% over tokens 65-128 (Wilson [98.90%, 99.28%]) and 98.80% over tokens 129-256 (Wilson [98.64%, 98.95%]). Overall it was 98.98% (Wilson [98.87%, 99.07%]), which neither clears nor fails 99%, with ppl delta 0.14% (bounds 0.01% to 0.27%). Near-lossless therefore rests on this card's 64-token measurement only, which clears 99% narrowly; it is not established for longer answers. In that run 6 of 160 prompts were skipped, 5 of them because the 8-bit pack stopped before the reference's trajectory ended, which biases its figures upward. Measured on the M3 Ultra only. Rig run_peer_divergence_cell.py sha256 01a5bbcf6c866c70\u2026, emitter emit_quality_card_teacher.py sha256 2b9c8d5ac65c552d\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
         "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
         "harnessGitSHA": null,
         "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
@@ -1006,7 +1006,7 @@
         }
       },
       "boundary": {
-        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only (not measured on M5 or any other class); short-context only: 64 new tokens per prompt, 160 prompts, 4096 served context",
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only (not measured on M5 or any other class); short-context only: near-lossless rests on 64 new tokens per prompt (160 prompts, 4096 served context), clearing 99% by 0.007 points; over 256 new tokens it is not established (top-1 98.98%, Wilson [98.87%, 99.07%]; tokens 129-256 98.80%)",
         "unmeasured": [
           "decode throughput (speedX)",
           "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
