@@ -458,6 +458,78 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertEqual(doc["rows"][0]["card"]["benefitFit"], MIXED_SPEED_FIT_TEXT)
 
     # ------------------------------------------------------------------
+    # boundary.measuredNewTokens: the generation length a card was measured
+    # over is surfaced (strict reader only) in the summary, the text row,
+    # and --json; any non-strict value leaves it absent everywhere.
+    # ------------------------------------------------------------------
+    def write_manifest_with_measured_new_tokens(self, value, present: bool = True) -> Path:
+        manifest = fixture_manifest()
+        for card in manifest["cards"]:
+            if card["id"] == PASS_CARD_ID and present:
+                card["boundary"] = {"measuredNewTokens": value}
+        path = self.root / "manifest-measured-new-tokens.json"
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return path
+
+    def test_summary_and_text_row_carry_measured_new_tokens(self):
+        card = {
+            "id": "mnt@test",
+            "verdict": "PASS",
+            "legible": {"tier": "Reference", "nextWordDrift": {"top1AgreementPct": 91.2}},
+            "boundary": {"measuredNewTokens": 64},
+        }
+        self.assertEqual(FASTMLX_RECOMMEND._card_summary(card)["measuredNewTokens"], 64)
+
+        manifest_path = self.write_manifest_with_measured_new_tokens(64)
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        code, stdout, _ = self.run_main(
+            self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("measured_tokens=64", stdout)
+        self.assertLess(stdout.index("top1="), stdout.index("measured_tokens=64"))
+
+    def test_non_strict_measured_new_tokens_is_absent_everywhere(self):
+        for index, bad in enumerate((True, 0, "64", 64.0)):
+            with self.subTest(value=repr(bad)):
+                card = {
+                    "id": "mnt@test",
+                    "verdict": "PASS",
+                    "legible": {"tier": "Reference"},
+                    "boundary": {"measuredNewTokens": bad},
+                }
+                self.assertNotIn("measuredNewTokens", FASTMLX_RECOMMEND._card_summary(card))
+                manifest_path = self.write_manifest_with_measured_new_tokens(bad)
+                model_dir = self.root / f"pass-model-bad-{index}"
+                model_dir.mkdir()
+                (model_dir / "config.json").write_text("{}", encoding="utf-8")
+                write_pull_receipt(model_dir, repo_id=PASS_REPO, revision="e" * 40)
+                code, stdout, _ = self.run_main(
+                    self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+                )
+                self.assertEqual(code, 0)
+                self.assertNotIn("measured_tokens=", stdout)
+                code, doc, _ = self.run_json(
+                    self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+                )
+                self.assertNotIn("measuredNewTokens", doc["rows"][0]["card"])
+
+    def test_card_without_boundary_has_no_measured_new_tokens(self):
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        code, doc, _ = self.run_json(self.base_argv([model_dir]))
+        self.assertEqual(code, 0)
+        self.assertNotIn("measuredNewTokens", doc["rows"][0]["card"])
+
+    def test_json_row_carries_measured_new_tokens(self):
+        manifest_path = self.write_manifest_with_measured_new_tokens(64)
+        model_dir = self.make_model_dir("pass-model", repo=PASS_REPO)
+        code, doc, _ = self.run_json(
+            self.base_argv([model_dir], **{"--quality-cards": str(manifest_path)})
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["rows"][0]["card"]["measuredNewTokens"], 64)
+
+    # ------------------------------------------------------------------
     # README drift pin: the --json field emitted by `_card_summary` for a
     # card's own fit sentence must stay documented, under its REAL name --
     # not a name hardcoded on both sides, which could drift with the code

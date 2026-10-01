@@ -225,6 +225,12 @@ def _card_summary(card: Optional[dict]) -> Optional[dict]:
     top1 = launch._as_dict(legible.get("nextWordDrift")).get("top1AgreementPct")
     if isinstance(top1, (int, float)) and not isinstance(top1, bool):
         summary["top1AgreementPct"] = top1
+    # The generation length the card was measured over (boundary.
+    # measuredNewTokens). Read through the proxy's strict reader -- the one
+    # validation site -- so a bool/float/string/<1 value never surfaces.
+    measured_new_tokens = launch.fastmlx_proxy.card_measured_new_tokens(card)
+    if measured_new_tokens is not None:
+        summary["measuredNewTokens"] = measured_new_tokens
     benefit = launch._as_dict(legible.get("benefit"))
     status = benefit.get("speedXStatus")
     if status is not None:
@@ -588,6 +594,8 @@ def _format_row_text(rank: int, row: dict) -> str:
         if "top1AgreementPct" in card:
             head.append(f"top1={card['top1AgreementPct']}%")
             prints_a_quality_number = True
+        if "measuredNewTokens" in card:
+            head.append(f"measured_tokens={card['measuredNewTokens']}")
         if "speedX" in card:
             prints_a_quality_number = True
 

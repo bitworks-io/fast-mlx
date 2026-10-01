@@ -246,6 +246,10 @@ very same row. `recommend --json` carries the same two facts under two different
 (`null` when the card has none) -- never merged into one `fit` key, and a `--json` consumer that only
 reads `fit` misses the card's own claim.
 
+When a card states the generation length it was measured over, its `recommend` row shows
+`measured_tokens=<n>` (and `--json` carries `measuredNewTokens`); longer generations are outside that
+measurement.
+
 A row carries its card **whatever the fit check decides**. A pack that does not fit this host, and a
 pack whose fit check could not run at all, both still report the card that was resolved for them --
 the `does-not-fit` case is exactly where the card matters most, since the measured quality of a pack
