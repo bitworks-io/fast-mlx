@@ -854,11 +854,80 @@ final class FastMLXServeArgumentsTests: XCTestCase {
         XCTAssertEqual(arguments.model, "mlx-community/Qwen3.8-27B-OptiQ-4bit")
     }
 
+    // --quality-cards-sha256 <hex> joins the same allowlist: the launcher forwards the digest of the
+    // card-store bytes it admitted against, and the engine's pre-load gate reads it off CommandLine.
+    func testQualityCardsSHA256FlagIsAcceptedByTheParser() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted",
+            "--model", "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+            "--quality-cards", "/site/quality-guides.json",
+            "--quality-cards-sha256", String(repeating: "ab", count: 32),
+            "--accept-quality", "qwen38-27b-optiq-4bit@m3ultra",
+        ])
+        XCTAssertEqual(arguments.backend, .scripted)
+        XCTAssertEqual(arguments.model, "mlx-community/Qwen3.8-27B-OptiQ-4bit")
+    }
+
+    func testQualityCardsSHA256FlagRequiresAValue() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--scripted", "--quality-cards-sha256"])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError, .missingValue("--quality-cards-sha256"))
+        }
+    }
+
     func testQualityCardsFlagRequiresAValue() {
         XCTAssertThrowsError(
             try FastMLXServeArguments.parse(["--scripted", "--quality-cards"])
         ) { error in
             XCTAssertEqual(error as? FastMLXServeArgumentError, .missingValue("--quality-cards"))
+        }
+    }
+
+    // --accept-quality is repeatable: the launcher forwards one `--accept-quality <id>` pair per
+    // operator-opted-in card id, and QualityOptIn.parse collects every occurrence off CommandLine.
+    func testAcceptQualityMayBeRepeated() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--scripted", "--model", "m/x",
+            "--accept-quality", "a",
+            "--accept-quality", "b",
+        ])
+        XCTAssertEqual(arguments.backend, .scripted)
+        XCTAssertEqual(arguments.model, "m/x")
+    }
+
+    func testAcceptQualityStillRequiresAValueWhenRepeated() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--scripted", "--accept-quality", "a", "--accept-quality"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .missingValue("--accept-quality"))
+        }
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse(["--scripted", "--accept-quality"])
+        ) { error in
+            XCTAssertEqual(error as? FastMLXServeArgumentError, .missingValue("--accept-quality"))
+        }
+    }
+
+    // The repeatable exemption is narrow: the card-store path and its pinned digest stay single-valued.
+    func testRepeatedQualityCardsAndSHA256StillFailClosed() {
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted", "--quality-cards", "/a.json", "--quality-cards", "/b.json",
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError, .duplicateOption("--quality-cards"))
+        }
+        let digest = String(repeating: "ab", count: 32)
+        XCTAssertThrowsError(
+            try FastMLXServeArguments.parse([
+                "--scripted", "--quality-cards-sha256", digest, "--quality-cards-sha256", digest,
+            ])
+        ) { error in
+            XCTAssertEqual(
+                error as? FastMLXServeArgumentError, .duplicateOption("--quality-cards-sha256"))
         }
     }
 

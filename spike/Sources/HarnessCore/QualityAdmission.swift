@@ -538,13 +538,50 @@ public enum QualityCardStore {
     /// this is the entry point that exposes it.
     public static func loadManifestDetailed(contentsOf url: URL) throws -> QualityCardManifestLoadResult
     {
-        guard let data = try? Data(contentsOf: url),
-            let manifest = try? JSONDecoder().decode(QualityCardManifest.self, from: data)
-        else {
+        guard let data = try? Data(contentsOf: url) else {
             throw QualityCardsManifestUndecodable(path: url.path)
+        }
+        return try decodeManifest(data, path: url.path)
+    }
+
+    /// The shared decode step: envelope failure throws `QualityCardsManifestUndecodable`; a malformed
+    /// individual card is dropped and counted (see `QualityCardManifest`). Both loaders decode through
+    /// here so the digest-verified path cannot drift from the plain one.
+    private static func decodeManifest(_ data: Data, path: String) throws -> QualityCardManifestLoadResult {
+        guard let manifest = try? JSONDecoder().decode(QualityCardManifest.self, from: data) else {
+            throw QualityCardsManifestUndecodable(path: path)
         }
         return QualityCardManifestLoadResult(
             cards: manifest.cards, droppedCardCount: manifest.droppedCardCount)
+    }
+
+    /// True iff `value` is exactly 64 LOWERCASE ASCII hex characters (the shape `sha256Hex` emits).
+    private static func isLowercaseSHA256Hex(_ value: String) -> Bool {
+        value.utf8.count == 64
+            && value.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+    }
+
+    /// Digest-verified strict load: reads the file's bytes ONCE, requires `expectedSHA256` to be exactly
+    /// 64 lowercase hex characters (`QualityCardsSHA256Malformed` otherwise), hashes THOSE bytes
+    /// (`sha256Hex`), throws `QualityCardsSHA256Mismatch` (naming expected and actual) when they differ,
+    /// and decodes the cards from the very same `Data` -- there is no second read, so the bytes judged
+    /// are provably the bytes hashed. An unreadable file or an undecodable envelope keeps
+    /// `QualityCardsManifestUndecodable`. Used for `--quality-cards-sha256`: the launcher admitted
+    /// against a store with this digest and the engine must judge exactly that store.
+    public static func loadManifestDetailed(
+        contentsOf url: URL, expectedSHA256: String
+    ) throws -> QualityCardManifestLoadResult {
+        guard isLowercaseSHA256Hex(expectedSHA256) else {
+            throw QualityCardsSHA256Malformed(value: expectedSHA256)
+        }
+        guard let data = try? Data(contentsOf: url) else {
+            throw QualityCardsManifestUndecodable(path: url.path)
+        }
+        let actual = sha256Hex(data)
+        guard actual == expectedSHA256 else {
+            throw QualityCardsSHA256Mismatch(path: url.path, expected: expectedSHA256, actual: actual)
+        }
+        return try decodeManifest(data, path: url.path)
     }
 
     /// `loadManifestDetailed(contentsOf:)`'s `.cards` only, for the four call sites that never needed
@@ -650,6 +687,36 @@ public struct QualityCardsManifestUndecodable: Error, CustomStringConvertible, S
 
     public var description: String {
         "quality-cards manifest at \(path) could not be read or decoded as fast-mlx-quality-card-v1"
+    }
+}
+
+/// `--quality-cards-sha256` was not exactly 64 lowercase hex characters.
+public struct QualityCardsSHA256Malformed: Error, CustomStringConvertible, Sendable, Equatable {
+    public let value: String
+
+    public init(value: String) {
+        self.value = value
+    }
+
+    public var description: String {
+        "--quality-cards-sha256 must be exactly 64 lowercase hex characters, got '\(value)'"
+    }
+}
+
+/// The bytes read from the quality-cards manifest do not hash to `--quality-cards-sha256`.
+public struct QualityCardsSHA256Mismatch: Error, CustomStringConvertible, Sendable, Equatable {
+    public let path: String
+    public let expected: String
+    public let actual: String
+
+    public init(path: String, expected: String, actual: String) {
+        self.path = path
+        self.expected = expected
+        self.actual = actual
+    }
+
+    public var description: String {
+        "quality-cards manifest at \(path) hashes to sha256 \(actual) but --quality-cards-sha256 expected \(expected)"
     }
 }
 

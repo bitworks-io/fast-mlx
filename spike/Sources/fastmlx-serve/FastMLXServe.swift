@@ -582,6 +582,18 @@ private func qualityCardsExplicitPathArgument(rawArguments: [String]) -> String?
     return rawArguments[index + 1]
 }
 
+/// Scan the raw argument list for `--quality-cards-sha256 <hex>` — the digest of the card-store bytes
+/// the launcher admitted against. Same scan idiom as `qualityCardsExplicitPathArgument`; the value is
+/// validated by `QualityCardStore.loadManifestDetailed(contentsOf:expectedSHA256:)`, not here.
+private func qualityCardsSHA256Argument(rawArguments: [String]) -> String? {
+    guard let index = rawArguments.firstIndex(of: "--quality-cards-sha256"),
+        index + 1 < rawArguments.count
+    else {
+        return nil
+    }
+    return rawArguments[index + 1]
+}
+
 /// Scan the raw argument list for an explicit `--model-revision <value>` value — the pinned HF
 /// commit sha this launch resolved, consulted by `QualityCardStore.resolve(repo:revision:...)` for
 /// hfPin-prefix card matching. Mirrors `qualityCardsExplicitPathArgument`'s scan idiom exactly:
@@ -646,6 +658,16 @@ private func modelRevisionArgument(rawArguments: [String]) -> String? {
 /// case; this binary stays self-consistent on 2 instead of introducing a second refusal exit code).
 private func applyQualityAdmissionGate(model: String, rawArguments: [String]) -> String {
     let explicitPath = qualityCardsExplicitPathArgument(rawArguments: rawArguments)
+    // `--quality-cards-sha256` pins the exact bytes of an EXPLICIT store: it is meaningless (and a
+    // silent no-op would hide a launcher/engine disagreement) without `--quality-cards`, so refuse.
+    let expectedSHA256 = qualityCardsSHA256Argument(rawArguments: rawArguments)
+    if expectedSHA256 != nil, explicitPath == nil {
+        FileHandle.standardError.write(
+            Data(
+                "fastmlx-serve configuration=refused reason=quality_cards_sha256 detail=--quality-cards-sha256 requires --quality-cards\n"
+                    .utf8))
+        exit(2)
+    }
     let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
     let resolution: QualityCardsManifestResolution
     do {
@@ -665,7 +687,29 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     let cards: [QualityCard]
     let droppedCardCount: Int
     do {
-        let loaded = try QualityCardStore.loadManifestDetailed(contentsOf: manifestURL)
+        let loaded: QualityCardManifestLoadResult
+        if let expectedSHA256 {
+            // Bytes read once, hashed, and decoded from those same bytes. Any digest problem refuses
+            // under its own reason so an operator can tell it from an unreadable/undecodable store.
+            do {
+                loaded = try QualityCardStore.loadManifestDetailed(
+                    contentsOf: manifestURL, expectedSHA256: expectedSHA256)
+            } catch let error as QualityCardsSHA256Malformed {
+                FileHandle.standardError.write(
+                    Data(
+                        "fastmlx-serve configuration=refused reason=quality_cards_sha256 detail=\(error)\n"
+                            .utf8))
+                exit(2)
+            } catch let error as QualityCardsSHA256Mismatch {
+                FileHandle.standardError.write(
+                    Data(
+                        "fastmlx-serve configuration=refused reason=quality_cards_sha256 detail=\(error)\n"
+                            .utf8))
+                exit(2)
+            }
+        } else {
+            loaded = try QualityCardStore.loadManifestDetailed(contentsOf: manifestURL)
+        }
         cards = loaded.cards
         droppedCardCount = loaded.droppedCardCount
     } catch {
@@ -739,8 +783,10 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     // never emit `quality_cards_count=0` for a well-formed non-empty manifest, so that happy path
     // stays byte-identical.
     let countFragment = QualityAdmission.cardsCountFragment(cards: cards)
+    // Appended LAST and only when the flag was given, so every existing token stays byte-identical.
+    let sha256Fragment = expectedSHA256.map { " quality_cards_sha256=\($0)" } ?? ""
     return
-        "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))\(droppedFragment)\(countFragment)"
+        "quality_cards=\(manifestURL.path) \(QualityAdmission.announceFragment(card: card))\(droppedFragment)\(countFragment)\(sha256Fragment)"
 }
 
 /// Resolve the `--tier` serve dial into a `ServingPolicy`, composing any explicit `--kv-quant`

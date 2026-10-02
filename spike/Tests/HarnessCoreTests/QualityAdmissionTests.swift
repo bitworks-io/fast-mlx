@@ -2087,4 +2087,127 @@ final class QualityAdmissionTests: XCTestCase {
                 + "files -- if it is missing, the discovery scan itself is broken, not proof of a clean "
                 + "codebase")
     }
+
+    // MARK: - digest-verified load (`--quality-cards-sha256`): the engine judges the exact bytes it hashed
+
+    private func writeTempManifest(_ data: Data) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-sha-\(UUID()).json")
+        try data.write(to: url)
+        return url
+    }
+
+    /// E1: a matching digest returns the same cards (ids, count, dropped count) as the plain loader.
+    func testDigestVerifiedLoadWithMatchingDigestReturnsTheSameCardsAsThePlainLoader() throws {
+        let data = Data(manifestJSON.utf8)
+        let url = try writeTempManifest(data)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let plain = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        let verified = try QualityCardStore.loadManifestDetailed(
+            contentsOf: url, expectedSHA256: sha256Hex(data))
+        XCTAssertFalse(plain.cards.isEmpty, "anti-vacuity: the fixture must carry cards")
+        XCTAssertEqual(verified.cards.count, plain.cards.count)
+        XCTAssertEqual(verified.cards.map(\.id), plain.cards.map(\.id))
+        XCTAssertEqual(verified.droppedCardCount, plain.droppedCardCount)
+    }
+
+    /// E1: a well-formed but wrong digest refuses with the typed mismatch error naming BOTH digests.
+    func testDigestVerifiedLoadWithWrongDigestThrowsMismatchNamingBothDigests() throws {
+        let data = Data(manifestJSON.utf8)
+        let url = try writeTempManifest(data)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let wrong = String(repeating: "0", count: 64)
+        XCTAssertNotEqual(wrong, sha256Hex(data))
+        XCTAssertThrowsError(
+            try QualityCardStore.loadManifestDetailed(contentsOf: url, expectedSHA256: wrong)
+        ) { error in
+            guard let mismatch = error as? QualityCardsSHA256Mismatch else {
+                return XCTFail("expected QualityCardsSHA256Mismatch, got \(error)")
+            }
+            XCTAssertEqual(mismatch.expected, wrong)
+            XCTAssertEqual(mismatch.actual, sha256Hex(data))
+            XCTAssertTrue(mismatch.description.contains(wrong))
+            XCTAssertTrue(mismatch.description.contains(sha256Hex(data)))
+        }
+    }
+
+    /// E1: uppercase hex, 63 chars, 65 chars, a non-hex character, and the empty string all refuse
+    /// as malformed -- and never as a mismatch, so the refusal names the right defect.
+    func testDigestVerifiedLoadRefusesMalformedDigestVariants() throws {
+        let data = Data(manifestJSON.utf8)
+        let url = try writeTempManifest(data)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let good = sha256Hex(data)
+        let variants: [(String, String)] = [
+            ("uppercase", good.uppercased()),
+            ("63 chars", String(good.dropLast())),
+            ("65 chars", good + "0"),
+            ("non-hex", String(good.dropLast()) + "g"),
+            ("empty", ""),
+        ]
+        for (label, value) in variants {
+            XCTAssertThrowsError(
+                try QualityCardStore.loadManifestDetailed(contentsOf: url, expectedSHA256: value),
+                label
+            ) { error in
+                XCTAssertTrue(
+                    error is QualityCardsSHA256Malformed,
+                    "\(label): expected QualityCardsSHA256Malformed, got \(error)")
+            }
+        }
+        // Control: the unmodified digest is accepted, so the refusals above are about the digest text.
+        XCTAssertNoThrow(
+            try QualityCardStore.loadManifestDetailed(contentsOf: url, expectedSHA256: good))
+    }
+
+    /// E1: one flipped byte in an otherwise valid manifest refuses under the ORIGINAL file's digest.
+    func testDigestVerifiedLoadRefusesAByteFlippedCopyUnderTheOriginalDigest() throws {
+        let original = Data(manifestJSON.utf8)
+        let originalDigest = sha256Hex(original)
+        var flipped = original
+        // Flip one byte inside a string value so the JSON stays decodable: only the digest can catch it.
+        let index = try XCTUnwrap(flipped.firstIndex(of: UInt8(ascii: "w")))
+        flipped[index] = UInt8(ascii: "x")
+        XCTAssertNotEqual(sha256Hex(flipped), originalDigest)
+        let url = try writeTempManifest(flipped)
+        defer { try? FileManager.default.removeItem(at: url) }
+        // Control: the flipped copy still decodes through the plain loader.
+        XCTAssertNoThrow(try QualityCardStore.loadManifestDetailed(contentsOf: url))
+        XCTAssertThrowsError(
+            try QualityCardStore.loadManifestDetailed(contentsOf: url, expectedSHA256: originalDigest)
+        ) { error in
+            XCTAssertTrue(error is QualityCardsSHA256Mismatch, "got \(error)")
+        }
+    }
+
+    /// A missing file and a digest-correct but undecodable payload keep the EXISTING error type.
+    func testDigestVerifiedLoadKeepsTheExistingUndecodableErrorType() throws {
+        let missing = URL(fileURLWithPath: "/nonexistent/quality-guides-\(UUID()).json")
+        XCTAssertThrowsError(
+            try QualityCardStore.loadManifestDetailed(
+                contentsOf: missing, expectedSHA256: String(repeating: "a", count: 64))
+        ) { XCTAssertTrue($0 is QualityCardsManifestUndecodable, "got \($0)") }
+
+        let garbage = Data("not json".utf8)
+        let url = try writeTempManifest(garbage)
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertThrowsError(
+            try QualityCardStore.loadManifestDetailed(
+                contentsOf: url, expectedSHA256: sha256Hex(garbage))
+        ) { XCTAssertTrue($0 is QualityCardsManifestUndecodable, "got \($0)") }
+    }
+
+    /// The real shipped manifest verifies under its own digest (the launcher's forwarded-digest shape).
+    func testDigestVerifiedLoadOfTheRealShippedManifestMatchesThePlainLoader() throws {
+        guard let url = locateSiteQualityGuidesJSON() else {
+            XCTFail("could not locate site/quality-guides.json by walking up from #filePath")
+            return
+        }
+        let digest = sha256Hex(try Data(contentsOf: url))
+        let plain = try QualityCardStore.loadManifestDetailed(contentsOf: url)
+        let verified = try QualityCardStore.loadManifestDetailed(contentsOf: url, expectedSHA256: digest)
+        XCTAssertFalse(verified.cards.isEmpty)
+        XCTAssertEqual(verified.droppedCardCount, 0)
+        XCTAssertEqual(verified.cards.map(\.id), plain.cards.map(\.id))
+    }
 }

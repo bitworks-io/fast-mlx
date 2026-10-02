@@ -1023,7 +1023,9 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             guard Self.supportedOptions.contains(argument) else {
                 throw FastMLXServeArgumentError.unknownArgument(argument)
             }
-            guard seen.insert(argument).inserted else {
+            // --accept-quality is repeatable: the launcher forwards one pair per opted-in card id and
+            // QualityOptIn.parse collects every occurrence; every other option stays single-valued.
+            guard Self.repeatableOptions.contains(argument) || seen.insert(argument).inserted else {
                 throw FastMLXServeArgumentError.duplicateOption(argument)
             }
 
@@ -1246,7 +1248,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.invalidRequestLogMode
                 }
                 requestLog = parsedRequestLog
-            case "--quality-cards", "--accept-quality", "--model-revision":
+            case "--quality-cards", "--quality-cards-sha256", "--accept-quality", "--model-revision":
                 // Quality-guidance moat admission flags, plus --model-revision (the pinned HF commit
                 // sha used for hfPin-prefix card resolution). Accepted + value-consumed here so the
                 // strict allowlist parser does not reject them; the values are read directly off
@@ -1753,6 +1755,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             requestLog: requestLog)
     }
 
+    private static let repeatableOptions: Set<String> = ["--accept-quality"]
+
     private static let supportedOptions: Set<String> = [
         "--scripted",
         "--continuous-batch-no-spec",
@@ -1799,6 +1803,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--default-sampling",
         "--request-log",
         "--quality-cards",
+        "--quality-cards-sha256",
         "--accept-quality",
         "--model-revision",
     ]

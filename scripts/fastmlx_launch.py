@@ -2615,6 +2615,10 @@ def _resolve_model_revision(args, model_path: Path) -> Optional[str]:
     return revision if isinstance(revision, str) else None
 
 
+# Flags the launcher itself forwards to the built-in engine (see _run_serve).
+BUILT_IN_FORWARDED_FLAGS = ("--quality-cards", "--quality-cards-sha256", "--accept-quality")
+
+
 def _run_serve(args, passthrough_args: list) -> int:
     model_path: Path = args.model_path
     if not model_path.is_dir():
@@ -2632,6 +2636,25 @@ def _run_serve(args, passthrough_args: list) -> int:
     # and failing on it before spending time on a fit-check subprocess
     # call keeps the refusal prompt.
     profile, is_built_in_profile = load_engine_profile(args.engine_profile)
+
+    # The built-in engine is handed the launcher's own --quality-cards,
+    # --quality-cards-sha256 and --accept-quality values (appended before the
+    # passthrough), and its parser rejects a repeated option as a duplicate --
+    # so a passthrough copy would surface as an opaque engine argument error
+    # (or, for --accept-quality, as a value the launcher never judged). Refuse
+    # it up front, before any fit check. A custom --engine-profile engine owns
+    # its own argv, so its passthrough is left alone.
+    if is_built_in_profile:
+        for passthrough in passthrough_args:
+            for flag in BUILT_IN_FORWARDED_FLAGS:
+                if passthrough == flag or passthrough.startswith(flag + "="):
+                    raise LaunchRefusal(
+                        2,
+                        f"passthrough argument {passthrough!r} is already forwarded to "
+                        "the built-in engine by the launcher's own flag; use the "
+                        "launcher's --quality-cards / --quality-cards-sha256 / "
+                        "--accept-quality instead of passing it after --",
+                    )
 
     # The --quality-cards-sha256 pin is likewise a configuration error: a
     # malformed or mismatching pin refuses (exit 3) before the fit-check
@@ -3199,6 +3222,23 @@ def _run_serve(args, passthrough_args: list) -> int:
     final_argv = [_substitute_placeholders(item, substitutions) for item in profile["argv"]]
     if residency == "expert-stream":
         final_argv += list(profile["residencyArgs"]["expert-stream"])
+    if is_built_in_profile and card_store_identity is not None:
+        # The built-in engine runs its own admission gate. Hand it the exact
+        # store the launcher admitted against -- the resolved path, the raw
+        # sha256 the launcher computed (never a re-read, never the operator's
+        # pin text) and every operator `--accept-quality`, verbatim and in
+        # order -- so it refuses unless the bytes it reads match. A custom
+        # engine profile is not passed these flags (its engine may not
+        # support them), and with no store (`card_store=none`) nothing is
+        # forwarded. The `admitted` line below is unaffected.
+        final_argv += [
+            "--quality-cards",
+            str(quality_cards_path.resolve()),
+            "--quality-cards-sha256",
+            card_store_identity["sha256"],
+        ]
+        for accepted in args.accept_quality:
+            final_argv += ["--accept-quality", accepted]
     final_argv += list(passthrough_args)
 
     plan = {

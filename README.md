@@ -230,8 +230,15 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b \
 
 A wrong digest, a malformed digest, a store that does not resolve (even the default path), or matching
 bytes that are not a quality-card manifest all refuse with exit 3. The tools never fetch anything.
-The built-in engine still runs its own admission gate against its own card store (it is not passed the
-pinned file), so pin the store the launcher reads.
+For the built-in engine the launcher forwards the store it read -- its path, its sha256 and every
+`--accept-quality` -- and the engine refuses unless the bytes it reads match that digest, so the engine
+reads the same card store bytes the launcher admitted against. That is byte identity only: the engine
+looks its card up by its own `--model` id and is not told which card the launcher chose, so it may
+resolve a different card, often none. Because the store is passed explicitly, the engine refuses a
+store containing a card it cannot decode. Passing `--quality-cards`, `--quality-cards-sha256` or
+`--accept-quality` after `--` is refused for the built-in engine (use the launcher's own flags).
+Custom `--engine-profile` engines are not forwarded these flags, and with no card store
+(`card_store=none`) nothing is forwarded.
 
 One pack can carry several cards -- the same pack measured on different hardware. A NO_GO card
 always takes precedence over admitting ones. Among the rest, `serve` picks the card measured on this

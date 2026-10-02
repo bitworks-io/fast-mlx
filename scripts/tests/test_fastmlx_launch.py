@@ -432,6 +432,11 @@ class FastmlxLaunchTestCase(unittest.TestCase):
                 "9001",
                 "--context",
                 "2048",
+                # The built-in engine is forwarded the store the launcher read.
+                "--quality-cards",
+                str(self.manifest_path.resolve()),
+                "--quality-cards-sha256",
+                hashlib.sha256(self.manifest_path.read_bytes()).hexdigest(),
             ],
         )
 
@@ -1379,6 +1384,11 @@ class FastmlxLaunchTestCase(unittest.TestCase):
                 "9000",
                 "--context",
                 "1234",
+                # The built-in engine is forwarded the store the launcher read.
+                "--quality-cards",
+                str(self.manifest_path.resolve()),
+                "--quality-cards-sha256",
+                hashlib.sha256(self.manifest_path.read_bytes()).hexdigest(),
             ],
         )
 
@@ -6854,6 +6864,385 @@ sys.exit(2)
                 self.assertEqual(code, 2, stderr)
                 self.assertIn("fit check refused", stderr)
                 self.assertTrue(marker.exists(), "the fit check never ran")
+
+
+# ---------------------------------------------------------------------
+# The launcher forwards the card store it admitted against to the built-in
+# engine: `--quality-cards <abs path> --quality-cards-sha256 <the raw sha256
+# it computed>` plus every `--accept-quality`, so the engine judges the same
+# bytes. Predeclaration rows E4-E6:
+# docs/task-inbox/2026-10-02-PREDECLARATION-engine-admits-against-the-launchers-pinned-card-store.md
+# ---------------------------------------------------------------------
+class EngineReceivesLaunchersCardStoreTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_bytes = json.dumps(fixture_manifest()).encode("utf-8")
+        self.manifest_path.write_bytes(self.manifest_bytes)
+        self.digest = hashlib.sha256(self.manifest_bytes).hexdigest()
+
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+        self.fake_repo_root = self.root / "repo"
+        (self.fake_repo_root / "site").mkdir(parents=True)
+
+    def base_args(self, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--model-repo": PASS_REPO,
+            "--context": "2048",
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_launch(self, argv: list):
+        """In-process ``main`` with ``os.execv`` recording its argv instead
+        of exec'ing: returns ``(exit_code, stdout, stderr, execed_argv)``."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        execed = []
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(
+                FASTMLX_LAUNCH.os, "execv", lambda path, args: execed.append(list(args))
+            ):
+                with patch.object(FASTMLX_LAUNCH, "REPO_ROOT", self.fake_repo_root):
+                    with self.assertRaises(SystemExit) as ctx:
+                        FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue(), execed
+
+    @staticmethod
+    def lines_starting(stderr: str, prefix: str) -> list:
+        return [line for line in stderr.splitlines() if line.startswith(prefix)]
+
+    @staticmethod
+    def flag_values(argv: list, flag: str) -> list:
+        return [argv[i + 1] for i, token in enumerate(argv[:-1]) if token == flag]
+
+    def card_store_sha256(self, stderr: str) -> str:
+        (line,) = self.lines_starting(stderr, "fastmlx_launch=card_store")
+        (field,) = [f for f in line.split() if f.startswith("sha256=")]
+        return field[len("sha256="):]
+
+    def write_store(self, path: Path, cards: list, generated_at: str) -> str:
+        manifest = fixture_manifest()
+        manifest["generatedAt"] = generated_at
+        manifest["cards"] = cards
+        raw = json.dumps(manifest).encode("utf-8")
+        path.write_bytes(raw)
+        return hashlib.sha256(raw).hexdigest()
+
+    @staticmethod
+    def pack_card(card_id: str, verdict: str) -> dict:
+        passing = verdict != "NO_GO"
+        return {
+            "id": card_id,
+            "model": {"repo": PASS_REPO, "hfPin": "cafebabe"},
+            "verdict": verdict,
+            "admission": {"default": passing, "optIn": True, "reason": "fixture"},
+            "legible": {"tier": "Reference", "headline": "fixture headline"},
+        }
+
+    # --- E4: default store and explicit store --------------------------
+    def test_explicit_store_is_forwarded_with_the_cardstore_lines_digest(self):
+        code, _, stderr, execed = self.run_launch(self.base_args())
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        resolved = str(self.manifest_path.resolve())
+        self.assertEqual(self.flag_values(argv, "--quality-cards"), [resolved])
+        self.assertTrue(os.path.isabs(resolved))
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [self.digest])
+        self.assertEqual(self.card_store_sha256(stderr), self.digest)
+        # Forwarded flags come after the built-in profile's own argv.
+        self.assertEqual(
+            argv[-4:], ["--quality-cards", resolved, "--quality-cards-sha256", self.digest]
+        )
+
+    def test_default_store_is_forwarded_as_an_absolute_path_with_the_cardstore_lines_digest(self):
+        default_store = self.fake_repo_root / "site" / "quality-guides.json"
+        default_store.write_bytes(self.manifest_bytes)
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--quality-cards": None})
+        )
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        (path_value,) = self.flag_values(argv, "--quality-cards")
+        self.assertTrue(os.path.isabs(path_value), path_value)
+        self.assertEqual(path_value, str(default_store.resolve()))
+        (digest_value,) = self.flag_values(argv, "--quality-cards-sha256")
+        self.assertEqual(digest_value, self.card_store_sha256(stderr))
+        self.assertEqual(digest_value, self.digest)
+
+    def test_dry_run_plan_argv_carries_the_forwarded_flags(self):
+        code, stdout, stderr, execed = self.run_launch(self.base_args() + ["--dry-run"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(execed, [])
+        plan = json.loads(stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            plan["argv"][-4:],
+            [
+                "--quality-cards",
+                str(self.manifest_path.resolve()),
+                "--quality-cards-sha256",
+                self.digest,
+            ],
+        )
+
+    def test_forwarded_digest_is_the_launchers_digest_not_the_pin_text(self):
+        # An uppercase pin matches case-insensitively; the engine is handed
+        # the launcher's own lowercase digest, never the operator's text.
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--quality-cards-sha256": self.digest.upper()})
+        )
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [self.digest])
+
+    # --- E5: two-store regression --------------------------------------
+    def test_pinned_newer_store_admits_and_the_engine_is_told_the_newer_store(self):
+        bundled = self.fake_repo_root / "site" / "quality-guides.json"
+        self.write_store(
+            bundled, [self.pack_card("pack-old@test", "NO_GO")], "2026-01-01T00:00:00Z"
+        )
+        newer = self.root / "newer-quality-guides.json"
+        newer_digest = self.write_store(
+            newer, [self.pack_card("pack-new@test", "PASS")], "2026-06-01T00:00:00Z"
+        )
+
+        # Control: the bundled (default) store alone refuses this pack.
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--quality-cards": None})
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertEqual(execed, [])
+
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(
+                **{"--quality-cards": newer, "--quality-cards-sha256": newer_digest}
+            )
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(self.lines_starting(stderr, "fastmlx_launch=admitted")), 1, stderr)
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards"), [str(newer.resolve())])
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [newer_digest])
+        self.assertNotIn(str(bundled.resolve()), argv)
+        self.assertNotIn(str(bundled), argv)
+        self.assertEqual(self.card_store_sha256(stderr), newer_digest)
+
+    def test_accept_quality_values_are_forwarded_verbatim_and_in_order(self):
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--model-repo": NO_GO_REPO})
+            + ["--accept-quality", "zeta-second-alphabetically", "--accept-quality", NO_GO_CARD_ID]
+        )
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        self.assertEqual(
+            self.flag_values(argv, "--accept-quality"),
+            ["zeta-second-alphabetically", NO_GO_CARD_ID],
+        )
+        # Order inside argv: store pair, then accepts.
+        resolved = str(self.manifest_path.resolve())
+        self.assertEqual(
+            argv[-8:],
+            [
+                "--quality-cards",
+                resolved,
+                "--quality-cards-sha256",
+                self.digest,
+                "--accept-quality",
+                "zeta-second-alphabetically",
+                "--accept-quality",
+                NO_GO_CARD_ID,
+            ],
+        )
+
+    def test_two_accept_quality_values_a_and_b_keep_their_order(self):
+        code, _, stderr, execed = self.run_launch(
+            self.base_args() + ["--accept-quality", "b", "--accept-quality", "a"]
+        )
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--accept-quality"), ["b", "a"])
+
+    def test_no_accept_quality_forwards_no_accept_flag(self):
+        _, _, _, execed = self.run_launch(self.base_args())
+        self.assertNotIn("--accept-quality", execed[0])
+
+    # --- E6: custom profile, no store, admitted line --------------------
+    def write_custom_profile(self) -> Path:
+        profile_path = self.root / "custom-profile.json"
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": "custom-engine",
+                    "argv": ["{engine_bin}", "--model", "{model_id}", "--port", "{port}"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return profile_path
+
+    def test_custom_engine_profile_argv_is_unchanged(self):
+        profile_path = self.write_custom_profile()
+        code, stdout, stderr, _ = self.run_launch(
+            self.base_args(**{"--engine-profile": profile_path, "--port": "9123"})
+            + ["--accept-quality", NO_GO_CARD_ID, "--dry-run", "--", "--extra", "x"]
+        )
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            plan["argv"],
+            [
+                str(self.fake_engine_bin.resolve()),
+                "--model",
+                self.model_dir.name,
+                "--port",
+                "9123",
+                "--extra",
+                "x",
+            ],
+        )
+        # The launcher still read its own store (control: the store exists).
+        self.assertEqual(plan["cardStore"]["sha256"], self.digest)
+
+    def test_custom_engine_profile_real_launch_forwards_none_of_the_flags(self):
+        profile_path = self.write_custom_profile()
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--engine-profile": profile_path})
+            + ["--accept-quality", NO_GO_CARD_ID]
+        )
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        for flag in ("--quality-cards", "--quality-cards-sha256", "--accept-quality"):
+            self.assertNotIn(flag, argv)
+
+    def test_no_store_forwards_nothing(self):
+        # The default store is absent: card_store=none.
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--quality-cards": None}) + ["--accept-quality", "a"]
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            self.lines_starting(stderr, "fastmlx_launch=card_store"),
+            ["fastmlx_launch=card_store source=default card_store=none"],
+        )
+        (argv,) = execed
+        for flag in ("--quality-cards", "--quality-cards-sha256", "--accept-quality"):
+            self.assertNotIn(flag, argv)
+
+    # --- passthrough of the forwarded flags is refused (built-in only) ---
+    def test_built_in_engine_refuses_each_forwarded_flag_as_passthrough(self):
+        for flag in ("--quality-cards", "--quality-cards-sha256", "--accept-quality"):
+            with self.subTest(flag=flag):
+                code, _, stderr, execed = self.run_launch(
+                    self.base_args() + ["--", flag, "x"]
+                )
+                self.assertEqual(code, 2, stderr)
+                self.assertEqual(execed, [])
+                self.assertIn(repr(flag), stderr)
+                self.assertIn("--quality-cards-sha256", stderr)
+                self.assertIn("--accept-quality", stderr)
+
+    def test_built_in_engine_refuses_the_equals_form_of_a_forwarded_flag(self):
+        for passthrough in (
+            "--accept-quality=x",
+            "--quality-cards=/tmp/other.json",
+            "--quality-cards-sha256=abc",
+        ):
+            with self.subTest(passthrough=passthrough):
+                code, _, stderr, execed = self.run_launch(
+                    self.base_args() + ["--", passthrough]
+                )
+                self.assertEqual(code, 2, stderr)
+                self.assertEqual(execed, [])
+                self.assertIn(repr(passthrough), stderr)
+
+    def test_built_in_engine_refuses_forwarded_flag_passthrough_without_a_store(self):
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--quality-cards": None}) + ["--", "--accept-quality", "x"]
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertEqual(execed, [])
+        self.assertIn("'--accept-quality'", stderr)
+
+    def test_forwarded_flag_passthrough_refuses_before_the_fit_check_runs(self):
+        marker = self.root / "fit-ran"
+        fit_bin = write_script(
+            self.root / "fit-marker.py",
+            f"#!{sys.executable}\nopen({str(marker)!r}, 'w').close()\n",
+        )
+        code, _, stderr, execed = self.run_launch(
+            self.base_args(**{"--fit-check-bin": fit_bin}) + ["--", "--quality-cards", "x"]
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertEqual(execed, [])
+        self.assertFalse(marker.exists(), "the fit check ran before the refusal")
+
+    def test_custom_engine_profile_does_not_refuse_forwarded_flag_passthrough(self):
+        profile_path = self.write_custom_profile()
+        code, stdout, stderr, _ = self.run_launch(
+            self.base_args(**{"--engine-profile": profile_path})
+            + ["--dry-run", "--", "--accept-quality", "x", "--quality-cards=y"]
+        )
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.strip().splitlines()[-1])
+        self.assertEqual(plan["argv"][-3:], ["--accept-quality", "x", "--quality-cards=y"])
+
+    def test_unrelated_passthrough_still_reaches_the_built_in_engine(self):
+        code, _, stderr, execed = self.run_launch(
+            self.base_args() + ["--", "--max-completion-tokens", "64"]
+        )
+        self.assertEqual(code, 0, stderr)
+        (argv,) = execed
+        self.assertEqual(argv[-2:], ["--max-completion-tokens", "64"])
+
+    def test_admitted_line_is_byte_identical_with_and_without_forwarding(self):
+        carded = (
+            "fastmlx_launch=admitted engine=fastmlx-serve "
+            "card=fixture-pass@test verdict=PASS fit=GREEN context=2048 "
+            "residency=resident engine_build=unrecorded mtp=off"
+        )
+        uncarded = (
+            "fastmlx_launch=admitted engine=fastmlx-serve "
+            "card=none verdict=none fit=GREEN context=2048 "
+            "residency=resident engine_build=unrecorded mtp=off"
+        )
+        cases = {
+            "forwarded": (self.base_args(), carded, True),
+            "forwarded-with-accept": (
+                self.base_args() + ["--accept-quality", "x"],
+                carded,
+                True,
+            ),
+            "not-forwarded-no-store": (
+                self.base_args(**{"--quality-cards": None}),
+                uncarded,
+                False,
+            ),
+        }
+        for name, (argv, expected, forwards) in cases.items():
+            with self.subTest(case=name):
+                code, _, stderr, execed = self.run_launch(argv)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(self.lines_starting(stderr, "fastmlx_launch=admitted"), [expected])
+                self.assertEqual("--quality-cards-sha256" in execed[0], forwards)
+                self.assertEqual(len(expected.split()), 9)
 
 
 if __name__ == "__main__":
