@@ -26,8 +26,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import shutil
 import statistics
+import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -441,6 +444,29 @@ def _write_json_file(directory, name: str, obj) -> str:
     path = Path(directory) / name
     path.write_text(json.dumps(obj))
     return str(path)
+
+
+def _procargs2_buffer(
+    argv,
+    env,
+    *,
+    exec_path=b"/opt/engine/bin/engine",
+    argc=None,
+    padding=3,
+    trailing_nuls=4,
+):
+    """A synthetic ``sysctl KERN_PROCARGS2`` buffer: int32 argc, the exec
+    path + NUL, NUL padding, ``argc`` NUL-terminated argv strings, then
+    NUL-terminated ``KEY=VALUE`` environment strings, then trailing NULs.
+    """
+    argv_bytes = [a.encode() if isinstance(a, str) else a for a in argv]
+    env_bytes = [e.encode() if isinstance(e, str) else e for e in env]
+    count = len(argv_bytes) if argc is None else argc
+    buf = struct.pack("=i", count) + exec_path + b"\0" + (b"\0" * padding)
+    buf += b"".join(a + b"\0" for a in argv_bytes)
+    buf += b"".join(e + b"\0" for e in env_bytes)
+    buf += b"\0" * trailing_nuls
+    return buf
 
 
 class FastmlxBenchTestCase(unittest.TestCase):
@@ -2617,6 +2643,429 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("--public-view cannot be combined with", stderr)
         self.assertIn("--combine", stderr)
+
+
+    # ------------------------------------------------------------------
+    # C-env (R3): the listener's environment, exactly, for ONLY the
+    # operator-named variables, recorded under operator-chosen public keys.
+    # ------------------------------------------------------------------
+    # -- _parse_procargs2: pure parser over a synthetic KERN_PROCARGS2 buffer.
+    def test_parse_procargs2_normal_buffer_returns_the_environment(self):
+        buf = _procargs2_buffer(
+            ["engine", "--model", "/m"], ["ALPHA=1", "BETA=two", "EMPTY="]
+        )
+        self.assertEqual(
+            FASTMLX_BENCH._parse_procargs2(buf),
+            {"ALPHA": "1", "BETA": "two", "EMPTY": ""},
+        )
+
+    def test_parse_procargs2_value_with_spaces_and_equals_is_exact(self):
+        buf = _procargs2_buffer(["engine"], ["SPACEY=a b  c=d", "NEXT=z"])
+        env = FASTMLX_BENCH._parse_procargs2(buf)
+        self.assertEqual(env["SPACEY"], "a b  c=d")
+        self.assertEqual(env["NEXT"], "z")
+
+    def test_parse_procargs2_does_not_read_argv_strings_as_environment(self):
+        # Anti-vacuity: an argv entry shaped like KEY=VALUE must never land
+        # in the environment -- the parser has to skip exactly argc strings.
+        buf = _procargs2_buffer(
+            ["engine", "ARGVLOOKS=likeenv", "--flag"], ["REALENV=yes"]
+        )
+        env = FASTMLX_BENCH._parse_procargs2(buf)
+        self.assertEqual(env, {"REALENV": "yes"})
+        self.assertNotIn("ARGVLOOKS", env)
+
+    def test_parse_procargs2_missing_env_section_is_an_empty_environment(self):
+        buf = _procargs2_buffer(["engine", "--model", "/m"], [])
+        self.assertEqual(FASTMLX_BENCH._parse_procargs2(buf), {})
+
+    def test_parse_procargs2_first_duplicate_wins_like_getenv(self):
+        buf = _procargs2_buffer(["engine"], ["DUP=first", "DUP=second"])
+        self.assertEqual(FASTMLX_BENCH._parse_procargs2(buf), {"DUP": "first"})
+
+    def test_parse_procargs2_malformed_buffers_return_none(self):
+        good = _procargs2_buffer(["engine", "--model", "/m"], ["ALPHA=1", "BETA=2"])
+        self.assertIsNotNone(FASTMLX_BENCH._parse_procargs2(good))
+        malformed = {
+            "empty": b"",
+            "short header": b"\x01\x00",
+            "negative argc": _procargs2_buffer(["engine"], ["A=1"], argc=-1),
+            "argc beyond present argv": _procargs2_buffer(
+                ["engine"], [], argc=3, trailing_nuls=0
+            ),
+            "unterminated exec path": struct.pack("=i", 1) + b"/opt/engine",
+            "truncated mid-argv": good[: len(b"....") + 30],
+            # the final environment string loses its NUL terminator
+            "truncated mid-env value": _procargs2_buffer(
+                ["engine"], ["ALPHA=1"], trailing_nuls=0
+            )[:-1],
+            "not bytes": None,
+        }
+        for label, buf in malformed.items():
+            with self.subTest(label):
+                self.assertIsNone(FASTMLX_BENCH._parse_procargs2(buf))
+
+    # -- environment_control: the five states.
+    _ENV_PID = 4242
+
+    def test_environment_control_not_requested_when_no_listener_env_given(self):
+        control = FASTMLX_BENCH.environment_control(self._ENV_PID, {})
+        self.assertEqual(
+            control,
+            {
+                "status": "not_requested",
+                "variables": {},
+                "reason": "--listener-env not given",
+            },
+        )
+
+    def test_environment_control_captured_records_only_requested_names_by_public_key(self):
+        captured_env = {
+            "FASTMLX_TEST_SWITCH": "off",
+            "FASTMLX_TEST_OTHER_SECRET": "hunter2-not-requested",
+        }
+        with mock.patch.object(
+            FASTMLX_BENCH, "_environ_for_pid", return_value=captured_env
+        ) as environ:
+            control = FASTMLX_BENCH.environment_control(
+                self._ENV_PID,
+                {"FASTMLX_TEST_SWITCH": "switchA", "FASTMLX_TEST_UNSET": "unsetB"},
+            )
+        environ.assert_called_once_with(self._ENV_PID)
+        self.assertEqual(
+            control,
+            {
+                "status": "captured",
+                "variables": {"switchA": "off", "unsetB": None},
+                "reason": None,
+            },
+        )
+        serialized = json.dumps(control)
+        # The env NAME itself is never written -- only its public key -- and
+        # no other variable (name or value) is ever recorded.
+        for forbidden in (
+            "FASTMLX_TEST_SWITCH", "FASTMLX_TEST_UNSET",
+            "FASTMLX_TEST_OTHER_SECRET", "hunter2-not-requested",
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_environment_control_capture_failed_is_a_status_not_an_exception(self):
+        with mock.patch.object(FASTMLX_BENCH, "_environ_for_pid", return_value=None):
+            control = FASTMLX_BENCH.environment_control(
+                self._ENV_PID, {"FASTMLX_TEST_SWITCH": "switchA"}
+            )
+        self.assertEqual(control["status"], "capture_failed")
+        self.assertEqual(control["variables"], {})
+        self.assertTrue(control["reason"])
+        self.assertNotIn("FASTMLX_TEST_SWITCH", json.dumps(control))
+
+    def test_environment_control_unsafe_value_refuses_the_whole_control_without_quoting_it(self):
+        unsafe_values = ["a b", "with/slash", "semi;colon", "x" * 65, "ünï", "line\nbreak"]
+        for value in unsafe_values:
+            with self.subTest(value=value):
+                env = {"FASTMLX_TEST_SAFE": "ok", "FASTMLX_TEST_SWITCH": value}
+                with mock.patch.object(FASTMLX_BENCH, "_environ_for_pid", return_value=env):
+                    control = FASTMLX_BENCH.environment_control(
+                        self._ENV_PID,
+                        {"FASTMLX_TEST_SAFE": "safeA", "FASTMLX_TEST_SWITCH": "switchB"},
+                    )
+                self.assertEqual(control["status"], "refused_unsafe_value")
+                self.assertEqual(control["variables"], {})
+                self.assertEqual(
+                    control["reason"],
+                    "switchB has a value outside the safe character set",
+                )
+                serialized = json.dumps(control)
+                self.assertNotIn(value, serialized)
+                self.assertNotIn("FASTMLX_TEST_SWITCH", serialized)
+
+    def test_environment_control_safe_value_boundaries(self):
+        for value in ("", "0", "off", "a.b_c:d-e", "x" * 64, "10.0.0.1"):
+            with self.subTest(value=value):
+                with mock.patch.object(
+                    FASTMLX_BENCH, "_environ_for_pid", return_value={"FASTMLX_TEST_V": value}
+                ):
+                    control = FASTMLX_BENCH.environment_control(
+                        self._ENV_PID, {"FASTMLX_TEST_V": "valueA"}
+                    )
+                self.assertEqual(control["status"], "captured")
+                self.assertEqual(control["variables"], {"valueA": value})
+
+    # -- run_bench integration (listener PID/argv/env mocked: the fake
+    # server lives in THIS process, so no lsof/ps dependence).
+    def _run_main_with_listener_env(self, extra_args, environ):
+        base_url = self.start(make_simple_stream(2, completion_tokens=2, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10",
+            "--expect-listener-pid", "4242", "--json", *extra_args,
+        ]
+        with mock.patch.object(FASTMLX_BENCH, "_listening_pid", return_value=4242), \
+                mock.patch.object(FASTMLX_BENCH, "_cmdline_for_pid", return_value="engine --model m"), \
+                mock.patch.object(FASTMLX_BENCH, "_environ_for_pid", return_value=environ):
+            return self._run_main(argv)
+
+    def test_bench_row_without_listener_env_carries_a_not_requested_environment_control(self):
+        code, stdout, stderr = self._run_main_with_listener_env([], {"FASTMLX_TEST_SWITCH": "off"})
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(
+            doc["controls"]["environment"],
+            {"status": "not_requested", "variables": {}, "reason": "--listener-env not given"},
+        )
+        self.assertNotIn("FASTMLX_TEST_SWITCH", stdout)
+
+    def test_bench_row_with_listener_env_records_public_key_only(self):
+        code, stdout, stderr = self._run_main_with_listener_env(
+            ["--listener-env", "FASTMLX_TEST_SWITCH=switchA",
+             "--listener-env", "FASTMLX_TEST_UNSET=unsetB"],
+            {"FASTMLX_TEST_SWITCH": "off", "FASTMLX_TEST_ELSE": "zzz"},
+        )
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(
+            doc["controls"]["environment"],
+            {
+                "status": "captured",
+                "variables": {"switchA": "off", "unsetB": None},
+                "reason": None,
+            },
+        )
+        for forbidden in ("FASTMLX_TEST_SWITCH", "FASTMLX_TEST_UNSET", "FASTMLX_TEST_ELSE", "zzz"):
+            self.assertNotIn(forbidden, stdout)
+        self.assertIn("publishable", doc)
+
+    def test_bench_text_mode_names_the_environment_control(self):
+        base_url = self.start(make_simple_stream(2, completion_tokens=2, inter_chunk_sleep=0.0))
+        argv = [
+            "--base-url", base_url, "--model", "candidate", "--runs", "1",
+            "--warmup", "0", "--timeout", "10", "--expect-listener-pid", "4242",
+            "--listener-env", "FASTMLX_TEST_SWITCH=switchA",
+        ]
+        with mock.patch.object(FASTMLX_BENCH, "_listening_pid", return_value=4242), \
+                mock.patch.object(FASTMLX_BENCH, "_cmdline_for_pid", return_value="engine"), \
+                mock.patch.object(
+                    FASTMLX_BENCH, "_environ_for_pid", return_value={"FASTMLX_TEST_SWITCH": "off"}
+                ):
+            code, stdout, stderr = self._run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("environment: captured", stdout)
+
+    # -- CLI usage errors: exit 64, never argparse's 2.
+    def test_listener_env_usage_errors_exit_64(self):
+        base = ["--base-url", "http://127.0.0.1:9", "--model", "x"]
+        cases = {
+            "no equals": [*base, "--expect-listener-pid", "1", "--listener-env", "NOEQUALS"],
+            "empty name": [*base, "--expect-listener-pid", "1", "--listener-env", "=key"],
+            "name starts with digit": [*base, "--expect-listener-pid", "1", "--listener-env", "1X=key"],
+            "name has dash": [*base, "--expect-listener-pid", "1", "--listener-env", "A-B=key"],
+            "name too long": [*base, "--expect-listener-pid", "1", "--listener-env", "A" * 129 + "=key"],
+            "key starts uppercase": [*base, "--expect-listener-pid", "1", "--listener-env", "A=Key"],
+            "key starts with digit": [*base, "--expect-listener-pid", "1", "--listener-env", "A=1key"],
+            "key has underscore": [*base, "--expect-listener-pid", "1", "--listener-env", "A=my_key"],
+            "key too long": [*base, "--expect-listener-pid", "1", "--listener-env", "A=k" + "a" * 40],
+            "empty key": [*base, "--expect-listener-pid", "1", "--listener-env", "A="],
+            "duplicate name": [
+                *base, "--expect-listener-pid", "1",
+                "--listener-env", "A=keyOne", "--listener-env", "A=keyTwo",
+            ],
+            "duplicate key": [
+                *base, "--expect-listener-pid", "1",
+                "--listener-env", "A=keyOne", "--listener-env", "B=keyOne",
+            ],
+            "without expect-listener-pid": [*base, "--listener-env", "A=keyOne"],
+            "with combine": [
+                "--combine", "a.json", "b.json", "c.json", "--listener-env", "A=keyOne",
+            ],
+            "with public-view": [
+                "--public-view", "row.json", "--listener-env", "A=keyOne",
+            ],
+        }
+        for label, argv in cases.items():
+            with self.subTest(label):
+                code, stdout, stderr = self._run_main(argv)
+                self.assertEqual(code, 64, stderr)
+                self.assertEqual(stdout, "")
+                self.assertIn("--listener-env", stderr)
+
+    def test_listener_env_boundary_specs_are_accepted(self):
+        # 128-char NAME and 40-char key sit exactly on the allowed edge.
+        name = "A" + "b" * 127
+        key = "k" + "a" * 39
+        parsed = FASTMLX_BENCH._parse_listener_env_specs([f"{name}={key}", "_X1=a"])
+        self.assertEqual(parsed, {name: key, "_X1": "a"})
+
+    # -- --combine.
+    def _combine_env_trio(self, envs):
+        trio = self._combine_baseline()
+        for role, env in zip(("ref_first", "candidate", "ref_last"), envs):
+            if env is not None:
+                trio[role]["controls"]["environment"] = env
+        return trio
+
+    @staticmethod
+    def _captured_env(**variables):
+        return {"status": "captured", "variables": dict(variables), "reason": None}
+
+    def test_combine_of_rows_with_no_environment_control_is_not_requested(self):
+        trio = self._combine_baseline()
+        for role in ("ref_first", "candidate", "ref_last"):
+            self.assertNotIn("environment", trio[role]["controls"])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            json.loads(stdout)["controls"]["environment"],
+            {"status": "not_requested", "variables": {}, "reason": "--listener-env not given"},
+        )
+
+    def test_combine_of_explicit_not_requested_rows_is_not_requested(self):
+        not_requested = {"status": "not_requested", "variables": {}, "reason": "x"}
+        trio = self._combine_env_trio([not_requested, None, dict(not_requested)])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["controls"]["environment"]["status"], "not_requested")
+
+    def test_combine_of_equal_captured_environments_carries_them(self):
+        trio = self._combine_env_trio(
+            [self._captured_env(switchA="off", unsetB=None) for _ in range(3)]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(
+            doc["controls"]["environment"],
+            {"status": "captured", "variables": {"switchA": "off", "unsetB": None}, "reason": None},
+        )
+        self.assertEqual(doc["publishable"]["status"], "publishable")
+
+    def test_combine_refuses_differing_environment_variables_naming_keys_only(self):
+        trio = self._combine_env_trio(
+            [
+                self._captured_env(switchA="off", otherB="1"),
+                self._captured_env(switchA="on-secretvalue", otherB="1"),
+                self._captured_env(switchA="off", otherB="1"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        doc = json.loads(stdout)
+        self.assertIsNone(doc["ratio"])
+        self.assertIn("switchA", stderr)
+        self.assertNotIn("otherB", stderr)
+        self.assertNotIn("on-secretvalue", stderr)
+        self.assertNotEqual(doc["controls"]["environment"]["status"], "captured")
+        self.assertNotIn("on-secretvalue", json.dumps(doc["controls"]["environment"]))
+
+    def test_combine_refuses_a_key_present_in_only_some_environments(self):
+        trio = self._combine_env_trio(
+            [
+                self._captured_env(switchA="off"),
+                self._captured_env(switchA="off", extraB="1"),
+                self._captured_env(switchA="off"),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("extraB", stderr)
+
+    def test_combine_refuses_a_mix_of_captured_and_missing_environment(self):
+        trio = self._combine_env_trio([self._captured_env(switchA="off"), None, None])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIsNone(json.loads(stdout)["ratio"])
+        self.assertIn("environment", stderr)
+
+    def test_combine_refuses_capture_failed_and_refused_environment_statuses(self):
+        for bad_status in ("capture_failed", "refused_unsafe_value"):
+            with self.subTest(bad_status):
+                bad = {"status": bad_status, "variables": {}, "reason": "x"}
+                trio = self._combine_env_trio(
+                    [self._captured_env(switchA="off"), bad, self._captured_env(switchA="off")]
+                )
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    paths = self._write_combine_trio(tmp_dir, trio)
+                    code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+                self.assertEqual(code, 1)
+                self.assertIsNone(json.loads(stdout)["ratio"])
+                self.assertIn(bad_status, stderr)
+
+    def test_combine_refuses_when_every_row_failed_to_capture(self):
+        bad = {"status": "capture_failed", "variables": {}, "reason": "x"}
+        trio = self._combine_env_trio([dict(bad), dict(bad), dict(bad)])
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            code, stdout, stderr = self._run_main(["--combine", *paths, "--json"])
+        self.assertEqual(code, 1)
+        self.assertIsNone(json.loads(stdout)["ratio"])
+
+    # -- --public-view: the environment control passes through unchanged.
+    def _public_view_row_with_environment(self, environment):
+        cmdline = "fastmlx-serve --model /models/candidate --ctx-size 4096"
+        row = _combine_fixture_row("candidate", [100.0], listener_cmdline=cmdline)
+        row["controls"]["environment"] = environment
+        return row
+
+    def test_public_view_passes_a_safe_captured_environment_through_unchanged(self):
+        environment = self._captured_env(switchA="off", unsetB=None)
+        row = self._public_view_row_with_environment(copy.deepcopy(environment))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["controls"]["environment"], environment)
+        self.assertEqual(doc["publishable"]["status"], "publishable")
+
+    def test_public_view_withholds_an_environment_value_that_is_an_ipv4_literal(self):
+        # 10.0.0.1 satisfies the safe-character regex, so only the existing
+        # host-address sweep stands between it and publication.
+        row = self._public_view_row_with_environment(self._captured_env(switchA="10.0.0.1"))
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = _write_json_file(tmp_dir, "row.json", row)
+            code, stdout, stderr = self._run_main(["--public-view", path])
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("host-address", stderr)
+        self.assertNotIn("10.0.0.1", stderr)
+
+    # -- Live smoke (macOS only): the real KERN_PROCARGS2 syscall.
+    @unittest.skipUnless(sys.platform == "darwin", "KERN_PROCARGS2 is macOS-only")
+    def test_environ_for_pid_reads_a_real_child_environment_exactly(self):
+        child_env = dict(os.environ)
+        child_env["FASTMLX_BENCH_TEST_ENV"] = "a b"
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            env=child_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            environ = None
+            for _ in range(50):
+                environ = FASTMLX_BENCH._environ_for_pid(child.pid)
+                if environ is not None and "FASTMLX_BENCH_TEST_ENV" in environ:
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(environ)
+            self.assertEqual(environ.get("FASTMLX_BENCH_TEST_ENV"), "a b")
+        finally:
+            child.kill()
+            child.wait()
+
+    def test_environ_for_pid_of_a_nonexistent_pid_is_none(self):
+        self.assertIsNone(FASTMLX_BENCH._environ_for_pid(2**30))
 
     # ------------------------------------------------------------------
     def _run_main(self, argv: list):

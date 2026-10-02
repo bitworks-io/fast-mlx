@@ -140,6 +140,31 @@ command can pass for free):
   C-flags     -- with --expect-listener-pid, that PID's own argv (via
                  ``ps``) is captured so a row cannot claim a configuration
                  it did not run.
+  C-env       -- with --listener-env NAME=publicKey (repeatable, requires
+                 --expect-listener-pid), that PID's own environment is read
+                 EXACTLY (macOS ``sysctl KERN_PROCARGS2`` via ``ctypes``,
+                 never parsed out of ``ps -E`` text, whose values may hold
+                 spaces) and ONLY the named variables are recorded, under
+                 their public key (never the variable's NAME; no other
+                 variable's name or value is ever recorded), so a row
+                 cannot claim a configuration an environment switch
+                 changed. ``controls.environment`` is ``not_requested``
+                 (no --listener-env), ``captured`` (``variables`` maps each
+                 publicKey to its value, ``null`` when unset),
+                 ``capture_failed``, or ``refused_unsafe_value`` (a value
+                 outside ``[A-Za-z0-9._:-]{0,64}`` voids the whole control
+                 and is never quoted). NAME matches
+                 ``[A-Za-z_][A-Za-z0-9_]{0,127}``, publicKey
+                 ``[a-z][A-Za-z0-9]{0,39}``; a duplicate NAME or publicKey,
+                 a malformed spec, --listener-env without
+                 --expect-listener-pid, or --listener-env together with
+                 --combine/--public-view is a usage error (exit 64).
+                 --combine carries the control forward only when every
+                 input row is ``not_requested`` (or predates the control)
+                 or every input is ``captured`` with equal ``variables``;
+                 any other mix REFUSES, naming the differing publicKeys
+                 only. --public-view passes it through unchanged (the
+                 publishability sweep still covers it).
 
 Usage errors (bad/missing flags) exit 64 (EX_USAGE), never argparse's
 default of 2 -- this project reserves other exit codes for measurement
@@ -868,6 +893,87 @@ def _cmdline_for_pid(pid: int) -> Optional[str]:
     return text or None
 
 
+# KERN_PROCARGS2 sysctl MIB: {CTL_KERN, KERN_PROCARGS2, pid} (macOS
+# <sys/sysctl.h>).
+_CTL_KERN = 1
+_KERN_PROCARGS2 = 49
+
+
+def _parse_procargs2(buf: bytes) -> Optional[dict]:
+    """Parses one ``sysctl KERN_PROCARGS2`` buffer into ``{NAME: value}``,
+    or ``None`` on ANY malformation (never a partial dict, never an
+    exception). Layout: a native int32 ``argc``, the exec path and its
+    NUL, NUL padding, ``argc`` NUL-terminated argv strings, then
+    NUL-terminated ``KEY=VALUE`` environment strings up to an empty string
+    or the end of the buffer. A buffer with no environment section is a
+    valid, empty environment; a string cut off before its NUL (a truncated
+    buffer) is a malformation, so a half-read value is never reported. An
+    environment string with no ``=`` cannot match any requested NAME and
+    is skipped; for a duplicated NAME the first wins (as ``getenv`` does).
+    """
+    if not isinstance(buf, (bytes, bytearray)) or len(buf) < 4:
+        return None
+    buf = bytes(buf)
+    argc = int.from_bytes(buf[:4], sys.byteorder, signed=True)
+    if argc < 0:
+        return None
+    pos = buf.find(b"\0", 4)
+    if pos < 0:
+        return None  # unterminated exec path
+    pos += 1
+    while pos < len(buf) and buf[pos] == 0:
+        pos += 1  # padding after the exec path
+    for _ in range(argc):
+        end = buf.find(b"\0", pos)
+        if pos >= len(buf) or end < 0:
+            return None  # fewer (or unterminated) argv strings than argc
+        pos = end + 1
+    environment: dict = {}
+    while pos < len(buf):
+        end = buf.find(b"\0", pos)
+        if end < 0:
+            return None  # truncated mid-string
+        if end == pos:
+            break  # empty string: end of the environment
+        entry = buf[pos:end].decode("utf-8", errors="surrogateescape")
+        pos = end + 1
+        name, separator, value = entry.partition("=")
+        if separator and name:
+            environment.setdefault(name, value)
+    return environment
+
+
+def _environ_for_pid(pid: int) -> Optional[dict]:
+    """``pid``'s environment at exec time via ``sysctl KERN_PROCARGS2``
+    (``ctypes``, stdlib only), parsed by ``_parse_procargs2``. ``None``
+    (never an exception) off macOS, for a process that is gone or owned by
+    another user, or on any parse failure.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.dylib", use_errno=True)
+        mib = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, int(pid))
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value <= 0:
+            return None
+        for _ in range(3):
+            # Slack: the argument area can grow between the two calls.
+            capacity = size.value + 4096
+            raw = ctypes.create_string_buffer(capacity)
+            size = ctypes.c_size_t(capacity)
+            if libc.sysctl(mib, 3, raw, ctypes.byref(size), None, 0) == 0:
+                return _parse_procargs2(raw.raw[: size.value])
+            if ctypes.get_errno() != 12:  # not ENOMEM: do not retry
+                return None
+        return None
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------
 # The five controls.
 # ---------------------------------------------------------------------
@@ -1073,6 +1179,77 @@ def flags_control(expect_pid: Optional[int]) -> dict:
             "reason": f"could not capture argv for PID {expect_pid} (process may have exited)",
         }
     return {"status": "captured", "listenerCmdline": cmdline, "reason": None}
+
+
+# C-env: NAME is the variable to read; publicKey is the ONLY name a row
+# ever carries for it. Both patterns are matched with ``fullmatch``.
+_LISTENER_ENV_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+_LISTENER_ENV_KEY_RE = re.compile(r"[a-z][A-Za-z0-9]{0,39}")
+_LISTENER_ENV_VALUE_RE = re.compile(r"[A-Za-z0-9._:-]{0,64}")
+
+
+def _parse_listener_env_specs(specs: "Sequence[str]") -> "dict":
+    """``["NAME=publicKey", ...]`` -> ``{NAME: publicKey}``. Raises
+    ``ValueError`` (message safe to show: it quotes the offending spec,
+    which is operator-typed, never an environment value) on a malformed
+    spec, a duplicate NAME, or a duplicate publicKey.
+    """
+    mapping: dict = {}
+    seen_keys: set = set()
+    for spec in specs:
+        name, separator, key = spec.partition("=")
+        if not separator:
+            raise ValueError(f"--listener-env {spec!r} is not NAME=publicKey")
+        if not _LISTENER_ENV_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"--listener-env {spec!r}: NAME must match [A-Za-z_][A-Za-z0-9_]{{0,127}}"
+            )
+        if not _LISTENER_ENV_KEY_RE.fullmatch(key):
+            raise ValueError(
+                f"--listener-env {spec!r}: publicKey must match [a-z][A-Za-z0-9]{{0,39}}"
+            )
+        if name in mapping:
+            raise ValueError(f"--listener-env NAME {name!r} given more than once")
+        if key in seen_keys:
+            raise ValueError(f"--listener-env publicKey {key!r} given more than once")
+        mapping[name] = key
+        seen_keys.add(key)
+    return mapping
+
+
+def environment_control(expect_pid: Optional[int], listener_env: "Optional[dict]") -> dict:
+    """C-env (see module docstring). ``listener_env`` is ``{NAME:
+    publicKey}``. The returned control never contains a NAME, an
+    environment value that failed the safe-character check, or any
+    variable that was not requested.
+    """
+    if not listener_env:
+        return {
+            "status": "not_requested",
+            "variables": {},
+            "reason": "--listener-env not given",
+        }
+    environ = _environ_for_pid(expect_pid) if expect_pid is not None else None
+    if environ is None:
+        return {
+            "status": "capture_failed",
+            "variables": {},
+            "reason": (
+                f"could not capture the environment of PID {expect_pid} "
+                "(process may have exited, or belongs to another user)"
+            ),
+        }
+    variables: dict = {}
+    for name, key in listener_env.items():
+        value = environ.get(name)
+        if value is not None and not _LISTENER_ENV_VALUE_RE.fullmatch(value):
+            return {
+                "status": "refused_unsafe_value",
+                "variables": {},
+                "reason": f"{key} has a value outside the safe character set",
+            }
+        variables[key] = value
+    return {"status": "captured", "variables": variables, "reason": None}
 
 
 # ---------------------------------------------------------------------
@@ -1428,6 +1605,9 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
     magnitude = magnitude_control(arms, args.magnitude_floor, args.magnitude_ceiling)
     owner = owner_control(args.expect_listener_pid, port)
     flags = flags_control(args.expect_listener_pid)
+    environment = environment_control(
+        args.expect_listener_pid, getattr(args, "listener_env", None)
+    )
 
     ratio = None
     refusal_reasons: List[str] = []
@@ -1468,6 +1648,7 @@ def run_bench(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             "magnitude": magnitude,
             "owner": owner,
             "flags": flags,
+            "environment": environment,
         },
     }
     # Computed LAST, over the row as otherwise complete, and attached only
@@ -1502,6 +1683,7 @@ _COMBINE_INCOMPATIBLE_FLAG_NAMES: dict = {
     "reference_model": "--reference-model",
     "prompt": "--prompt",
     "expect_listener_pid": "--expect-listener-pid",
+    "listener_env": "--listener-env",
     "runs": "--runs",
     "warmup": "--warmup",
     "max_tokens": "--max-tokens",
@@ -1838,6 +2020,69 @@ def _combine_flags_control(loaded: "Sequence[dict]") -> dict:
     }
 
 
+def _combine_environment_control(loaded: "Sequence[dict]") -> dict:
+    """C-env across the three inputs (see module docstring): every input
+    ``not_requested`` (or predating the control) -> ``not_requested``;
+    every input ``captured`` with equal ``variables`` -> that ``captured``
+    control; anything else -> ``mismatch`` (a REFUSAL), whose reason names
+    statuses and differing publicKeys only, never a value.
+    """
+    per_role_control = {
+        role: _nested_status(entry["row"], "controls", "environment")
+        for role, entry in zip(_COMBINE_ROLES, loaded)
+    }
+
+    def _status(control) -> str:
+        if control is None:
+            return "not_requested"
+        status = control.get("status") if isinstance(control, dict) else None
+        return status if isinstance(status, str) else "malformed"
+
+    per_role_status = {role: _status(c) for role, c in per_role_control.items()}
+    if all(status == "not_requested" for status in per_role_status.values()):
+        return {
+            "status": "not_requested",
+            "variables": {},
+            "reason": "--listener-env not given",
+        }
+
+    def _mismatch(reason: str) -> dict:
+        return {"status": "mismatch", "variables": {}, "reason": reason}
+
+    if any(status != "captured" for status in per_role_status.values()):
+        return _mismatch(
+            "not every input row's environment control is captured (a row "
+            "cannot claim an environment its sibling rows did not prove): "
+            + ", ".join(f"{role}={status}" for role, status in per_role_status.items())
+        )
+    per_role_variables = {}
+    for role, control in per_role_control.items():
+        variables = control.get("variables")
+        if not isinstance(variables, dict) or not all(
+            isinstance(key, str)
+            and _LISTENER_ENV_KEY_RE.fullmatch(key)
+            and (value is None or (isinstance(value, str) and _LISTENER_ENV_VALUE_RE.fullmatch(value)))
+            for key, value in variables.items()
+        ):
+            return _mismatch(f"{role}'s captured environment variables are malformed")
+        per_role_variables[role] = variables
+    first = per_role_variables[_COMBINE_ROLES[0]]
+    if any(variables != first for variables in per_role_variables.values()):
+        keys = sorted(
+            {
+                key
+                for variables in per_role_variables.values()
+                for key in set(variables) | set(first)
+                if any(v.get(key, "\0absent") != first.get(key, "\0absent")
+                       for v in per_role_variables.values())
+            }
+        )
+        return _mismatch(
+            "input rows' environment controls differ for: " + ", ".join(keys)
+        )
+    return {"status": "captured", "variables": dict(first), "reason": None}
+
+
 def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
     """Combines three separately-measured single-arm rows (see module
     docstring's --combine section) into one ratio row, using the SAME
@@ -1987,6 +2232,10 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
     if refusal_reason is None and flags["status"] != "captured":
         refusal_reason = flags["reason"]
 
+    environment = _combine_environment_control(loaded)
+    if refusal_reason is None and environment["status"] not in ("captured", "not_requested"):
+        refusal_reason = environment["reason"]
+
     candidate_arm = _arm_result_from_json(_first_arm(candidate_in["row"]))
     ref_first_arm = _arm_result_from_json(_first_arm(ref_first["row"]))
     ref_last_arm = _arm_result_from_json(_first_arm(ref_last["row"]))
@@ -2034,6 +2283,7 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
             "magnitude": magnitude,
             "owner": owner,
             "flags": flags,
+            "environment": environment,
         },
         "combinedFrom": combined_from,
     }
@@ -2264,7 +2514,9 @@ def format_text(row: dict) -> str:
     if row["ratio"] is not None:
         lines.append(f"  ratio (candidate/reference): {row['ratio']:.3f}x")
     controls = row["controls"]
-    for name in ("tokens", "drift", "magnitude", "owner", "flags"):
+    for name in ("tokens", "drift", "magnitude", "owner", "flags", "environment"):
+        if name not in controls:
+            continue  # a row from before C-env existed (--public-view of one)
         control = controls[name]
         status = control.get("status")
         if name == "magnitude":
@@ -2423,6 +2675,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="PID expected to be LISTENing on --base-url's port; a mismatch refuses the run (C-owner).",
     )
     parser.add_argument(
+        "--listener-env", action="append", default=None, metavar="NAME=publicKey",
+        help=(
+            "Repeatable. Record the listener PID's environment variable "
+            "NAME in the row's controls.environment under the public key "
+            "publicKey (never under NAME); requires --expect-listener-pid. "
+            "Only the named variables are ever recorded. NAME matches "
+            "[A-Za-z_][A-Za-z0-9_]{0,127}, publicKey [a-z][A-Za-z0-9]{0,39}."
+        ),
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="Emit the result row as one line of JSON on stdout instead of human-readable text.",
     )
@@ -2527,6 +2789,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             args.warmup = DEFAULT_WARMUP
         if args.temperature is None:
             args.temperature = DEFAULT_TEMPERATURE
+        if args.listener_env is not None:
+            if args.expect_listener_pid is None:
+                parser.error(
+                    "--listener-env requires --expect-listener-pid (the "
+                    "environment is read from that PID)"
+                )
+            try:
+                args.listener_env = _parse_listener_env_specs(args.listener_env)
+            except ValueError as exc:
+                parser.error(str(exc))
         if args.warmup < 0:
             # argparse's type=int happily accepts a negative value -- this is a
             # usage error (design decision 4), not a measurement outcome, so it
