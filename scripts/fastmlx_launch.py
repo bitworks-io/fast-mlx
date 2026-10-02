@@ -646,6 +646,143 @@ def load_quality_cards(path: Path) -> Optional[list]:
     return cards
 
 
+_QUALITY_CARDS_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+# A manifest's ``generatedAt`` is untrusted file content that is echoed onto
+# a one-line, space-delimited stderr record. Only a conservative ISO-8601-ish
+# token is ever echoed; anything else (whitespace, a newline, a forged
+# ``key=value``) prints as ``invalid`` so it can never split or extend the
+# record. The raw value still travels in the identity dict (JSON-escaped).
+_CARD_STORE_GENERATED_AT_SAFE_RE = re.compile(r"[0-9A-Za-z:.+\-]{1,40}")
+
+
+def _inspect_quality_card_store(path: Path) -> tuple:
+    """``(raw_sha256 | None, cards | None, identity | None)`` for the
+    manifest at ``path``.
+
+    The file is read ONCE: the digest is sha256 over those raw bytes (so it
+    equals ``shasum -a 256 <file>``) and the cards are parsed from the SAME
+    bytes -- there is no second read between hashing and parsing for a file
+    swap to slip through. ``raw_sha256`` is ``None`` only when the file
+    cannot be read at all; it is set even for bytes that are not a manifest
+    (``cards``/``identity`` are then ``None``), so a pin can still tell
+    "wrong bytes" from "right bytes, not a manifest".
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, None, None
+    digest = hashlib.sha256(raw).hexdigest()
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError both subclass it
+        return digest, None, None
+    if not isinstance(document, dict):
+        return digest, None, None
+    cards = document.get("cards")
+    if not isinstance(cards, list):
+        return digest, None, None
+    generated_at = document.get("generatedAt")
+    identity = {
+        "sha256": digest,
+        "generatedAt": generated_at if isinstance(generated_at, str) else None,
+        "cards": len(cards),
+    }
+    return digest, cards, identity
+
+
+def load_quality_card_store(path: Path) -> tuple:
+    """``(cards | None, identity | None)`` -- the same cards
+    ``load_quality_cards`` returns (``None`` on a missing/unreadable/non-
+    manifest file: the same fail-open-to-"no card" rule), plus the
+    store's identity ``{"sha256", "generatedAt", "cards"}`` so an operator
+    can see (and pin) exactly which bytes admitted a launch.
+    """
+    _, cards, identity = _inspect_quality_card_store(path)
+    return cards, identity
+
+
+def parse_quality_cards_pin(value: Optional[str]) -> Optional[str]:
+    """The lowercase 64-hex digest named by ``--quality-cards-sha256``
+    (``None`` when the flag is absent).
+
+    Malformed input is a launch refusal (exit 3, never argparse's exit 2:
+    exit 2 collides with the RED verdict), so this is deliberately NOT an
+    argparse ``type=``.
+    """
+    if value is None:
+        return None
+    if _QUALITY_CARDS_SHA256_RE.fullmatch(value) is None:
+        raise LaunchRefusal(
+            3,
+            "--quality-cards-sha256 must be exactly 64 hexadecimal characters "
+            f"(the sha256 of the manifest file's raw bytes); got {_bounded_repr(value)}",
+        )
+    return value.lower()
+
+
+def enforce_quality_cards_pin(
+    pin: Optional[str], path: Path, raw_sha256: Optional[str], cards: Optional[list]
+) -> None:
+    """Refuse (``LaunchRefusal(3, ...)``) unless the manifest at ``path`` is
+    exactly the bytes ``pin`` names. A no-op without a pin.
+
+    A pinned expectation NEVER fails open: unlike the unpinned conventional
+    default path (which fails open to "no card"), a pin plus a store that
+    does not resolve refuses -- including the default path -- because the
+    operator said "admit only against these exact bytes". Matching bytes
+    that are not a manifest also refuse: the digest alone proves identity,
+    not that the file is usable.
+    """
+    if pin is None:
+        return
+    if raw_sha256 is None:
+        raise LaunchRefusal(
+            3,
+            f"--quality-cards-sha256 {pin} was given but the quality-card "
+            f"manifest {path} is missing or unreadable",
+        )
+    if raw_sha256 != pin:
+        raise LaunchRefusal(
+            3,
+            f"the quality-card manifest {path} does not match "
+            f"--quality-cards-sha256: expected {pin}, actual {raw_sha256}",
+        )
+    if cards is None:
+        raise LaunchRefusal(
+            3,
+            f"the quality-card manifest {path} matches --quality-cards-sha256 "
+            "but is not a quality-card manifest",
+        )
+
+
+def card_store_fields(identity: dict) -> str:
+    """``sha256=<hex> generated_at=<iso|none|invalid> cards=<n>`` for a
+    store identity -- the one place an untrusted ``generatedAt`` is made
+    safe for a single space-delimited line (shared with ``fastmlx
+    recommend``'s text header)."""
+    generated_at = identity.get("generatedAt")
+    if generated_at is None:
+        generated_at_token = "none"
+    elif _CARD_STORE_GENERATED_AT_SAFE_RE.fullmatch(generated_at):
+        generated_at_token = generated_at
+    else:
+        generated_at_token = "invalid"
+    return (
+        f"sha256={identity['sha256']} generated_at={generated_at_token} "
+        f"cards={identity['cards']}"
+    )
+
+
+def card_store_notice_line(source: str, identity: Optional[dict]) -> str:
+    """The ``fastmlx_launch=card_store`` stderr record: which card store
+    admitted this launch. A SEPARATE line, never a field on the fixed-arity
+    ``admitted`` line.
+    """
+    if identity is None:
+        return f"fastmlx_launch=card_store source={source} card_store=none"
+    return f"fastmlx_launch=card_store source={source} {card_store_fields(identity)}"
+
+
 def find_card_by_id(cards: list, card_id: str) -> Optional[dict]:
     for card in cards:
         if isinstance(card, dict) and card.get("id") == card_id:
@@ -2212,6 +2349,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
+        "--quality-cards-sha256",
+        default=None,
+        help=(
+            "pin the quality-card manifest by the sha256 of its raw bytes "
+            "(64 hex characters, case-insensitive; equals `shasum -a 256 "
+            "<file>`); a mismatch, a manifest that does not resolve (even "
+            "the default path), or matching bytes that are not a manifest "
+            "refuse startup"
+        ),
+    )
+    serve.add_argument(
         "--accept-quality",
         action="append",
         default=[],
@@ -2484,6 +2632,24 @@ def _run_serve(args, passthrough_args: list) -> int:
     # and failing on it before spending time on a fit-check subprocess
     # call keeps the refusal prompt.
     profile, is_built_in_profile = load_engine_profile(args.engine_profile)
+
+    # The --quality-cards-sha256 pin is likewise a configuration error: a
+    # malformed or mismatching pin refuses (exit 3) before the fit-check
+    # subprocess runs, so a RED fit (exit 2) can never mask it. A pin never
+    # fails open itself (see enforce_quality_cards_pin); the fail-open /
+    # explicit-manifest rules for the unpinned store stay with the
+    # quality-card admission below.
+    quality_cards_path = Path(
+        args.quality_cards
+        if args.quality_cards is not None
+        else (REPO_ROOT / DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
+    )
+    quality_cards_pin = parse_quality_cards_pin(args.quality_cards_sha256)
+    raw_store_sha256, cards, card_store_identity = _inspect_quality_card_store(
+        quality_cards_path
+    )
+    enforce_quality_cards_pin(quality_cards_pin, quality_cards_path, raw_store_sha256, cards)
+    card_store_source = "default" if args.quality_cards is None else "explicit"
     # This launch's own engine build (absent for the built-in profile and
     # for any profile that does not declare one) -- resolved this early
     # because the quality-card lookup below (`resolve_card`) needs it to
@@ -2737,12 +2903,8 @@ def _run_serve(args, passthrough_args: list) -> int:
             )
 
     # --- quality-card admission ---------------------------------------
-    quality_cards_path = Path(
-        args.quality_cards
-        if args.quality_cards is not None
-        else (REPO_ROOT / DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
-    )
-    cards = load_quality_cards(quality_cards_path)
+    # (the card-store pin was parsed and enforced right after the engine
+    # profile load above; `cards`/`card_store_identity` come from there)
     # Only the conventional default path may fail open to "no card" (mirrors
     # QualityCardStore); a manifest the operator named explicitly must load,
     # or a typo would silently disable the gate.
@@ -3042,6 +3204,7 @@ def _run_serve(args, passthrough_args: list) -> int:
     plan = {
         "fit": {"verdict": fit_label, "fields": fit_fields},
         "card": card,
+        "cardStore": card_store_identity,
         "admission": outcome,
         "argv": final_argv,
         "residency": residency,
@@ -3079,6 +3242,10 @@ def _run_serve(args, passthrough_args: list) -> int:
     if front_mode:
         admitted_line += f" front={args.front_host}:{args.front_port}"
     print(admitted_line, file=sys.stderr)
+    # A SEPARATE line (the `admitted` line keeps its fixed arity): which card
+    # store this launch admitted against, so an operator can tell a bundled
+    # store from a newer one and pin it with --quality-cards-sha256.
+    print(card_store_notice_line(card_store_source, card_store_identity), file=sys.stderr)
     # A SEPARATE line (never a field on the fixed-arity `admitted` line
     # above), printed only when the admitted card states the generation
     # length it measured.

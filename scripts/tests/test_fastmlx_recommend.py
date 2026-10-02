@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -2603,6 +2604,146 @@ class UnrecognizedVerdictRecommendTestCase(FastmlxRecommendTestCase):
                 row = doc["rows"][0]
                 self.assertEqual(row["status"], expected_status, stderr)
                 self.assertIsNone(row["verdictNotice"])
+
+
+# ---------------------------------------------------------------------
+# `fastmlx recommend` names the card store it ranked against and can pin it
+# by sha256 (`--quality-cards-sha256`), exactly like `fastmlx serve`.
+# Predeclaration:
+# docs/task-inbox/2026-10-02-PREDECLARATION-launcher-names-and-pins-its-card-store.md
+# ---------------------------------------------------------------------
+class RecommendCardStoreTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_bytes = json.dumps(fixture_manifest()).encode("utf-8")
+        self.manifest_path.write_bytes(self.manifest_bytes)
+        self.digest = hashlib.sha256(self.manifest_bytes).hexdigest()
+        self.n_cards = len(fixture_manifest()["cards"])
+
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.model_dir = self.root / "pass-model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+        write_pull_receipt(self.model_dir, repo_id=PASS_REPO, revision="e" * 40)
+
+        # An empty stand-in repo root, so the conventional DEFAULT manifest
+        # path is absent unless a test writes it.
+        self.fake_repo_root = self.root / "repo"
+        (self.fake_repo_root / "site").mkdir(parents=True)
+
+    def argv(self, *extra, cards="explicit") -> list:
+        argv = ["recommend", "--model-path", str(self.model_dir),
+                "--fit-check-bin", str(self.green_fit_bin)]
+        if cards == "explicit":
+            argv += ["--quality-cards", str(self.manifest_path)]
+        return argv + list(extra)
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(FASTMLX_RECOMMEND.launch, "REPO_ROOT", self.fake_repo_root):
+                with self.assertRaises(SystemExit) as ctx:
+                    FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def identity(self) -> dict:
+        return {"sha256": self.digest, "generatedAt": "2026-01-01T00:00:00Z",
+                "cards": self.n_cards}
+
+    def test_json_carries_card_store_identity(self):
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"], self.identity())
+
+    def test_json_card_store_is_null_when_default_store_absent(self):
+        code, stdout, stderr = self.run_main(self.argv("--json", cards="default"))
+        self.assertEqual(code, 1, stderr)  # uncarded: fits, nothing measured-good
+        doc = json.loads(stdout)
+        self.assertIn("cardStore", doc)
+        self.assertIsNone(doc["cardStore"])
+
+    def test_text_output_has_one_header_line_naming_the_store(self):
+        code, stdout, stderr = self.run_main(self.argv())
+        self.assertEqual(code, 0, stderr)
+        header = (
+            f"card store: sha256={self.digest} "
+            f"generated_at=2026-01-01T00:00:00Z cards={self.n_cards}"
+        )
+        lines = stdout.splitlines()
+        self.assertEqual(lines[0], header)
+        self.assertEqual(stdout.count("card store:"), 1)
+        self.assertTrue(lines[1].startswith("1. "), lines[1])
+
+    def test_text_header_says_none_when_default_store_absent(self):
+        _, stdout, _ = self.run_main(self.argv(cards="default"))
+        self.assertEqual(stdout.splitlines()[0], "card store: none")
+
+    def test_matching_pin_ranks_normally_case_insensitively(self):
+        for pin in (self.digest, self.digest.upper()):
+            with self.subTest(pin=pin[:8]):
+                code, stdout, stderr = self.run_main(
+                    self.argv("--quality-cards-sha256", pin, "--json")
+                )
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(json.loads(stdout)["rows"][0]["status"], "recommended")
+
+    def test_pin_mismatch_refuses_exit_3_naming_both_digests(self):
+        wrong = "0" * 64
+        code, stdout, stderr = self.run_main(
+            self.argv("--quality-cards-sha256", wrong, "--json")
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn(wrong, stderr)
+        self.assertIn(self.digest, stderr)
+
+    def test_malformed_pin_refuses_exit_3_not_argparse_exit_2(self):
+        for bad in ("xyz", "", "g" * 64, self.digest[:63], self.digest + "0"):
+            with self.subTest(pin=bad):
+                code, stdout, stderr = self.run_main(
+                    self.argv("--quality-cards-sha256", bad, "--json")
+                )
+                self.assertEqual(code, 3, stderr)
+                self.assertEqual(stdout, "")
+                self.assertIn("--quality-cards-sha256", stderr)
+                self.assertNotIn("usage:", stderr)
+
+    def test_pin_with_missing_default_store_refuses_exit_3(self):
+        code, stdout, stderr = self.run_main(
+            self.argv("--quality-cards-sha256", self.digest, "--json", cards="default")
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+
+    def test_pin_matching_non_manifest_bytes_refuses_exit_3(self):
+        not_a_manifest = b'{"schema": 1}'
+        self.manifest_path.write_bytes(not_a_manifest)
+        code, stdout, stderr = self.run_main(
+            self.argv(
+                "--quality-cards-sha256",
+                hashlib.sha256(not_a_manifest).hexdigest(),
+                "--json",
+            )
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn("not a quality-card manifest", stderr)
+
+    def test_one_changed_byte_refuses_under_the_original_pin(self):
+        flipped = bytearray(self.manifest_bytes)
+        flipped[flipped.index(b"2026-01-01") + 3] ^= 0x01
+        json.loads(bytes(flipped))
+        self.manifest_path.write_bytes(bytes(flipped))
+        code, stdout, stderr = self.run_main(
+            self.argv("--quality-cards-sha256", self.digest, "--json")
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn(hashlib.sha256(bytes(flipped)).hexdigest(), stderr)
 
 
 if __name__ == "__main__":

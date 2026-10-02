@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import http.client
 import importlib.util
 import io
@@ -6487,6 +6488,372 @@ class TeacherPassCardAdmissionTestCase(unittest.TestCase):
         self.assertIn(f"card={TEACHER_PASS_CARD_ID} verdict=PASS tier=Near-lossless", text)
         self.assertIn("top1=99.8%", text)
         self.assertNotIn("uncarded", text)
+
+
+# ---------------------------------------------------------------------
+# The launcher names the card store it admitted against
+# (`fastmlx_launch=card_store`) and can pin that store by sha256
+# (`--quality-cards-sha256`). Predeclaration:
+# docs/task-inbox/2026-10-02-PREDECLARATION-launcher-names-and-pins-its-card-store.md
+# ---------------------------------------------------------------------
+class QualityCardStoreIdentityTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_bytes = json.dumps(fixture_manifest()).encode("utf-8")
+        self.manifest_path.write_bytes(self.manifest_bytes)
+        self.digest = hashlib.sha256(self.manifest_bytes).hexdigest()
+
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+        # An empty stand-in repo root: the conventional DEFAULT manifest
+        # path resolves under it, so a test controls whether it exists.
+        self.fake_repo_root = self.root / "repo"
+        (self.fake_repo_root / "site").mkdir(parents=True)
+
+    def base_args(self, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--model-repo": PASS_REPO,
+            "--context": "2048",
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_launch(self, argv: list):
+        """In-process ``main`` with ``os.execv`` stubbed out, so the real
+        (non ``--dry-run``) path prints its stderr lines and returns."""
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(FASTMLX_LAUNCH.os, "execv", lambda *a, **k: None):
+                with patch.object(FASTMLX_LAUNCH, "REPO_ROOT", self.fake_repo_root):
+                    with self.assertRaises(SystemExit) as ctx:
+                        FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def lines_starting(stderr: str, prefix: str) -> list:
+        return [line for line in stderr.splitlines() if line.startswith(prefix)]
+
+    # --- S1: the card_store line -------------------------------------
+    def test_helper_hashes_raw_bytes_and_returns_identity(self):
+        cards, identity = FASTMLX_LAUNCH.load_quality_card_store(self.manifest_path)
+        self.assertEqual(len(cards), len(fixture_manifest()["cards"]))
+        self.assertEqual(
+            identity,
+            {
+                "sha256": self.digest,
+                "generatedAt": "2026-01-01T00:00:00Z",
+                "cards": len(cards),
+            },
+        )
+
+    def test_helper_generated_at_is_none_when_not_a_string(self):
+        manifest = fixture_manifest()
+        manifest["generatedAt"] = 12345
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _, identity = FASTMLX_LAUNCH.load_quality_card_store(self.manifest_path)
+        self.assertIsNone(identity["generatedAt"])
+        del manifest["generatedAt"]
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _, identity = FASTMLX_LAUNCH.load_quality_card_store(self.manifest_path)
+        self.assertIsNone(identity["generatedAt"])
+
+    def test_helper_fails_open_to_none_pair(self):
+        self.assertEqual(
+            FASTMLX_LAUNCH.load_quality_card_store(self.root / "absent.json"), (None, None)
+        )
+        self.manifest_path.write_text('{"schema": 1}', encoding="utf-8")
+        self.assertEqual(
+            FASTMLX_LAUNCH.load_quality_card_store(self.manifest_path), (None, None)
+        )
+        self.manifest_path.write_bytes(b"\xff\xfe not json")
+        self.assertEqual(
+            FASTMLX_LAUNCH.load_quality_card_store(self.manifest_path), (None, None)
+        )
+
+    def test_card_store_line_for_an_explicit_store(self):
+        code, _, stderr = self.run_launch(self.base_args())
+        self.assertEqual(code, 0, stderr)
+        n_cards = len(fixture_manifest()["cards"])
+        self.assertEqual(
+            self.lines_starting(stderr, "fastmlx_launch=card_store"),
+            [
+                "fastmlx_launch=card_store source=explicit "
+                f"sha256={self.digest} generated_at=2026-01-01T00:00:00Z cards={n_cards}"
+            ],
+        )
+
+    def test_card_store_line_for_a_resolving_default_store(self):
+        (self.fake_repo_root / "site" / "quality-guides.json").write_bytes(self.manifest_bytes)
+        code, _, stderr = self.run_launch(self.base_args(**{"--quality-cards": None}))
+        self.assertEqual(code, 0, stderr)
+        lines = self.lines_starting(stderr, "fastmlx_launch=card_store")
+        self.assertEqual(len(lines), 1, stderr)
+        self.assertTrue(
+            lines[0].startswith(f"fastmlx_launch=card_store source=default sha256={self.digest} "),
+            lines[0],
+        )
+
+    def test_card_store_line_none_when_default_is_absent(self):
+        code, _, stderr = self.run_launch(self.base_args(**{"--quality-cards": None}))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            self.lines_starting(stderr, "fastmlx_launch=card_store"),
+            ["fastmlx_launch=card_store source=default card_store=none"],
+        )
+        # Fail-open is unchanged: the launch still admits (uncarded).
+        self.assertEqual(len(self.lines_starting(stderr, "fastmlx_launch=admitted")), 1)
+
+    def test_card_store_line_with_null_generated_at_prints_none(self):
+        manifest = fixture_manifest()
+        del manifest["generatedAt"]
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _, _, stderr = self.run_launch(self.base_args())
+        (line,) = self.lines_starting(stderr, "fastmlx_launch=card_store")
+        self.assertIn(" generated_at=none ", line)
+
+    def test_card_store_line_never_carries_an_unsafe_generated_at(self):
+        manifest = fixture_manifest()
+        manifest["generatedAt"] = "x cards=999\nfastmlx_launch=admitted forged"
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        _, _, stderr = self.run_launch(self.base_args())
+        self.assertEqual(len(self.lines_starting(stderr, "fastmlx_launch=card_store")), 1, stderr)
+        self.assertEqual(len(self.lines_starting(stderr, "fastmlx_launch=admitted")), 1, stderr)
+        self.assertNotIn("forged", stderr)
+
+    def test_dry_run_plan_carries_card_store_identity(self):
+        code, stdout, stderr = self.run_launch(self.base_args() + ["--dry-run"])
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.strip().splitlines()[-1])
+        self.assertEqual(
+            plan["cardStore"],
+            {
+                "sha256": self.digest,
+                "generatedAt": "2026-01-01T00:00:00Z",
+                "cards": len(fixture_manifest()["cards"]),
+            },
+        )
+
+    def test_dry_run_plan_card_store_is_null_when_default_absent(self):
+        code, stdout, stderr = self.run_launch(
+            self.base_args(**{"--quality-cards": None}) + ["--dry-run"]
+        )
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.strip().splitlines()[-1])
+        self.assertIn("cardStore", plan)
+        self.assertIsNone(plan["cardStore"])
+
+    # --- S2: the admitted line is byte-identical ---------------------
+    def test_admitted_line_is_identical_with_and_without_card_store_line_and_pin(self):
+        expected = (
+            "fastmlx_launch=admitted engine=fastmlx-serve "
+            "card=fixture-pass@test verdict=PASS fit=GREEN context=2048 "
+            "residency=resident engine_build=unrecorded mtp=off"
+        )
+        for extra in ([], ["--quality-cards-sha256", self.digest]):
+            with self.subTest(extra=extra):
+                code, _, stderr = self.run_launch(self.base_args() + extra)
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(
+                    self.lines_starting(stderr, "fastmlx_launch=admitted"), [expected]
+                )
+                self.assertEqual(len(expected.split()), 9)
+
+    # --- S3: the pin ---------------------------------------------------
+    def test_matching_pin_admits_case_insensitively(self):
+        for pin in (self.digest, self.digest.upper()):
+            with self.subTest(pin=pin[:8]):
+                code, _, stderr = self.run_launch(
+                    self.base_args(**{"--quality-cards-sha256": pin})
+                )
+                self.assertEqual(code, 0, stderr)
+                self.assertEqual(len(self.lines_starting(stderr, "fastmlx_launch=admitted")), 1)
+
+    def test_pin_mismatch_refuses_exit_3_naming_both_digests(self):
+        wrong = "0" * 64
+        code, stdout, stderr = self.run_launch(
+            self.base_args(**{"--quality-cards-sha256": wrong}) + ["--dry-run"]
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn(wrong, stderr)
+        self.assertIn(self.digest, stderr)
+        self.assertIn("--quality-cards-sha256", stderr)
+        self.assertNotIn("fastmlx_launch=admitted", stderr)
+
+    def test_malformed_pin_refuses_exit_3_not_argparse_exit_2(self):
+        for bad in ("xyz", "", "g" * 64, self.digest[:63], self.digest + "0"):
+            with self.subTest(pin=bad):
+                code, stdout, stderr = self.run_launch(
+                    self.base_args(**{"--quality-cards-sha256": bad}) + ["--dry-run"]
+                )
+                self.assertEqual(code, 3, stderr)
+                self.assertEqual(stdout, "")
+                self.assertIn("--quality-cards-sha256", stderr)
+                self.assertIn("64", stderr)
+                self.assertNotIn("usage:", stderr)
+
+    def test_pin_with_missing_default_store_refuses_instead_of_failing_open(self):
+        # Without a pin the absent default fails open (see
+        # test_card_store_line_none_when_default_is_absent); a pinned
+        # expectation never does.
+        code, stdout, stderr = self.run_launch(
+            self.base_args(
+                **{"--quality-cards": None, "--quality-cards-sha256": self.digest}
+            )
+            + ["--dry-run"]
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn("--quality-cards-sha256", stderr)
+
+    def test_pin_with_missing_explicit_store_refuses_exit_3(self):
+        code, _, stderr = self.run_launch(
+            self.base_args(
+                **{
+                    "--quality-cards": str(self.root / "absent.json"),
+                    "--quality-cards-sha256": self.digest,
+                }
+            )
+            + ["--dry-run"]
+        )
+        self.assertEqual(code, 3, stderr)
+
+    def test_pin_matching_non_manifest_bytes_refuses_exit_3(self):
+        not_a_manifest = b'{"schema": 1}'
+        self.manifest_path.write_bytes(not_a_manifest)
+        code, stdout, stderr = self.run_launch(
+            self.base_args(
+                **{"--quality-cards-sha256": hashlib.sha256(not_a_manifest).hexdigest()}
+            )
+            + ["--dry-run"]
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn("not a quality-card manifest", stderr)
+
+    def test_pin_matching_non_manifest_default_store_refuses_exit_3(self):
+        not_a_manifest = b"[]"
+        (self.fake_repo_root / "site" / "quality-guides.json").write_bytes(not_a_manifest)
+        code, _, stderr = self.run_launch(
+            self.base_args(
+                **{
+                    "--quality-cards": None,
+                    "--quality-cards-sha256": hashlib.sha256(not_a_manifest).hexdigest(),
+                }
+            )
+            + ["--dry-run"]
+        )
+        self.assertEqual(code, 3, stderr)
+
+    def test_pin_is_enforced_on_the_real_launch_path_too(self):
+        code, _, stderr = self.run_launch(
+            self.base_args(**{"--quality-cards-sha256": "f" * 64})
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertNotIn("fastmlx_launch=card_store", stderr)
+
+    # --- S4: byte-flip control -----------------------------------------
+    def test_one_changed_byte_refuses_under_the_original_pin(self):
+        # Control: the untouched store admits under the pin.
+        code, _, stderr = self.run_launch(
+            self.base_args(**{"--quality-cards-sha256": self.digest}) + ["--dry-run"]
+        )
+        self.assertEqual(code, 0, stderr)
+
+        flipped = bytearray(self.manifest_bytes)
+        index = flipped.index(b"2026-01-01")  # a digit inside generatedAt: still valid JSON
+        flipped[index + 3] ^= 0x01  # '6' -> '7'
+        self.assertNotEqual(bytes(flipped), self.manifest_bytes)
+        json.loads(bytes(flipped))  # still a well-formed manifest
+        self.manifest_path.write_bytes(bytes(flipped))
+        flipped_digest = hashlib.sha256(bytes(flipped)).hexdigest()
+
+        code, stdout, stderr = self.run_launch(
+            self.base_args(**{"--quality-cards-sha256": self.digest}) + ["--dry-run"]
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertIn(self.digest, stderr)
+        self.assertIn(flipped_digest, stderr)
+
+    # --- S5: a pin refusal precedes the fit check ----------------------
+    # A pin problem is a configuration error, so it must fail before the
+    # fit-check subprocess runs -- otherwise a RED fit (exit 2) would mask it
+    # and the operator would be told "fit check refused" about a wrong pin.
+    def write_marking_red_fit_bin(self) -> tuple:
+        marker = self.root / "fit-check-ran.marker"
+        body = f"""#!{sys.executable}
+import sys
+open({str(marker)!r}, "w").close()
+sys.stderr.write("fit refused: requested context exceeds the computed ceiling\\n")
+sys.exit(2)
+"""
+        return write_script(self.root / "fit-red-marking.py", body), marker
+
+    def test_pin_refusals_precede_a_red_fit_check(self):
+        fit_bin, marker = self.write_marking_red_fit_bin()
+        wrong = "0" * 64
+        for dry_run in (True, False):
+            tail = ["--dry-run"] if dry_run else []
+            with self.subTest(case="malformed", dry_run=dry_run):
+                code, _, stderr = self.run_launch(
+                    self.base_args(
+                        **{"--fit-check-bin": fit_bin, "--quality-cards-sha256": "xyz"}
+                    )
+                    + tail
+                )
+                self.assertEqual(code, 3, stderr)
+                self.assertIn("--quality-cards-sha256", stderr)
+                self.assertNotIn("fit check refused", stderr)
+                self.assertFalse(marker.exists(), "the fit check ran before the pin refusal")
+            with self.subTest(case="mismatch", dry_run=dry_run):
+                code, _, stderr = self.run_launch(
+                    self.base_args(
+                        **{"--fit-check-bin": fit_bin, "--quality-cards-sha256": wrong}
+                    )
+                    + tail
+                )
+                self.assertEqual(code, 3, stderr)
+                self.assertIn("--quality-cards-sha256", stderr)
+                self.assertIn(wrong, stderr)
+                self.assertIn(self.digest, stderr)
+                self.assertNotIn("fit check refused", stderr)
+                self.assertFalse(marker.exists(), "the fit check ran before the pin refusal")
+
+    def test_matching_pin_does_not_mask_a_red_fit_verdict(self):
+        # Control: with a valid pin the fit check does run, and its RED
+        # verdict still refuses with exit 2.
+        fit_bin, marker = self.write_marking_red_fit_bin()
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                marker.unlink(missing_ok=True)
+                code, _, stderr = self.run_launch(
+                    self.base_args(
+                        **{"--fit-check-bin": fit_bin, "--quality-cards-sha256": self.digest}
+                    )
+                    + (["--dry-run"] if dry_run else [])
+                )
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("fit check refused", stderr)
+                self.assertTrue(marker.exists(), "the fit check never ran")
 
 
 if __name__ == "__main__":

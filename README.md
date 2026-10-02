@@ -217,6 +217,22 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 `recommend` read it to find the model's quality card. A pack whose card says NO_GO is refused until
 you opt in with `--accept-quality <card-id>`, so a measured quality cost is never applied silently.
 
+Newer cards without a release: `serve` prints a `fastmlx_launch=card_store` line naming the card store
+it admitted against (its sha256, `generatedAt`, card count; `fastmlx recommend` prints the same as a
+`card store:` header and as `cardStore` in `--json`). To take newer cards than your install bundles,
+fetch `site/quality-guides.json` at a public commit of this repository, compute its digest with
+`shasum -a 256 <file>`, and pass both, so the launcher's admission decision (the `admitted` line from `serve`, and `fastmlx recommend`) rests only on those exact bytes:
+
+```bash
+python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b \
+  --quality-cards ./quality-guides.json --quality-cards-sha256 <64-hex digest>
+```
+
+A wrong digest, a malformed digest, a store that does not resolve (even the default path), or matching
+bytes that are not a quality-card manifest all refuse with exit 3. The tools never fetch anything.
+The built-in engine still runs its own admission gate against its own card store (it is not passed the
+pinned file), so pin the store the launcher reads.
+
 One pack can carry several cards -- the same pack measured on different hardware. A NO_GO card
 always takes precedence over admitting ones. Among the rest, `serve` picks the card measured on this
 Mac's chip when exactly one matches, then the one measured with this launch's engine build;

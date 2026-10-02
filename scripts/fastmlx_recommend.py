@@ -42,7 +42,9 @@ Exit codes: ``0`` if at least one row is ``recommended``; ``1`` if none is
 recommended but at least one row is ``opt-in`` or ``uncarded`` (something
 fits, just nothing measured-good); ``2`` on a usage error (no candidates
 resolved at all, an explicitly-named ``--quality-cards`` manifest that does
-not load) or when every candidate is ``does-not-fit``/``error``.
+not load) or when every candidate is ``does-not-fit``/``error``; ``3`` is a
+launch refusal (a ``--quality-cards-sha256`` pin refusal or an engine-profile
+refusal).
 
 Every subprocess this script starts is invoked as an argv list, via the
 same ``fastmlx_launch.run_fit_check`` helper ``fastmlx serve`` uses --
@@ -665,6 +667,14 @@ def _format_row_text(rank: int, row: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_card_store_header(identity: Optional[dict]) -> str:
+    """One text-output header line naming the card store the ranking used
+    (the same identity ``--json`` carries as ``cardStore``)."""
+    if identity is None:
+        return "card store: none"
+    return "card store: " + launch.card_store_fields(identity)
+
+
 def format_text(rows: list) -> str:
     return "\n".join(_format_row_text(index + 1, row) for index, row in enumerate(rows))
 
@@ -711,6 +721,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
             f"{launch.DEFAULT_QUALITY_CARDS_RELATIVE_PATH} under the repo "
             "root; an explicitly-named manifest that fails to load is a "
             "usage error, unlike the default path)"
+        ),
+    )
+    recommend.add_argument(
+        "--quality-cards-sha256",
+        default=None,
+        help=(
+            "pin the quality-card manifest by the sha256 of its raw bytes "
+            "(64 hex characters, case-insensitive; equals `shasum -a 256 "
+            "<file>`); a mismatch, a manifest that does not resolve (even "
+            "the default path), or matching bytes that are not a manifest "
+            "exit 3"
         ),
     )
     recommend.add_argument(
@@ -873,7 +894,20 @@ def _run_recommend(args) -> int:
         if args.quality_cards is not None
         else (launch.REPO_ROOT / launch.DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
     )
-    cards = launch.load_quality_cards(quality_cards_path)
+    # Malformed hex and every pin refusal exit 3 (never argparse's 2: exit 2
+    # collides with the all-does-not-fit verdict), exactly like `fastmlx
+    # serve`; the pin never fails open, even for the conventional default.
+    try:
+        quality_cards_pin = launch.parse_quality_cards_pin(args.quality_cards_sha256)
+        raw_store_sha256, cards, card_store_identity = launch._inspect_quality_card_store(
+            quality_cards_path
+        )
+        launch.enforce_quality_cards_pin(
+            quality_cards_pin, quality_cards_path, raw_store_sha256, cards
+        )
+    except launch.LaunchRefusal as refusal:
+        print(f"fastmlx recommend: {refusal.message}", file=sys.stderr)
+        return refusal.exit_code
     if cards is None and args.quality_cards is not None:
         print(
             f"fastmlx recommend: the --quality-cards manifest {quality_cards_path} "
@@ -900,10 +934,15 @@ def _run_recommend(args) -> int:
     rows = rank_rows(rows)
 
     if args.json:
-        print(json.dumps({"schema": JSON_SCHEMA, "rows": rows}))
+        print(
+            json.dumps(
+                {"schema": JSON_SCHEMA, "cardStore": card_store_identity, "rows": rows}
+            )
+        )
     else:
         text = format_text(rows)
         if text:
+            print(_format_card_store_header(card_store_identity))
             print(text)
 
     return exit_code_for(rows)
