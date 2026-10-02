@@ -395,23 +395,21 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-6",
-                "title": "Publish v0.1.6: bench rows name what produced them",
-                "publishedAt": "2026-09-30T03:06:22Z",
+                "id": "tagged-distribution-v0-1-7",
+                "title": "Publish v0.1.7: the first near-lossless quality card admits by default",
+                "publishedAt": "2026-10-02T02:46:41Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.6 arm64 macOS distribution, in which fastmlx "
-                    "bench times first-token latency and decode from the first "
-                    "streamed event that carries text rather than a role-only "
-                    "preamble, every bench row records the hashes of the bench "
-                    "script and prompt set that produced it, fastmlx bench "
-                    "--combine joins three separately measured arms into one "
-                    "ratio row, fastmlx bench --public-view prints a row only "
-                    "after removing paths, the listener's host and port, and the "
-                    "base URL, a quality card whose verdict serve cannot read is "
-                    "announced rather than passing silently, and a card with a "
-                    "malformed model field no longer crashes serve."
+                    "Publishes the v0.1.7 arm64 macOS distribution, which bundles the "
+                    "Qwen3-8B 8-bit quality card measured near-lossless against its "
+                    "BF16 build over 64 generated tokens on an M3 Ultra, so fastmlx "
+                    "serve admits that pack without an explicit quality opt-in; "
+                    "quality cards state the generation length they measured, serve "
+                    "and fastmlx recommend print it, the front proxy tells each "
+                    "completion request whether its token limit is within that "
+                    "length, and fastmlx bench --listener-env records the listener "
+                    "process environment under operator-chosen public keys."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -420,7 +418,7 @@ class PublicSiteTests(unittest.TestCase):
                     "host-qualification, deployment, or production-promotion claim "
                     "follows."
                 ),
-                "publicCommit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
+                "publicCommit": "45dd4b8d98d672e940b44803879d99f7170f441e",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -437,6 +435,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "45dd4b8d98d672e940b44803879d99f7170f441e",
                 "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
                 "8dcd8b9244841514c640131f1d363ab8b00f65d8",
                 "2538456a936cefbe0c624d15f4e038fac9158102",

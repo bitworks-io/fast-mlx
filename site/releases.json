@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-09-30",
+  "updatedAt": "2026-10-02",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-7",
+      "title": "Publish v0.1.7: the first near-lossless quality card admits by default",
+      "publishedAt": "2026-10-02T02:46:41Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.7 arm64 macOS distribution, which bundles the Qwen3-8B 8-bit quality card measured near-lossless against its BF16 build over 64 generated tokens on an M3 Ultra, so fastmlx serve admits that pack without an explicit quality opt-in; quality cards state the generation length they measured, serve and fastmlx recommend print it, the front proxy tells each completion request whether its token limit is within that length, and fastmlx bench --listener-env records the listener process environment under operator-chosen public keys.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "45dd4b8d98d672e940b44803879d99f7170f441e",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-6",
       "title": "Publish v0.1.6: bench rows name what produced them",
