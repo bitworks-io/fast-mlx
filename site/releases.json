@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-10-02",
+  "updatedAt": "2026-10-03",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-8",
+      "title": "Publish v0.1.8: serve pins its quality-card store by sha256 and names a card measured on another chip",
+      "publishedAt": "2026-10-03T09:28:07Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.8 arm64 macOS distribution: fastmlx serve and fastmlx recommend name the quality-card store they admitted against and accept --quality-cards-sha256 to pin it, refusing a mismatched, malformed, or unresolvable store before the fit check; the bundled engine refuses unless the store bytes it reads match the digest the launcher forwards; the bundled Qwen3-8B 8-bit card is scoped to the M3 Ultra class it was measured on; and serve prints one stderr notice when the card it settles on was measured on a different hardware class than the host, without changing the admission outcome.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "c08aeb1bbe0f21261a245757007e9c7808aa3d7a",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-7",
       "title": "Publish v0.1.7: the first near-lossless quality card admits by default",
