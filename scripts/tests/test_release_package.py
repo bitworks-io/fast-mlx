@@ -30,6 +30,7 @@ _TOOLING_SCRIPT_NAMES = (
     "fastmlx_proxy.py",
     "fastmlx_recommend.py",
     "fastmlx_bench.py",
+    "fastmlx_cards.py",
     "validate_public_repository.py",
     "hf_pinned_snapshot_download.py",
     "fastmlx_gguf_fit.py",
@@ -362,6 +363,7 @@ class ReleasePackageTests(unittest.TestCase):
                     "libexec/scripts/fastmlx_proxy.py",
                     "libexec/scripts/fastmlx_recommend.py",
                     "libexec/scripts/fastmlx_bench.py",
+                    "libexec/scripts/fastmlx_cards.py",
                     "libexec/scripts/validate_public_repository.py",
                     "libexec/scripts/hf_pinned_snapshot_download.py",
                     "libexec/scripts/fastmlx_gguf_fit.py",
@@ -877,6 +879,7 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertIn('"scripts/fastmlx_proxy.py"', body)
             self.assertIn('"scripts/fastmlx_recommend.py"', body)
             self.assertIn('"scripts/fastmlx_bench.py"', body)
+            self.assertIn('"scripts/fastmlx_cards.py"', body)
             self.assertIn('"scripts/hf_pinned_snapshot_download.py"', body)
             self.assertIn('"scripts/fastmlx_gguf_fit.py"', body)
             self.assertIn('"scripts/fastmlx_safetensors_fit.py"', body)

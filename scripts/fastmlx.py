@@ -17,6 +17,9 @@ Subcommands:
 - ``fastmlx recommend ...`` -> ``fastmlx_recommend.main`` with the
   ``recommend`` subcommand word prepended (rank local packs by fit +
   measured quality).
+- ``fastmlx cards ...``     -> ``fastmlx_cards.main`` (``cards pull``: fetch a
+  digest-pinned quality-card store that may only add to the bundled one; the
+  only subcommand that touches the network for card data).
 - ``fastmlx capacity ...``  -> exec the ``fastmlx-capacity`` binary found
   next to this dispatcher's own install (a sibling ``bin`` dir) or on
   ``PATH``, argv passthrough, never through a shell.
@@ -26,6 +29,9 @@ Subcommands:
   resolution and passthrough rules as ``capacity``.
 - ``fastmlx bench ...``     -> ``fastmlx_bench.main`` (measure decode
   throughput against any OpenAI-compatible endpoint).
+
+``cards`` has its own ``pull`` subparser, so this dispatcher passes its
+arguments through unchanged (``cards pull ...`` -> ``fastmlx_cards.main(["pull", ...])``).
 
 ``pull`` and ``bench`` each have no subparser of their own (each is a bare
 ``argparse.ArgumentParser`` with its own positional/flag arguments), so this
@@ -61,6 +67,7 @@ _pull = _load_sibling_module("fastmlx_pull", "fastmlx_pull.py")
 _launch = _load_sibling_module("fastmlx_launch", "fastmlx_launch.py")
 _recommend = _load_sibling_module("fastmlx_recommend", "fastmlx_recommend.py")
 _bench = _load_sibling_module("fastmlx_bench", "fastmlx_bench.py")
+_cards = _load_sibling_module("fastmlx_cards", "fastmlx_cards.py")
 
 
 # The capacity-check binary this repository ships. Unlike
@@ -84,7 +91,7 @@ ENGINE_BINARY_NAME = _launch._BUILT_IN_ENGINE_BINARY_NAME
 # falls through to ``PATH``.
 _SIBLING_BIN_DIR = Path(__file__).resolve().parent.parent.parent / "bin"
 
-SUBCOMMANDS = ("pull", "serve", "recommend", "capacity", "engine", "bench")
+SUBCOMMANDS = ("pull", "serve", "recommend", "cards", "capacity", "engine", "bench")
 
 USAGE = """usage: fastmlx <subcommand> [args ...]
 
@@ -92,6 +99,7 @@ subcommands:
   pull        pull a pinned Hugging Face model snapshot
   serve       fit-check, admit, then serve an OpenAI-compatible engine
   recommend   rank local model packs that fit this host by measured quality
+  cards       fetch a digest-pinned quality-card store (cards pull)
   capacity    run the capacity-check binary directly
   engine      run the Swift serving engine binary directly (escape hatch)
   bench       measure decode throughput against any OpenAI-compatible endpoint
@@ -156,6 +164,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         return
     if subcommand == "recommend":
         _recommend.main(["recommend", *rest])
+        return
+    if subcommand == "cards":
+        _cards.main(rest)
         return
     if subcommand == "capacity":
         _exec_binary("capacity", CAPACITY_BINARY_NAME, rest)

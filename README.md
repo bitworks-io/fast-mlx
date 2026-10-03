@@ -220,16 +220,31 @@ you opt in with `--accept-quality <card-id>`, so a measured quality cost is neve
 Newer cards without a release: `serve` prints a `fastmlx_launch=card_store` line naming the card store
 it admitted against (its sha256, `generatedAt`, card count; `fastmlx recommend` prints the same as a
 `card store:` header and as `cardStore` in `--json`). To take newer cards than your install bundles,
-fetch `site/quality-guides.json` at a public commit of this repository, compute its digest with
-`shasum -a 256 <file>`, and pass both, so the launcher's admission decision (the `admitted` line from `serve`, and `fastmlx recommend`) rests only on those exact bytes:
+pull `site/quality-guides.json` at a public commit of this repository with its expected sha256:
 
 ```bash
+python3 scripts/fastmlx.py cards pull --commit <40-hex public commit> --sha256 <64-hex digest>
+# prints the absolute path it wrote (default ~/.fastmlx/cards/<digest>.json) as two flags:
+#   --quality-cards <path> --quality-cards-sha256 <digest>
 python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b \
-  --quality-cards ./quality-guides.json --quality-cards-sha256 <64-hex digest>
+  --quality-cards <path printed above> --quality-cards-sha256 <64-hex digest>
 ```
 
-A wrong digest, a malformed digest, a store that does not resolve (even the default path), or matching
-bytes that are not a quality-card manifest all refuse with exit 3. The tools never fetch anything.
+`cards pull` checks the digest before it writes anything. It then compares the store with the one
+your install bundles and refuses (exit 3) anything that could loosen admission: an older or
+future-dated `generatedAt`, a dropped card id (an uncarded pack admits silently), a duplicate id, a
+card the lookup would skip, an unrecognized verdict, or any change to a bundled card other than
+turning its verdict into NO_GO. Only new cards and verdicts tightened to NO_GO pass. The baseline is
+the store your install bundles, not the newest one you have pulled, so a store published between your
+release and a later NO_GO card still passes. The pin proves the bytes are the ones published at that
+commit. It does not defend against a compromised repository; that would need signed stores. You can
+still fetch the file yourself and pass `--quality-cards`/`--quality-cards-sha256` directly, but those
+launches skip these checks.
+
+The launcher's admission decision (the `admitted` line from `serve`, and `fastmlx recommend`) rests
+only on the pinned bytes. A wrong digest, a malformed digest, a store that does not resolve (even the
+default path), or matching bytes that are not a quality-card manifest all refuse with exit 3. `serve`
+and `recommend` never fetch anything; `cards pull` is the only command that does.
 For the built-in engine the launcher forwards the store it read -- its path, its sha256 and every
 `--accept-quality` -- and the engine refuses unless the bytes it reads match that digest, so the engine
 reads the same card store bytes the launcher admitted against. That is byte identity only: the engine

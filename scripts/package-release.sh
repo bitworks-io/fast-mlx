@@ -208,7 +208,7 @@ CAPACITY_BINARY_SHA256="$(shasum -a 256 "$STAGE_ROOT/bin/fastmlx-capacity" | awk
 # fastmlx_safetensors_fit.py loads fastmlx_gguf_fit.py (via importlib, resolving
 # Path(__file__).resolve().parent), each resolving the sibling path relative to its own
 # __file__.
-for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_proxy fastmlx_recommend fastmlx_bench validate_public_repository hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
+for name in fastmlx fastmlx_pull fastmlx_launch fastmlx_proxy fastmlx_recommend fastmlx_bench fastmlx_cards validate_public_repository hf_pinned_snapshot_download fastmlx_gguf_fit fastmlx_safetensors_fit; do
   cp -f "$REPO_ROOT/scripts/${name}.py" "$STAGE_ROOT/libexec/scripts/${name}.py"
 done
 # The two fit sizers are exec'd directly (fastmlx_launch.py's --fit-check-bin), unlike the other
@@ -367,6 +367,7 @@ class Fastmlx < Formula
     (libexec/"scripts").install "scripts/fastmlx_proxy.py"
     (libexec/"scripts").install "scripts/fastmlx_recommend.py"
     (libexec/"scripts").install "scripts/fastmlx_bench.py"
+    (libexec/"scripts").install "scripts/fastmlx_cards.py"
     (libexec/"scripts").install "scripts/validate_public_repository.py"
     (libexec/"scripts").install "scripts/hf_pinned_snapshot_download.py"
     (libexec/"scripts").install "scripts/fastmlx_gguf_fit.py"

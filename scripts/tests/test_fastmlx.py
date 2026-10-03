@@ -77,6 +77,13 @@ class UsageAndDispatchTests(unittest.TestCase):
             FASTMLX.main(["bench", "--base-url", "http://localhost:8080"])
         fake_main.assert_called_once_with(["--base-url", "http://localhost:8080"])
 
+    def test_cards_routes_to_fastmlx_cards_main_with_argv_unchanged(self):
+        with mock.patch.object(FASTMLX._cards, "main") as fake_main:
+            FASTMLX.main(["cards", "pull", "--commit", "a" * 40, "--sha256", "b" * 64])
+        fake_main.assert_called_once_with(
+            ["pull", "--commit", "a" * 40, "--sha256", "b" * 64]
+        )
+
 
 class SubcommandHelpEquivalenceTests(unittest.TestCase):
     """fastmlx <subcommand> --help must behave exactly like invoking the
@@ -93,6 +100,12 @@ class SubcommandHelpEquivalenceTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as ctx:
                 FASTMLX.main(["serve", "--help"])
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_cards_pull_help_exits_0(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX.main(["cards", "pull", "--help"])
         self.assertEqual(ctx.exception.code, 0)
 
     def test_recommend_help_exits_0(self):
@@ -207,6 +220,7 @@ class CLIHelpTextCoverageTests(unittest.TestCase):
     # second time.
     MODULES = {
         "fastmlx_bench.py": FASTMLX._bench,
+        "fastmlx_cards.py": FASTMLX._cards,
         "fastmlx_gguf_fit.py": FASTMLX._load_sibling_module(
             "fastmlx_gguf_fit", "fastmlx_gguf_fit.py"
         ),
