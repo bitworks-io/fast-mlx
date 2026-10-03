@@ -746,9 +746,9 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     }
 
     let revision = modelRevisionArgument(rawArguments: rawArguments)
+    let hostHardwareClass = QualityCardStore.hostHardwareClass()
     let cardResolution = QualityCardStore.resolve(
-        repo: model, revision: revision, hostHardwareClass: QualityCardStore.hostHardwareClass(),
-        in: cards)
+        repo: model, revision: revision, hostHardwareClass: hostHardwareClass, in: cards)
     let card: QualityCard?
     switch cardResolution {
     case .none:
@@ -761,6 +761,13 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         FileHandle.standardError.write(
             Data("fastmlx-serve configuration=refused reason=quality_card_ambiguous detail=\(detail)\n".utf8))
         exit(2)
+    }
+    // Notice only: its own stderr line, before the outcome switch (so also before a refusal). Never
+    // folded into the refusal text and never changes the outcome or exit code.
+    if let notice = QualityAdmission.hostMismatchNotice(
+        card: card, hostHardwareClass: hostHardwareClass)
+    {
+        FileHandle.standardError.write(Data("fastmlx-serve: \(notice)\n".utf8))
     }
     let optIn = QualityOptIn.parse(rawArguments)
     let outcome = QualityAdmission.decide(

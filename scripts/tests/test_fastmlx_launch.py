@@ -7245,5 +7245,232 @@ class EngineReceivesLaunchersCardStoreTestCase(unittest.TestCase):
                 self.assertEqual(len(expected.split()), 9)
 
 
+
+# ---------------------------------------------------------------------
+# hardware_mismatch_notice: a card measured on other hardware is NAMED at
+# admission (notice only; never a refusal, never a filter). See
+# docs/task-inbox/2026-10-03-PREDECLARATION-admission-notices-a-card-measured-on-other-hardware.md.
+# ---------------------------------------------------------------------
+def _hw_notice_sentence(card_id: str, card_class: str, host_class: str) -> str:
+    return (
+        f"quality card '{card_id}' was measured on hardware class '{card_class}', "
+        f"not this host's '{host_class}'; its figures are not established on this "
+        "hardware (see the card's boundary)"
+    )
+
+
+# The shared parity table: (id, card hardwareClass key state, host class,
+# expected). The Swift suite (HarnessCoreTests) carries the SAME literal
+# cases. The sentinel _NO_CLASS means the card has no ``config`` at all.
+_NO_CLASS = object()
+HARDWARE_MISMATCH_PARITY_CASES = (
+    (
+        "qwen3-8b-8bit@m3ultra",
+        "apple-m3-ultra",
+        "apple-m5",
+        "quality card 'qwen3-8b-8bit@m3ultra' was measured on hardware class "
+        "'apple-m3-ultra', not this host's 'apple-m5'; its figures are not "
+        "established on this hardware (see the card's boundary)",
+    ),
+    ("a", "apple-m5", "apple-m5", None),
+    ("a", _NO_CLASS, "apple-m5", None),
+    ("a", "", "apple-m5", None),
+    ("a", "apple-m3-ultra", None, None),
+    (
+        "bad\nid",
+        "apple-m3-ultra",
+        "apple-m5",
+        _hw_notice_sentence("bad?id", "apple-m3-ultra", "apple-m5"),
+    ),
+    (
+        "é-card",
+        "apple-m3-ultra",
+        "apple-m5",
+        _hw_notice_sentence("?-card", "apple-m3-ultra", "apple-m5"),
+    ),
+    (
+        "x" * 100,
+        "apple-m3-ultra",
+        "apple-m5",
+        _hw_notice_sentence("x" * 80, "apple-m3-ultra", "apple-m5"),
+    ),
+)
+
+
+class HardwareMismatchNoticeTestCase(unittest.TestCase):
+    @staticmethod
+    def _card(card_id, card_class) -> dict:
+        card = {"id": card_id}
+        if card_class is not _NO_CLASS:
+            card["config"] = {"hardwareClass": card_class}
+        return card
+
+    def test_parity_table(self):
+        for card_id, card_class, host_class, expected in HARDWARE_MISMATCH_PARITY_CASES:
+            with self.subTest(card_id=card_id, card_class=card_class, host=host_class):
+                self.assertEqual(
+                    FASTMLX_LAUNCH.hardware_mismatch_notice(
+                        self._card(card_id, card_class), host_class
+                    ),
+                    expected,
+                )
+
+    def test_no_card_is_none(self):
+        self.assertIsNone(FASTMLX_LAUNCH.hardware_mismatch_notice(None, "apple-m5"))
+
+    def test_empty_host_class_is_none(self):
+        self.assertIsNone(
+            FASTMLX_LAUNCH.hardware_mismatch_notice(self._card("a", "apple-m3-ultra"), "")
+        )
+
+    def test_card_and_host_classes_are_sanitized_too(self):
+        notice = FASTMLX_LAUNCH.hardware_mismatch_notice(
+            self._card("a", "m3\r\nultra" + "y" * 100), "m5\té" + "z" * 100
+        )
+        self.assertEqual(
+            notice,
+            _hw_notice_sentence("a", "m3??ultra" + "y" * 71, "m5??" + "z" * 76),
+        )
+        self.assertNotIn("\n", notice)
+        self.assertNotIn("\r", notice)
+
+    def test_notice_never_contains_chars_outside_printable_ascii(self):
+        notice = FASTMLX_LAUNCH.hardware_mismatch_notice(
+            self._card("id\x00\x1b\x7f ", "cé"), "h中"
+        )
+        self.assertTrue(all(0x20 <= ord(ch) <= 0x7E for ch in notice), notice)
+
+
+HWN_REPO = "example/HwMismatchModel"
+HWN_PASS_ID = "hwn-pass@m3ultra"
+HWN_NO_GO_REPO = "example/HwMismatchNoGoModel"
+HWN_NO_GO_ID = "hwn-no-go@m3ultra"
+HWN_CARD_CLASS = "apple-m3-ultra"
+HWN_OTHER_HOST_CHIP = "Apple M5"
+HWN_SAME_HOST_CHIP = "Apple M3 Ultra"
+
+
+def hardware_mismatch_manifest() -> dict:
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": HWN_PASS_ID,
+                "model": {"repo": HWN_REPO, "hfPin": "cafeb0b1"},
+                "verdict": "PASS",
+                "config": {"hardwareClass": HWN_CARD_CLASS},
+                "admission": {"default": True, "optIn": True, "reason": "measured pass"},
+                "legible": {"tier": "Reference", "headline": "hwn pass headline"},
+            },
+            {
+                "id": HWN_NO_GO_ID,
+                "model": {"repo": HWN_NO_GO_REPO, "hfPin": "deadb0b1"},
+                "verdict": "NO_GO",
+                "config": {"hardwareClass": HWN_CARD_CLASS},
+                "admission": {
+                    "default": False,
+                    "optIn": True,
+                    "reason": "quality-degraded vs reference",
+                },
+                "legible": {"tier": "Noticeable", "headline": "hwn no-go headline"},
+            },
+        ],
+    }
+
+
+class HardwareMismatchCallSiteTestCase(unittest.TestCase):
+    NOTICE_PREFIX = "fastmlx serve: quality card "
+    _REAL_SUBPROCESS_RUN = subprocess.run
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+        self.manifest_path = self.root / "hwn-quality-cards.json"
+        self.manifest_path.write_text(json.dumps(hardware_mismatch_manifest()), encoding="utf-8")
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    def argv(self, repo: str, **extra) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--model-repo": repo,
+            "--context": "2048",
+        }
+        args.update(extra)
+        argv = ["serve"]
+        for key, value in args.items():
+            argv += [key, str(value)]
+        return argv + ["--dry-run"]
+
+    def run_main(self, argv: list, host_chip: str):
+        """Runs ``main`` with this host's ``sysctl`` brand string forced to
+        ``host_chip`` (every other ``subprocess.run`` call delegates to the
+        real one)."""
+        real_run = type(self)._REAL_SUBPROCESS_RUN
+
+        def fake_run(*args, **kwargs):
+            call = args[0] if args else kwargs.get("args")
+            if call == ["sysctl", "-n", "machdep.cpu.brand_string"]:
+                return subprocess.CompletedProcess(call, 0, stdout=host_chip + "\n", stderr="")
+            return real_run(*args, **kwargs)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                with patch.object(FASTMLX_LAUNCH.subprocess, "run", side_effect=fake_run):
+                    FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def notice_lines(self, stderr: str) -> list:
+        return [line for line in stderr.splitlines() if line.startswith(self.NOTICE_PREFIX)]
+
+    def expected_notice_line(self, card_id: str) -> str:
+        return "fastmlx serve: " + _hw_notice_sentence(card_id, HWN_CARD_CLASS, "apple-m5")
+
+    def test_admitted_off_class_pass_card_prints_one_line_stdout_unchanged(self):
+        argv = self.argv(HWN_REPO)
+        code, stdout, stderr = self.run_main(argv, HWN_OTHER_HOST_CHIP)
+        same_code, same_stdout, same_stderr = self.run_main(argv, HWN_SAME_HOST_CHIP)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(same_code, 0, same_stderr)
+        self.assertEqual(self.notice_lines(stderr), [self.expected_notice_line(HWN_PASS_ID)])
+        self.assertEqual(stdout, same_stdout)
+
+    def test_explicit_card_id_off_class_prints_one_line(self):
+        argv = self.argv(HWN_REPO, **{"--card-id": HWN_PASS_ID})
+        code, _, stderr = self.run_main(argv, HWN_OTHER_HOST_CHIP)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.notice_lines(stderr), [self.expected_notice_line(HWN_PASS_ID)])
+
+    def test_refused_off_class_no_go_keeps_exit_and_message_and_adds_one_line(self):
+        argv = self.argv(HWN_NO_GO_REPO)
+        code, stdout, stderr = self.run_main(argv, HWN_OTHER_HOST_CHIP)
+        same_code, same_stdout, same_stderr = self.run_main(argv, HWN_SAME_HOST_CHIP)
+        self.assertEqual(code, 2, stderr)
+        self.assertEqual(same_code, 2, same_stderr)
+        self.assertEqual(stdout, same_stdout)
+        notice = self.expected_notice_line(HWN_NO_GO_ID)
+        self.assertEqual(self.notice_lines(stderr), [notice])
+        self.assertEqual(self.notice_lines(same_stderr), [])
+        # Removing the one notice line leaves the refusal text byte-identical.
+        remaining = [line for line in stderr.splitlines(keepends=True) if line.rstrip("\n") != notice]
+        self.assertEqual("".join(remaining), same_stderr)
+
+    def test_same_class_card_prints_no_notice(self):
+        for repo in (HWN_REPO, HWN_NO_GO_REPO):
+            with self.subTest(repo=repo):
+                _, _, stderr = self.run_main(self.argv(repo), HWN_SAME_HOST_CHIP)
+                self.assertEqual(self.notice_lines(stderr), [])
+                self.assertNotIn("was measured on hardware class", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

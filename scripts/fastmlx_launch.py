@@ -1652,6 +1652,55 @@ def decide_admission(card: Optional[dict], opted_in: bool) -> tuple:
 _RECOGNIZED_VERDICTS = ("PASS", "REFERENCE", "EXACT", "NO_GO", "UNMEASURED")
 
 
+_HARDWARE_NOTICE_FIELD_MAX_LEN = 80
+
+
+def _hardware_notice_field(value: str) -> str:
+    """One-line-safe rendering of a ``hardware_mismatch_notice`` field: every
+    code point outside printable ASCII (0x20..0x7E) becomes ``?``, then the
+    result is truncated to the first 80 characters. Deliberately NOT
+    ``repr()``: the Swift ``QualityAdmission.hostMismatchNotice`` applies the
+    identical rule, so both sides produce byte-identical strings.
+    """
+    cleaned = "".join(ch if 0x20 <= ord(ch) <= 0x7E else "?" for ch in value)
+    return cleaned[:_HARDWARE_NOTICE_FIELD_MAX_LEN]
+
+
+def hardware_mismatch_notice(card: Optional[dict], host_class: Optional[str]) -> Optional[str]:
+    """A stderr-facing notice when the resolved quality ``card`` was measured
+    on a different hardware class than this host's (``host_class``, from
+    ``host_hardware_class()``) -- ``None`` when ``card`` is ``None``, the card
+    carries no (or an empty) ``config.hardwareClass``, ``host_class`` is
+    unknown/empty, or the two strings are equal.
+
+    This is a NOTICE-ONLY helper: it never changes ``decide_admission``'s
+    outcome, the exit code, or any refusal message. Why it exists: cycle 191
+    measured a 0.63% top-1 cross-host floor between an M3 Ultra and an M5 on
+    the same build, pack and trajectory, so a card's figures do not transfer
+    across hardware classes and an operator on other hardware should be told
+    which hardware the card actually speaks for. ``hardwareClass`` stays a
+    resolve-time TIEBREAK (see ``resolve_card``), never a FILTER: a card
+    measured elsewhere is still admitted exactly as before, merely named.
+
+    Each of the three interpolated fields (card id, card class, host class)
+    goes through ``_hardware_notice_field`` so the result is always exactly
+    one printable-ASCII line. Mirrors Swift
+    ``QualityAdmission.hostMismatchNotice``.
+    """
+    if card is None:
+        return None
+    card_class = card_hardware_class(card)
+    if not card_class or not host_class or card_class == host_class:
+        return None
+    card_id = _hardware_notice_field(str(card.get("id", "")))
+    return (
+        f"quality card '{card_id}' was measured on hardware class "
+        f"'{_hardware_notice_field(card_class)}', not this host's "
+        f"'{_hardware_notice_field(host_class)}'; its figures are not "
+        "established on this hardware (see the card's boundary)"
+    )
+
+
 def unrecognized_verdict_notice(card: Optional[dict]) -> Optional[str]:
     """A stderr-facing notice for an admitted-unmeasured card whose
     ``verdict`` field ``decide_admission`` did NOT recognize -- ``None``
@@ -3036,6 +3085,20 @@ def _run_serve(args, passthrough_args: list) -> int:
     # (whichever one set ``card`` above), so an unrecognized verdict is
     # announced regardless of how the card was found.
     verdict_notice = unrecognized_verdict_notice(card)
+    # A card measured on other hardware is NAMED, never refused or filtered.
+    # Its own stderr line, printed BEFORE the refusal block so it appears on
+    # the admit paths AND ahead of a refusal, and deliberately NOT folded into
+    # ``notice_texts`` so the LaunchRefusal message and exit code stay
+    # byte-identical.
+    # The host class is probed (one ``sysctl`` subprocess) only when the card
+    # records a hardware class at all: with nothing to compare, the notice is
+    # ``None`` regardless of the host, and an uncarded launch stays free of
+    # the extra subprocess.
+    hardware_notice = hardware_mismatch_notice(
+        card, host_hardware_class() if card_hardware_class(card) else None
+    )
+    if hardware_notice:
+        print(f"fastmlx serve: {hardware_notice}", file=sys.stderr)
     if outcome == "refuse_quality_flagged":
         notice_texts = " ".join(
             notice for notice in (build_notice, mtp_notice, *resolve_notices) if notice

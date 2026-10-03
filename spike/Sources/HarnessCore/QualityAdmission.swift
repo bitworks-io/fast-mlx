@@ -234,6 +234,41 @@ public enum QualityAdmission {
         cards.isEmpty ? " quality_cards_count=0" : ""
     }
 
+    /// One-line safety for a field interpolated into the host-mismatch notice: every unicode scalar
+    /// outside printable ASCII `0x20...0x7E` becomes `?`, then the result is truncated to its first 80
+    /// scalars. The identical rule runs on the Python side (`scripts/fastmlx_launch.py`).
+    private static func noticeSafe(_ value: String) -> String {
+        var out = String.UnicodeScalarView()
+        for scalar in value.unicodeScalars.prefix(80) {
+            out.append((0x20...0x7E).contains(scalar.value) ? scalar : "?")
+        }
+        return String(out)
+    }
+
+    /// The host-mismatch NOTICE: one stderr line telling the operator that the resolved card was
+    /// measured on a different hardware class than this host. NOTICE ONLY -- it never changes the
+    /// admission outcome, the exit code, or the refusal text; `decide(card:optIn:)` does not consult
+    /// it, and the caller prints it as its own line on the admit paths and before a refusal.
+    ///
+    /// Why: cycle 191 measured a 0.63% top-1 cross-host floor between an M3 Ultra and an M5 (same
+    /// build, pack, and trajectory), so a card's figures do not transfer across hardware classes.
+    /// `hardwareClass` nevertheless remains a tiebreak, never a filter (see
+    /// `QualityCardStore.card(forRepo:hostHardwareClass:in:)`): the card still gates, and the
+    /// operator is simply told what it was and was not measured on.
+    ///
+    /// `nil` when there is no card, the card has no (or an empty) `config.hardwareClass`, the host
+    /// class is unknown (`nil` or empty), or the two classes are equal (compared raw, before
+    /// sanitizing). Otherwise exactly
+    /// `quality card '<id>' was measured on hardware class '<cardClass>', not this host's '<hostClass>'; its figures are not established on this hardware (see the card's boundary)`
+    /// with each of the three fields passed through `noticeSafe`.
+    public static func hostMismatchNotice(card: QualityCard?, hostHardwareClass: String?) -> String? {
+        guard let card, let cardClass = card.config?.hardwareClass, !cardClass.isEmpty,
+            let hostClass = hostHardwareClass, !hostClass.isEmpty, cardClass != hostClass
+        else { return nil }
+        return
+            "quality card '\(noticeSafe(card.id))' was measured on hardware class '\(noticeSafe(cardClass))', not this host's '\(noticeSafe(hostClass))'; its figures are not established on this hardware (see the card's boundary)"
+    }
+
     public static func decide(card: QualityCard?, optIn: Bool) -> QualityAdmissionOutcome {
         guard let card else { return .admitUnmeasured }
         switch card.verdict {

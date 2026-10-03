@@ -250,6 +250,13 @@ the model's repo name, or its pinned revision, and `--card-id <id>` selects a sp
 `recommend` prints the same notice on the affected row's status line, and in `--json` as the row's
 `tiebreakNotice` key (`null` when no tiebreak fired).
 
+When the card `serve` settles on was measured on a different chip than this Mac's, both the
+launcher and the engine print one stderr line naming the card, its hardware class and this host's,
+and saying that its figures are not established on this hardware. It is a notice, not a gate: the
+admission outcome, exit code, refusal text and stdout announce line are unchanged. The same pack's
+top-1 choices differed at 0.63% of positions between an M3 Ultra and an M5 on one build and
+trajectory, so a card speaks only for the hardware it was measured on.
+
 A card states what a pack **buys**, not only what it costs, and both surfaces say so at the moment
 you choose. Alongside the quality cost, `serve`'s admission message and each `recommend` row carry
 the card's measured benefit as two separately labelled facts -- `speed:` (a decode-throughput ratio)

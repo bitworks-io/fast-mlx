@@ -2210,4 +2210,84 @@ final class QualityAdmissionTests: XCTestCase {
         XCTAssertEqual(verified.droppedCardCount, 0)
         XCTAssertEqual(verified.cards.map(\.id), plain.cards.map(\.id))
     }
+
+    // MARK: - host-mismatch notice (notice only; never changes the outcome)
+
+    private func expectedMismatch(id: String, cardClass: String, hostClass: String) -> String {
+        "quality card '\(id)' was measured on hardware class '\(cardClass)', not this host's '\(hostClass)'; its figures are not established on this hardware (see the card's boundary)"
+    }
+
+    /// The shared parity table: the Python launcher suite uses the identical literal cases.
+    func testHostMismatchNoticeParityTable() {
+        let m3 = "apple-m3-ultra"
+        let m5 = "apple-m5"
+        let cases: [(id: String, cardClass: String?, host: String?, expected: String?)] = [
+            (
+                "qwen3-8b-8bit@m3ultra", m3, m5,
+                "quality card 'qwen3-8b-8bit@m3ultra' was measured on hardware class 'apple-m3-ultra', not this host's 'apple-m5'; its figures are not established on this hardware (see the card's boundary)"
+            ),
+            ("a", m5, m5, nil),
+            ("a", nil, m5, nil),
+            ("a", "", m5, nil),
+            ("a", m3, nil, nil),
+            (
+                "bad\nid", m3, m5,
+                "quality card 'bad?id' was measured on hardware class 'apple-m3-ultra', not this host's 'apple-m5'; its figures are not established on this hardware (see the card's boundary)"
+            ),
+            (
+                "\u{00E9}-card", m3, m5,
+                "quality card '?-card' was measured on hardware class 'apple-m3-ultra', not this host's 'apple-m5'; its figures are not established on this hardware (see the card's boundary)"
+            ),
+            (
+                String(repeating: "x", count: 100), m3, m5,
+                "quality card '\(String(repeating: "x", count: 80))' was measured on hardware class 'apple-m3-ultra', not this host's 'apple-m5'; its figures are not established on this hardware (see the card's boundary)"
+            ),
+        ]
+        for c in cases {
+            let fixture = card(id: c.id, verdict: .pass, hardwareClass: c.cardClass)
+            XCTAssertEqual(
+                QualityAdmission.hostMismatchNotice(card: fixture, hostHardwareClass: c.host), c.expected,
+                "case id=\(c.id.debugDescription) cardClass=\(String(describing: c.cardClass)) host=\(String(describing: c.host))"
+            )
+        }
+    }
+
+    func testHostMismatchNoticeIsNilWhenThereIsNoCard() {
+        XCTAssertNil(QualityAdmission.hostMismatchNotice(card: nil, hostHardwareClass: "apple-m5"))
+    }
+
+    func testHostMismatchNoticeIsNilWhenTheCardHasNoConfig() {
+        let c = card(verdict: .pass)
+        XCTAssertNil(c.config)
+        XCTAssertNil(QualityAdmission.hostMismatchNotice(card: c, hostHardwareClass: "apple-m5"))
+    }
+
+    func testHostMismatchNoticeIsNilWhenTheHostClassIsEmpty() {
+        let c = card(verdict: .pass, hardwareClass: "apple-m3-ultra")
+        XCTAssertNil(QualityAdmission.hostMismatchNotice(card: c, hostHardwareClass: ""))
+    }
+
+    func testHostMismatchNoticeSanitizesAllThreeFields() {
+        let c = card(id: "i\td", verdict: .pass, hardwareClass: "c\u{7F}x")
+        XCTAssertEqual(
+            QualityAdmission.hostMismatchNotice(card: c, hostHardwareClass: "h\r\u{00E9}"),
+            expectedMismatch(id: "i?d", cardClass: "c?x", hostClass: "h??"))
+    }
+
+    func testHostMismatchNoticeDoesNotChangeTheAdmissionOutcome() {
+        for verdict in [QualityVerdict.pass, .noGo] {
+            let offClass = card(verdict: verdict, hardwareClass: "apple-m3-ultra")
+            let sameClass = card(verdict: verdict, hardwareClass: "apple-m5")
+            XCTAssertNotNil(
+                QualityAdmission.hostMismatchNotice(card: offClass, hostHardwareClass: "apple-m5"))
+            XCTAssertNil(
+                QualityAdmission.hostMismatchNotice(card: sameClass, hostHardwareClass: "apple-m5"))
+            for optIn in [false, true] {
+                XCTAssertEqual(
+                    QualityAdmission.decide(card: offClass, optIn: optIn),
+                    QualityAdmission.decide(card: sameClass, optIn: optIn),
+                    "off-class \(verdict) card must decide exactly like a same-class one (optIn=\(optIn))")
+            }
+        }
+    }
 }
