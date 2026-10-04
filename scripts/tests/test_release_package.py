@@ -161,6 +161,20 @@ def _run_git(repo_dir: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _temp_prefixes() -> tuple[str, ...]:
+    """The temporary prefixes package-release.sh exempts from the checkout-path needle: /tmp,
+    /var/folders and $TMPDIR, each as given and resolved (both are symlinks on macOS)."""
+    prefixes: list[str] = []
+    for raw in ("/tmp", "/var/folders", os.environ.get("TMPDIR", "")):
+        if not raw:
+            continue
+        prefixes.append(raw.rstrip("/") + "/")
+        resolved = str(Path(raw).resolve())
+        if resolved != "/":
+            prefixes.append(resolved.rstrip("/") + "/")
+    return tuple(prefixes)
+
+
 def _init_git_repo(repo_dir: Path) -> None:
     repo_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -242,14 +256,21 @@ def _init_fixture_release_repo(repo_dir: Path) -> None:
 class ReleasePackageTests(unittest.TestCase):
     # --- helpers -----------------------------------------------------------------------------
 
-    def _make_fake_binaries(self, directory: Path) -> tuple[Path, Path, Path]:
+    def _make_fake_binaries(
+        self,
+        directory: Path,
+        *,
+        serve_extra: bytes = b"",
+        capacity_extra: bytes = b"",
+        metallib_extra: bytes = b"",
+    ) -> tuple[Path, Path, Path]:
         directory.mkdir(parents=True, exist_ok=True)
         fake_serve = directory / "fake-fastmlx-serve"
         fake_capacity = directory / "fake-fastmlx-capacity"
         fake_metallib = directory / "fake-mlx.metallib"
-        fake_serve.write_text("#!/bin/sh\necho serve\n", encoding="utf-8")
-        fake_capacity.write_text("#!/bin/sh\necho capacity\n", encoding="utf-8")
-        fake_metallib.write_bytes(b"fake-metallib-bytes")
+        fake_serve.write_bytes(b"#!/bin/sh\necho serve\n" + serve_extra)
+        fake_capacity.write_bytes(b"#!/bin/sh\necho capacity\n" + capacity_extra)
+        fake_metallib.write_bytes(b"fake-metallib-bytes" + metallib_extra)
         fake_serve.chmod(0o755)
         fake_capacity.chmod(0o755)
         return fake_serve, fake_capacity, fake_metallib
@@ -270,9 +291,15 @@ class ReleasePackageTests(unittest.TestCase):
         script: Path = PACKAGE_SCRIPT,
         cwd: Optional[Path] = None,
         env: Optional[dict] = None,
+        serve_extra: bytes = b"",
+        capacity_extra: bytes = b"",
+        metallib_extra: bytes = b"",
     ) -> subprocess.CompletedProcess:
         fake_serve, fake_capacity, fake_metallib = self._make_fake_binaries(
-            stage_dir.parent / "fakes"
+            stage_dir.parent / "fakes",
+            serve_extra=serve_extra,
+            capacity_extra=capacity_extra,
+            metallib_extra=metallib_extra,
         )
 
         args = [
@@ -1411,6 +1438,202 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertIn("git checkout", result.stderr.lower())
             tarball, _ = self._tarball_paths(out_dir)
             self.assertFalse(tarball.exists())
+
+    # --- embedded local paths: rows B1-B9 -------------------------------------------------------
+    # package-release.sh scans the STAGED bin/fastmlx-serve, bin/fastmlx-capacity and
+    # bin/mlx.metallib for the real $HOME path (and the script's own non-temporary checkout path)
+    # and refuses before the tarball, .sha256, provenance.json or formula exist. The v0.1.9 first
+    # build embedded 23 home-directory __FILE__ paths and only a manual `strings` sweep caught it.
+
+    def _home_env(self, home: Path) -> dict:
+        return {**os.environ, "HOME": str(home)}
+
+    def _assert_refused(
+        self,
+        result: subprocess.CompletedProcess,
+        root: Path,
+        *,
+        staged_name: str,
+        needle_kind: str,
+        emit_formula: Optional[Path] = None,
+    ) -> None:
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(staged_name, result.stderr)
+        self.assertIn(needle_kind, result.stderr)
+        tarball, sha_file = self._tarball_paths(root / "out")
+        self.assertFalse(tarball.exists(), "tarball must not be written on refusal")
+        self.assertFalse(sha_file.exists(), ".sha256 must not be written on refusal")
+        self.assertFalse(
+            (root / "stage" / "fastmlx-testver-arm64-macos").exists(),
+            "staged top dir must be removed on refusal",
+        )
+        if emit_formula is not None:
+            self.assertFalse(emit_formula.exists(), "formula must not be written on refusal")
+
+    def _fake_home(self, root: Path) -> Path:
+        home = root / "home"
+        home.mkdir()
+        return home.resolve()
+
+    def test_b1_refuses_serve_binary_embedding_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env=self._home_env(home),
+                serve_extra=b"\0" + str(home).encode() + b"/mlx-c/fmt/format.h\0",
+            )
+            self._assert_refused(
+                result, root, staged_name="fastmlx-serve", needle_kind="home directory"
+            )
+
+    def test_b2_refuses_capacity_binary_embedding_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env=self._home_env(home),
+                capacity_extra=b"\0" + str(home).encode() + b"/x.c\0",
+            )
+            self._assert_refused(
+                result, root, staged_name="fastmlx-capacity", needle_kind="home directory"
+            )
+
+    def test_b3_refuses_metallib_embedding_home(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env=self._home_env(home),
+                metallib_extra=b"\0" + str(home).encode() + b"/k.metal\0",
+            )
+            self._assert_refused(
+                result, root, staged_name="mlx.metallib", needle_kind="home directory"
+            )
+
+    def test_b4_refuses_binary_embedding_a_non_temp_checkout_path(self) -> None:
+        checkout = REPOSITORY_ROOT.resolve()
+        temp_prefixes = _temp_prefixes()
+        if any(f"{checkout}/".startswith(prefix) for prefix in temp_prefixes):
+            self.skipTest(f"test checkout {checkout} is itself under a temporary prefix")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env=self._home_env(home),
+                serve_extra=b"\0" + str(checkout).encode() + b"/spike/Sources/x.swift\0",
+            )
+            self._assert_refused(
+                result, root, staged_name="fastmlx-serve", needle_kind="checkout path"
+            )
+
+    def test_b5_temp_checkout_path_is_exempt_and_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            fixture_root = root / "fixture-repo"
+            _init_fixture_release_repo(fixture_root)
+            _git_commit(fixture_root, "a.txt", "a", "initial")
+            real_fixture = fixture_root.resolve()
+            self.assertTrue(
+                f"{real_fixture}/".startswith(_temp_prefixes()),
+                f"fixture root {real_fixture} is not under a temp prefix; test not discriminating",
+            )
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                script=fixture_root / "scripts" / "package-release.sh",
+                cwd=fixture_root,
+                env=self._home_env(home),
+                serve_extra=b"\0" + str(real_fixture).encode() + b"/Sources/x.swift\0",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tarball, sha_file = self._tarball_paths(root / "out")
+            self.assertTrue(tarball.is_file())
+            self.assertTrue(sha_file.is_file())
+
+    def test_b6_clean_binaries_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env=self._home_env(home),
+                serve_extra=b"\0/tmp/rel-c197/mlx-c/x.c\0",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tarball, _ = self._tarball_paths(root / "out")
+            self.assertTrue(tarball.is_file())
+
+    def test_b7_home_slash_contributes_no_needle(self) -> None:
+        # The fake serve binary already contains "/" (its shebang), so a "/" needle would refuse.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env={**os.environ, "HOME": "/"},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tarball, _ = self._tarball_paths(root / "out")
+            self.assertTrue(tarball.is_file())
+
+    def test_b8_symlinked_home_refuses_on_resolved_real_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            real_home = root / "real-home"
+            real_home.mkdir()
+            link_home = root / "link-home"
+            link_home.symlink_to(real_home)
+            self.assertNotEqual(str(link_home), str(real_home.resolve()))
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                env=self._home_env(link_home),
+                serve_extra=b"\0" + str(real_home.resolve()).encode() + b"/x.c\0",
+            )
+            self._assert_refused(
+                result, root, staged_name="fastmlx-serve", needle_kind="home directory"
+            )
+
+    def test_b9_refused_run_writes_no_formula(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = self._fake_home(root)
+            formula = root / "emitted-fastmlx.rb"
+            result = self.run_package_script(
+                root / "stage",
+                root / "out",
+                check=False,
+                emit_formula=formula,
+                env=self._home_env(home),
+                serve_extra=b"\0" + str(home).encode() + b"/x.c\0",
+            )
+            self._assert_refused(
+                result,
+                root,
+                staged_name="fastmlx-serve",
+                needle_kind="home directory",
+                emit_formula=formula,
+            )
+
 
 
 # --- no internal deployment names leak into the generic release script -----------------------

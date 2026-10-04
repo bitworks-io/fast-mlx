@@ -14,6 +14,10 @@
 # scripts/serve.sh does at dev time (MLX searches <bindir>/mlx.metallib first), so a downloaded
 # tarball "just works" with no Metal Toolchain download.
 #
+# Before anything is hashed or tarred, the staged binaries and metallib are scanned for the
+# builder's home directory and (outside /tmp-style clones) checkout path, and the run is refused if
+# one is embedded -- build the release from a clone under /tmp.
+#
 # This script only STAGES artifacts locally. It does not create a tap repo, push a GitHub
 # release, or publish anything -- publication is human-gated.
 #
@@ -186,6 +190,72 @@ cp -f "$BINARY" "$STAGE_ROOT/bin/fastmlx-serve"
 cp -f "$CAPACITY_BINARY" "$STAGE_ROOT/bin/fastmlx-capacity"
 cp -f "$METALLIB" "$STAGE_ROOT/bin/mlx.metallib"
 chmod +x "$STAGE_ROOT/bin/fastmlx-serve" "$STAGE_ROOT/bin/fastmlx-capacity"
+
+# Refuse a staged artifact that carries the builder's home directory or checkout path. The first
+# v0.1.9 build embedded 23 home-directory __FILE__ paths (from the vendored mlx-c / fmt sources)
+# and only a manual `strings` sweep caught it; the check belongs in the packaging step itself.
+# The match is a raw-byte fixed-string grep over the whole file (not `strings`), so no section or
+# minimum-length rule can hide a hit and no Xcode tool is needed. A build from a clone under a
+# temporary prefix (/tmp/..., the v0.1.8 and shipped v0.1.9 regime) carries only /tmp build paths,
+# which identify no person or machine, so a REPO_ROOT under such a prefix is not a needle. An
+# unset, empty, "/" or unresolvable $HOME contributes no needle (a "/" needle would match anything).
+refuse_embedded_local_paths() {
+  local needle kind rel file prefix tmp_real
+  local -a home_needles=() checkout_needles=()
+  local home_real=""
+  # `cd ""` succeeds in place, so an empty $HOME must be skipped explicitly, not left to cd.
+  if [ -n "${HOME:-}" ]; then
+    home_real="$(cd "$HOME" 2>/dev/null && pwd -P || true)"
+  fi
+  if [ -n "$home_real" ] && [ "$home_real" != "/" ]; then
+    home_needles+=("$home_real")
+  fi
+  if [ -n "${HOME:-}" ] && [ "${HOME:-}" != "/" ] && [ "${HOME:-}" != "$home_real" ]; then
+    home_needles+=("$HOME")
+  fi
+
+  local repo_is_temp=0
+  # /tmp and /var/folders are symlinks on macOS, so each prefix is listed as given and resolved
+  # (REPO_ROOT_REAL is a `pwd -P` path).
+  local -a temp_prefixes=()
+  for prefix in /tmp /var/folders "${TMPDIR:-}"; do
+    [ -n "$prefix" ] || continue
+    temp_prefixes+=("${prefix%/}/")
+    tmp_real="$(cd "$prefix" 2>/dev/null && pwd -P || true)"
+    if [ -n "$tmp_real" ] && [ "$tmp_real" != "/" ]; then
+      temp_prefixes+=("${tmp_real%/}/")
+    fi
+  done
+  for prefix in "${temp_prefixes[@]}"; do
+    case "$REPO_ROOT_REAL/" in
+      "$prefix"*) repo_is_temp=1 ;;
+    esac
+  done
+  if [ "$repo_is_temp" -eq 0 ] && [ "$REPO_ROOT_REAL" != "/" ]; then
+    checkout_needles+=("$REPO_ROOT_REAL")
+  fi
+
+  for rel in bin/fastmlx-serve bin/fastmlx-capacity bin/mlx.metallib; do
+    file="$STAGE_ROOT/$rel"
+    for kind in "home directory" "checkout path"; do
+      if [ "$kind" = "home directory" ]; then
+        [ "${#home_needles[@]}" -gt 0 ] || continue
+        set -- "${home_needles[@]}"
+      else
+        [ "${#checkout_needles[@]}" -gt 0 ] || continue
+        set -- "${checkout_needles[@]}"
+      fi
+      for needle in "$@"; do
+        if LC_ALL=C grep -aqF -- "$needle" "$file"; then
+          rm -rf "$STAGE_ROOT"
+          echo "[package-release] ERROR: staged $rel embeds a $kind ($needle); build the release from a clone under /tmp" >&2
+          exit 1
+        fi
+      done
+    done
+  done
+}
+refuse_embedded_local_paths
 
 # Hashed AFTER staging (the staged copy is what a downloaded tarball actually execs) so
 # provenance.json's binary digests describe the exact bytes an operator's tarball ships, not
