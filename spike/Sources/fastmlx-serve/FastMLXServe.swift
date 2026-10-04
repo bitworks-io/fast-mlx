@@ -769,6 +769,10 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     {
         FileHandle.standardError.write(Data("fastmlx-serve: \(notice)\n".utf8))
     }
+    // Same shape: an unrecognized verdict string still admits as UNMEASURED, but is announced.
+    if let notice = QualityAdmission.unrecognizedVerdictNotice(card: card) {
+        FileHandle.standardError.write(Data("fastmlx-serve: \(notice)\n".utf8))
+    }
     let optIn = QualityOptIn.parse(rawArguments)
     let outcome = QualityAdmission.decide(
         card: card, optIn: optIn.isElected(card: card))

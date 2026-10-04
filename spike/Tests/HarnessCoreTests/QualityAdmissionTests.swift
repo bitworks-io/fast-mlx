@@ -2290,4 +2290,126 @@ final class QualityAdmissionTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - unrecognized-verdict notice (notice only; admission unchanged)
+    // docs/task-inbox/2026-10-04-PREDECLARATION-swift-engine-announces-an-unrecognized-verdict.md
+
+    private static let unrecognizedVerdictSamples = ["no_go", "NO-GO", "NO_G", "nogo", "SIXTH_VERDICT"]
+
+    private func unrecognizedCardJSON(
+        id: String = "c1", repo: String = "org/model", verdictJSON: String
+    ) -> String {
+        """
+        {
+          "id": \(id.debugDescription),
+          "model": { "repo": \(repo.debugDescription), "hfPin": "abcdefab" },
+          "verdict": \(verdictJSON),
+          "admission": { "default": false, "optIn": true, "reason": "fixture" },
+          "legible": { "tier": "Noticeable", "headline": "h" }
+        }
+        """
+    }
+
+    private func decodeManifest(cardsJSON: [String]) throws -> QualityCardManifestLoadResult {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-guides-unrecognized-\(UUID().uuidString).json")
+        try Data("{\"cards\": [\(cardsJSON.joined(separator: ","))]}".utf8).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        return try QualityCardStore.loadManifestDetailed(contentsOf: url)
+    }
+
+    private func decodedCard(id: String = "c1", verdict raw: String) throws -> QualityCard {
+        let result = try decodeManifest(cardsJSON: [
+            unrecognizedCardJSON(id: id, verdictJSON: "\(raw.debugDescription)")
+        ])
+        XCTAssertEqual(result.droppedCardCount, 0)
+        return try XCTUnwrap(result.cards.first)
+    }
+
+    private func expectedUnrecognized(id: String, raw: String) -> String {
+        "quality card '\(id)' has unrecognized verdict '\(raw)'; treated as unmeasured. upgrade fastmlx or fix the card"
+    }
+
+    /// A0 -- reachability: a `NO_GO` card written `"no_go"` decodes from manifest bytes, is not dropped,
+    /// reads `.unmeasured`, keeps the raw string, and admits unmeasured.
+    func testA0LowercaseNoGoDecodesNotDroppedAsUnmeasuredAndAdmits() throws {
+        let result = try decodeManifest(cardsJSON: [unrecognizedCardJSON(verdictJSON: "\"no_go\"")])
+        XCTAssertEqual(result.droppedCardCount, 0)
+        let c = try XCTUnwrap(result.cards.first)
+        XCTAssertEqual(c.verdict, .unmeasured)
+        XCTAssertEqual(c.unrecognizedVerdict, "no_go")
+        XCTAssertEqual(QualityAdmission.decide(card: c, optIn: false), .admitUnmeasured)
+    }
+
+    /// A1 -- exact wording, naming id and raw.
+    func testA1UnrecognizedVerdictNoticeHasTheExactWording() throws {
+        for raw in Self.unrecognizedVerdictSamples {
+            let c = try decodedCard(id: "card@id", verdict: raw)
+            XCTAssertEqual(
+                QualityAdmission.unrecognizedVerdictNotice(card: c),
+                expectedUnrecognized(id: "card@id", raw: raw), "raw=\(raw)")
+        }
+    }
+
+    /// A2 -- recognized verdicts (decoded and constructed) and a nil card have no notice.
+    func testA2RecognizedVerdictsAndNilCardHaveNoNotice() throws {
+        XCTAssertNil(QualityAdmission.unrecognizedVerdictNotice(card: nil))
+        for raw in ["NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"] {
+            let c = try decodedCard(verdict: raw)
+            XCTAssertNil(c.unrecognizedVerdict, raw)
+            XCTAssertNil(QualityAdmission.unrecognizedVerdictNotice(card: c), raw)
+        }
+        for verdict in [QualityVerdict.noGo, .pass, .reference, .exact, .unmeasured] {
+            XCTAssertNil(QualityAdmission.unrecognizedVerdictNotice(card: card(verdict: verdict)))
+        }
+    }
+
+    /// A3 -- admission is unchanged for an unrecognized verdict, opted in or not.
+    func testA3UnrecognizedVerdictDecideIsUnchanged() throws {
+        for raw in Self.unrecognizedVerdictSamples {
+            let c = try decodedCard(verdict: raw)
+            for optIn in [false, true] {
+                XCTAssertEqual(
+                    QualityAdmission.decide(card: c, optIn: optIn), .admitUnmeasured,
+                    "raw=\(raw) optIn=\(optIn)")
+            }
+        }
+    }
+
+    /// A4 -- one line, printable ASCII, raw bounded to 80 scalars.
+    func testA4UnrecognizedVerdictNoticeIsOneLinePrintableAsciiAndBounded() throws {
+        let c = try decodedCard(id: "i\u{00E9}d", verdict: "bad\r\nverd\u{00E9}ct")
+        XCTAssertEqual(
+            QualityAdmission.unrecognizedVerdictNotice(card: c),
+            expectedUnrecognized(id: "i?d", raw: "bad??verd?ct"))
+        let long = try decodedCard(verdict: String(repeating: "v", count: 100))
+        let notice = try XCTUnwrap(QualityAdmission.unrecognizedVerdictNotice(card: long))
+        XCTAssertEqual(
+            notice, expectedUnrecognized(id: "c1", raw: String(repeating: "v", count: 80)))
+        for n in [notice, try XCTUnwrap(QualityAdmission.unrecognizedVerdictNotice(card: c))] {
+            XCTAssertTrue(n.unicodeScalars.allSatisfy { (0x20...0x7E).contains($0.value) }, n)
+        }
+    }
+
+    /// A5 -- an unrecognized card beside well-formed ones: nothing dropped, raw preserved, recognized
+    /// cards carry nil; a card with a MISSING verdict still drops.
+    func testA5ManifestKeepsUnrecognizedCardBesideWellFormedAndStillDropsMissingVerdict() throws {
+        var cards = [unrecognizedCardJSON(id: "u", verdictJSON: "\"no_go\"")]
+        cards += ["NO_GO", "PASS", "REFERENCE", "EXACT", "UNMEASURED"].map {
+            unrecognizedCardJSON(id: "ok-\($0)", verdictJSON: "\"\($0)\"")
+        }
+        let result = try decodeManifest(cardsJSON: cards)
+        XCTAssertEqual(result.droppedCardCount, 0)
+        XCTAssertEqual(result.cards.count, 6)
+        for c in result.cards {
+            XCTAssertEqual(c.unrecognizedVerdict, c.id == "u" ? "no_go" : nil, c.id)
+        }
+        let missing = """
+            { "id": "m", "model": { "repo": "org/model" },
+              "legible": { "tier": "Noticeable", "headline": "h" } }
+            """
+        let withMissing = try decodeManifest(cardsJSON: [cards[0], missing])
+        XCTAssertEqual(withMissing.droppedCardCount, 1)
+        XCTAssertEqual(withMissing.cards.map(\.id), ["u"])
+    }
 }

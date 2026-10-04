@@ -105,10 +105,14 @@ public struct QualityCard: Sendable, Decodable, Equatable {
     /// `nil` when the card predates the `config.residency` field, or when its `config` object omits
     /// `residency` — both mean "measured resident" per `effectiveResidency` below.
     public let config: Config?
+    /// The raw `verdict` string when it is not one of the five `QualityVerdict` raw values (such a
+    /// card reads `verdict == .unmeasured` and admits), else `nil`. Carried only so the serve gate can
+    /// announce it -- see `QualityAdmission.unrecognizedVerdictNotice(card:)`. Never read by `decide`.
+    public let unrecognizedVerdict: String?
 
     public init(
         id: String, model: Model, verdict: QualityVerdict, admission: Admission?, legible: Legible,
-        config: Config? = nil
+        config: Config? = nil, unrecognizedVerdict: String? = nil
     ) {
         self.id = id
         self.model = model
@@ -116,6 +120,7 @@ public struct QualityCard: Sendable, Decodable, Equatable {
         self.admission = admission
         self.legible = legible
         self.config = config
+        self.unrecognizedVerdict = unrecognizedVerdict
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -130,7 +135,13 @@ public struct QualityCard: Sendable, Decodable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(String.self, forKey: .id)
         model = try container.decode(Model.self, forKey: .model)
-        verdict = try container.decode(QualityVerdict.self, forKey: .verdict)
+        // Decoded once as a String (a missing or non-string verdict still throws, dropping the card);
+        // an unrecognized string reads `.unmeasured` exactly as `QualityVerdict.init(from:)` does, but
+        // its raw value is kept so the serve gate can announce it.
+        let rawVerdict = try container.decode(String.self, forKey: .verdict)
+        let recognized = QualityVerdict(rawValue: rawVerdict)
+        verdict = recognized ?? .unmeasured
+        unrecognizedVerdict = recognized == nil ? rawVerdict : nil
         admission = try? container.decodeIfPresent(Admission.self, forKey: .admission)
         legible = try container.decode(Legible.self, forKey: .legible)
         config = try container.decodeIfPresent(Config.self, forKey: .config)
@@ -267,6 +278,24 @@ public enum QualityAdmission {
         else { return nil }
         return
             "quality card '\(noticeSafe(card.id))' was measured on hardware class '\(noticeSafe(cardClass))', not this host's '\(noticeSafe(hostClass))'; its figures are not established on this hardware (see the card's boundary)"
+    }
+
+    /// The unrecognized-verdict NOTICE: one stderr line telling the operator that the resolved card's
+    /// `verdict` string is not one of the five recognized values, so the card was read as UNMEASURED
+    /// (e.g. a `NO_GO` card written `"no_go"` admits). NOTICE ONLY -- it never changes the admission
+    /// outcome, the exit code, or the announce; `decide(card:optIn:)` does not consult it (an older
+    /// binary must not refuse a sixth verdict a newer emitter adds). Mirrors the Python verdict notice
+    /// in `scripts/fastmlx_launch.py`; closes the Swift half of
+    /// `docs/task-inbox/2026-09-23-NEXT-a-mangled-verdict-string-alone-fails-open.md` per
+    /// `docs/task-inbox/2026-10-04-PREDECLARATION-swift-engine-announces-an-unrecognized-verdict.md`.
+    ///
+    /// `nil` when there is no card or its verdict was recognized. Otherwise exactly
+    /// `quality card '<id>' has unrecognized verdict '<raw>'; treated as unmeasured. upgrade fastmlx or fix the card`
+    /// with `<id>` and `<raw>` each passed through `noticeSafe`.
+    public static func unrecognizedVerdictNotice(card: QualityCard?) -> String? {
+        guard let card, let raw = card.unrecognizedVerdict else { return nil }
+        return
+            "quality card '\(noticeSafe(card.id))' has unrecognized verdict '\(noticeSafe(raw))'; treated as unmeasured. upgrade fastmlx or fix the card"
     }
 
     public static func decide(card: QualityCard?, optIn: Bool) -> QualityAdmissionOutcome {
