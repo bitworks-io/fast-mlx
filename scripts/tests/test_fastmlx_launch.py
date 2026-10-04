@@ -7472,5 +7472,527 @@ class HardwareMismatchCallSiteTestCase(unittest.TestCase):
                 self.assertNotIn("was measured on hardware class", stderr)
 
 
+# ---------------------------------------------------------------------
+# `serve` resolves a pulled card store (`~/.fastmlx/cards/<sha256>.json`) by
+# default. Predeclaration rows D1-D9:
+# docs/task-inbox/2026-10-03-PREDECLARATION-serve-and-recommend-resolve-a-pulled-card-store-by-default.md
+# ---------------------------------------------------------------------
+PULLED_NEWER = "2026-06-01T00:00:00Z"
+PULLED_OLDER = "2025-12-01T00:00:00Z"
+PULLED_ADDED_ID = "pulled-no-go@test"
+PULLED_ADDED_REPO = "example/PulledNoGoModel"
+PULLED_BUNDLED_GENERATED_AT = "2026-01-01T00:00:00Z"
+
+
+def pulled_added_card(card_id: str = PULLED_ADDED_ID, repo: str = PULLED_ADDED_REPO,
+                      verdict: str = "NO_GO") -> dict:
+    return {
+        "id": card_id,
+        "model": {"repo": repo, "hfPin": "5eed1234"},
+        "verdict": verdict,
+        "admission": {"default": verdict != "NO_GO", "optIn": True, "reason": "fixture"},
+        "legible": {"tier": "Noticeable", "headline": "Pulled card headline."},
+    }
+
+
+def pulled_store_bytes(generated_at: str = PULLED_NEWER, extra=None, mutate=None) -> bytes:
+    """A newer, honest superset of ``fixture_manifest()`` (the bundled store
+    these tests install): same cards plus ``extra``; ``mutate(document)`` may
+    then break a rule."""
+    document = fixture_manifest()
+    document["generatedAt"] = generated_at
+    document["cards"] = document["cards"] + (
+        [pulled_added_card()] if extra is None else list(extra)
+    )
+    if mutate is not None:
+        mutate(document)
+    return json.dumps(document).encode("utf-8")
+
+
+def _fit_marker_body(marker: Path) -> str:
+    return GREEN_FIT_CHECK_BODY.replace(
+        "import sys\n", f"import sys\nopen({str(marker)!r}, 'w').close()\n", 1
+    )
+
+
+_REAL_PULLED_CARDS_DIR = FASTMLX_LAUNCH.pulled_cards_dir
+
+
+def setUpModule():
+    # Hermeticity (row D11): no test in this module may read the real
+    # ``~/.fastmlx/cards``. The D tests re-patch this to their own directory.
+    global _MODULE_EMPTY_PULLED_DIR, _MODULE_PULLED_PATCH
+    _MODULE_EMPTY_PULLED_DIR = tempfile.TemporaryDirectory()
+    empty = Path(_MODULE_EMPTY_PULLED_DIR.name) / "no-pulled-cards"
+    _MODULE_PULLED_PATCH = patch.object(FASTMLX_LAUNCH, "pulled_cards_dir", lambda: empty)
+    _MODULE_PULLED_PATCH.start()
+
+
+def tearDownModule():
+    _MODULE_PULLED_PATCH.stop()
+    _MODULE_EMPTY_PULLED_DIR.cleanup()
+
+
+class PulledCardStoreServeTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.fit_marker = self.root / "fit-ran"
+        self.fit_bin = write_script(self.root / "fit.py", _fit_marker_body(self.fit_marker))
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+        self.fake_repo_root = self.root / "repo"
+        (self.fake_repo_root / "site").mkdir(parents=True)
+        self.bundled_path = self.fake_repo_root / "site" / "quality-guides.json"
+        self.bundled_bytes = json.dumps(fixture_manifest()).encode("utf-8")
+        self.bundled_path.write_bytes(self.bundled_bytes)
+        self.bundled_digest = hashlib.sha256(self.bundled_bytes).hexdigest()
+
+        self.pulled = self.root / "pulled"  # NOT created: D1 starts with no directory
+
+    def write_pulled(self, raw: bytes, name: str = None) -> Path:
+        self.pulled.mkdir(exist_ok=True)
+        digest = hashlib.sha256(raw).hexdigest()
+        path = self.pulled / (name if name is not None else f"{digest}.json")
+        path.write_bytes(raw)
+        return path
+
+    def args(self, repo=PASS_REPO, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--fit-check-bin": str(self.fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--model-repo": repo,
+            "--context": "2048",
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_launch(self, argv: list, pulled_dir=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        execed = []
+        pulled_dir = self.pulled if pulled_dir is None else pulled_dir
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(
+                FASTMLX_LAUNCH.os, "execv", lambda path, a: execed.append(list(a))
+            ), patch.object(FASTMLX_LAUNCH, "REPO_ROOT", self.fake_repo_root), patch.object(
+                FASTMLX_LAUNCH, "pulled_cards_dir", lambda: pulled_dir
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue(), execed
+
+    @staticmethod
+    def card_store_line(stderr: str) -> str:
+        (line,) = [l for l in stderr.splitlines() if l.startswith("fastmlx_launch=card_store")]
+        return line
+
+    @staticmethod
+    def flag_values(argv: list, flag: str) -> list:
+        return [argv[i + 1] for i, token in enumerate(argv[:-1]) if token == flag]
+
+    def assert_refused_before_fit(self, code, stderr, execed, expected_code=3):
+        self.assertEqual(code, expected_code, stderr)
+        self.assertEqual(execed, [])
+        self.assertFalse(self.fit_marker.exists(), "the fit-check ran before the refusal")
+
+    # --- the directory function ---------------------------------------
+    def test_pulled_cards_dir_is_home_fastmlx_cards(self):
+        home = self.root / "home"
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            self.assertEqual(_REAL_PULLED_CARDS_DIR(), home / ".fastmlx" / "cards")
+
+    # --- D1 -------------------------------------------------------------
+    def test_d1_missing_and_empty_directory_are_the_bundled_store_unchanged(self):
+        results = []
+        for create in (False, True):
+            if create:
+                self.pulled.mkdir()
+            code, stdout, stderr, execed = self.run_launch(self.args(), self.pulled)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(
+                self.card_store_line(stderr),
+                f"fastmlx_launch=card_store source=default sha256={self.bundled_digest} "
+                f"generated_at={PULLED_BUNDLED_GENERATED_AT} cards={len(fixture_manifest()['cards'])}",
+            )
+            (argv,) = execed
+            self.assertEqual(
+                self.flag_values(argv, "--quality-cards"), [str(self.bundled_path.resolve())]
+            )
+            self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [self.bundled_digest])
+            self.assertNotIn("skipping pulled card store", stderr)
+            results.append((code, stdout, stderr, execed))
+        self.assertEqual(results[0], results[1])
+
+    # --- D2 -------------------------------------------------------------
+    def test_d2_newer_store_is_pulled_and_its_added_no_go_card_is_enforced(self):
+        raw = pulled_store_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        path = self.write_pulled(raw)
+        # Control: with no pulled store the pack is uncarded and admits.
+        code, _, stderr, _ = self.run_launch(
+            self.args(PULLED_ADDED_REPO), self.root / "none"
+        )
+        self.assertEqual(code, 0, stderr)
+        # The pulled card refuses without --accept-quality ...
+        code, _, stderr, execed = self.run_launch(self.args(PULLED_ADDED_REPO))
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(PULLED_ADDED_ID, stderr)
+        self.assertEqual(execed, [])
+        # ... and admits with it, naming the pulled store everywhere.
+        code, _, stderr, execed = self.run_launch(
+            self.args(PULLED_ADDED_REPO) + ["--accept-quality", PULLED_ADDED_ID]
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            self.card_store_line(stderr),
+            f"fastmlx_launch=card_store source=pulled sha256={digest} "
+            f"generated_at={PULLED_NEWER} cards={len(fixture_manifest()['cards']) + 1}",
+        )
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards"), [str(path.resolve())])
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [digest])
+
+    def test_d2_dry_run_plan_names_the_pulled_store(self):
+        raw = pulled_store_bytes()
+        self.write_pulled(raw)
+        code, stdout, stderr, _ = self.run_launch(self.args() + ["--dry-run"])
+        self.assertEqual(code, 0, stderr)
+        plan = json.loads(stdout.strip().splitlines()[-1])
+        self.assertEqual(plan["cardStore"]["sha256"], hashlib.sha256(raw).hexdigest())
+
+    # --- D3 -------------------------------------------------------------
+    def test_d3_an_older_store_is_skipped_with_exactly_one_notice(self):
+        older = self.write_pulled(pulled_store_bytes(PULLED_OLDER))
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        notices = [l for l in stderr.splitlines() if "skipping pulled card store" in l]
+        self.assertEqual(
+            notices,
+            [
+                f"fastmlx serve: skipping pulled card store {older}: generatedAt "
+                f"{PULLED_OLDER} is older than the bundled store's {PULLED_BUNDLED_GENERATED_AT}"
+            ],
+        )
+        self.assertIn("source=default", self.card_store_line(stderr))
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [self.bundled_digest])
+
+    def test_d3_a_bundled_identical_copy_is_skipped_silently(self):
+        self.write_pulled(self.bundled_bytes)
+        code, _, stderr, _ = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("skipping", stderr)
+        self.assertIn("source=default", self.card_store_line(stderr))
+
+    # --- D4 -------------------------------------------------------------
+    def test_d4_a_name_hash_mismatch_refuses_naming_the_file_without_fallback(self):
+        # A perfectly valid newer store under the wrong name, next to nothing
+        # else: the bundled store must not be used as a fallback.
+        wrong = "a" * 64 + ".json"
+        path = self.write_pulled(pulled_store_bytes(), name=wrong)
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(str(path), stderr)
+        self.assertNotIn("fastmlx_launch=admitted", stderr)
+
+    def test_d4_a_mismatch_refuses_even_beside_a_good_store(self):
+        self.write_pulled(pulled_store_bytes("2026-05-01T00:00:00Z"))
+        bad = self.write_pulled(b"not a card store", name="b" * 64 + ".json")
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(str(bad), stderr)
+
+    def test_d4_an_unreadable_candidate_refuses_naming_the_file(self):
+        path = self.write_pulled(pulled_store_bytes())
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o644)
+        if os.access(path, os.R_OK):
+            self.skipTest("running as a user that can read a mode-000 file")
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(str(path), stderr)
+
+    # --- D5 -------------------------------------------------------------
+    def assert_rule_refusal(self, raw: bytes, rule_text: str):
+        path = self.write_pulled(raw)
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(rule_text, stderr)
+        self.assertIn(
+            f"pass --quality-cards {self.bundled_path} to use the bundled store, "
+            f"or remove {path}",
+            stderr,
+        )
+        path.unlink()
+
+    def test_d5_dropping_a_bundled_no_go_card_refuses_with_r3_and_the_remedy(self):
+        def drop(document):
+            document["cards"] = [c for c in document["cards"] if c["id"] != NO_GO_CARD_ID]
+
+        self.assert_rule_refusal(pulled_store_bytes(mutate=drop), f"R3 drops bundled card id(s): {NO_GO_CARD_ID}")
+
+    def test_d5_relaxing_a_verdict_refuses_with_r6_and_the_remedy(self):
+        def relax(document):
+            for card in document["cards"]:
+                if card["id"] == NO_GO_CARD_ID:
+                    card["verdict"] = "PASS"
+
+        self.assert_rule_refusal(
+            pulled_store_bytes(mutate=relax),
+            f"R6 card {NO_GO_CARD_ID} relaxes verdict NO_GO -> PASS",
+        )
+
+    def test_d5_control_the_same_store_without_the_violation_is_admitted(self):
+        self.write_pulled(pulled_store_bytes())
+        code, _, stderr, _ = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("source=pulled", self.card_store_line(stderr))
+
+    def test_d5_the_rules_run_against_the_bundled_store_at_use_time(self):
+        # A pulled store that was honest when pulled stops being usable when
+        # the bundled store gains a card the pulled one does not carry.
+        self.write_pulled(pulled_store_bytes())
+        newer_bundled = fixture_manifest()
+        newer_bundled["cards"].append(pulled_added_card("later-bundled@test", "example/Later"))
+        self.bundled_path.write_text(json.dumps(newer_bundled), encoding="utf-8")
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn("R3 drops bundled card id(s): later-bundled@test", stderr)
+
+    # --- D6 -------------------------------------------------------------
+    def test_d6_the_greatest_generated_at_wins(self):
+        older_raw = pulled_store_bytes("2026-05-01T00:00:00Z", extra=[pulled_added_card("a@test", "example/A")])
+        newer_raw = pulled_store_bytes("2026-07-01T00:00:00Z", extra=[pulled_added_card("b@test", "example/B")])
+        self.write_pulled(older_raw)
+        newer = self.write_pulled(newer_raw)
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(
+            f"source=pulled sha256={hashlib.sha256(newer_raw).hexdigest()} ",
+            self.card_store_line(stderr),
+        )
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards"), [str(newer.resolve())])
+
+    def test_d6_equal_generated_at_with_different_bytes_is_ambiguous(self):
+        first = self.write_pulled(pulled_store_bytes(extra=[pulled_added_card("a@test", "example/A")]))
+        second = self.write_pulled(pulled_store_bytes(extra=[pulled_added_card("b@test", "example/B")]))
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn("ambiguous", stderr)
+        self.assertIn(str(first), stderr)
+        self.assertIn(str(second), stderr)
+
+    # --- D7 -------------------------------------------------------------
+    def test_d7_an_explicit_store_never_reads_the_directory(self):
+        self.write_pulled(b"corrupt", name="c" * 64 + ".json")
+        explicit = self.root / "explicit.json"
+        explicit.write_bytes(self.bundled_bytes)
+
+        def forbidden():
+            raise AssertionError("the pulled-cards directory was read")
+
+        stdout, stream = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stream):
+            with patch.object(FASTMLX_LAUNCH.os, "execv", lambda *a: None), patch.object(
+                FASTMLX_LAUNCH, "REPO_ROOT", self.fake_repo_root
+            ), patch.object(FASTMLX_LAUNCH, "pulled_cards_dir", forbidden):
+                with self.assertRaises(SystemExit) as ctx:
+                    FASTMLX_LAUNCH.main(self.args(**{"--quality-cards": explicit}))
+        self.assertEqual(ctx.exception.code, 0, stream.getvalue())
+        self.assertIn("source=explicit", self.card_store_line(stream.getvalue()))
+        # And with the real directory contents in place, still explicit.
+        code, _, stderr, _ = self.run_launch(self.args(**{"--quality-cards": explicit}))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("source=explicit", self.card_store_line(stderr))
+
+    # --- D8 -------------------------------------------------------------
+    def test_d8_other_entries_are_ignored_silently(self):
+        valid_raw = pulled_store_bytes()
+        valid_digest = hashlib.sha256(valid_raw).hexdigest()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "target.json").write_bytes(valid_raw)
+        self.pulled.mkdir()
+        (self.pulled / ".fastmlx-cards-abc123.tmp").write_bytes(b"half written")
+        (self.pulled / "notes.json").write_bytes(b"{}")
+        (self.pulled / ("A" * 64 + ".json")).write_bytes(b"uppercase name")
+        (self.pulled / ("d" * 63 + ".json")).write_bytes(b"short name")
+        (self.pulled / (valid_digest + ".json.bak")).write_bytes(b"suffix")
+        (self.pulled / ("e" * 64 + ".json")).mkdir()
+        os.symlink(elsewhere / "target.json", self.pulled / f"{valid_digest}.json")
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("source=default", self.card_store_line(stderr))
+        self.assertNotIn("skipping", stderr)
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [self.bundled_digest])
+
+    # --- D9 -------------------------------------------------------------
+    def test_d9_pin_alone_pins_the_resolved_pulled_store(self):
+        raw = pulled_store_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        self.write_pulled(raw)
+        code, _, stderr, execed = self.run_launch(
+            self.args(**{"--quality-cards-sha256": digest})
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("source=pulled", self.card_store_line(stderr))
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards-sha256"), [digest])
+
+    def test_d9_the_bundled_digest_pin_is_refused_once_a_newer_store_is_pulled(self):
+        raw = pulled_store_bytes()
+        pulled_digest = hashlib.sha256(raw).hexdigest()
+        # Control: with nothing pulled, the bundled digest pins the bundled store.
+        code, _, stderr, _ = self.run_launch(
+            self.args(**{"--quality-cards-sha256": self.bundled_digest})
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("source=default", self.card_store_line(stderr))
+        self.write_pulled(raw)
+        self.fit_marker.unlink()  # the control run above reached the fit-check
+        code, _, stderr, execed = self.run_launch(
+            self.args(**{"--quality-cards-sha256": self.bundled_digest})
+        )
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(self.bundled_digest, stderr)
+        self.assertIn(pulled_digest, stderr)
+
+    # --- review follow-ups: identity re-check, edge cases, lstat, HOME -----
+    def swap_after_resolution(self, path: Path, replacement: bytes):
+        """Patch the resolver so ``path`` holds ``replacement`` right after it
+        was verified: the file swapped between resolution and admission."""
+        real = FASTMLX_LAUNCH.resolve_quality_card_store
+
+        def resolve_then_swap(*args, **kwargs):
+            result = real(*args, **kwargs)
+            path.write_bytes(replacement)
+            return result
+
+        return patch.object(FASTMLX_LAUNCH, "resolve_quality_card_store", resolve_then_swap)
+
+    def test_a_a_store_swapped_after_verification_is_refused_before_the_fit_check(self):
+        path = self.write_pulled(pulled_store_bytes())
+        with self.swap_after_resolution(
+            path, pulled_store_bytes(extra=[pulled_added_card("evil@test", "example/Evil")])
+        ):
+            code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(f"pulled card store {path} changed after it was verified", stderr)
+
+    def test_b1_a_sole_store_with_an_unparsable_generated_at_is_refused_by_r2(self):
+        path = self.write_pulled(pulled_store_bytes("not-a-date"))
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn("R2 generatedAt 'not-a-date' is not strictly", stderr)
+        self.assertIn(str(path), stderr)
+        self.assertNotIn("source=default", stderr)
+
+    def test_b2_an_unparsable_store_beside_a_parsable_newer_one_selects_the_newer(self):
+        self.write_pulled(pulled_store_bytes("not-a-date"))
+        good_raw = pulled_store_bytes("2026-05-01T00:00:00Z")
+        good = self.write_pulled(good_raw)
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertIn(
+            f"source=pulled sha256={hashlib.sha256(good_raw).hexdigest()} ",
+            self.card_store_line(stderr),
+        )
+        (argv,) = execed
+        self.assertEqual(self.flag_values(argv, "--quality-cards"), [str(good.resolve())])
+
+    def test_b2_two_unparsable_stores_are_ambiguous_without_claiming_a_shared_generated_at(self):
+        first = self.write_pulled(pulled_store_bytes("not-a-date"))
+        second = self.write_pulled(
+            pulled_store_bytes("also-not-a-date", extra=[pulled_added_card("x@test", "example/X")])
+        )
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn("ambiguous", stderr)
+        self.assertIn(str(first), stderr)
+        self.assertIn(str(second), stderr)
+        self.assertIn("do not parse", stderr)
+        self.assertNotIn("same generatedAt", stderr)
+
+    def test_b3_the_bundled_generated_at_with_different_bytes_is_refused_by_r2(self):
+        path = self.write_pulled(pulled_store_bytes(PULLED_BUNDLED_GENERATED_AT))
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(
+            f"R2 generatedAt {PULLED_BUNDLED_GENERATED_AT} equals the bundled store's "
+            "but the bytes differ",
+            stderr,
+        )
+        self.assertIn(str(path), stderr)
+        self.assertNotIn("skipping", stderr)
+
+    def test_b4_a_future_dated_store_is_refused_by_r2_with_no_fallback(self):
+        path = self.write_pulled(pulled_store_bytes("2099-01-01T00:00:00Z"))
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn("R2 generatedAt 2099-01-01T00:00:00Z is in the future", stderr)
+        self.assertIn(str(path), stderr)
+        self.assertNotIn("source=default", stderr)
+
+    def _lstat_raising(self, victim: Path, error: OSError):
+        real = os.lstat
+
+        def lstat(path, *args, **kwargs):
+            if str(path) == str(victim):
+                raise error
+            return real(path, *args, **kwargs)
+
+        return patch.object(FASTMLX_LAUNCH.os, "lstat", lstat)
+
+    def test_d_an_lstat_permission_error_on_a_candidate_refuses_naming_it(self):
+        good = self.write_pulled(pulled_store_bytes("2026-05-01T00:00:00Z"))
+        victim = self.write_pulled(
+            pulled_store_bytes(extra=[pulled_added_card("a@test", "example/A")])
+        )
+        with self._lstat_raising(victim, PermissionError(13, "Permission denied")):
+            code, _, stderr, execed = self.run_launch(self.args())
+        self.assert_refused_before_fit(code, stderr, execed)
+        self.assertIn(str(victim), stderr)
+        self.assertNotIn(str(good), stderr)
+        self.assertIn(f"pass --quality-cards {self.bundled_path} to use the bundled store", stderr)
+
+    def test_d_an_lstat_file_not_found_is_skipped_silently(self):
+        raw = pulled_store_bytes()
+        victim = self.write_pulled(raw)
+        with self._lstat_raising(victim, FileNotFoundError(2, "No such file")):
+            code, _, stderr, execed = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("source=default", self.card_store_line(stderr))
+        self.assertNotIn(str(victim), stderr)
+
+    def test_e_no_home_directory_means_no_pulled_candidates(self):
+        self.write_pulled(b"corrupt", name="c" * 64 + ".json")  # must never be reached
+        with patch.object(
+            FASTMLX_LAUNCH.Path, "home", side_effect=RuntimeError("no home")
+        ):
+            with self.assertRaises(RuntimeError):
+                _REAL_PULLED_CARDS_DIR()
+            with patch.object(FASTMLX_LAUNCH, "pulled_cards_dir", _REAL_PULLED_CARDS_DIR):
+                self.assertEqual(FASTMLX_LAUNCH._pulled_card_candidates(), [])
+                path, source, notices = FASTMLX_LAUNCH.resolve_quality_card_store(
+                    None, notice_prefix="fastmlx serve"
+                )
+        self.assertEqual((source, notices), ("default", []))
+        self.assertEqual(path, FASTMLX_LAUNCH.REPO_ROOT / FASTMLX_LAUNCH.DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -889,18 +889,25 @@ def _run_recommend(args) -> int:
         )
         return 2
 
-    quality_cards_path = Path(
-        args.quality_cards
-        if args.quality_cards is not None
-        else (launch.REPO_ROOT / launch.DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
-    )
     # Malformed hex and every pin refusal exit 3 (never argparse's 2: exit 2
     # collides with the all-does-not-fit verdict), exactly like `fastmlx
     # serve`; the pin never fails open, even for the conventional default.
     try:
         quality_cards_pin = launch.parse_quality_cards_pin(args.quality_cards_sha256)
+        # Without --quality-cards the store is resolved from the pulled-cards
+        # directory, exactly like `fastmlx serve`.
+        quality_cards_path, card_store_source, card_store_notices = (
+            launch.resolve_quality_card_store(
+                args.quality_cards, notice_prefix="fastmlx recommend"
+            )
+        )
+        for card_store_notice in card_store_notices:
+            print(card_store_notice, file=sys.stderr)
         raw_store_sha256, cards, card_store_identity = launch._inspect_quality_card_store(
             quality_cards_path
+        )
+        launch.enforce_pulled_store_identity(
+            quality_cards_path, card_store_source, raw_store_sha256
         )
         launch.enforce_quality_cards_pin(
             quality_cards_pin, quality_cards_path, raw_store_sha256, cards

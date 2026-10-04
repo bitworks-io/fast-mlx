@@ -2746,5 +2746,389 @@ class RecommendCardStoreTestCase(unittest.TestCase):
         self.assertIn(hashlib.sha256(bytes(flipped)).hexdigest(), stderr)
 
 
+# ---------------------------------------------------------------------
+# `recommend` resolves a pulled card store by default, exactly like `serve`.
+# Predeclaration rows D1-D8:
+# docs/task-inbox/2026-10-03-PREDECLARATION-serve-and-recommend-resolve-a-pulled-card-store-by-default.md
+# ---------------------------------------------------------------------
+PULLED_NEWER = "2026-06-01T00:00:00Z"
+PULLED_OLDER = "2025-12-01T00:00:00Z"
+PULLED_ADDED_ID = "pulled-no-go@test"
+PULLED_ADDED_REPO = "example/PulledNoGoModel"
+BUNDLED_GENERATED_AT = "2026-01-01T00:00:00Z"
+
+
+def pulled_added_card(card_id=PULLED_ADDED_ID, repo=PULLED_ADDED_REPO, verdict="NO_GO") -> dict:
+    return {
+        "id": card_id,
+        "model": {"repo": repo, "hfPin": "5eed1234"},
+        "verdict": verdict,
+        "legible": {"tier": "Noticeable", "headline": "Pulled card headline."},
+    }
+
+
+def pulled_store_bytes(generated_at=PULLED_NEWER, extra=None, mutate=None) -> bytes:
+    document = fixture_manifest()
+    document["generatedAt"] = generated_at
+    document["cards"] = document["cards"] + (
+        [pulled_added_card()] if extra is None else list(extra)
+    )
+    if mutate is not None:
+        mutate(document)
+    return json.dumps(document).encode("utf-8")
+
+
+_MODULE_STATE = {}
+_REAL_PULLED_CARDS_DIR = FASTMLX_RECOMMEND.launch.pulled_cards_dir
+
+
+def setUpModule():
+    # Hermeticity (row D11): no test in this module may read the real
+    # ``~/.fastmlx/cards``. The D tests re-patch this to their own directory.
+    tmp = tempfile.TemporaryDirectory()
+    empty = Path(tmp.name) / "no-pulled-cards"
+    patcher = patch.object(FASTMLX_RECOMMEND.launch, "pulled_cards_dir", lambda: empty)
+    patcher.start()
+    _MODULE_STATE["tmp"], _MODULE_STATE["patcher"] = tmp, patcher
+
+
+def tearDownModule():
+    _MODULE_STATE["patcher"].stop()
+    _MODULE_STATE["tmp"].cleanup()
+
+
+class RecommendPulledCardStoreTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.fit_marker = self.root / "fit-ran"
+        self.fit_bin = write_script(
+            self.root / "fit.py",
+            GREEN_FIT_CHECK_BODY.replace(
+                "import sys\n", f"import sys\nopen({str(self.fit_marker)!r}, 'w').close()\n", 1
+            ),
+        )
+        self.model_dir = self.root / "pass-model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+        write_pull_receipt(self.model_dir, repo_id=PASS_REPO, revision="e" * 40)
+        self.added_dir = self.root / "added-model"
+        self.added_dir.mkdir()
+        (self.added_dir / "config.json").write_text("{}", encoding="utf-8")
+        write_pull_receipt(self.added_dir, repo_id=PULLED_ADDED_REPO, revision="f" * 40)
+
+        self.fake_repo_root = self.root / "repo"
+        (self.fake_repo_root / "site").mkdir(parents=True)
+        self.bundled_path = self.fake_repo_root / "site" / "quality-guides.json"
+        self.bundled_bytes = json.dumps(fixture_manifest()).encode("utf-8")
+        self.bundled_path.write_bytes(self.bundled_bytes)
+        self.bundled_digest = hashlib.sha256(self.bundled_bytes).hexdigest()
+        self.n_cards = len(fixture_manifest()["cards"])
+
+        self.pulled = self.root / "pulled"  # not created: D1 starts with no directory
+
+    def write_pulled(self, raw: bytes, name: str = None) -> Path:
+        self.pulled.mkdir(exist_ok=True)
+        path = self.pulled / (name if name is not None else f"{hashlib.sha256(raw).hexdigest()}.json")
+        path.write_bytes(raw)
+        return path
+
+    def argv(self, *extra, models=None) -> list:
+        argv = ["recommend", "--fit-check-bin", str(self.fit_bin)]
+        for model in (models if models is not None else [self.model_dir]):
+            argv += ["--model-path", str(model)]
+        return argv + list(extra)
+
+    def run_main(self, argv: list, pulled_dir=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        pulled_dir = self.pulled if pulled_dir is None else pulled_dir
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(FASTMLX_RECOMMEND.launch, "REPO_ROOT", self.fake_repo_root), patch.object(
+                FASTMLX_RECOMMEND.launch, "pulled_cards_dir", lambda: pulled_dir
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_refused_before_fit(self, code, stdout, stderr):
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(stdout, "")
+        self.assertFalse(self.fit_marker.exists(), "the fit-check ran before the refusal")
+
+    # --- D1 ---------------------------------------------------------------
+    def test_d1_missing_and_empty_directory_are_the_bundled_store_unchanged(self):
+        results = []
+        for create in (False, True):
+            if create:
+                self.pulled.mkdir()
+            code, stdout, stderr = self.run_main(self.argv("--json"))
+            self.assertEqual(code, 0, stderr)
+            doc = json.loads(stdout)
+            self.assertEqual(
+                doc["cardStore"],
+                {"sha256": self.bundled_digest, "generatedAt": BUNDLED_GENERATED_AT,
+                 "cards": self.n_cards},
+            )
+            self.assertNotIn("skipping", stderr)
+            code_t, text, stderr_t = self.run_main(self.argv())
+            self.assertEqual(
+                text.splitlines()[0],
+                f"card store: sha256={self.bundled_digest} "
+                f"generated_at={BUNDLED_GENERATED_AT} cards={self.n_cards}",
+            )
+            results.append((code, stdout, stderr, code_t, text, stderr_t))
+        self.assertEqual(results[0], results[1])
+
+    # --- D2 ---------------------------------------------------------------
+    def test_d2_newer_store_is_ranked_against_and_named(self):
+        raw = pulled_store_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        self.write_pulled(raw)
+        # Control: with no pulled store the pack is uncarded.
+        code, stdout, stderr = self.run_main(
+            self.argv("--json", models=[self.added_dir]), pulled_dir=self.root / "none"
+        )
+        self.assertEqual(json.loads(stdout)["rows"][0]["status"], "uncarded", stderr)
+        code, stdout, stderr = self.run_main(self.argv("--json", models=[self.added_dir]))
+        doc = json.loads(stdout)
+        self.assertEqual(doc["cardStore"]["sha256"], digest)
+        self.assertEqual(doc["cardStore"]["cards"], self.n_cards + 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "opt-in", stderr)
+        self.assertEqual(row["accept_quality_flag"], f"--accept-quality {PULLED_ADDED_ID}")
+        _, text, _ = self.run_main(self.argv(models=[self.added_dir]))
+        self.assertEqual(
+            text.splitlines()[0],
+            f"card store: sha256={digest} generated_at={PULLED_NEWER} cards={self.n_cards + 1}",
+        )
+
+    # --- D3 ---------------------------------------------------------------
+    def test_d3_an_older_store_is_skipped_with_exactly_one_notice(self):
+        older = self.write_pulled(pulled_store_bytes(PULLED_OLDER))
+        self.write_pulled(self.bundled_bytes)  # bundled-identical: silent
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], self.bundled_digest)
+        self.assertEqual(
+            [l for l in stderr.splitlines() if "skipping" in l],
+            [
+                f"fastmlx recommend: skipping pulled card store {older}: generatedAt "
+                f"{PULLED_OLDER} is older than the bundled store's {BUNDLED_GENERATED_AT}"
+            ],
+        )
+
+    # --- D4 ---------------------------------------------------------------
+    def test_d4_a_name_hash_mismatch_refuses_naming_the_file_without_fallback(self):
+        bad = self.write_pulled(pulled_store_bytes(), name="a" * 64 + ".json")
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn(str(bad), stderr)
+
+    def test_d4_an_unreadable_candidate_refuses_naming_the_file(self):
+        path = self.write_pulled(pulled_store_bytes())
+        path.chmod(0)
+        self.addCleanup(path.chmod, 0o644)
+        if os.access(path, os.R_OK):
+            self.skipTest("running as a user that can read a mode-000 file")
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn(str(path), stderr)
+
+    # --- D5 ---------------------------------------------------------------
+    def test_d5_rule_violations_refuse_with_the_rule_and_the_remedy(self):
+        def drop(document):
+            document["cards"] = [c for c in document["cards"] if c["id"] != NO_GO_CARD_ID]
+
+        def relax(document):
+            for card in document["cards"]:
+                if card["id"] == NO_GO_CARD_ID:
+                    card["verdict"] = "PASS"
+
+        for mutate, rule_text in (
+            (drop, f"R3 drops bundled card id(s): {NO_GO_CARD_ID}"),
+            (relax, f"R6 card {NO_GO_CARD_ID} relaxes verdict NO_GO -> PASS"),
+        ):
+            with self.subTest(rule=rule_text[:2]):
+                path = self.write_pulled(pulled_store_bytes(mutate=mutate))
+                code, stdout, stderr = self.run_main(self.argv("--json"))
+                self.assert_refused_before_fit(code, stdout, stderr)
+                self.assertIn(rule_text, stderr)
+                self.assertIn(
+                    f"pass --quality-cards {self.bundled_path} to use the bundled store, "
+                    f"or remove {path}",
+                    stderr,
+                )
+                path.unlink()
+
+    def test_d5_control_the_same_store_without_the_violation_is_used(self):
+        raw = pulled_store_bytes()
+        self.write_pulled(raw)
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], hashlib.sha256(raw).hexdigest())
+
+    # --- D6 ---------------------------------------------------------------
+    def test_d6_greatest_generated_at_wins_and_equal_is_ambiguous(self):
+        older = pulled_store_bytes("2026-05-01T00:00:00Z", extra=[pulled_added_card("a@test", "example/A")])
+        newer = pulled_store_bytes("2026-07-01T00:00:00Z", extra=[pulled_added_card("b@test", "example/B")])
+        self.write_pulled(older)
+        self.write_pulled(newer)
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], hashlib.sha256(newer).hexdigest())
+        twin = pulled_store_bytes("2026-07-01T00:00:00Z", extra=[pulled_added_card("c@test", "example/C")])
+        self.write_pulled(twin)
+        self.fit_marker.unlink()  # the run above reached the fit-check
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn("ambiguous", stderr)
+
+    # --- D7 ---------------------------------------------------------------
+    def test_d7_an_explicit_store_never_reads_the_directory(self):
+        self.write_pulled(b"corrupt", name="c" * 64 + ".json")
+        explicit = self.root / "explicit.json"
+        explicit.write_bytes(self.bundled_bytes)
+
+        def forbidden():
+            raise AssertionError("the pulled-cards directory was read")
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(FASTMLX_RECOMMEND.launch, "REPO_ROOT", self.fake_repo_root), patch.object(
+                FASTMLX_RECOMMEND.launch, "pulled_cards_dir", forbidden
+            ):
+                with self.assertRaises(SystemExit) as ctx:
+                    FASTMLX_RECOMMEND.main(self.argv("--quality-cards", str(explicit), "--json"))
+        self.assertEqual(ctx.exception.code, 0, stderr.getvalue())
+        self.assertEqual(json.loads(stdout.getvalue())["cardStore"]["sha256"], self.bundled_digest)
+        code, out, err = self.run_main(self.argv("--quality-cards", str(explicit), "--json"))
+        self.assertEqual(code, 0, err)
+
+    # --- D8 ---------------------------------------------------------------
+    def test_d8_other_entries_are_ignored_silently(self):
+        valid_raw = pulled_store_bytes()
+        valid_digest = hashlib.sha256(valid_raw).hexdigest()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "target.json").write_bytes(valid_raw)
+        self.pulled.mkdir()
+        (self.pulled / ".fastmlx-cards-abc123.tmp").write_bytes(b"half written")
+        (self.pulled / "notes.json").write_bytes(b"{}")
+        (self.pulled / ("e" * 64 + ".json")).mkdir()
+        os.symlink(elsewhere / "target.json", self.pulled / f"{valid_digest}.json")
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], self.bundled_digest)
+        self.assertNotIn("skipping", stderr)
+
+    # --- D9 (recommend side) ----------------------------------------------
+    def test_d9_pin_alone_pins_the_resolved_store(self):
+        raw = pulled_store_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        self.write_pulled(raw)
+        code, stdout, stderr = self.run_main(self.argv("--quality-cards-sha256", digest, "--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], digest)
+        self.fit_marker.unlink()  # the run above reached the fit-check
+        code, stdout, stderr = self.run_main(
+            self.argv("--quality-cards-sha256", self.bundled_digest, "--json")
+        )
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn(self.bundled_digest, stderr)
+        self.assertIn(digest, stderr)
+
+    # --- review follow-ups ---------------------------------------------------
+    def test_a_a_store_swapped_after_verification_is_refused_before_the_fit_check(self):
+        path = self.write_pulled(pulled_store_bytes())
+        real = FASTMLX_RECOMMEND.launch.resolve_quality_card_store
+        evil = pulled_store_bytes(extra=[pulled_added_card("evil@test", "example/Evil")])
+
+        def resolve_then_swap(*args, **kwargs):
+            result = real(*args, **kwargs)
+            path.write_bytes(evil)
+            return result
+
+        with patch.object(FASTMLX_RECOMMEND.launch, "resolve_quality_card_store", resolve_then_swap):
+            code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn(f"pulled card store {path} changed after it was verified", stderr)
+
+    def test_b1_a_sole_store_with_an_unparsable_generated_at_is_refused_by_r2(self):
+        path = self.write_pulled(pulled_store_bytes("not-a-date"))
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn("R2 generatedAt 'not-a-date' is not strictly", stderr)
+        self.assertIn(str(path), stderr)
+
+    def test_b2_an_unparsable_store_beside_a_parsable_newer_one_selects_the_newer(self):
+        self.write_pulled(pulled_store_bytes("not-a-date"))
+        good = pulled_store_bytes("2026-05-01T00:00:00Z")
+        self.write_pulled(good)
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], hashlib.sha256(good).hexdigest())
+
+    def test_b3_the_bundled_generated_at_with_different_bytes_is_refused_by_r2(self):
+        self.write_pulled(pulled_store_bytes(BUNDLED_GENERATED_AT))
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn("equals the bundled store's but the bytes differ", stderr)
+        self.assertNotIn("skipping", stderr)
+
+    def test_b4_a_future_dated_store_is_refused_by_r2_with_no_fallback(self):
+        self.write_pulled(pulled_store_bytes("2099-01-01T00:00:00Z"))
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn("R2 generatedAt 2099-01-01T00:00:00Z is in the future", stderr)
+
+    def test_c_a_hash_mismatched_store_beside_a_good_newer_store_refuses_naming_it(self):
+        self.write_pulled(pulled_store_bytes("2026-07-01T00:00:00Z"))
+        bad = self.write_pulled(
+            pulled_store_bytes("2026-05-01T00:00:00Z"), name="b" * 64 + ".json"
+        )
+        code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn(str(bad), stderr)
+        self.assertIn("does not match its file name", stderr)
+
+    def test_d_an_lstat_permission_error_refuses_and_file_not_found_is_skipped(self):
+        raw = pulled_store_bytes()
+        victim = self.write_pulled(raw)
+        real = os.lstat
+
+        def raising(error):
+            def lstat(path, *args, **kwargs):
+                if str(path) == str(victim):
+                    raise error
+                return real(path, *args, **kwargs)
+
+            return patch.object(FASTMLX_RECOMMEND.launch.os, "lstat", lstat)
+
+        with raising(PermissionError(13, "Permission denied")):
+            code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assert_refused_before_fit(code, stdout, stderr)
+        self.assertIn(str(victim), stderr)
+        with raising(FileNotFoundError(2, "No such file")):
+            code, stdout, stderr = self.run_main(self.argv("--json"))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["cardStore"]["sha256"], self.bundled_digest)
+
+    def test_e_no_home_directory_resolves_the_bundled_store(self):
+        self.write_pulled(b"corrupt", name="c" * 64 + ".json")  # must never be reached
+        real_dir = _REAL_PULLED_CARDS_DIR
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(FASTMLX_RECOMMEND.launch, "REPO_ROOT", self.fake_repo_root), patch.object(
+                FASTMLX_RECOMMEND.launch, "pulled_cards_dir", real_dir
+            ), patch.object(FASTMLX_RECOMMEND.launch.Path, "home", side_effect=RuntimeError("no home")):
+                with self.assertRaises(SystemExit) as ctx:
+                    FASTMLX_RECOMMEND.main(self.argv("--json"))
+        self.assertEqual(ctx.exception.code, 0, stderr.getvalue())
+        self.assertEqual(json.loads(stdout.getvalue())["cardStore"]["sha256"], self.bundled_digest)
+
+
 if __name__ == "__main__":
     unittest.main()

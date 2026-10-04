@@ -50,10 +50,12 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -781,6 +783,399 @@ def card_store_notice_line(source: str, identity: Optional[dict]) -> str:
     if identity is None:
         return f"fastmlx_launch=card_store source={source} card_store=none"
     return f"fastmlx_launch=card_store source={source} {card_store_fields(identity)}"
+
+
+# ---------------------------------------------------------------------
+# Card-store rules R1-R7 and the pulled-store resolver.
+#
+# ``fastmlx cards pull`` (the only network code on
+# the card-store path) writes a verified store to
+# ``~/.fastmlx/cards/<sha256>.json``. ``serve`` and ``recommend`` only READ
+# that directory (never fetch): when ``--quality-cards`` is not given they
+# resolve the newest eligible pulled store through ``resolve_quality_card_store``
+# and re-run the same rules R1-R7 against the bundled store at use time.
+# Predeclaration:
+# docs/task-inbox/2026-10-03-PREDECLARATION-serve-and-recommend-resolve-a-pulled-card-store-by-default.md
+# ---------------------------------------------------------------------
+CARD_STORE_SCHEMA = "fast-mlx-quality-card-v1"
+CARD_STORE_GENERATED_AT_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+_CARD_STORE_GENERATED_AT_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_PULLED_CARD_FILE_RE = re.compile(r"[0-9a-f]{64}\.json")
+
+# R6 (strict): every bundled card must reappear, matched by id, DEEP-EQUAL to
+# the bundled card (json-equal), with exactly one allowed difference: its
+# ``verdict`` may change from an admitting verdict to this one (tightening).
+# Anything else on a kept id is refused: ``decide_admission`` only refuses a
+# ``NO_GO`` card, but ``resolve_card`` finds the card by ``model.repo`` /
+# ``model.hfPin`` and filters it by ``config.residency``, and refuses
+# (exit 3) a mixed-verdict tie, so editing any of those, or swapping a verdict
+# within the admitting tier, can move a launch's outcome. A test pins that
+# this stays one of the recognized verdicts.
+CARD_STORE_TIGHTENING_VERDICT = "NO_GO"
+# R2: a ``generatedAt`` further than this past the current UTC time is refused
+# (a far-future stamp would make every later honest store an R2 "rollback").
+CARD_STORE_MAX_FUTURE_SKEW_SECONDS = 24 * 60 * 60
+
+
+class CardStoreRuleRefusal(LaunchRefusal):
+    """A card store broke one of the rules R1-R7 (exit 3); the message names
+    the rule."""
+
+
+def card_store_utc_now() -> datetime:
+    """The current UTC time as a naive datetime (comparable with the
+    ``strptime`` result for ``generatedAt``). Module-level so tests patch it."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _parse_card_store(raw: bytes) -> Optional[dict]:
+    """The decoded document iff ``raw`` is a JSON object whose ``cards`` is a
+    list (the same shape test ``_inspect_quality_card_store`` applies;
+    bytes-level because nothing may touch the disk before the checks pass)."""
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except ValueError:  # JSONDecodeError and UnicodeDecodeError both subclass it
+        return None
+    except RecursionError:  # pathologically nested JSON: unparsable, not a crash
+        return None
+    if not isinstance(document, dict) or not isinstance(document.get("cards"), list):
+        return None
+    return document
+
+
+def _parse_card_store_generated_at(value) -> Optional[datetime]:
+    if not isinstance(value, str) or _CARD_STORE_GENERATED_AT_RE.fullmatch(value) is None:
+        return None
+    try:
+        return datetime.strptime(value, CARD_STORE_GENERATED_AT_FORMAT)
+    except ValueError:
+        return None
+
+
+def _card_store_card_ids(cards: list) -> list:
+    return [
+        card["id"]
+        for card in cards
+        if isinstance(card, dict) and isinstance(card.get("id"), str)
+    ]
+
+
+def _card_store_canonical(value) -> str:
+    """A json-equal comparison key: unlike ``==``, it keeps ``1``, ``1.0`` and
+    ``true`` apart (``1 == 1.0 == True`` in Python)."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _load_card_store_baseline(baseline_path: Path) -> tuple:
+    """``(raw_sha256, document, generated_at)`` for the bundled store, else R7."""
+    try:
+        raw = baseline_path.read_bytes()
+    except OSError as error:
+        raise CardStoreRuleRefusal(
+            3, f"R7 no resolvable bundled baseline: cannot read {baseline_path}: {error}"
+        )
+    document = _parse_card_store(raw)
+    if document is None or document.get("schema") != CARD_STORE_SCHEMA:
+        raise CardStoreRuleRefusal(
+            3,
+            f"R7 no resolvable bundled baseline: {baseline_path} is not a "
+            f"{CARD_STORE_SCHEMA} store",
+        )
+    generated_at = _parse_card_store_generated_at(document.get("generatedAt"))
+    if generated_at is None:
+        raise CardStoreRuleRefusal(
+            3, f"R7 no resolvable bundled baseline: {baseline_path} has no valid generatedAt"
+        )
+    return hashlib.sha256(raw).hexdigest(), document, generated_at
+
+
+def check_card_store_rules(raw: bytes, *, baseline_path: Path, now: datetime) -> tuple:
+    """Run R1-R7 for ``raw`` against the bundled store at ``baseline_path``.
+
+    Pure and network-free: reads only the baseline, writes nothing. Returns
+    ``(document, added)`` or raises ``CardStoreRuleRefusal(3, ...)`` naming
+    the rule. ``now`` is the naive UTC time R2's future-skew bound uses.
+    """
+    baseline_sha, baseline, baseline_generated_at = _load_card_store_baseline(
+        baseline_path
+    )  # R7
+
+    document = _parse_card_store(raw)
+    if document is None:
+        raise CardStoreRuleRefusal(3, "R1 the body does not parse as a card store")
+    if document.get("schema") != CARD_STORE_SCHEMA:
+        raise CardStoreRuleRefusal(
+            3,
+            f"R1 schema is {_bounded_repr(document.get('schema'))}, "
+            f"expected {CARD_STORE_SCHEMA!r}",
+        )
+
+    generated_at = _parse_card_store_generated_at(document.get("generatedAt"))  # R2
+    if generated_at is None:
+        raise CardStoreRuleRefusal(
+            3,
+            "R2 generatedAt "
+            f"{_bounded_repr(document.get('generatedAt'))} is not strictly "
+            "%Y-%m-%dT%H:%M:%SZ",
+        )
+    if generated_at > now + timedelta(seconds=CARD_STORE_MAX_FUTURE_SKEW_SECONDS):
+        raise CardStoreRuleRefusal(
+            3, f"R2 generatedAt {document['generatedAt']} is in the future"
+        )
+    if generated_at < baseline_generated_at:
+        raise CardStoreRuleRefusal(
+            3,
+            f"R2 generatedAt {document['generatedAt']} is older than the bundled "
+            f"store's {baseline['generatedAt']} (rollback)",
+        )
+    if generated_at == baseline_generated_at and hashlib.sha256(raw).hexdigest() != baseline_sha:
+        raise CardStoreRuleRefusal(
+            3,
+            f"R2 generatedAt {document['generatedAt']} equals the bundled store's "
+            "but the bytes differ",
+        )
+
+    cards = document["cards"]
+    ids = _card_store_card_ids(cards)
+    baseline_ids = _card_store_card_ids(baseline["cards"])
+    dropped = sorted(set(baseline_ids) - set(ids))  # R3
+    if dropped:
+        raise CardStoreRuleRefusal(
+            3, "R3 drops bundled card id(s): " + ", ".join(dropped)
+        )
+    duplicates = sorted({i for i in ids if ids.count(i) > 1})  # R4
+    if duplicates:
+        raise CardStoreRuleRefusal(3, "R4 duplicate card id(s): " + ", ".join(duplicates))
+
+    for card in cards:  # R5
+        if not isinstance(card, dict):
+            raise CardStoreRuleRefusal(3, "R5 a card is not an object")
+        label = _bounded_repr(card.get("id"))
+        if not isinstance(card.get("id"), str):
+            raise CardStoreRuleRefusal(3, f"R5 card {label} has a missing or non-string id")
+        model = card.get("model")
+        # The schema makes ``model.repo`` required but NULLABLE (hfPin-only
+        # and enhancement cards carry ``repo: null``, as five bundled cards
+        # do), so "no repo" means the key is absent or not a string/null.
+        if (
+            not isinstance(model, dict)
+            or "repo" not in model
+            or not (model["repo"] is None or isinstance(model["repo"], str))
+        ):
+            raise CardStoreRuleRefusal(
+                3,
+                f"R5 card {label} has a missing or non-object 'model', or no "
+                "'repo' key: the repo lookup would skip it",
+            )
+        if card.get("verdict") not in _RECOGNIZED_VERDICTS:
+            raise CardStoreRuleRefusal(
+                3,
+                f"R5 card {label} has an unrecognized verdict "
+                f"{_bounded_repr(card.get('verdict'))}",
+            )
+
+    pulled_by_id = {card["id"]: card for card in cards}  # R6 (ids unique: R4)
+    for bundled in baseline["cards"]:
+        if not isinstance(bundled, dict) or not isinstance(bundled.get("id"), str):
+            continue
+        pulled = pulled_by_id[bundled["id"]]  # present: R3
+        differing = sorted(
+            key
+            for key in set(bundled) | set(pulled)
+            if key not in bundled
+            or key not in pulled
+            or _card_store_canonical(bundled[key]) != _card_store_canonical(pulled[key])
+        )
+        if not differing:
+            continue
+        if differing == ["verdict"]:
+            if pulled["verdict"] == CARD_STORE_TIGHTENING_VERDICT:
+                continue  # an admitting verdict tightened to NO_GO
+            if bundled["verdict"] == CARD_STORE_TIGHTENING_VERDICT:
+                raise CardStoreRuleRefusal(
+                    3,
+                    f"R6 card {bundled['id']} relaxes verdict {bundled['verdict']} "
+                    f"-> {pulled['verdict']}",
+                )
+        raise CardStoreRuleRefusal(
+            3,
+            f"R6 card {bundled['id']} changes {','.join(differing)} relative to "
+            "the bundled store",
+        )
+
+    return document, len(set(ids) - set(baseline_ids))
+
+
+def pulled_cards_dir() -> Path:
+    """Where ``fastmlx cards pull`` writes stores (``~/.fastmlx/cards``). The
+    one place tests redirect the directory ``serve``/``recommend`` read."""
+    return Path.home() / ".fastmlx" / "cards"
+
+
+def _pulled_card_candidates() -> list:
+    """Regular files (never symlinks: ``lstat``) named exactly
+    ``<64 lowercase hex>.json`` in the pulled-cards directory, sorted by name.
+    Everything else -- temp files, other names, symlinks, subdirectories -- is
+    ignored; a missing or unreadable directory yields no candidates."""
+    try:
+        directory = pulled_cards_dir()
+    except RuntimeError:  # Path.home() with HOME unset and no passwd entry
+        return []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    candidates = []
+    for name in names:
+        if _PULLED_CARD_FILE_RE.fullmatch(name) is None:
+            continue
+        path = directory / name
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            continue  # the entry vanished between the listing and now
+        except OSError as error:
+            # A name-matching candidate that cannot be inspected is as
+            # unreadable as one that cannot be read: refuse, never skip.
+            bundled_path = REPO_ROOT / DEFAULT_QUALITY_CARDS_RELATIVE_PATH
+            raise LaunchRefusal(
+                3,
+                f"pulled card store {path} cannot be read: {error}; remove it, or "
+                f"pass --quality-cards {bundled_path} to use the bundled store",
+            )
+        if stat.S_ISREG(mode):
+            candidates.append(path)
+    return candidates
+
+
+def resolve_quality_card_store(
+    explicit: Optional[str], *, notice_prefix: str
+) -> tuple:
+    """``(path, source, notices)`` for the card store a launch admits against.
+
+    ``source`` is ``"explicit"`` (``--quality-cards`` was given; the pulled
+    directory is never read), ``"pulled"`` (the newest eligible store in the
+    pulled-cards directory, after its integrity and rules R1-R7 passed) or
+    ``"default"`` (the bundled store). ``notices`` are stderr lines the caller
+    prints (one per stale pulled store skipped, prefixed ``notice_prefix``).
+    Any refusal raises ``LaunchRefusal(3, ...)`` with no fallback to the
+    bundled store.
+    """
+    if explicit is not None:
+        return Path(explicit), "explicit", []
+    bundled_path = REPO_ROOT / DEFAULT_QUALITY_CARDS_RELATIVE_PATH
+    candidates = _pulled_card_candidates()
+    if not candidates:
+        return bundled_path, "default", []
+
+    # Integrity first, for every candidate: the bytes must hash to the name.
+    loaded = []
+    for path in candidates:
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise LaunchRefusal(
+                3,
+                f"pulled card store {path} cannot be read: {error}; remove it, or "
+                f"pass --quality-cards {bundled_path} to use the bundled store",
+            )
+        digest = hashlib.sha256(raw).hexdigest()
+        if digest + ".json" != path.name:
+            raise LaunchRefusal(
+                3,
+                f"pulled card store {path} does not match its file name: sha256 "
+                f"of its bytes is {digest}; remove it, or pass --quality-cards "
+                f"{bundled_path} to use the bundled store",
+            )
+        loaded.append((path, raw))
+
+    try:
+        bundled_raw = bundled_path.read_bytes()
+    except OSError:
+        bundled_raw = None
+    bundled_document = _parse_card_store(bundled_raw) if bundled_raw is not None else None
+    bundled_generated_at_text = (
+        bundled_document.get("generatedAt") if bundled_document is not None else None
+    )
+    bundled_generated_at = _parse_card_store_generated_at(bundled_generated_at_text)
+
+    notices = []
+    eligible = []  # (path, raw, generatedAt text, parsed generatedAt | None)
+    for path, raw in loaded:
+        if bundled_raw is not None and raw == bundled_raw:
+            continue  # it IS the bundled store
+        document = _parse_card_store(raw)
+        generated_at_text = document.get("generatedAt") if document is not None else None
+        generated_at = _parse_card_store_generated_at(generated_at_text)
+        if (
+            generated_at is not None
+            and bundled_generated_at is not None
+            and generated_at < bundled_generated_at
+        ):
+            notices.append(
+                f"{notice_prefix}: skipping pulled card store {path}: generatedAt "
+                f"{generated_at_text} is older than the bundled store's "
+                f"{bundled_generated_at_text}"
+            )
+            continue
+        eligible.append((path, raw, generated_at_text, generated_at))
+    if not eligible:
+        return bundled_path, "default", notices
+
+    parsed = [entry for entry in eligible if entry[3] is not None]
+    if parsed:
+        newest = max(entry[3] for entry in parsed)
+        tied = [entry for entry in parsed if entry[3] == newest]
+    else:
+        tied = eligible  # none parses: only a sole store is selectable
+    if len(tied) > 1 and not parsed:
+        raise LaunchRefusal(
+            3,
+            "ambiguous pulled card stores: "
+            + " and ".join(str(entry[0]) for entry in tied)
+            + " are both eligible but their generatedAt values do not parse "
+            "as %Y-%m-%dT%H:%M:%SZ, so neither is newer; remove one, or pass "
+            f"--quality-cards {bundled_path} to use the bundled store",
+        )
+    if len(tied) > 1:
+        raise LaunchRefusal(
+            3,
+            "ambiguous pulled card stores: "
+            + " and ".join(str(entry[0]) for entry in tied)
+            + " are both eligible with the same generatedAt "
+            f"{tied[0][2]!r} but different bytes; remove one, or pass "
+            f"--quality-cards {bundled_path} to use the bundled store",
+        )
+    selected_path, selected_raw = tied[0][0], tied[0][1]
+
+    try:
+        check_card_store_rules(
+            selected_raw, baseline_path=bundled_path, now=card_store_utc_now()
+        )
+    except CardStoreRuleRefusal as refusal:
+        raise LaunchRefusal(
+            3,
+            f"pulled card store {selected_path} refused: {refusal.message}; pass "
+            f"--quality-cards {bundled_path} to use the bundled store, or remove "
+            f"{selected_path}",
+        )
+    return selected_path, "pulled", notices
+
+
+def enforce_pulled_store_identity(
+    path: Path, source: str, raw_sha256: Optional[str]
+) -> None:
+    """A pulled store is named by its own digest: refuse (exit 3) if the
+    bytes read for admission are not the bytes the resolver verified (a file
+    swapped between resolution and admission)."""
+    if source != "pulled":
+        return
+    if raw_sha256 is None or path.name != raw_sha256 + ".json":
+        raise LaunchRefusal(
+            3,
+            f"pulled card store {path} changed after it was verified; re-run, or "
+            "remove it",
+        )
 
 
 def find_card_by_id(cards: list, card_id: str) -> Optional[dict]:
@@ -2711,17 +3106,21 @@ def _run_serve(args, passthrough_args: list) -> int:
     # fails open itself (see enforce_quality_cards_pin); the fail-open /
     # explicit-manifest rules for the unpinned store stay with the
     # quality-card admission below.
-    quality_cards_path = Path(
-        args.quality_cards
-        if args.quality_cards is not None
-        else (REPO_ROOT / DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
-    )
+    #
+    # Without --quality-cards the store is resolved from the pulled-cards
+    # directory (see resolve_quality_card_store); every refusal there is
+    # exit 3 and likewise happens before the fit-check subprocess.
     quality_cards_pin = parse_quality_cards_pin(args.quality_cards_sha256)
+    quality_cards_path, card_store_source, card_store_notices = resolve_quality_card_store(
+        args.quality_cards, notice_prefix="fastmlx serve"
+    )
+    for card_store_notice in card_store_notices:
+        print(card_store_notice, file=sys.stderr)
     raw_store_sha256, cards, card_store_identity = _inspect_quality_card_store(
         quality_cards_path
     )
+    enforce_pulled_store_identity(quality_cards_path, card_store_source, raw_store_sha256)
     enforce_quality_cards_pin(quality_cards_pin, quality_cards_path, raw_store_sha256, cards)
-    card_store_source = "default" if args.quality_cards is None else "explicit"
     # This launch's own engine build (absent for the built-in profile and
     # for any profile that does not declare one) -- resolved this early
     # because the quality-card lookup below (`resolve_card`) needs it to

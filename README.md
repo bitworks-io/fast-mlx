@@ -224,11 +224,24 @@ pull `site/quality-guides.json` at a public commit of this repository with its e
 
 ```bash
 python3 scripts/fastmlx.py cards pull --commit <40-hex public commit> --sha256 <64-hex digest>
-# prints the absolute path it wrote (default ~/.fastmlx/cards/<digest>.json) as two flags:
+# writes ~/.fastmlx/cards/<digest>.json and prints its path as two flags:
 #   --quality-cards <path> --quality-cards-sha256 <digest>
-python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b \
-  --quality-cards <path printed above> --quality-cards-sha256 <64-hex digest>
+python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
+# a plain serve (or recommend) now uses the pulled store; the flags above are optional
 ```
+
+Without `--quality-cards`, `serve` and `recommend` read `~/.fastmlx/cards` (they never fetch). Only
+regular files named `<64-hex>.json` count; temp files, symlinks and other names are ignored. Each
+candidate's bytes must hash to its file name, or the launch refuses (exit 3) with no fallback to the
+bundled store. A store older than the bundled one (left behind by an upgrade) is skipped with a stderr
+notice, and a copy of the bundled store is skipped silently. Of the rest, the one with the greatest
+`generatedAt` is used (two with the same `generatedAt` refuse as ambiguous), after it passes the same
+checks `cards pull` applies, re-run against the bundled store at launch time; a failure refuses
+(exit 3) and says to pass `--quality-cards <bundled path>` or remove the file. The card store line
+then reads `source=pulled`. With no candidate nothing changes (`source=default`), and an explicit
+`--quality-cards` never reads the directory. `--quality-cards-sha256` without `--quality-cards` pins
+the store that resolved, so a pin of the bundled digest is refused once a newer store is pulled. A pulled
+store is checked against the bundled store only, not against stores you pulled earlier.
 
 `cards pull` checks the digest before it writes anything. It then compares the store with the one
 your install bundles and refuses (exit 3) anything that could loosen admission: an older or
@@ -239,7 +252,7 @@ the store your install bundles, not the newest one you have pulled, so a store p
 release and a later NO_GO card still passes. The pin proves the bytes are the ones published at that
 commit. It does not defend against a compromised repository; that would need signed stores. You can
 still fetch the file yourself and pass `--quality-cards`/`--quality-cards-sha256` directly, but those
-launches skip these checks.
+launches skip the rule checks.
 
 The launcher's admission decision (the `admitted` line from `serve`, and `fastmlx recommend`) rests
 only on the pinned bytes. A wrong digest, a malformed digest, a store that does not resolve (even the
