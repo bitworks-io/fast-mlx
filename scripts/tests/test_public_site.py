@@ -395,22 +395,22 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-8",
-                "title": "Publish v0.1.8: serve pins its quality-card store by sha256 and names a card measured on another chip",
-                "publishedAt": "2026-10-03T09:28:07Z",
+                "id": "tagged-distribution-v0-1-9",
+                "title": "Publish v0.1.9: fastmlx cards pull fetches a digest-pinned card store, and a plain serve uses the newest verified one",
+                "publishedAt": "2026-10-04T12:02:51Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.8 arm64 macOS distribution: fastmlx serve "
-                    "and fastmlx recommend name the quality-card store they admitted "
-                    "against and accept --quality-cards-sha256 to pin it, refusing a "
-                    "mismatched, malformed, or unresolvable store before the fit "
-                    "check; the bundled engine refuses unless the store bytes it "
-                    "reads match the digest the launcher forwards; the bundled "
-                    "Qwen3-8B 8-bit card is scoped to the M3 Ultra class it was "
-                    "measured on; and serve prints one stderr notice when the card "
-                    "it settles on was measured on a different hardware class than "
-                    "the host, without changing the admission outcome."
+                    "Publishes the v0.1.9 arm64 macOS distribution: fastmlx cards "
+                    "pull fetches the quality-card store from the public "
+                    "repository at an immutable commit, verifies its sha256 before "
+                    "writing, and refuses any store that could loosen admission "
+                    "against the bundled one; without --quality-cards, fastmlx "
+                    "serve and fastmlx recommend use the newest pulled store that "
+                    "hashes to its file name and passes the same rules at launch, "
+                    "refuse a corrupt one with no fallback, skip one older than "
+                    "the bundled store with a notice, and report it as "
+                    "source=pulled; serve and recommend never fetch."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -419,7 +419,7 @@ class PublicSiteTests(unittest.TestCase):
                     "host-qualification, deployment, or production-promotion claim "
                     "follows."
                 ),
-                "publicCommit": "c08aeb1bbe0f21261a245757007e9c7808aa3d7a",
+                "publicCommit": "0bac07f61dca748e92bbd4ece009b1f1de276a1c",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -436,6 +436,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "0bac07f61dca748e92bbd4ece009b1f1de276a1c",
                 "c08aeb1bbe0f21261a245757007e9c7808aa3d7a",
                 "45dd4b8d98d672e940b44803879d99f7170f441e",
                 "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",

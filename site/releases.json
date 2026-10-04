@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-10-03",
+  "updatedAt": "2026-10-04",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-9",
+      "title": "Publish v0.1.9: fastmlx cards pull fetches a digest-pinned card store, and a plain serve uses the newest verified one",
+      "publishedAt": "2026-10-04T12:02:51Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.9 arm64 macOS distribution: fastmlx cards pull fetches the quality-card store from the public repository at an immutable commit, verifies its sha256 before writing, and refuses any store that could loosen admission against the bundled one; without --quality-cards, fastmlx serve and fastmlx recommend use the newest pulled store that hashes to its file name and passes the same rules at launch, refuse a corrupt one with no fallback, skip one older than the bundled store with a notice, and report it as source=pulled; serve and recommend never fetch.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "0bac07f61dca748e92bbd4ece009b1f1de276a1c",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-8",
       "title": "Publish v0.1.8: serve pins its quality-card store by sha256 and names a card measured on another chip",
