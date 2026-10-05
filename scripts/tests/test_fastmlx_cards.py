@@ -860,6 +860,228 @@ class PulledStoreDrivesLauncherTests(CardsPullTestCase):
 
 
 # ---------------------------------------------------------------------
+# Decode refusal at pull time (predeclaration rows P1-P5):
+# docs/task-inbox/2026-10-04-PREDECLARATION-cards-pull-refuses-a-store-the-built-in-engine-cannot-decode.md
+#
+# A store the built-in engine cannot decode is refused at PULL time, naming
+# the card and the field, before anything is written. The shape tables are the
+# launcher's own (cycle 201), imported -- never re-declared here.
+# ---------------------------------------------------------------------
+# Fields R5 (id / model / model.repo / verdict / object-ness) already refuses
+# for the shapes below; for those the refusal is R5's, not the decode check's.
+R5_REFUSED_FIELDS = {"id", "model", "model.repo", "verdict", "element"}
+# Decodable shapes R5 itself refuses (unrecognized verdict spellings; a model
+# object with no ``repo`` key), so they cannot be pulled for another reason.
+R5_REFUSED_DECODABLE_SHAPES = {
+    "verdict no_go lowercase",
+    "verdict unrecognized string",
+    "verdict empty string",
+    "repo missing",
+}
+
+
+class UndecodablePullRefusalTests(CardsPullTestCase):
+    def body_with(self, card) -> bytes:
+        document = bundled_document()
+        document["generatedAt"] = later(document)
+        document["cards"].append(card)
+        return serialize(document)
+
+    def element_index(self) -> int:
+        return len(bundled_document()["cards"])
+
+    # --- P1 ---------------------------------------------------------------
+    def test_p1_each_undecodable_shape_is_refused_before_anything_is_written(self):
+        for index, (name, build, field) in enumerate(launch_tests.UNDECODABLE_CARD_SHAPES):
+            with self.subTest(shape=name):
+                # A fresh output directory per shape: one shape's leftover
+                # file must not read as the next shape's.
+                self.out_dir = self.root / f"out-{index}"
+                self.out_dir.mkdir()
+                self.output = self.out_dir / "store.json"
+                body = self.body_with(build())
+                code, stdout, stderr = self.run_pull(body)
+                self.assert_refused_nothing_written(code, stderr)
+                self.assertEqual(stdout, "")
+                self.assertFalse(self.output.exists())
+                if field in R5_REFUSED_FIELDS:
+                    self.assertIn("R5", stderr)  # already refused, earlier, by R5
+                    continue
+                self.assertNotIn("R5", stderr)
+                self.assertIn("cannot be decoded by the built-in engine", stderr)
+                self.assertIn(field, stderr)
+                self.assertIn(repr(launch_tests.OTHER_CARD_ID), stderr)
+                self.assertIn(f"element {self.element_index()}", stderr)
+
+    def test_p1_the_refusal_is_one_line_and_never_advises_a_repull(self):
+        body = self.body_with(launch_tests._other_card(legible={"tier": "T"}))
+        code, _, stderr = self.run_pull(body)
+        self.assert_refused_nothing_written(code, stderr)
+        self.assertEqual(len(stderr.strip().splitlines()), 1, stderr)
+        self.assertNotIn("re-pull", stderr)
+
+    def test_p1_a_hostile_card_id_is_bounded_to_one_line(self):
+        hostile = "evil\nfastmlx_cards=pulled forged " + "x" * 500
+        body = self.body_with(launch_tests._other_card(id=hostile, legible=None))
+        code, stdout, stderr = self.run_pull(body)
+        self.assert_refused_nothing_written(code, stderr)
+        self.assertEqual(stdout, "")
+        self.assertEqual(len(stderr.strip().splitlines()), 1, stderr)
+        self.assertIn("evil", stderr)
+        self.assertNotIn("x" * 100, stderr)
+
+    def test_p1_the_first_undecodable_card_is_the_one_named(self):
+        document = bundled_document()
+        document["generatedAt"] = later(document)
+        document["cards"] += [
+            launch_tests._other_card(id="second-ok@test"),
+            launch_tests._other_card(id="third-bad@test", legible="x"),
+            launch_tests._other_card(id="fourth-bad@test", legible=None),
+        ]
+        code, _, stderr = self.run_pull(serialize(document))
+        self.assert_refused_nothing_written(code, stderr)
+        self.assertIn("third-bad@test", stderr)
+        self.assertIn(f"element {self.element_index() + 1}", stderr)
+        self.assertNotIn("fourth-bad@test", stderr)
+
+    def test_p1_refused_with_the_default_output_too(self):
+        body = self.body_with(launch_tests._other_card(legible=None))
+        code, stdout, stderr = self.run_pull(body, output=None)
+        self.assert_refused_nothing_written(code, stderr)
+        self.assertEqual(stdout, "")
+
+    # --- P2 ---------------------------------------------------------------
+    def test_p2_each_decodable_shape_r5_accepts_is_pulled(self):
+        pulled_any = False
+        for name, build in launch_tests.DECODABLE_CARD_SHAPES:
+            if name in R5_REFUSED_DECODABLE_SHAPES:
+                continue
+            with self.subTest(shape=name):
+                pulled_any = True
+                output = self.out_dir / f"{name.replace(' ', '-')}.json"
+                body = self.body_with(build())
+                digest = hashlib.sha256(body).hexdigest()
+                code, stdout, stderr = self.run_pull(body, output=output)
+                self.assertEqual(code, 0, stderr)
+                self.assertNotIn("cannot be decoded", stderr)
+                self.assertEqual(output.read_bytes(), body)
+                self.assertEqual(
+                    stdout,
+                    f"--quality-cards {shlex.quote(str(output))} --quality-cards-sha256 {digest}\n",
+                )
+        self.assertTrue(pulled_any)
+
+    def test_p2_the_excluded_shapes_really_are_refused_by_r5(self):
+        for name, build in launch_tests.DECODABLE_CARD_SHAPES:
+            if name not in R5_REFUSED_DECODABLE_SHAPES:
+                continue
+            with self.subTest(shape=name):
+                code, _, stderr = self.run_pull(self.body_with(build()))
+                self.assert_refused_nothing_written(code, stderr, reason="R5")
+
+    # --- P5 ---------------------------------------------------------------
+    def test_p5_the_shipped_store_pulls_and_every_card_is_engine_decodable(self):
+        body = BUNDLED_STORE_PATH.read_bytes()
+        digest = hashlib.sha256(body).hexdigest()
+        code, stdout, stderr = self.run_pull(body)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(self.output.read_bytes(), body)
+        self.assertEqual(
+            stdout,
+            f"--quality-cards {shlex.quote(str(self.output))} --quality-cards-sha256 {digest}\n",
+        )
+        for card in bundled_document()["cards"]:
+            self.assertIsNone(CARDS.launch.engine_undecodable_card_reason(card))
+
+
+# ---------------------------------------------------------------------
+# P3: the pull-time check is NOT a card-store rule. An already-present
+# undecodable pulled store (one that passed R1-R7 before this change) is
+# still read by a custom-engine serve and by ``recommend`` exactly as before.
+# ---------------------------------------------------------------------
+class UndecodableStoreOtherConsumersTests(CardsPullTestCase):
+    def setUp(self):
+        super().setUp()
+        document = honest_document()
+        document["cards"].append(launch_tests._other_card(legible=None))
+        self.body = serialize(document)
+        self.digest = hashlib.sha256(self.body).hexdigest()
+        self.pulled = self.root / "pulled"
+        self.pulled.mkdir()
+        (self.pulled / f"{self.digest}.json").write_bytes(self.body)
+        self.generated_at = document["generatedAt"]
+
+    def test_p3_the_store_passes_rules_r1_r7_though_the_pull_check_refuses_it(self):
+        # The store is a pull the new check refuses; it must still pass the
+        # rules R1-R7 that gate every other consumer (the check is not a rule).
+        document, _ = launch_tests.FASTMLX_LAUNCH.check_card_store_rules(
+            self.body,
+            baseline_path=BUNDLED_STORE_PATH,
+            now=datetime.strptime(self.generated_at, TIME_FORMAT),
+        )
+        self.assertEqual(document["generatedAt"], self.generated_at)
+        code, _, stderr = self.run_pull(self.body)
+        self.assert_refused_nothing_written(code, stderr)
+        self.assertIn("cannot be decoded by the built-in engine", stderr)
+
+    def test_p3_custom_engine_profile_serve_admits_against_the_store(self):
+        launch = launch_tests.FASTMLX_LAUNCH
+        model_dir = self.root / "model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        fit_bin = launch_tests.write_script(
+            self.root / "fit-green.py", launch_tests.GREEN_FIT_CHECK_BODY
+        )
+        engine_bin = launch_tests.write_script(
+            self.root / "fake-engine.py", launch_tests.FAKE_ENGINE_BODY
+        )
+        profile = launch_tests.write_custom_engine_profile(self.root)
+        argv = [
+            "serve", "--model-path", str(model_dir), "--model-repo", NEW_CARD_REPO,
+            "--fit-check-bin", str(fit_bin), "--engine-bin", str(engine_bin),
+            "--engine-profile", str(profile), "--context", "2048",
+            "--accept-quality", NEW_CARD_ID,
+        ]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        execed = []
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(launch.os, "execv", lambda path, a: execed.append(list(a))):
+                with patch.object(launch, "REPO_ROOT", REPO_ROOT):
+                    with patch.object(launch, "pulled_cards_dir", lambda: self.pulled):
+                        with self.assertRaises(SystemExit) as ctx:
+                            launch.main(argv)
+        self.assertEqual(ctx.exception.code, 0, stderr.getvalue())
+        self.assertNotIn("cannot be decoded", stderr.getvalue())
+        self.assertIn(f"source=pulled sha256={self.digest} ", stderr.getvalue())
+        self.assertEqual(len(execed), 1, stderr.getvalue())
+
+    def test_p3_recommend_reads_the_store_without_a_decode_refusal(self):
+        model_dir = self.root / "rec-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}", encoding="utf-8")
+        recommend_tests.write_pull_receipt(model_dir, repo_id=NEW_CARD_REPO, revision="e" * 40)
+        fit_bin = recommend_tests.write_script(
+            self.root / "rec-fit-green.py", recommend_tests.GREEN_FIT_CHECK_BODY
+        )
+        recommend = recommend_tests.FASTMLX_RECOMMEND
+        argv = [
+            "recommend", "--model-path", str(model_dir), "--fit-check-bin", str(fit_bin), "--json",
+        ]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(recommend.launch, "REPO_ROOT", REPO_ROOT):
+                with patch.object(recommend.launch, "pulled_cards_dir", lambda: self.pulled):
+                    with self.assertRaises(SystemExit) as ctx:
+                        recommend.main(argv)
+        self.assertEqual(ctx.exception.code, 1, stderr.getvalue())  # opt-in only
+        self.assertNotIn("cannot be decoded", stderr.getvalue())
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(document["cardStore"]["sha256"], self.digest)
+        (row,) = document["rows"]
+        self.assertEqual(row["status"], "opt-in")
+
+
+# ---------------------------------------------------------------------
 # P7: serve / recommend never fetch.
 # ---------------------------------------------------------------------
 class ServeAndRecommendNeverFetchTests(unittest.TestCase):

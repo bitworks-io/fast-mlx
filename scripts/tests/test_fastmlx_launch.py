@@ -8050,6 +8050,70 @@ class PulledCardStoreServeTestCase(unittest.TestCase):
         self.assertEqual((source, notices), ("default", []))
         self.assertEqual(path, FASTMLX_LAUNCH.REPO_ROOT / FASTMLX_LAUNCH.DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
 
+    # --- P4: a pulled store the built-in engine cannot decode ------------
+    # (predeclaration docs/task-inbox/2026-10-04-PREDECLARATION-cards-pull-
+    # refuses-a-store-the-built-in-engine-cannot-decode.md). A pulled store is
+    # digest-pinned and named by its digest, so "re-pull" fetches the same
+    # bytes and editing the file breaks its name check: the message must name
+    # the file to remove and the bundled store to pass instead.
+    def undecodable_pulled_store(self) -> Path:
+        return self.write_pulled(
+            pulled_store_bytes(extra=[_other_card(legible={"tier": "Reference"})])
+        )
+
+    def test_p4_built_in_serve_on_a_pulled_undecodable_store_names_the_file_and_the_bundled_path(self):
+        path = self.undecodable_pulled_store()
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                code, stdout, stderr, execed = self.run_launch(
+                    self.args() + (["--dry-run"] if dry_run else [])
+                )
+                self.assert_refused_before_fit(code, stderr, execed)
+                self.assertEqual(stdout, "")
+                self.assertIn("cannot be decoded by the built-in engine", stderr)
+                self.assertIn("legible.headline", stderr)
+                self.assertIn(str(path), stderr)
+                self.assertIn(f"--quality-cards {self.bundled_path}", stderr)
+                self.assertNotIn("re-pull", stderr)
+                self.assertNotIn("fastmlx_launch=admitted", stderr)
+
+    def test_p4_the_message_does_not_tell_the_user_to_fix_the_pulled_file_in_place(self):
+        self.undecodable_pulled_store()
+        code, _, stderr, _ = self.run_launch(self.args())
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("remove", stderr)
+        self.assertNotIn("fix or remove", stderr)
+
+    def test_p4_removing_the_named_file_makes_the_bundled_store_launch(self):
+        path = self.undecodable_pulled_store()
+        code, _, stderr, _ = self.run_launch(self.args())
+        self.assertEqual(code, 3, stderr)
+        path.unlink()
+        code, _, stderr, execed = self.run_launch(self.args())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(execed), 1)
+        self.assertIn("source=default", self.card_store_line(stderr))
+
+    def test_p4_passing_the_bundled_path_as_named_launches_despite_the_pulled_store(self):
+        self.undecodable_pulled_store()
+        code, _, stderr, execed = self.run_launch(
+            self.args(**{"--quality-cards": str(self.bundled_path)})
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(execed), 1)
+        self.assertIn("source=explicit", self.card_store_line(stderr))
+
+    def test_p3_custom_engine_profile_still_uses_an_undecodable_pulled_store(self):
+        self.undecodable_pulled_store()
+        profile = write_custom_engine_profile(self.root)
+        code, _, stderr, execed = self.run_launch(
+            self.args(**{"--engine-profile": str(profile)})
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("cannot be decoded", stderr)
+        self.assertIn("source=pulled", self.card_store_line(stderr))
+        self.assertEqual(len(execed), 1)
+
 
 # ---------------------------------------------------------------------
 # `fastmlx serve` refuses a card store the built-in engine cannot decode. The
@@ -8282,6 +8346,9 @@ class BuiltInEngineUndecodableCardStoreTestCase(unittest.TestCase):
         self.assertEqual(code, 3, stderr)
         self.assertIn(repr(OTHER_CARD_ID), stderr)
         self.assertIn(str(store), stderr)
+        # An explicit store is the user's own file: fix or remove the card.
+        self.assertIn("fix or remove that card", stderr)
+        self.assertNotIn("re-pull", stderr)
 
     def test_a1_the_first_undecodable_card_is_the_one_named(self):
         store = self.write_store(

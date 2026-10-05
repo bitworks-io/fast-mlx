@@ -3126,25 +3126,54 @@ def engine_undecodable_card_reason(card) -> Optional[str]:
     return None
 
 
-def enforce_engine_decodable_card_store(cards: list, store_path: Path) -> None:
-    """Refuse (exit 3) on the first card of ``cards`` the built-in engine
-    cannot decode -- see ``engine_undecodable_card_reason``. The card is named
-    by its element index and, when its ``id`` is a string, that id through
-    ``_bounded_repr`` (bounded, control characters escaped) so a hostile id can
-    never forge or extend a launcher line."""
+def first_engine_undecodable_card(cards: list) -> Optional[tuple]:
+    """``(index, named, reason)`` for the first card of ``cards`` the built-in
+    engine cannot decode -- see ``engine_undecodable_card_reason`` -- or
+    ``None`` when every card decodes. ``named`` is ``"card <id> "`` (the id
+    through ``_bounded_repr``: bounded, control characters escaped, so a hostile
+    id can never forge or extend a launcher line) when the card's ``id`` is a
+    string, else ``"card "``; the element index is returned separately."""
     for index, card in enumerate(cards):
         reason = engine_undecodable_card_reason(card)
         if reason is None:
             continue
         card_id = card.get("id") if isinstance(card, dict) else None
         named = f"card {_bounded_repr(card_id)} " if isinstance(card_id, str) else "card "
-        raise LaunchRefusal(
-            3,
-            f"card store {store_path}: {named}(element {index}) cannot be decoded by "
-            f"the built-in engine: {reason}. The engine would exit 2 "
-            "(quality_cards_dropped) on this store for every model, even one this "
-            "card does not name; fix or remove that card, or re-pull the store",
+        return index, named, reason
+    return None
+
+
+def enforce_engine_decodable_card_store(
+    cards: list, store_path: Path, *, source: str = "explicit"
+) -> None:
+    """Refuse (exit 3) on the first card of ``cards`` the built-in engine
+    cannot decode -- see ``first_engine_undecodable_card``.
+
+    The advice depends on ``source`` (``resolve_quality_card_store``): a
+    ``"pulled"`` store is digest-pinned and named by its digest, so neither a
+    re-pull (the same bytes) nor an in-place edit (breaks the name check) can
+    help -- the message names the file to remove and the bundled store to pass
+    with ``--quality-cards`` instead. An explicit or default store is the
+    user's own file: fix or remove the card."""
+    found = first_engine_undecodable_card(cards)
+    if found is None:
+        return
+    index, named, reason = found
+    if source == "pulled":
+        bundled_path = REPO_ROOT / DEFAULT_QUALITY_CARDS_RELATIVE_PATH
+        advice = (
+            f"remove the pulled store {store_path}, or pass --quality-cards "
+            f"{bundled_path} to use the bundled store"
         )
+    else:
+        advice = "fix or remove that card"
+    raise LaunchRefusal(
+        3,
+        f"card store {store_path}: {named}(element {index}) cannot be decoded by "
+        f"the built-in engine: {reason}. The engine would exit 2 "
+        f"(quality_cards_dropped) on this store for every model, even one this "
+        f"card does not name; {advice}",
+    )
 
 
 def _run_serve(args, passthrough_args: list) -> int:
@@ -3210,7 +3239,9 @@ def _run_serve(args, passthrough_args: list) -> int:
         # it fails to decode; refuse here, before the fit check and before any
         # `admitted` line, rather than admit and exec an engine that cannot
         # start. A custom engine decodes for itself and is not handed the store.
-        enforce_engine_decodable_card_store(cards, quality_cards_path)
+        enforce_engine_decodable_card_store(
+            cards, quality_cards_path, source=card_store_source
+        )
     # This launch's own engine build (absent for the built-in profile and
     # for any profile that does not declare one) -- resolved this early
     # because the quality-card lookup below (`resolve_card`) needs it to

@@ -33,7 +33,8 @@ and are re-exported here.
 
 Exit codes: 0 OK; 1 network/IO failure (including a non-HTTPS or cross-host
 redirect and an oversize body); 2 argparse error or malformed ``--commit``;
-3 malformed ``--sha256``, digest mismatch, any R1-R7 refusal, or a
+3 malformed ``--sha256``, digest mismatch, any R1-R7 refusal, a card the
+built-in engine cannot decode (``engine_undecodable_card_reason``), or a
 conflicting ``--output``.
 """
 
@@ -198,6 +199,29 @@ def check_rules(raw: bytes) -> tuple:
         raise CardsRefusal(refusal.exit_code, refusal.message)
 
 
+def check_engine_decodable(document: dict) -> None:
+    """Refuse (exit 3) a store whose cards the BUILT-IN engine cannot decode.
+
+    R5 checks only ``id``, ``model.repo`` and the verdict, so a store missing,
+    say, ``legible.headline`` passes R1-R7; plain ``fastmlx serve`` would then
+    pick that digest-pinned store by default and refuse every built-in launch
+    -- and a re-pull fetches the same bytes. Refuse it here, before anything
+    is written. Pull time only: ``launch.check_card_store_rules`` is unchanged
+    (it also runs at use time for custom engines and ``recommend``, where the
+    Swift decoder is irrelevant).
+    """
+    found = launch.first_engine_undecodable_card(document["cards"])
+    if found is None:
+        return
+    index, named, reason = found
+    raise CardsRefusal(
+        3,
+        f"{named}(element {index}) cannot be decoded by the built-in engine: "
+        f"{reason}; `fastmlx serve` would refuse every launch with this store, "
+        "so it was not written",
+    )
+
+
 # ---------------------------------------------------------------------
 # Write
 # ---------------------------------------------------------------------
@@ -317,6 +341,7 @@ def _run_pull(args: argparse.Namespace) -> int:
                 f"actual {digest}",
             )
         document, added = check_rules(raw)
+        check_engine_decodable(document)
         output = _resolve_output(args.output, digest)
         already_there = _store_or_conflict(output, raw)
         if not already_there:
