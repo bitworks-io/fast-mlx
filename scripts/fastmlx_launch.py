@@ -3063,6 +3063,90 @@ def _resolve_model_revision(args, model_path: Path) -> Optional[str]:
 BUILT_IN_FORWARDED_FLAGS = ("--quality-cards", "--quality-cards-sha256", "--accept-quality")
 
 
+def engine_undecodable_card_reason(card) -> Optional[str]:
+    """Why the built-in engine cannot decode ``card``, or ``None`` when it can.
+
+    Mirrors ``QualityCard.init(from:)`` in
+    ``spike/Sources/HarnessCore/QualityAdmission.swift``: the card is a JSON
+    object; ``id`` and ``verdict`` are strings (ANY string -- an unrecognized
+    verdict decodes and reads as unmeasured); ``model`` is an object whose
+    ``repo`` and ``hfPin`` are each absent, null or a string; ``legible`` is an
+    object with string ``tier`` and ``headline``; ``config`` is absent, null or
+    an object whose ``residency`` and ``hardwareClass`` are each absent, null
+    or a string. ``admission`` is decoded with ``try?`` so it is never
+    examined, and unknown keys are ignored. A JSON number or bool is not a
+    string in Swift's decoder, and ``bool`` is not ``str`` here either.
+
+    The built-in engine, handed the store explicitly, refuses at exit 2
+    (``quality_cards_dropped``) when ANY card fails this decode -- even a card
+    for an unrelated model -- so the launcher uses this to refuse first.
+    """
+    if not isinstance(card, dict):
+        return "element is not a JSON object"
+
+    def required_string(container: dict, key: str, path: str) -> Optional[str]:
+        return None if isinstance(container.get(key), str) else f"{path} is missing or not a string"
+
+    def optional_string(container: dict, key: str, path: str) -> Optional[str]:
+        value = container.get(key)
+        return None if value is None or isinstance(value, str) else f"{path} is not a string"
+
+    def required_object(key: str) -> Optional[str]:
+        return None if isinstance(card.get(key), dict) else f"{key} is missing or not an object"
+
+    reason = required_string(card, "id", "id")
+    if reason is not None:
+        return reason
+    reason = required_object("model")
+    if reason is not None:
+        return reason
+    for key in ("repo", "hfPin"):
+        reason = optional_string(card["model"], key, f"model.{key}")
+        if reason is not None:
+            return reason
+    reason = required_string(card, "verdict", "verdict")
+    if reason is not None:
+        return reason
+    reason = required_object("legible")
+    if reason is not None:
+        return reason
+    for key in ("tier", "headline"):
+        reason = required_string(card["legible"], key, f"legible.{key}")
+        if reason is not None:
+            return reason
+    config = card.get("config")
+    if config is None:
+        return None
+    if not isinstance(config, dict):
+        return "config is not an object"
+    for key in ("residency", "hardwareClass"):
+        reason = optional_string(config, key, f"config.{key}")
+        if reason is not None:
+            return reason
+    return None
+
+
+def enforce_engine_decodable_card_store(cards: list, store_path: Path) -> None:
+    """Refuse (exit 3) on the first card of ``cards`` the built-in engine
+    cannot decode -- see ``engine_undecodable_card_reason``. The card is named
+    by its element index and, when its ``id`` is a string, that id through
+    ``_bounded_repr`` (bounded, control characters escaped) so a hostile id can
+    never forge or extend a launcher line."""
+    for index, card in enumerate(cards):
+        reason = engine_undecodable_card_reason(card)
+        if reason is None:
+            continue
+        card_id = card.get("id") if isinstance(card, dict) else None
+        named = f"card {_bounded_repr(card_id)} " if isinstance(card_id, str) else "card "
+        raise LaunchRefusal(
+            3,
+            f"card store {store_path}: {named}(element {index}) cannot be decoded by "
+            f"the built-in engine: {reason}. The engine would exit 2 "
+            "(quality_cards_dropped) on this store for every model, even one this "
+            "card does not name; fix or remove that card, or re-pull the store",
+        )
+
+
 def _run_serve(args, passthrough_args: list) -> int:
     model_path: Path = args.model_path
     if not model_path.is_dir():
@@ -3121,6 +3205,12 @@ def _run_serve(args, passthrough_args: list) -> int:
     )
     enforce_pulled_store_identity(quality_cards_path, card_store_source, raw_store_sha256)
     enforce_quality_cards_pin(quality_cards_pin, quality_cards_path, raw_store_sha256, cards)
+    if is_built_in_profile and card_store_identity is not None:
+        # The built-in engine is handed this store and exits 2 if ANY card in
+        # it fails to decode; refuse here, before the fit check and before any
+        # `admitted` line, rather than admit and exec an engine that cannot
+        # start. A custom engine decodes for itself and is not handed the store.
+        enforce_engine_decodable_card_store(cards, quality_cards_path)
     # This launch's own engine build (absent for the built-in profile and
     # for any profile that does not declare one) -- resolved this early
     # because the quality-card lookup below (`resolve_card`) needs it to

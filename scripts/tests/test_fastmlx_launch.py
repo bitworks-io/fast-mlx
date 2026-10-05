@@ -208,6 +208,25 @@ def write_script(path: Path, body: str) -> Path:
     return path
 
 
+def write_custom_engine_profile(root: Path) -> Path:
+    """A minimal custom ``--engine-profile``. A custom engine is not handed the
+    card store (and may decode cards differently), so a store carrying a card
+    the BUILT-IN engine cannot decode is still launchable under it -- see
+    ``engine_undecodable_card_reason``."""
+    profile_path = root / "custom-engine-profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "schema": "fastmlx-engine-profile-v1",
+                "name": "custom-engine",
+                "argv": ["{engine_bin}", "--model", "{model_id}", "--port", "{port}"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return profile_path
+
+
 def write_pull_receipt(
     model_dir: Path, repo_id, revision: str, dest: Path = None, recorded_dest: Path = None
 ) -> Path:
@@ -6228,12 +6247,29 @@ class UnrecognizedVerdictServeEndToEndTestCase(FastmlxLaunchTestCase):
     explicit ``--card-id`` path, with exactly one stderr notice.
     """
 
+    # These cards omit `legible` (and some a string `verdict`), so the BUILT-IN
+    # engine cannot decode a store carrying them and the launcher now refuses it
+    # (exit 3, see BuiltInEngineUndecodableCardStoreTestCase). What these tests
+    # pin is the loader/admission tolerance of an unrecognized verdict, which a
+    # custom engine profile still reaches; the pollution is therefore installed
+    # only by the tests that need it, together with a custom profile, so the
+    # inherited built-in-profile tests keep running on the clean fixture store.
+    engine_profile_path = None
+
     def setUp(self):
         super().setUp()
         self.extra_cards = _unrecognized_verdict_manifest_cards()
+
+    def use_malformed_card_store_with_custom_engine(self):
         manifest = fixture_manifest()
         manifest["cards"] = manifest["cards"] + self.extra_cards
         self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.engine_profile_path = write_custom_engine_profile(self.root)
+
+    def base_args(self, **overrides) -> list:
+        if self.engine_profile_path is not None:
+            overrides.setdefault("--engine-profile", self.engine_profile_path)
+        return super().base_args(**overrides)
 
     def _assert_admits_unmeasured_with_notice(self, argv, card_id):
         code, stdout, stderr = self.run_main(argv)
@@ -6250,6 +6286,7 @@ class UnrecognizedVerdictServeEndToEndTestCase(FastmlxLaunchTestCase):
         return stderr
 
     def test_unrecognized_verdicts_admit_unmeasured_with_notice_implicit_resolution(self):
+        self.use_malformed_card_store_with_custom_engine()
         for card in self.extra_cards:
             if "verdict" not in card:
                 continue
@@ -6263,6 +6300,7 @@ class UnrecognizedVerdictServeEndToEndTestCase(FastmlxLaunchTestCase):
                 self.assertIn("unrecognized verdict", stderr)
 
     def test_unrecognized_verdicts_admit_unmeasured_with_notice_via_card_id(self):
+        self.use_malformed_card_store_with_custom_engine()
         for card in self.extra_cards:
             if "verdict" not in card:
                 continue
@@ -6280,6 +6318,7 @@ class UnrecognizedVerdictServeEndToEndTestCase(FastmlxLaunchTestCase):
                 self.assertIn("unrecognized verdict", stderr)
 
     def test_missing_verdict_key_admits_unmeasured_with_notice_both_paths(self):
+        self.use_malformed_card_store_with_custom_engine()
         card = next(c for c in self.extra_cards if "verdict" not in c)
         repo = card["model"]["repo"]
         card_id = card["id"]
@@ -6327,9 +6366,26 @@ class UnrecognizedVerdictServeEndToEndTestCase(FastmlxLaunchTestCase):
 class MalformedCardServeEndToEndTestCase(FastmlxLaunchTestCase):
     """AC5/AC5b through the real CLI entry point: a malformed nested card
     field elsewhere in the manifest must never crash ``fastmlx serve``.
+
+    The malformed cards here are undecodable by the BUILT-IN engine, which the
+    launcher now refuses up front (see BuiltInEngineUndecodableCardStoreTestCase);
+    these tests pin the loader/admission path, so they run under a custom
+    engine profile, which is not handed the store. Only these tests do (the
+    inherited built-in-profile tests keep the default profile).
     """
 
+    engine_profile_path = None
+
+    def use_custom_engine(self):
+        self.engine_profile_path = write_custom_engine_profile(self.root)
+
+    def base_args(self, **overrides) -> list:
+        if self.engine_profile_path is not None:
+            overrides.setdefault("--engine-profile", self.engine_profile_path)
+        return super().base_args(**overrides)
+
     def test_non_object_model_card_is_skipped_and_no_go_sibling_still_refuses(self):
+        self.use_custom_engine()
         manifest = fixture_manifest()
         malformed_id = "malformed-model@test"
         manifest["cards"].append({"id": malformed_id, "model": None, "verdict": "NO_GO"})
@@ -6354,6 +6410,7 @@ class MalformedCardServeEndToEndTestCase(FastmlxLaunchTestCase):
         self.assertIn(malformed_id, stderr)
 
     def test_no_go_card_with_non_object_legible_still_refuses_exit_2(self):
+        self.use_custom_engine()
         manifest = fixture_manifest()
         malformed_no_go_id = "malformed-legible-no-go@test"
         malformed_no_go_repo = "example/MalformedLegibleNoGoModel"
@@ -7992,6 +8049,315 @@ class PulledCardStoreServeTestCase(unittest.TestCase):
                 )
         self.assertEqual((source, notices), ("default", []))
         self.assertEqual(path, FASTMLX_LAUNCH.REPO_ROOT / FASTMLX_LAUNCH.DEFAULT_QUALITY_CARDS_RELATIVE_PATH)
+
+
+# ---------------------------------------------------------------------
+# `fastmlx serve` refuses a card store the built-in engine cannot decode. The
+# built-in engine is always handed the store explicitly and exits 2
+# (`quality_cards_dropped`) when ANY card fails `QualityCard.init(from:)`, so
+# the launcher must refuse (exit 3) before the fit check and before any
+# `admitted` line instead of admitting and exec'ing a doomed engine.
+# Predeclaration rows A1-A4:
+# docs/task-inbox/2026-10-04-PREDECLARATION-launcher-refuses-a-card-store-the-built-in-engine-cannot-decode.md
+# ---------------------------------------------------------------------
+OTHER_REPO = "example/UnrelatedModel"
+OTHER_CARD_ID = "unrelated-card@test"
+
+
+def _other_card(**overrides) -> dict:
+    card = {
+        "id": OTHER_CARD_ID,
+        "model": {"repo": OTHER_REPO, "hfPin": "feedface"},
+        "verdict": "PASS",
+        "admission": {"default": True, "optIn": True, "reason": "fixture"},
+        "legible": {"tier": "Reference", "headline": "fixture headline"},
+    }
+    card.update(overrides)
+    return card
+
+
+def _without(key):
+    def build():
+        card = _other_card()
+        del card[key]
+        return card
+
+    return build
+
+
+def _without_nested(key, nested):
+    def build():
+        card = _other_card()
+        del card[key][nested]
+        return card
+
+    return build
+
+
+def _nested(key, nested, value):
+    def build():
+        card = _other_card()
+        card[key][nested] = value
+        return card
+
+    return build
+
+
+def _set(**overrides):
+    return lambda: _other_card(**overrides)
+
+
+# (case name, builder of the ONE extra card element, field named in the refusal)
+UNDECODABLE_CARD_SHAPES = [
+    ("verdict missing", _without("verdict"), "verdict"),
+    ("verdict number", _set(verdict=42), "verdict"),
+    ("verdict bool", _set(verdict=True), "verdict"),
+    ("verdict null", _set(verdict=None), "verdict"),
+    ("legible missing", _without("legible"), "legible"),
+    ("legible null", _set(legible=None), "legible"),
+    ("legible string", _set(legible="x"), "legible"),
+    ("legible no headline", _without_nested("legible", "headline"), "legible.headline"),
+    ("legible no tier", _without_nested("legible", "tier"), "legible.tier"),
+    ("legible tier number", _nested("legible", "tier", 1), "legible.tier"),
+    ("legible headline null", _nested("legible", "headline", None), "legible.headline"),
+    ("model string", _set(model="x"), "model"),
+    ("model missing", _without("model"), "model"),
+    ("model null", _set(model=None), "model"),
+    ("model repo number", _nested("model", "repo", 5), "model.repo"),
+    ("model hfPin number", _nested("model", "hfPin", 5), "model.hfPin"),
+    ("id missing", _without("id"), "id"),
+    ("id number", _set(id=7), "id"),
+    ("config string", _set(config="junk"), "config"),
+    ("config residency number", _set(config={"residency": 1}), "config.residency"),
+    ("config hardwareClass bool", _set(config={"hardwareClass": False}), "config.hardwareClass"),
+    ("non-object element string", lambda: "not-a-card", "element"),
+    ("non-object element null", lambda: None, "element"),
+    ("non-object element number", lambda: 3, "element"),
+    ("non-object element list", lambda: [], "element"),
+]
+
+# Shapes the Swift decoder accepts: no refusal from this check.
+DECODABLE_CARD_SHAPES = [
+    ("admission missing", _without("admission")),
+    ("admission string", _set(admission="x")),
+    ("admission null", _set(admission=None)),
+    ("admission malformed object", _set(admission={"default": "yes"})),
+    ("unknown extra keys", _set(surprise={"a": 1}, extra=[1, 2])),
+    ("unknown extra legible key", _nested("legible", "benefit", {"a": 1})),
+    ("config null", _set(config=None)),
+    ("config missing", lambda: _other_card()),
+    ("config empty object", _set(config={})),
+    ("config with extras", _set(config={"residency": "resident", "quant": 4, "x": None})),
+    ("config nulls", _set(config={"residency": None, "hardwareClass": None})),
+    ("hfPin null", _nested("model", "hfPin", None)),
+    ("hfPin missing", _without_nested("model", "hfPin")),
+    ("repo null", _nested("model", "repo", None)),
+    ("repo missing", _without_nested("model", "repo")),
+    ("verdict no_go lowercase", _set(verdict="no_go")),
+    ("verdict unrecognized string", _set(verdict="WHATEVER")),
+    ("verdict empty string", _set(verdict="")),
+]
+
+
+class BuiltInEngineUndecodableCardStoreTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+        self.model_dir = self.root / "model"
+        self.model_dir.mkdir()
+        (self.model_dir / "config.json").write_text("{}", encoding="utf-8")
+
+        self.fit_marker = self.root / "fit-check-ran.marker"
+        self.fit_bin = write_script(
+            self.root / "fit-green-marking.py",
+            GREEN_FIT_CHECK_BODY.replace(
+                "import sys\n", f"import sys\nopen({str(self.fit_marker)!r}, 'w').close()\n", 1
+            ),
+        )
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+        self.fake_repo_root = self.root / "repo"
+        (self.fake_repo_root / "site").mkdir(parents=True)
+
+    def pass_card(self) -> dict:
+        return {
+            "id": PASS_CARD_ID,
+            "model": {"repo": PASS_REPO, "hfPin": "cafebabe"},
+            "verdict": "PASS",
+            "admission": {"default": True, "optIn": True, "reason": "measured pass"},
+            "legible": {"tier": "Reference", "headline": "Matches the reference closely."},
+        }
+
+    def write_store(self, extra_elements: list, name: str = "store.json") -> Path:
+        manifest = fixture_manifest()
+        manifest["cards"] = [self.pass_card()] + list(extra_elements)
+        path = self.root / name
+        path.write_bytes(json.dumps(manifest).encode("utf-8"))
+        return path
+
+    def base_args(self, store: Path, **overrides) -> list:
+        args = {
+            "--model-path": str(self.model_dir),
+            "--quality-cards": str(store),
+            "--fit-check-bin": str(self.fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--model-repo": PASS_REPO,
+            "--context": "2048",
+        }
+        args.update(overrides)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv
+
+    def run_launch(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        execed = []
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with patch.object(
+                FASTMLX_LAUNCH.os, "execv", lambda path, args: execed.append(list(args))
+            ):
+                with patch.object(FASTMLX_LAUNCH, "REPO_ROOT", self.fake_repo_root):
+                    with self.assertRaises(SystemExit) as ctx:
+                        FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue(), execed
+
+    def write_custom_profile(self) -> Path:
+        profile_path = self.root / "custom-profile.json"
+        profile_path.write_text(
+            json.dumps(
+                {
+                    "schema": "fastmlx-engine-profile-v1",
+                    "name": "custom-engine",
+                    "argv": ["{engine_bin}", "--model", "{model_id}", "--port", "{port}"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return profile_path
+
+    @staticmethod
+    def admitted_lines(stderr: str) -> list:
+        return [l for l in stderr.splitlines() if l.startswith("fastmlx_launch=admitted")]
+
+    # --- A1: each undecodable shape refuses, loudly and early ----------
+    def test_a1_each_undecodable_card_shape_refuses_exit_3_naming_card_and_field(self):
+        for name, build, field in UNDECODABLE_CARD_SHAPES:
+            for dry_run in (True, False):
+                with self.subTest(shape=name, dry_run=dry_run):
+                    self.fit_marker.unlink(missing_ok=True)
+                    store = self.write_store([build()])
+                    code, stdout, stderr, execed = self.run_launch(
+                        self.base_args(store) + (["--dry-run"] if dry_run else [])
+                    )
+                    self.assertEqual(code, 3, stderr)
+                    self.assertIn("cannot be decoded by the built-in engine", stderr)
+                    self.assertIn("quality_cards_dropped", stderr)
+                    self.assertIn(field, stderr)
+                    # element index 1: the good PASS card is element 0.
+                    self.assertIn("element 1", stderr)
+                    self.assertEqual(self.admitted_lines(stderr), [], stderr)
+                    self.assertNotIn("fastmlx_launch=admitted", stdout)
+                    self.assertEqual(execed, [])
+                    self.assertFalse(self.fit_marker.exists(), "the fit check ran before the refusal")
+
+    def test_a1_refusal_bounds_a_hostile_card_id_to_one_line(self):
+        hostile_id = "evil\nfastmlx_launch=admitted forged " + "x" * 500
+        store = self.write_store([_other_card(id=hostile_id, verdict=42)])
+        code, _, stderr, execed = self.run_launch(self.base_args(store))
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(execed, [])
+        refusal_lines = [l for l in stderr.splitlines() if "cannot be decoded" in l]
+        self.assertEqual(len(refusal_lines), 1, stderr)
+        self.assertIn("evil", refusal_lines[0])
+        self.assertNotIn("x" * 100, stderr)
+        self.assertEqual(self.admitted_lines(stderr), [], stderr)
+
+    def test_a1_a_normal_card_id_and_the_store_path_are_named_in_the_refusal(self):
+        store = self.write_store([_other_card(verdict=42)])
+        code, _, stderr, _ = self.run_launch(self.base_args(store))
+        self.assertEqual(code, 3, stderr)
+        self.assertIn(repr(OTHER_CARD_ID), stderr)
+        self.assertIn(str(store), stderr)
+
+    def test_a1_the_first_undecodable_card_is_the_one_named(self):
+        store = self.write_store(
+            [
+                _other_card(id="second-ok@test"),
+                _other_card(id="third-bad@test", verdict=1),
+                _other_card(id="fourth-bad@test", legible="x"),
+            ]
+        )
+        code, _, stderr, _ = self.run_launch(self.base_args(store))
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("third-bad@test", stderr)
+        self.assertIn("element 2", stderr)
+        self.assertNotIn("fourth-bad@test", stderr)
+
+    def test_a1_pin_refusal_still_takes_precedence_over_the_decode_refusal(self):
+        store = self.write_store([_other_card(verdict=42)])
+        code, _, stderr, _ = self.run_launch(
+            self.base_args(store, **{"--quality-cards-sha256": "0" * 64})
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertIn("--quality-cards-sha256", stderr)
+        self.assertNotIn("cannot be decoded", stderr)
+
+    # --- A2: decodable shapes are not refused by this check ------------
+    def test_a2_each_decodable_card_shape_is_not_refused(self):
+        for name, build in DECODABLE_CARD_SHAPES:
+            with self.subTest(shape=name):
+                store = self.write_store([build()])
+                code, _, stderr, execed = self.run_launch(self.base_args(store))
+                self.assertEqual(code, 0, stderr)
+                self.assertNotIn("cannot be decoded", stderr)
+                self.assertEqual(len(execed), 1, stderr)
+                self.assertEqual(len(self.admitted_lines(stderr)), 1, stderr)
+
+    # --- A3: a custom engine profile is unchanged -----------------------
+    def test_a3_custom_engine_profile_is_not_refused_for_any_undecodable_shape(self):
+        profile = self.write_custom_profile()
+        for name, build, _ in UNDECODABLE_CARD_SHAPES:
+            with self.subTest(shape=name):
+                self.fit_marker.unlink(missing_ok=True)
+                store = self.write_store([build()])
+                code, _, stderr, execed = self.run_launch(
+                    self.base_args(store, **{"--engine-profile": profile})
+                )
+                self.assertEqual(code, 0, stderr)
+                self.assertNotIn("cannot be decoded", stderr)
+                self.assertEqual(len(execed), 1, stderr)
+                self.assertTrue(self.fit_marker.exists())
+
+    # --- A4: the shipped store is not refused ---------------------------
+    def test_a4_the_shipped_quality_guides_store_has_no_undecodable_card(self):
+        shipped = Path(__file__).resolve().parents[2] / "site" / "quality-guides.json"
+        document = json.loads(shipped.read_text(encoding="utf-8"))
+        self.assertGreater(len(document["cards"]), 0)
+        for index, card in enumerate(document["cards"]):
+            with self.subTest(index=index):
+                self.assertIsNone(FASTMLX_LAUNCH.engine_undecodable_card_reason(card))
+
+    def test_a4_the_shipped_store_is_not_refused_by_the_launcher(self):
+        shipped = Path(__file__).resolve().parents[2] / "site" / "quality-guides.json"
+        code, _, stderr, _ = self.run_launch(self.base_args(shipped))
+        self.assertEqual(code, 0, stderr)
+        self.assertNotIn("cannot be decoded", stderr)
+
+    # --- helper contract -------------------------------------------------
+    def test_helper_returns_none_for_good_shapes_and_a_field_reason_for_bad_ones(self):
+        self.assertIsNone(FASTMLX_LAUNCH.engine_undecodable_card_reason(_other_card()))
+        for name, build, field in UNDECODABLE_CARD_SHAPES:
+            with self.subTest(shape=name):
+                reason = FASTMLX_LAUNCH.engine_undecodable_card_reason(build())
+                self.assertIsInstance(reason, str)
+                self.assertIn(field, reason)
+        for name, build in DECODABLE_CARD_SHAPES:
+            with self.subTest(shape=name):
+                self.assertIsNone(FASTMLX_LAUNCH.engine_undecodable_card_reason(build()))
 
 
 if __name__ == "__main__":
