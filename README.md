@@ -200,6 +200,7 @@ named or found.
 ```sh
 # Pull an exact Hugging Face revision: every file is hash-checked, and an interrupted pull resumes.
 python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b
+# Add --kv-reserve-gib 2 to refuse a pack that cannot fit this Mac before any byte is downloaded.
 
 # Adopt a directory that was staged by hand (rsync, a copy from another host, ...) instead of by
 # `fastmlx pull`: verifies every manifest file already there against the pinned revision (size +

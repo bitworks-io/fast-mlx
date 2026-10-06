@@ -49,6 +49,24 @@ same exclusive, never-overwritten write as a normal pull, plus
 ``"acquisition": "adopted"`` (a normal ``pull()`` receipt now carries
 ``"acquisition": "downloaded"`` for the same reason).
 
+``--kv-reserve-gib N`` (with optional ``--context C`` and ``--host-use
+{shared,dedicated-serving}``) turns on a pre-download judgment: from the
+revision manifest ``pull`` has just fetched (never a second fetch), and
+before the free-space probe or any staging directory exists, it sizes the
+pack exactly as ``fastmlx recommend --pinned`` does (the built-in safetensors
+sizer fed the manifest's file sizes, against this host's wired-memory
+ceiling) and looks the pinned revision up in the default quality-card store.
+A pack that does not fit, or that cannot be sized (a GGUF-only manifest, a
+>= 1 GiB unnamed non-safetensors file), or a card store that fails to load, is
+refused with exit 1 and nothing written; the message says to drop
+``--kv-reserve-gib`` to pull unchecked. A pack that fits prints ONE stderr
+line naming its quality card and verdict (``--accept-quality <id>`` when the
+card is opt-in, "unmeasured" when it has none) and the download proceeds --
+``pull`` never refuses on the card verdict; admission is ``fastmlx serve``'s
+job. Without ``--kv-reserve-gib`` nothing changes (staging a pack for another
+host stays legitimate); ``--context``/``--host-use`` alone, and ``--adopt``
+with ``--kv-reserve-gib``, are usage errors (exit 2).
+
 This script never executes or imports anything from the pulled repository,
 and it does not add any new token/credential handling.
 """
@@ -102,6 +120,11 @@ class PinnedReferenceError(Exception):
 
 class PullError(Exception):
     """The pull could not be completed."""
+
+
+class PreflightRefused(Exception):
+    """A pre-download check (``--kv-reserve-gib``) refused this pull; nothing
+    has been written. The message is shown verbatim on stderr."""
 
 
 # ---------------------------------------------------------------------
@@ -201,8 +224,14 @@ def pull(
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     min_free_bytes: Optional[int] = None,
     disk_usage_bytes: Optional[Callable[[Path], int]] = None,
+    preflight: Optional[Callable[[list], None]] = None,
 ) -> Path:
     """Pull one pinned snapshot into ``dest``, resuming across attempts.
+
+    ``preflight``, when given, is called with the validated manifest
+    ``entries`` right after they are fetched and BEFORE the free-space probe
+    and before any staging directory exists; it refuses the pull by raising
+    ``PreflightRefused`` (nothing has been written by then).
 
     ``disk_usage_bytes``, when given, overrides the free-space probe used
     for the preflight floor check (tests inject a fake here). When not
@@ -222,6 +251,8 @@ def pull(
 
     document, _api_data = downloader.fetch_api(repo_id, revision)
     entries = downloader.validated_entries(document, repo_id, revision)
+    if preflight is not None:
+        preflight(entries)
     total_bytes = sum(entry["size"] for entry in entries)
 
     required_free_bytes = (
@@ -587,12 +618,136 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "wrong-content, or unverified-but-loadable file"
         ),
     )
+    parser.add_argument(
+        "--kv-reserve-gib",
+        type=float,
+        default=None,
+        help=(
+            "judge fit and the quality card BEFORE downloading: size the "
+            "pinned revision's manifest (as 'fastmlx recommend --pinned' "
+            "does) against this host's wired-memory ceiling with this "
+            "KV-cache reserve (GiB). A pack that does not fit or cannot be "
+            "sized is refused (exit 1, nothing written); otherwise one line "
+            "names its quality card and verdict and the download proceeds "
+            "(the card verdict never refuses a pull). Without this flag no "
+            "check runs. Not combinable with --adopt"
+        ),
+    )
+    parser.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help=(
+            "the context length the --kv-reserve-gib check sizes for "
+            "(needs --kv-reserve-gib)"
+        ),
+    )
+    parser.add_argument(
+        "--host-use",
+        choices=["shared", "dedicated-serving"],
+        default=None,
+        help=(
+            "the host-sharing mode the --kv-reserve-gib check assumes "
+            "(default 'shared'; needs --kv-reserve-gib)"
+        ),
+    )
     return parser
+
+
+def _load_recommend_module():
+    """Load ``fastmlx_recommend.py`` by file path, on demand.
+
+    ``fastmlx_recommend`` imports ``fastmlx_launch``, which imports this
+    module, so a top-level import here would recurse; ``main`` calls this
+    only when ``--kv-reserve-gib`` asks for the pre-download check.
+    """
+    path = Path(__file__).resolve().parent / "fastmlx_recommend.py"
+    spec = importlib.util.spec_from_file_location("fastmlx_recommend", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_fit_and_card_preflight(
+    repo_id: str,
+    revision: str,
+    kv_reserve_gib: float,
+    context: Optional[int],
+    host_use: str,
+) -> Callable[[list], None]:
+    """The ``--kv-reserve-gib`` pre-download check, as a ``pull(preflight=)``
+    hook. Loads ``fastmlx_recommend`` and the default card store NOW (a store
+    that cannot be loaded refuses before any network request), and classifies
+    the manifest entries ``pull`` hands it with the same pure classifier
+    ``recommend --pinned`` uses -- it never fetches the manifest itself."""
+    recommend = _load_recommend_module()
+    try:
+        cards = recommend.load_default_card_store("fastmlx pull")
+    except recommend.launch.LaunchRefusal as refusal:
+        raise PreflightRefused(
+            f"the quality-card store could not be loaded, so fit and card "
+            f"cannot be judged: {refusal.message}; nothing was written (drop "
+            "--kv-reserve-gib to pull without the check)"
+        ) from refusal
+    ref = f"{repo_id}@{revision}"
+
+    def preflight(entries: list) -> None:
+        row = recommend.classify_pinned_entries(
+            ref=ref,
+            entries=entries,
+            cards=cards,
+            host_use=host_use,
+            context=context,
+            fit_check_args=[],
+            kv_reserve_gib=kv_reserve_gib,
+        )
+        status = row["status"]
+        if status in (recommend.STATUS_DOES_NOT_FIT, recommend.STATUS_ERROR):
+            raise PreflightRefused(
+                f"{row['message']}; nothing was written (drop --kv-reserve-gib "
+                "to pull without the check)"
+            )
+        card = row.get("card") or {}
+        card_id = card.get("id")
+        verdict = card.get("verdict")
+        if status == recommend.STATUS_OPT_IN:
+            line = (
+                f"fits this host; quality card {card_id} verdict {verdict} -- "
+                f"serving it needs {row['accept_quality_flag']}"
+            )
+        elif status == recommend.STATUS_UNCARDED:
+            if card_id:
+                line = (
+                    f"fits this host; quality card {card_id} verdict {verdict} "
+                    "is not a measured verdict -- fastmlx serve admits it as "
+                    "unmeasured"
+                )
+            else:
+                line = (
+                    "fits this host; no quality card names this pack (uncarded) "
+                    "-- fastmlx serve admits it as unmeasured"
+                )
+        else:
+            line = f"fits this host; quality card {card_id} verdict {verdict}"
+        print(f"fastmlx pull: {ref}: {line}", file=sys.stderr, flush=True)
+
+    return preflight
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    if args.kv_reserve_gib is None:
+        for flag, value in (("--context", args.context), ("--host-use", args.host_use)):
+            if value is not None:
+                parser.error(f"{flag} has no effect without --kv-reserve-gib")
+    elif args.adopt:
+        parser.error(
+            "--adopt cannot be combined with --kv-reserve-gib: --adopt "
+            "verifies a directory that already exists and downloads nothing, "
+            "so there is nothing to check before a download"
+        )
     try:
         repo_id, revision = validate_pinned_reference(args.pinned_reference)
     except PinnedReferenceError as error:
@@ -602,13 +757,26 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.adopt:
             adopt(repo_id=repo_id, revision=revision, dest=args.dest)
         else:
+            preflight = None
+            if args.kv_reserve_gib is not None:
+                preflight = _build_fit_and_card_preflight(
+                    repo_id,
+                    revision,
+                    args.kv_reserve_gib,
+                    args.context,
+                    args.host_use or "shared",
+                )
             pull(
                 repo_id=repo_id,
                 revision=revision,
                 dest=args.dest,
                 max_attempts=args.max_attempts,
                 min_free_bytes=args.min_free_bytes,
+                preflight=preflight,
             )
+    except PreflightRefused as error:
+        print(f"fastmlx pull refused: {error}", file=sys.stderr)
+        raise SystemExit(1)
     except PullError as error:
         print(f"fastmlx pull failed: {error}", file=sys.stderr)
         raise SystemExit(1)

@@ -3130,5 +3130,461 @@ class RecommendPulledCardStoreTestCase(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["cardStore"]["sha256"], self.bundled_digest)
 
 
+
+# ---------------------------------------------------------------------
+# `recommend --pinned <repo>@<sha>`: a fit + card verdict from the Hugging
+# Face revision manifest, BEFORE any download. Standalone TestCase (see the
+# comment on BuiltinSizerAutoSelectionTestCase above for why).
+# ---------------------------------------------------------------------
+PINNED_SHA = "a" * 40
+PINNED_REF = f"{PASS_REPO}@{PINNED_SHA}"
+PINNED_SIZER_ARGS = [
+    "--fit-check-arg=--wired-limit-mib",
+    "--fit-check-arg",
+    "4096",
+    "--fit-check-arg=--wired-margin-gib",
+    "--fit-check-arg",
+    "2",
+]
+
+
+def manifest_document(repo: str, sha: str, files: dict) -> dict:
+    """A revision-API document shaped like Hugging Face's, ``files`` being
+    ``{relative_path: size}`` (the real ``validated_entries`` validates it)."""
+    return {
+        "id": repo,
+        "sha": sha,
+        "private": False,
+        "siblings": [
+            {"rfilename": name, "size": size, "blobId": "b" * 40}
+            for name, size in files.items()
+        ],
+    }
+
+
+class RecommendPinnedTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.fetch_calls = []
+        self.documents = {}
+        patcher = patch.object(
+            FASTMLX_RECOMMEND.downloader, "fetch_api", side_effect=self._fake_fetch
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _fake_fetch(self, repo_id, revision):
+        self.fetch_calls.append((repo_id, revision))
+        document = self.documents.get((repo_id, revision))
+        if isinstance(document, Exception):
+            raise document
+        return document, b""
+
+    def serve_manifest(self, repo: str, sha: str, files: dict) -> str:
+        self.documents[(repo, sha)] = manifest_document(repo, sha, files)
+        return f"{repo}@{sha}"
+
+    def argv(self, refs, *extra, kv="0.5", sizer_args=True) -> list:
+        argv = ["recommend", "--quality-cards", str(self.manifest_path)]
+        for ref in refs:
+            argv += ["--pinned", ref]
+        if kv is not None:
+            argv += ["--kv-reserve-gib", kv]
+        if sizer_args:
+            argv += PINNED_SIZER_ARGS
+        return argv + list(extra)
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def run_json(self, argv: list):
+        code, stdout, stderr = self.run_main(argv + ["--json"])
+        return code, json.loads(stdout), stderr
+
+    def small_pack(self, repo=PASS_REPO, sha=PINNED_SHA, **overrides) -> str:
+        files = {
+            "config.json": 10,
+            "model-00001-of-00002.safetensors": 1000,
+            "model-00002-of-00002.safetensors": 2000,
+        }
+        files.update(overrides)
+        return self.serve_manifest(repo, sha, files)
+
+    # --- A1 --------------------------------------------------------
+    def test_pinned_row_statuses_and_marking(self):
+        ref = self.small_pack()
+        code, doc, _ = self.run_json(self.argv([ref]))
+        self.assertEqual(code, 0, doc)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "recommended")
+        self.assertEqual(row["source"], "revision-manifest")
+        self.assertIs(row["downloaded"], False)
+        self.assertEqual(row["ref"], ref)
+        self.assertEqual(row["repo"], PASS_REPO)
+        self.assertEqual(row["revision"], PINNED_SHA)
+        self.assertEqual(row["fit"]["verdict"], "GREEN")
+        self.assertEqual(row["card"]["id"], PASS_CARD_ID)
+        self.assertEqual(self.fetch_calls, [(PASS_REPO, PINNED_SHA)])
+
+    def test_pinned_text_says_not_downloaded_and_prints_pull_next_step(self):
+        ref = self.small_pack()
+        code, stdout, _ = self.run_main(self.argv([ref]))
+        self.assertEqual(code, 0)
+        self.assertIn("not downloaded", stdout)
+        self.assertIn(f"fastmlx pull {ref} --dest <dir>", stdout)
+        self.assertNotIn("--accept-quality", stdout)
+
+    def test_pinned_pack_over_the_ceiling_is_does_not_fit(self):
+        ref = self.small_pack(**{"model-00001-of-00002.safetensors": 3 << 30})
+        code, doc, _ = self.run_json(self.argv([ref]))
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "does-not-fit")
+        self.assertEqual(row["fit"]["verdict"], "RED")
+        self.assertIsNone(row["next_step"])
+        code, stdout, _ = self.run_main(self.argv([ref]))
+        self.assertIn("not downloaded", stdout)
+        self.assertNotIn("fastmlx pull", stdout)
+
+    def test_pinned_uncarded_row(self):
+        ref = self.small_pack(repo=UNCARDED_REPO)
+        code, doc, _ = self.run_json(self.argv([ref]))
+        self.assertEqual(code, 1)
+        self.assertEqual(doc["rows"][0]["status"], "uncarded")
+        self.assertEqual(doc["rows"][0]["source"], "revision-manifest")
+
+    def test_pinned_row_combines_with_a_local_candidate_and_ranks_with_it(self):
+        ref = self.small_pack()
+        local = self.root / "local-model"
+        local.mkdir()
+        (local / "config.json").write_text("{}", encoding="utf-8")
+        blob = build_safetensors_bytes([("t.a", "F32", [4], zero_tensor_bytes("F32", [4]))])
+        (local / "model.safetensors").write_bytes(blob)
+        argv = self.argv([ref]) + ["--model-path", str(local)]
+        code, doc, _ = self.run_json(argv)
+        self.assertEqual(code, 0, doc)
+        by_source = {row.get("source"): row for row in doc["rows"]}
+        self.assertEqual(by_source["revision-manifest"]["status"], "recommended")
+        self.assertEqual(by_source[None]["status"], "uncarded")
+        self.assertEqual(doc["rows"][0]["source"], "revision-manifest")  # recommended first
+
+    # --- A2 (differential) ------------------------------------------
+    def _local_fixture_dir(self) -> Path:
+        pack = self.root / "local-diff-pack"
+        pack.mkdir()
+        (pack / "config.json").write_text("{}", encoding="utf-8")
+        (pack / "tokenizer.json").write_text('{"a": 1}', encoding="utf-8")
+        for index, count in enumerate((4, 9), start=1):
+            blob = build_safetensors_bytes(
+                [("t.a", "F32", [count], zero_tensor_bytes("F32", [count]))]
+            )
+            (pack / f"model-0000{index}-of-00002.safetensors").write_bytes(blob)
+        (pack / ".hidden").mkdir()
+        (pack / ".hidden" / "stray.safetensors").write_bytes(
+            build_safetensors_bytes([("t.z", "F32", [64], zero_tensor_bytes("F32", [64]))])
+        )
+        return pack
+
+    def _manifest_files_of(self, pack: Path) -> dict:
+        return {
+            path.relative_to(pack).as_posix(): path.stat().st_size
+            for path in sorted(pack.rglob("*"))
+            if path.is_file()
+        }
+
+    def _local_compute_fit(self, pack: Path, kv: str) -> dict:
+        sizer = FASTMLX_RECOMMEND.launch._safetensors_fit
+        args = sizer.build_arg_parser().parse_args(
+            [
+                "--model-path", str(pack),
+                "--kv-reserve-gib", kv,
+                "--wired-limit-mib", "4096",
+                "--wired-margin-gib", "2",
+            ]
+        )
+        return sizer.compute_fit(args)
+
+    def test_pinned_row_matches_local_fit_verdict(self):
+        pack = self._local_fixture_dir()
+        files = self._manifest_files_of(pack)
+        ref = self.serve_manifest(PASS_REPO, PINNED_SHA, files)
+        for kv, expected_fit in (("0.5", "green"), ("3", "red")):
+            with self.subTest(kv=kv):
+                local = self._local_compute_fit(pack, kv)
+                self.assertEqual(local["fit"], expected_fit)
+                code, doc, _ = self.run_json(self.argv([ref], kv=kv))
+                row = doc["rows"][0]
+                self.assertEqual(row["sizing"]["weights_bytes"], local["weights_bytes"])
+                self.assertEqual(row["sizing"]["ceiling_bytes"], local["ceiling_bytes"])
+                self.assertEqual(row["sizing"]["total_bytes"], local["total_bytes"])
+                self.assertEqual(row["fit"]["verdict"], local["fit"].upper())
+                self.assertEqual(
+                    row["status"], "recommended" if expected_fit == "green" else "does-not-fit"
+                )
+        # the .hidden shard is excluded on both sides, and sizes are non-trivial
+        self.assertGreater(local["weights_bytes"], 0)
+
+    # --- A3 ---------------------------------------------------------
+    def test_invalid_refs_are_usage_errors_before_any_fetch(self):
+        bad_refs = (
+            f"{PASS_REPO}@main",
+            f"{PASS_REPO}@{'a' * 12}",
+            f"{PASS_REPO}@{'A' * 40}",
+            f"{PASS_REPO}",
+            f"{PASS_REPO}@{'a' * 40}@{'b' * 40}",
+            f"noslash@{'a' * 40}",
+        )
+        good = self.small_pack()
+        for bad in bad_refs:
+            with self.subTest(ref=bad):
+                self.fetch_calls.clear()
+                code, stdout, stderr = self.run_main(self.argv([good, bad]))
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("fastmlx recommend", stderr)
+                self.assertIn(bad, stderr)
+                self.assertEqual(self.fetch_calls, [])
+
+    # --- A4 ---------------------------------------------------------
+    def _assert_error_row_with_other_rows_unaffected(self, bad_ref, argv_extra=(), kv="0.5"):
+        good = self.small_pack(repo=PASS_REPO, sha="c" * 40)
+        code, doc, _ = self.run_json(self.argv([good, bad_ref], *argv_extra, kv=kv))
+        rows = {row["ref"]: row for row in doc["rows"]}
+        self.assertEqual(rows[good]["status"], "recommended")
+        self.assertEqual(rows[bad_ref]["status"], "error")
+        self.assertEqual(code, 0)
+        return rows[bad_ref]
+
+    def test_error_row_when_the_manifest_fetch_raises(self):
+        bad = f"{NO_GO_REPO}@{'d' * 40}"
+        self.documents[(NO_GO_REPO, "d" * 40)] = RuntimeError("network down")
+        row = self._assert_error_row_with_other_rows_unaffected(bad)
+        self.assertIn("revision manifest", row["message"])
+        self.assertIn("network down", row["message"])
+        self.assertEqual(row["source"], "revision-manifest")
+        self.assertIs(row["downloaded"], False)
+
+    def test_error_row_when_the_manifest_identity_does_not_validate(self):
+        bad = f"{NO_GO_REPO}@{'d' * 40}"
+        self.documents[(NO_GO_REPO, "d" * 40)] = manifest_document(
+            NO_GO_REPO, "e" * 40, {"model.safetensors": 5}
+        )
+        row = self._assert_error_row_with_other_rows_unaffected(bad)
+        self.assertIn("identity mismatch", row["message"])
+
+    def test_error_row_when_the_manifest_has_no_safetensors(self):
+        bad = self.serve_manifest(NO_GO_REPO, "d" * 40, {"config.json": 5, "README.md": 9})
+        row = self._assert_error_row_with_other_rows_unaffected(bad)
+        self.assertIn("no .safetensors files", row["message"])
+
+    def test_error_row_for_an_unnamed_big_non_safetensors_file(self):
+        bad = self.serve_manifest(
+            NO_GO_REPO,
+            "d" * 40,
+            {"model.safetensors": 100, "model-q4.gguf": 2 << 30},
+        )
+        row = self._assert_error_row_with_other_rows_unaffected(bad)
+        self.assertIn("model-q4.gguf", row["message"])
+        self.assertIn("--mmap-side-file", row["message"])
+
+    def test_big_file_named_by_mmap_side_file_is_not_resident(self):
+        ref = self.serve_manifest(
+            PASS_REPO, PINNED_SHA, {"model.safetensors": 100, "ngram.bin": 2 << 30}
+        )
+        code, doc, _ = self.run_json(
+            self.argv([ref], "--fit-check-arg=--mmap-side-file", "--fit-check-arg", "ngram.bin")
+        )
+        self.assertEqual(doc["rows"][0]["status"], "recommended", doc)
+        self.assertEqual(doc["rows"][0]["sizing"]["weights_bytes"], 100)
+
+    def test_error_row_for_expert_stream_residency(self):
+        ref = self.small_pack()
+        code, doc, _ = self.run_json(self.argv([ref], "--residency", "expert-stream"))
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("expert-stream", row["message"])
+        self.assertEqual(self.fetch_calls, [])
+
+    def test_error_row_for_an_explicit_fit_check_bin(self):
+        ref = self.small_pack()
+        code, doc, _ = self.run_json(self.argv([ref], "--fit-check-bin", "/bin/true"))
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("--fit-check-bin", row["message"])
+        self.assertEqual(self.fetch_calls, [])
+
+    def test_error_row_for_a_profile_fit_check_bin(self):
+        ref = self.small_pack()
+        profile = FASTMLX_RECOMMEND.launch.load_engine_profile(None)[0]
+        profile = dict(profile, fitCheck={"bin": "/bin/true", "args": []})
+        with patch.object(
+            FASTMLX_RECOMMEND.launch, "load_engine_profile", return_value=(profile, False)
+        ):
+            code, doc, _ = self.run_json(self.argv([ref]))
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("fitCheck.bin", row["message"])
+        self.assertEqual(self.fetch_calls, [])
+
+    def test_error_row_for_a_missing_kv_reserve_matches_the_local_message(self):
+        ref = self.small_pack()
+        code, doc, _ = self.run_json(self.argv([ref], kv=None))
+        self.assertEqual(code, 2)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn("requires --kv-reserve-gib", row["message"])
+        self.assertIn("never silently assume a zero KV-cache reserve", row["message"])
+        self.assertEqual(self.fetch_calls, [])
+        # the same sentence the local auto-selected-sizer refusal prints
+        local = self.root / "kv-local"
+        local.mkdir()
+        (local / "config.json").write_text("{}", encoding="utf-8")
+        (local / "model.safetensors").write_bytes(
+            build_safetensors_bytes([("t.a", "F32", [4], zero_tensor_bytes("F32", [4]))])
+        )
+        _, local_doc, _ = self.run_json(
+            ["recommend", "--quality-cards", str(self.manifest_path), "--model-path", str(local)]
+        )
+        self.assertEqual(local_doc["rows"][0]["message"], row["message"])
+
+    def test_a_bad_fit_check_arg_is_an_error_row_not_a_crash(self):
+        ref = self.small_pack()
+        code, doc, _ = self.run_json(
+            self.argv([ref], "--fit-check-arg=--no-such-sizer-flag", sizer_args=False)
+        )
+        self.assertEqual(doc["rows"][0]["status"], "error")
+
+    # --- A5 ---------------------------------------------------------
+    def test_dot_prefixed_manifest_paths_are_excluded(self):
+        ref = self.serve_manifest(
+            PASS_REPO,
+            PINNED_SHA,
+            {
+                "model.safetensors": 1000,
+                ".hidden/shard.safetensors": 5 << 30,
+                "sub/.inner/shard.safetensors": 5 << 30,
+                ".gitattributes.safetensors": 5 << 30,
+                ".big-dotfile.bin": 5 << 30,
+            },
+        )
+        code, doc, _ = self.run_json(self.argv([ref]))
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "recommended", row)
+        self.assertEqual(row["sizing"]["weights_bytes"], 1000)
+
+    def test_only_dot_prefixed_safetensors_is_the_no_safetensors_error(self):
+        ref = self.serve_manifest(
+            PASS_REPO, PINNED_SHA, {"config.json": 3, ".hidden/model.safetensors": 10}
+        )
+        _, doc, _ = self.run_json(self.argv([ref]))
+        self.assertEqual(doc["rows"][0]["status"], "error")
+
+    # --- A6 ---------------------------------------------------------
+    def test_card_lookup_by_repo_and_by_hf_pin(self):
+        by_repo = self.small_pack(repo=NO_GO_REPO, sha="1" * 40)
+        by_pin = self.small_pack(repo="example/Unrelated", sha=PIN_ONLY_NO_GO_REVISION)
+        _, doc, _ = self.run_json(self.argv([by_repo, by_pin]))
+        rows = {row["ref"]: row for row in doc["rows"]}
+        self.assertEqual(rows[by_repo]["card"]["id"], NO_GO_CARD_ID)
+        self.assertEqual(rows[by_pin]["card"]["id"], PIN_ONLY_NO_GO_CARD_ID)
+
+    def test_no_go_card_is_an_opt_in_row_with_the_accept_quality_next_step(self):
+        ref = self.small_pack(repo=NO_GO_REPO, sha="1" * 40)
+        code, doc, _ = self.run_json(self.argv([ref]))
+        self.assertEqual(code, 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "opt-in")
+        self.assertEqual(row["accept_quality_flag"], f"--accept-quality {NO_GO_CARD_ID}")
+        self.assertEqual(row["source"], "revision-manifest")
+        self.assertIs(row["downloaded"], False)
+        self.assertIn(f"fastmlx pull {ref} --dest <dir>", row["next_step"])
+        self.assertIn(f"--accept-quality {NO_GO_CARD_ID}", row["next_step"])
+        _, stdout, _ = self.run_main(self.argv([ref]))
+        self.assertIn(f"fastmlx pull {ref} --dest <dir>", stdout)
+        self.assertIn(f"--accept-quality {NO_GO_CARD_ID}", stdout)
+        self.assertIn("not downloaded", stdout)
+
+    def test_exit_code_for_is_unchanged_for_pinned_rows(self):
+        statuses = {
+            "recommended": 0,
+            "opt-in": 1,
+            "uncarded": 1,
+            "does-not-fit": 2,
+            "error": 2,
+        }
+        for status, expected in statuses.items():
+            rows = [{"status": status, "source": "revision-manifest"}]
+            self.assertEqual(FASTMLX_RECOMMEND.exit_code_for(rows), expected)
+
+    # --- no disk writes ---------------------------------------------
+    def test_pinned_path_writes_nothing_to_disk(self):
+        ref = self.small_pack()
+        before = sorted(p.name for p in self.root.rglob("*"))
+        cwd_before = sorted(os.listdir("."))
+        self.run_json(self.argv([ref]))
+        self.assertEqual(sorted(p.name for p in self.root.rglob("*")), before)
+        self.assertEqual(sorted(os.listdir(".")), cwd_before)
+
+
+class WeightsFromManifestTestCase(unittest.TestCase):
+    """The pure manifest -> weights-tuple helper (rules mirror the local
+    ``compute_model_bytes`` / ``_iter_regular_files``)."""
+
+    SIZER = FASTMLX_RECOMMEND.launch._safetensors_fit
+
+    def test_sums_safetensors_and_ignores_small_other_files(self):
+        entries = [
+            {"name": "config.json", "size": 10},
+            {"name": "a.safetensors", "size": 7},
+            {"name": "sub/b.safetensors", "size": 5},
+        ]
+        weight_bytes, weight_files, side_files = self.SIZER.weights_from_manifest(entries)
+        self.assertEqual(weight_bytes, 12)
+        self.assertEqual(
+            weight_files,
+            [{"name": "a.safetensors", "bytes": 7}, {"name": "sub/b.safetensors", "bytes": 5}],
+        )
+        self.assertEqual(side_files, [])
+
+    def test_dot_component_excludes_a_path_at_any_depth(self):
+        entries = [
+            {"name": "a.safetensors", "size": 7},
+            {"name": ".x/b.safetensors", "size": 100},
+            {"name": "d/.y/c.safetensors", "size": 100},
+        ]
+        self.assertEqual(self.SIZER.weights_from_manifest(entries)[0], 7)
+
+    def test_big_unnamed_file_refused_and_named_one_is_a_side_file(self):
+        entries = [{"name": "a.safetensors", "size": 7}, {"name": "t.bin", "size": 1 << 30}]
+        with self.assertRaises(self.SIZER.FitCheckError):
+            self.SIZER.weights_from_manifest(entries)
+        _, _, side = self.SIZER.weights_from_manifest(entries, ["t.bin"])
+        self.assertEqual(side, [{"name": "t.bin", "bytes": 1 << 30}])
+        with self.assertRaises(self.SIZER.FitCheckError):
+            self.SIZER.weights_from_manifest(entries, ["missing.bin"])
+
+    def test_compute_fit_with_weights_walks_nothing(self):
+        args = self.SIZER.build_arg_parser().parse_args(
+            [
+                "--model-path", "/nonexistent/never/touched",
+                "--kv-reserve-gib", "1",
+                "--wired-limit-mib", "4096",
+                "--wired-margin-gib", "2",
+            ]
+        )
+        result = self.SIZER.compute_fit(args, weights=(123, [{"name": "x", "bytes": 123}], []))
+        self.assertEqual(result["weights_bytes"], 123)
+        self.assertEqual(result["fit"], "green")
+
+
 if __name__ == "__main__":
     unittest.main()

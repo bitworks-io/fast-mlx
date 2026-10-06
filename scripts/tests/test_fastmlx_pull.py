@@ -1,7 +1,10 @@
 import argparse
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -986,6 +989,321 @@ class AdoptTests(unittest.TestCase):
                 FASTMLX_PULL.receipt_path_for(dest).read_text(encoding="utf-8")
             )
             self.assertEqual(receipt["acquisition"], "adopted")
+
+
+# ---------------------------------------------------------------------
+# `fastmlx pull --kv-reserve-gib N`: judge fit and the quality card from the
+# manifest pull already fetched, BEFORE the free-space probe and any staging
+# directory. No real network: `downloader.fetch_api`, `acquire` and the
+# free-space probe are faked, the card store is a local manifest, and the
+# host ceiling is pinned through the sizer's own environment inputs.
+# ---------------------------------------------------------------------
+_RECOMMEND_PATH = Path(__file__).resolve().parents[1] / "fastmlx_recommend.py"
+_RECOMMEND_MODULE = None
+
+
+def _recommend_module():
+    """One shared instance of ``fastmlx_recommend`` loaded by file path (the
+    same idiom the scripts use for siblings), only when a test asks."""
+    global _RECOMMEND_MODULE
+    if _RECOMMEND_MODULE is None:
+        spec = importlib.util.spec_from_file_location("fastmlx_recommend", _RECOMMEND_PATH)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _RECOMMEND_MODULE = module
+    return _RECOMMEND_MODULE
+
+
+PREFLIGHT_PASS_REPO = "example/PassModel"
+PREFLIGHT_PASS_CARD = "fixture-pass@test"
+PREFLIGHT_NO_GO_REPO = "example/NoGoModel"
+PREFLIGHT_NO_GO_CARD = "fixture-no-go@test"
+PREFLIGHT_UNCARDED_REPO = "example/NoCardModel"
+PREFLIGHT_SHA = "a" * 40
+# kv 0.5 GiB over a 2 GiB ceiling (4096 MiB wired limit - 2 GiB margin).
+PREFLIGHT_CEILING_BYTES = (4096 << 20) - (2 << 30)
+
+
+def preflight_card_manifest() -> dict:
+    return {
+        "schema": "fast-mlx-quality-card-v1",
+        "generatedAt": "2026-01-01T00:00:00Z",
+        "cards": [
+            {
+                "id": PREFLIGHT_PASS_CARD,
+                "model": {"repo": PREFLIGHT_PASS_REPO, "hfPin": "cafebabe"},
+                "verdict": "PASS",
+                "legible": {
+                    "tier": "Reference",
+                    "headline": "Matches the reference closely.",
+                    "nextWordDrift": {"top1AgreementPct": 91.2},
+                    "benefit": {"speedX": None, "speedXStatus": "not-measured"},
+                },
+            },
+            {
+                "id": PREFLIGHT_NO_GO_CARD,
+                "model": {"repo": PREFLIGHT_NO_GO_REPO, "hfPin": "deadbeef"},
+                "verdict": "NO_GO",
+                "legible": {
+                    "tier": "Noticeable",
+                    "headline": "About 1 word in 6 differs from the reference model.",
+                },
+            },
+        ],
+    }
+
+
+def preflight_document(repo: str, sha: str, files: dict) -> dict:
+    return {
+        "id": repo,
+        "sha": sha,
+        "private": False,
+        "siblings": [
+            {"rfilename": name, "size": size, "blobId": "b" * 40}
+            for name, size in files.items()
+        ],
+    }
+
+
+SMALL_PACK = {
+    "config.json": 10,
+    "model-00001-of-00002.safetensors": 1000,
+    "model-00002-of-00002.safetensors": 2000,
+}
+
+
+class PullPreflightTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.dest = self.work / "model"
+        self.cards_path = self.root / "quality-guides.json"
+        self.cards_path.write_text(json.dumps(preflight_card_manifest()), encoding="utf-8")
+        self.recommend = _recommend_module()
+        self.document = None
+        self.files = dict(SMALL_PACK)
+        self.repo = PREFLIGHT_PASS_REPO
+
+        env = mock.patch.dict(
+            os.environ,
+            {"FASTMLX_WIRED_LIMIT_MIB": "4096", "FASTMLX_WIRED_MARGIN_GIB": "2"},
+        )
+        env.start()
+        self.addCleanup(env.stop)
+
+        self.fetch_api = mock.patch.object(
+            DOWNLOADER, "fetch_api", side_effect=self._fake_fetch
+        ).start()
+        self.acquire = mock.patch.object(
+            DOWNLOADER, "acquire", side_effect=self._fake_acquire
+        ).start()
+        self.probe = mock.patch.object(
+            DOWNLOADER, "probe_free_space_bytes", return_value=1 << 60
+        ).start()
+        self.loader = mock.patch.object(
+            FASTMLX_PULL, "_load_recommend_module", side_effect=_recommend_module
+        ).start()
+        self.store = mock.patch.object(
+            self.recommend.launch,
+            "resolve_quality_card_store",
+            return_value=(self.cards_path, "explicit", []),
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _fake_fetch(self, repo_id, revision):
+        return preflight_document(repo_id, revision, self.files), b""
+
+    def _fake_acquire(self, namespace):
+        output = Path(namespace.output)
+        output.mkdir()
+        for name, size in self.files.items():
+            (output / name).write_bytes(b"x" * size)
+
+    def run_main(self, *extra, repo=None, revision=PREFLIGHT_SHA):
+        argv = [f"{repo or self.repo}@{revision}", "--dest", str(self.dest), *extra]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                FASTMLX_PULL.main(argv)
+            except SystemExit as exit_:
+                code = exit_.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_nothing_written(self):
+        self.assertEqual(sorted(self.work.iterdir()), [])
+        self.acquire.assert_not_called()
+        self.probe.assert_not_called()
+
+    # --- A1 -----------------------------------------------------------
+    def test_does_not_fit_refuses_before_probe_staging_or_download(self):
+        self.files = {"config.json": 10, "model.safetensors": 3 << 30}
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertEqual(code, 1)
+        self.assertIn("exceeds ceiling", err)  # the sizer's own reason
+        self.assertIn("over by 1610612736 bytes", err)
+        self.assertIn("drop --kv-reserve-gib", err)
+        self.assert_nothing_written()
+        self.fetch_api.assert_called_once()
+
+    # --- A2 -----------------------------------------------------------
+    def test_pass_card_prints_one_verdict_line_then_downloads_and_writes_receipt(self):
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertIsNone(code, err)
+        verdict_lines = [line for line in err.splitlines() if PREFLIGHT_PASS_CARD in line]
+        self.assertEqual(len(verdict_lines), 1, err)
+        self.assertIn("PASS", verdict_lines[0])
+        self.assertNotIn("--accept-quality", err)
+        self.fetch_api.assert_called_once()  # the manifest is never fetched twice
+        self.acquire.assert_called_once()
+        receipt = json.loads(
+            FASTMLX_PULL.receipt_path_for(self.dest).read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["total_files"], 3)
+        self.assertTrue(self.dest.is_dir())
+
+    # --- A3 -----------------------------------------------------------
+    def test_no_go_card_names_accept_quality_and_still_downloads(self):
+        code, _out, err = self.run_main(
+            "--kv-reserve-gib", "0.5", repo=PREFLIGHT_NO_GO_REPO
+        )
+        self.assertIsNone(code, err)
+        self.assertIn(f"--accept-quality {PREFLIGHT_NO_GO_CARD}", err)
+        self.assertIn("NO_GO", err)
+        self.acquire.assert_called_once()
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    def test_uncarded_pack_says_unmeasured_and_still_downloads(self):
+        code, _out, err = self.run_main(
+            "--kv-reserve-gib", "0.5", repo=PREFLIGHT_UNCARDED_REPO
+        )
+        self.assertIsNone(code, err)
+        self.assertIn("unmeasured", err)
+        self.assertNotIn("--accept-quality", err)
+        self.acquire.assert_called_once()
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    # --- A4 -----------------------------------------------------------
+    def test_gguf_only_manifest_refuses_naming_the_reason_and_writes_nothing(self):
+        self.files = {"config.json": 10, "model.gguf": 5000}
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertEqual(code, 1)
+        self.assertIn("no .safetensors files found", err)
+        self.assertIn("drop --kv-reserve-gib", err)
+        self.assert_nothing_written()
+
+    def test_big_unnamed_non_safetensors_file_refuses_and_writes_nothing(self):
+        self.files = {"a.safetensors": 10, "weights.bin": 2 << 30}
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertEqual(code, 1)
+        self.assertIn("weights.bin", err)
+        self.assert_nothing_written()
+
+    def test_default_card_store_that_refuses_to_load_is_exit_1_and_writes_nothing(self):
+        self.store.side_effect = self.recommend.launch.LaunchRefusal(
+            3, "pulled card store /x refused: simulated"
+        )
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertEqual(code, 1)
+        self.assertIn("simulated", err)
+        self.assert_nothing_written()
+
+    def test_default_card_store_that_is_not_a_manifest_is_exit_1_and_writes_nothing(self):
+        junk = self.root / "junk.json"
+        junk.write_text("not json", encoding="utf-8")
+        self.store.return_value = (junk, "default", [])
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertEqual(code, 1)
+        self.assertIn("quality-card", err)
+        self.assert_nothing_written()
+
+    # --- A5 -----------------------------------------------------------
+    def test_without_the_flag_pull_is_unchanged_and_never_loads_recommend(self):
+        self.loader.side_effect = AssertionError("recommend must not load without the flag")
+        code, _out, err = self.run_main()
+        self.assertIsNone(code, err)
+        self.loader.assert_not_called()
+        self.fetch_api.assert_called_once()
+        self.acquire.assert_called_once()
+        self.assertNotIn("quality card", err)
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    # --- A6 -----------------------------------------------------------
+    def test_adopt_with_the_check_flag_is_a_usage_error(self):
+        self.dest.mkdir()
+        code, _out, err = self.run_main("--adopt", "--kv-reserve-gib", "0.5")
+        self.assertEqual(code, 2)
+        self.assertIn("--adopt cannot be combined with --kv-reserve-gib", err)
+        self.fetch_api.assert_not_called()
+        self.loader.assert_not_called()
+
+    def test_context_or_host_use_without_the_flag_is_a_usage_error(self):
+        for extra in (["--context", "4096"], ["--host-use", "dedicated-serving"]):
+            with self.subTest(extra=extra):
+                code, _out, err = self.run_main(*extra)
+                self.assertEqual(code, 2)
+                self.assertIn("--kv-reserve-gib", err)
+        self.fetch_api.assert_not_called()
+        self.acquire.assert_not_called()
+        self.assertEqual(sorted(self.work.iterdir()), [])
+
+    def test_host_use_and_context_reach_the_classifier(self):
+        spy = mock.patch.object(
+            self.recommend,
+            "classify_pinned_entries",
+            wraps=self.recommend.classify_pinned_entries,
+        ).start()
+        code, _out, err = self.run_main(
+            "--kv-reserve-gib", "0.5", "--context", "4096", "--host-use", "dedicated-serving"
+        )
+        self.assertIsNone(code, err)
+        kwargs = spy.call_args.kwargs
+        self.assertEqual(kwargs["host_use"], "dedicated-serving")
+        self.assertEqual(kwargs["context"], 4096)
+        self.assertEqual(kwargs["kv_reserve_gib"], 0.5)
+
+    # --- A7 -----------------------------------------------------------
+    def test_preflight_sizing_equals_build_pinned_row_sizing_for_the_same_manifest(self):
+        rows = []
+        real = self.recommend.classify_pinned_entries
+
+        def capture(*args, **kwargs):
+            row = real(*args, **kwargs)
+            rows.append(row)
+            return row
+
+        mock.patch.object(self.recommend, "classify_pinned_entries", side_effect=capture).start()
+        code, _out, err = self.run_main("--kv-reserve-gib", "0.5")
+        self.assertIsNone(code, err)
+        self.assertEqual(len(rows), 1)
+        pull_row = rows[0]
+
+        ref = f"{PREFLIGHT_PASS_REPO}@{PREFLIGHT_SHA}"
+        document = preflight_document(PREFLIGHT_PASS_REPO, PREFLIGHT_SHA, self.files)
+        with mock.patch.object(
+            self.recommend.downloader, "fetch_api", return_value=(document, b"")
+        ):
+            recommend_row = self.recommend.build_pinned_row(
+                ref=ref,
+                cards=self.recommend.launch._inspect_quality_card_store(self.cards_path)[1],
+                fit_check_bin=None,
+                host_use="shared",
+                context=None,
+                fit_check_args=[],
+                kv_reserve_gib=0.5,
+            )
+        self.assertEqual(pull_row["sizing"], recommend_row["sizing"])
+        self.assertEqual(pull_row, recommend_row)
+        # Independent expected values, so a classifier that ignores the
+        # manifest cannot pass by agreeing with itself.
+        self.assertEqual(pull_row["sizing"]["weights_bytes"], 3000)
+        self.assertEqual(pull_row["sizing"]["kv_reserve_bytes"], 1 << 29)
+        self.assertEqual(pull_row["sizing"]["total_bytes"], 3000 + (1 << 29))
+        self.assertEqual(pull_row["sizing"]["ceiling_bytes"], PREFLIGHT_CEILING_BYTES)
 
 
 if __name__ == "__main__":

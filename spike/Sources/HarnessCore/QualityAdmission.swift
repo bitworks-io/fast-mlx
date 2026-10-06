@@ -157,10 +157,12 @@ public struct QualityCard: Sendable, Decodable, Equatable {
     /// `true` only when this card was measured under resident weights — the ONLY residency the Swift
     /// `fastmlx-serve` engine can serve (it cannot stream experts from SSD). A card measured under SSD
     /// expert streaming changes greedy-decode output relative to a resident load, so an
-    /// `"expert-stream"` card must never gate a resident launch. Fail-closed: any residency string
-    /// other than exactly `"resident"` — including an unrecognized future value — never matches, so a
-    /// typo'd or forward-incompatible `config.residency` can only ever make a card LESS eligible to
-    /// gate, never silently trusted as resident.
+    /// `"expert-stream"` card must never gate a resident launch. Fail-closed for the CLAIM only: any
+    /// residency string other than exactly `"resident"` — including an unrecognized future value —
+    /// never matches, so a typo'd or forward-incompatible `config.residency` can only ever make a
+    /// card LESS eligible to gate, never silently trusted as resident. That is NOT fail-closed for
+    /// ADMISSION: a card filtered out here (even a `NO_GO` one) leaves the candidate pool, so the
+    /// launch it should have refused ADMITS. Re-check that before widening the residency vocabulary.
     public var matchesResidentLaunch: Bool {
         effectiveResidency == "resident"
     }
@@ -333,7 +335,23 @@ public enum QualityAdmission {
 /// the same way it advances past a well-formed one.
 private struct LenientQualityCard: Decodable {
     let card: QualityCard?
-    init(from decoder: Decoder) throws { card = try? QualityCard(from: decoder) }
+    /// Best-effort identity hint read from the RAW element's `model` object, so a card that failed
+    /// `QualityCard.init(from:)` can still be tied to a served model. Each field has its own `try?`
+    /// (a non-object element, a missing/non-object `model`, or a wrong-typed field yields nil), so
+    /// this can never make `init(from:)` throw.
+    let repo: String?
+    let hfPin: String?
+
+    private enum ElementKeys: String, CodingKey { case model }
+    private enum ModelKeys: String, CodingKey { case repo, hfPin }
+
+    init(from decoder: Decoder) throws {
+        card = try? QualityCard(from: decoder)
+        let model = try? (try? decoder.container(keyedBy: ElementKeys.self))?
+            .nestedContainer(keyedBy: ModelKeys.self, forKey: .model)
+        repo = (try? model?.decodeIfPresent(String.self, forKey: .repo)) ?? nil
+        hfPin = (try? model?.decodeIfPresent(String.self, forKey: .hfPin)) ?? nil
+    }
 }
 
 /// The top-level `site/quality-guides.json` manifest envelope
@@ -355,6 +373,9 @@ struct QualityCardManifest: Decodable {
     /// `0` for a fully well-formed manifest (including every manifest decoded before this type
     /// gained per-element leniency).
     let droppedCardCount: Int
+    /// One hint per dropped element, `elementIndex` = its position in the RAW `cards` array
+    /// (well-formed cards count toward the index).
+    let droppedCards: [DroppedCardHint]
 
     private enum CodingKeys: String, CodingKey {
         case cards
@@ -365,6 +386,10 @@ struct QualityCardManifest: Decodable {
         let lenientCards = try container.decode([LenientQualityCard].self, forKey: .cards)
         cards = lenientCards.compactMap(\.card)
         droppedCardCount = lenientCards.count - cards.count
+        droppedCards = lenientCards.enumerated().compactMap { index, lenient in
+            lenient.card == nil
+                ? DroppedCardHint(elementIndex: index, repo: lenient.repo, hfPin: lenient.hfPin) : nil
+        }
     }
 }
 
@@ -374,10 +399,24 @@ struct QualityCardManifest: Decodable {
 public struct QualityCardManifestLoadResult: Sendable, Equatable {
     public let cards: [QualityCard]
     public let droppedCardCount: Int
+    public let droppedCards: [DroppedCardHint]
 
-    public init(cards: [QualityCard], droppedCardCount: Int) {
+    public init(cards: [QualityCard], droppedCardCount: Int, droppedCards: [DroppedCardHint] = []) {
         self.cards = cards
         self.droppedCardCount = droppedCardCount
+        self.droppedCards = droppedCards
+    }
+}
+
+public struct DroppedCardHint: Sendable, Equatable {
+    public let elementIndex: Int
+    public let repo: String?
+    public let hfPin: String?
+
+    public init(elementIndex: Int, repo: String?, hfPin: String?) {
+        self.elementIndex = elementIndex
+        self.repo = repo
+        self.hfPin = hfPin
     }
 }
 
@@ -578,6 +617,15 @@ public enum QualityCardStore {
         return residentCards.filter { hfPinMatchesRevision(hfPin: $0.model.hfPin, revision: revision) }
     }
 
+    public static func droppedCardsNaming(
+        repo: String?, revision: String?, in hints: [DroppedCardHint]
+    ) -> [DroppedCardHint] {
+        hints.filter { hint in
+            (hint.repo != nil && hint.repo == repo)
+                || hfPinMatchesRevision(hfPin: hint.hfPin, revision: revision)
+        }
+    }
+
     /// Convenience: read `manifestURL` and decode it. Returns `nil` (never throws) when the file is
     /// missing or unreadable — the no-manifest-today behavior is unchanged.
     public static func card(
@@ -616,7 +664,8 @@ public enum QualityCardStore {
             throw QualityCardsManifestUndecodable(path: path)
         }
         return QualityCardManifestLoadResult(
-            cards: manifest.cards, droppedCardCount: manifest.droppedCardCount)
+            cards: manifest.cards, droppedCardCount: manifest.droppedCardCount,
+            droppedCards: manifest.droppedCards)
     }
 
     /// True iff `value` is exactly 64 LOWERCASE ASCII hex characters (the shape `sha256Hex` emits).

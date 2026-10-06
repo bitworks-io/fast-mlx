@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-10-04",
+  "updatedAt": "2026-10-05",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-10",
+      "title": "Publish v0.1.10: serve and cards pull refuse a card store the built-in engine cannot decode, and an unrecognized verdict is announced",
+      "publishedAt": "2026-10-05T21:42:18Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.10 arm64 macOS distribution: with the built-in engine profile, fastmlx serve checks every card in the store against the shape the engine decodes before the fit check and before any admitted line, including under --dry-run, and exits 3 naming the first card and field that do not decode; fastmlx cards pull refuses such a store before writing it, and a pulled store refused at launch names the file to remove and the bundled store to pass with --quality-cards; fastmlx-serve prints one stderr line naming the card and the raw verdict when a card verdict is not one of the five recognized values, which still admits as unmeasured; and the release packaging script refuses a binary or metallib that embeds the builder's home directory or a non-temporary checkout path.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "c5be493f132c618f7c083dfd73c5157d938791fb",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-9",
       "title": "Publish v0.1.9: fastmlx cards pull fetches a digest-pinned card store, and a plain serve uses the newest verified one",

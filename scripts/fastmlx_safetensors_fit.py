@@ -523,6 +523,68 @@ def compute_model_bytes(model_path: Path, mmap_side_files: Optional[list] = None
     return weight_bytes, weight_files, side_files
 
 
+def weights_from_manifest(entries: list, mmap_side_files: Optional[list] = None) -> tuple:
+    """Returns ``(weight_bytes, weight_files, side_files)`` from a Hugging
+    Face revision manifest -- the same triple ``compute_model_bytes``
+    returns for a local directory -- WITHOUT any file existing on disk.
+
+    ``entries`` is ``[{"name": <repo-relative posix path>, "size": <int>}, ...]``
+    (``hf_pinned_snapshot_download.validated_entries`` output; only those
+    two keys are read). The rules mirror ``compute_model_bytes`` /
+    ``_iter_regular_files`` exactly: a path with ANY dot-prefixed component
+    is invisible (as a dot-named file or directory is locally); every
+    ``*.safetensors`` file is a resident weight shard sized by its manifest
+    size (the local sizer sums file sizes too); a name in
+    ``mmap_side_files`` is a side file; any other non-safetensors file of
+    at least 1 GiB is a configuration error. Unlike the local sizer this
+    cannot header-parse a shard or cross-check
+    ``model.safetensors.index.json`` -- neither is available before a
+    download, so a manifest verdict is a size-based estimate of what the
+    pulled pack would size to.
+    """
+    requested_side_files = list(mmap_side_files or [])
+    requested_side_file_set = set(requested_side_files)
+
+    weight_bytes = 0
+    weight_files = []
+    side_files = []
+    seen_relative_paths: set = set()
+
+    for entry in sorted(entries, key=lambda item: item["name"]):
+        relative = entry["name"]
+        if any(part.startswith(".") for part in relative.split("/")):
+            continue
+        size = entry["size"]
+        seen_relative_paths.add(relative)
+        if relative.endswith(".safetensors"):
+            weight_bytes += size
+            weight_files.append({"name": relative, "bytes": size})
+            continue
+        if relative in requested_side_file_set:
+            side_files.append({"name": relative, "bytes": size})
+            continue
+        if size >= _SIDE_FILE_MIN_BYTES:
+            raise FitCheckError(
+                f"the revision manifest lists {relative}, a non-safetensors "
+                f"file of {size} bytes (>= {_SIDE_FILE_MIN_BYTES} byte(s), "
+                "i.e. >= 1 GiB) that is not named by --mmap-side-file; pass "
+                f"--mmap-side-file {relative} if the serving engine "
+                "memory-maps it, or this pack holds weights this sizer "
+                "cannot size"
+            )
+
+    if not weight_files:
+        raise FitCheckError("no .safetensors files found in the revision manifest")
+
+    for requested in requested_side_files:
+        if requested not in seen_relative_paths:
+            raise FitCheckError(
+                f"--mmap-side-file {requested} does not exist in the revision manifest"
+            )
+
+    return weight_bytes, weight_files, side_files
+
+
 # ---------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------
@@ -671,7 +733,12 @@ class MissingKvReserveError(FitCheckError):
     error (exit 1)."""
 
 
-def compute_fit(args: argparse.Namespace) -> dict:
+def compute_fit(args: argparse.Namespace, weights: Optional[tuple] = None) -> dict:
+    """The fit verdict for ``args``. ``weights``, when given, is a ready
+    ``(weight_bytes, weight_files, side_files)`` triple (see
+    ``weights_from_manifest``) that REPLACES the ``args.model_path``
+    directory walk entirely -- nothing is read from disk. ``None`` (every
+    existing caller) sizes ``args.model_path`` exactly as before."""
     residency = args.residency or "resident"
 
     kv_reserve_gib = args.kv_reserve_gib
@@ -698,9 +765,12 @@ def compute_fit(args: argparse.Namespace) -> dict:
         args.wired_limit_mib, _GGUF._env_int(_GGUF.ENV_WIRED_LIMIT_MIB)
     )
 
-    weight_bytes, weight_files, side_files = compute_model_bytes(
-        args.model_path, getattr(args, "mmap_side_file", None)
-    )
+    if weights is not None:
+        weight_bytes, weight_files, side_files = weights
+    else:
+        weight_bytes, weight_files, side_files = compute_model_bytes(
+            args.model_path, getattr(args, "mmap_side_file", None)
+        )
 
     kv_reserve_bytes = int(round(kv_reserve_gib * GIB))
     ceiling_bytes = wired_limit_mib * MIB - wired_margin_gib * GIB

@@ -46,6 +46,26 @@ not load) or when every candidate is ``does-not-fit``/``error``; ``3`` is a
 launch refusal (a ``--quality-cards-sha256`` pin refusal or an engine-profile
 refusal).
 
+``--pinned <repo>@<40-hex sha>`` (repeatable, combinable with local
+candidates) answers the same two questions BEFORE any download: the fit from
+the Hugging Face revision manifest's file sizes (the same manifest
+``fastmlx pull`` fetches for its free-space check; sizes summed by
+``fastmlx_safetensors_fit.weights_from_manifest`` under the local sizer's
+rules -- ``*.safetensors`` are weights, dot-prefixed paths are ignored, an
+unnamed non-safetensors file of 1 GiB or more is refused) and the card from
+the same repo/``hfPin`` lookup. The row uses the same statuses, carries
+``source: "revision-manifest"`` and ``downloaded: false``, and prints the
+next step ``fastmlx pull <ref> --dest <dir>`` (with the ``--accept-quality``
+flag when the row is opt-in). Nothing is downloaded or written. A malformed
+ref (branch name, short sha, uppercase hex, no ``@``) is a usage error (exit
+2) before any fetch. A manifest verdict is a size-based estimate: shard
+headers and ``model.safetensors.index.json`` cannot be read before a
+download, so the local checks on those only run once the pack is pulled. A
+pinned row is an ``error`` row for ``--residency expert-stream``, an explicit
+``--fit-check-bin`` or an engine profile's ``fitCheck.bin``, a missing
+``--kv-reserve-gib``, a failed manifest fetch, or a manifest with no
+``*.safetensors`` (e.g. a GGUF-only pack); other rows are unaffected.
+
 Every subprocess this script starts is invoked as an argv list, via the
 same ``fastmlx_launch.run_fit_check`` helper ``fastmlx serve`` uses --
 never through a shell. This script never reads or prints environment
@@ -66,7 +86,9 @@ refusal naming the exact flag to pass.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
@@ -92,7 +114,18 @@ _uncounted_safetensors_message = launch._uncounted_safetensors_message
 _select_builtin_fit_check_bin = launch._select_builtin_fit_check_bin
 
 
+# The pinned-snapshot downloader and ``<repo>@<sha>`` validation `fastmlx
+# pull` itself uses (``launch.pull`` already loaded them by file path), reused
+# so a ``--pinned`` ref and its revision manifest are read by exactly the
+# code `pull` reads them with -- no separate HTTP path. Exposed as module
+# attributes so tests can patch ``downloader.fetch_api``.
+downloader = launch.pull.downloader
+validate_pinned_reference = launch.pull.validate_pinned_reference
+PinnedReferenceError = launch.pull.PinnedReferenceError
+_safetensors_fit = launch._safetensors_fit
+
 JSON_SCHEMA = "fastmlx-recommend-v0"
+SOURCE_REVISION_MANIFEST = "revision-manifest"
 
 STATUS_RECOMMENDED = "recommended"
 STATUS_OPT_IN = "opt-in"
@@ -260,6 +293,136 @@ def _card_summary(card: Optional[dict]) -> Optional[dict]:
     return summary
 
 
+def _resolve_card_into_row(
+    row: dict,
+    cards: Optional[list],
+    model_repo: Optional[str],
+    model_revision: Optional[str],
+    residency: str,
+    engine_build_commit: Optional[str],
+    mtp_launch: bool,
+    resolved_host_hardware_class: Callable[[], Optional[str]],
+) -> tuple:
+    """The card lookup plus the informational notices every row carries
+    (tiebreak/verdict notices, engineBuild, mtp), written into ``row``.
+    Shared by local rows (``build_row``) and ``--pinned`` rows
+    (``build_pinned_row``) so both resolve identity exactly the same way.
+    Returns ``(card, ok)``; ``ok`` is false when the lookup refused (an
+    ambiguous match), in which case ``row`` is already a finished ``error``
+    row.
+    """
+    notices: list = []
+    try:
+        card = launch.resolve_card(
+            cards,
+            model_repo,
+            model_revision,
+            residency=residency,
+            engine_build_commit=engine_build_commit,
+            host_hardware_class=resolved_host_hardware_class,
+            notices=notices,
+            # Kept apart so `notices` holds only the tiebreak notice.
+            shape_notices=[],
+        )
+    except launch.LaunchRefusal as refusal:
+        row["status"] = STATUS_ERROR
+        row["message"] = refusal.message
+        return None, False
+
+    # Set immediately after resolve_card returns, before the
+    # engineBuild/mtp/fit-check logic below, so a does-not-fit or error row
+    # (returned further down) still carries whichever notice fired here --
+    # mirrors how `row["engineBuild"]`/`row["mtp"]` are always present
+    # (initialized above) even on rows that return early.
+    row["tiebreakNotice"] = notices[0] if notices else None
+    # Same reasoning: an unrecognized/missing-verdict notice must survive
+    # into a does-not-fit/error row too, never only a recommended/opt-in/
+    # uncarded one -- see the "not recommended: no measured quality card"
+    # override further down for the uncarded case specifically.
+    row["verdictNotice"] = launch.unrecognized_verdict_notice(card)
+
+    # Engine-build status/notice: informational only, never gates a row's
+    # status/verdict (mirrors fastmlx serve -- see docs/quality-card-schema-v1.md
+    # "Engine build"). Computed as soon as the card is known, regardless of
+    # what the fit check below decides.
+    card_build_commit = launch.card_engine_build_commit(card)
+    build_status = launch.engine_build_status(card_build_commit, engine_build_commit)
+    build_message = None
+    if build_status in (
+        launch.ENGINE_BUILD_STATUS_UNDECLARED,
+        launch.ENGINE_BUILD_STATUS_MISMATCH,
+    ):
+        build_message = launch.engine_build_notice_text(
+            card.get("id") if card else None, card_build_commit, engine_build_commit
+        )
+    row["engineBuild"] = {
+        "status": build_status,
+        "card": card_build_commit,
+        "launch": engine_build_commit,
+        "message": build_message,
+    }
+
+    # `--mtp` flag-transfer status/notice: informational only, never gates
+    # a row's status/verdict (mirrors fastmlx serve -- see
+    # docs/quality-card-schema-v1.md "Flag transfer"). Computed from the
+    # same card/build_status this row already resolved, regardless of what
+    # the fit check below decides.
+    mtp_status, mtp_divergent_prompts, mtp_prompts = launch.mtp_transfer_status(
+        card, build_status, mtp_launch
+    )
+    mtp_message = None
+    if mtp_status not in (launch.MTP_STATUS_OFF, launch.MTP_STATUS_EXACT):
+        mtp_message = launch.mtp_notice_text(
+            card.get("id") if card else None,
+            mtp_status,
+            mtp_divergent_prompts,
+            mtp_prompts,
+            card_build_commit,
+        )
+    row["mtp"] = {
+        "status": mtp_status,
+        "divergentPrompts": mtp_divergent_prompts,
+        "prompts": mtp_prompts,
+        "message": mtp_message,
+    }
+    return card, True
+
+
+def _kv_reserve_required_message(builtin_name: str) -> str:
+    """The per-candidate refusal for a built-in sizer with no
+    ``--kv-reserve-gib`` (shared by local and ``--pinned`` rows)."""
+    return (
+        "fit check could not run: a built-in sizer "
+        f"({builtin_name}) was auto-selected for this pack, which "
+        "requires --kv-reserve-gib (a fit check must never "
+        "silently assume a zero KV-cache reserve); pass "
+        "--kv-reserve-gib"
+    )
+
+
+def _classify_fitting_row(row: dict, card: Optional[dict]) -> None:
+    """Status of a row whose fit check passed (GREEN/YELLOW), from its card
+    alone: ``recommended`` / ``opt-in`` / ``uncarded`` (see ``build_row``)."""
+    outcome, message = launch.decide_admission(card, opted_in=False)
+    if outcome == "admit":
+        row["status"] = STATUS_RECOMMENDED
+        row["card"] = _card_summary(card)
+    elif outcome == "refuse_quality_flagged":
+        row["status"] = STATUS_OPT_IN
+        row["card"] = _card_summary(card)
+        row["message"] = message
+        row["accept_quality_flag"] = f"--accept-quality {card.get('id')}"
+    else:  # "admit_unmeasured": no card, or an UNMEASURED/unrecognized verdict
+        row["status"] = STATUS_UNCARDED
+        row["card"] = _card_summary(card)
+        # A card WITH an unrecognized verdict is a different fact than "no
+        # measured quality card at all" (no card, or an explicit
+        # UNMEASURED) -- show the verdict notice instead of the generic
+        # message so an operator can tell a misspelled/malformed verdict
+        # apart from a pack that was simply never measured.
+        row["message"] = row["verdictNotice"] or "not recommended: no measured quality card"
+
+
 def build_row(
     model_path: Path,
     cards: Optional[list],
@@ -352,80 +515,18 @@ def build_row(
     if model_repo is None and model_revision is None:
         _print_recommend_no_model_identity_hint(str(model_path))
 
-    notices: list = []
-    try:
-        card = launch.resolve_card(
-            cards,
-            model_repo,
-            model_revision,
-            residency=residency,
-            engine_build_commit=engine_build_commit,
-            host_hardware_class=resolved_host_hardware_class,
-            notices=notices,
-            # Kept apart so `notices` holds only the tiebreak notice.
-            shape_notices=[],
-        )
-    except launch.LaunchRefusal as refusal:
-        row["status"] = STATUS_ERROR
-        row["message"] = refusal.message
-        return row
-
-    # Set immediately after resolve_card returns, before the
-    # engineBuild/mtp/fit-check logic below, so a does-not-fit or error row
-    # (returned further down) still carries whichever notice fired here --
-    # mirrors how `row["engineBuild"]`/`row["mtp"]` are always present
-    # (initialized above) even on rows that return early.
-    row["tiebreakNotice"] = notices[0] if notices else None
-    # Same reasoning: an unrecognized/missing-verdict notice must survive
-    # into a does-not-fit/error row too, never only a recommended/opt-in/
-    # uncarded one -- see the "not recommended: no measured quality card"
-    # override further down for the uncarded case specifically.
-    row["verdictNotice"] = launch.unrecognized_verdict_notice(card)
-
-    # Engine-build status/notice: informational only, never gates a row's
-    # status/verdict (mirrors fastmlx serve -- see docs/quality-card-schema-v1.md
-    # "Engine build"). Computed as soon as the card is known, regardless of
-    # what the fit check below decides.
-    card_build_commit = launch.card_engine_build_commit(card)
-    build_status = launch.engine_build_status(card_build_commit, engine_build_commit)
-    build_message = None
-    if build_status in (
-        launch.ENGINE_BUILD_STATUS_UNDECLARED,
-        launch.ENGINE_BUILD_STATUS_MISMATCH,
-    ):
-        build_message = launch.engine_build_notice_text(
-            card.get("id") if card else None, card_build_commit, engine_build_commit
-        )
-    row["engineBuild"] = {
-        "status": build_status,
-        "card": card_build_commit,
-        "launch": engine_build_commit,
-        "message": build_message,
-    }
-
-    # `--mtp` flag-transfer status/notice: informational only, never gates
-    # a row's status/verdict (mirrors fastmlx serve -- see
-    # docs/quality-card-schema-v1.md "Flag transfer"). Computed from the
-    # same card/build_status this row already resolved, regardless of what
-    # the fit check below decides.
-    mtp_status, mtp_divergent_prompts, mtp_prompts = launch.mtp_transfer_status(
-        card, build_status, mtp_launch
+    card, resolved_ok = _resolve_card_into_row(
+        row,
+        cards,
+        model_repo,
+        model_revision,
+        residency,
+        engine_build_commit,
+        mtp_launch,
+        resolved_host_hardware_class,
     )
-    mtp_message = None
-    if mtp_status not in (launch.MTP_STATUS_OFF, launch.MTP_STATUS_EXACT):
-        mtp_message = launch.mtp_notice_text(
-            card.get("id") if card else None,
-            mtp_status,
-            mtp_divergent_prompts,
-            mtp_prompts,
-            card_build_commit,
-        )
-    row["mtp"] = {
-        "status": mtp_status,
-        "divergentPrompts": mtp_divergent_prompts,
-        "prompts": mtp_prompts,
-        "message": mtp_message,
-    }
+    if not resolved_ok:
+        return row
 
     resolved_model_id = model_path.resolve().name
 
@@ -447,13 +548,7 @@ def build_row(
         if kv_reserve_gib is None:
             row["status"] = STATUS_ERROR
             row["card"] = _card_summary(card)
-            row["message"] = (
-                "fit check could not run: a built-in sizer "
-                f"({builtin_name}) was auto-selected for this pack, which "
-                "requires --kv-reserve-gib (a fit check must never "
-                "silently assume a zero KV-cache reserve); pass "
-                "--kv-reserve-gib"
-            )
+            row["message"] = _kv_reserve_required_message(builtin_name)
             return row
         resolved_fit_check_bin = launch._resolve_fit_check_bin_value(
             builtin_name, "<fastmlx recommend auto-selected built-in sizer>"
@@ -516,25 +611,276 @@ def build_row(
     )
     row["fit"] = {"verdict": fit_label, "context": reported_context}
 
-    outcome, message = launch.decide_admission(card, opted_in=False)
-    if outcome == "admit":
-        row["status"] = STATUS_RECOMMENDED
-        row["card"] = _card_summary(card)
-    elif outcome == "refuse_quality_flagged":
-        row["status"] = STATUS_OPT_IN
+    _classify_fitting_row(row, card)
+    return row
+
+
+# ---------------------------------------------------------------------
+# Pinned (revision-manifest) row: a fit + card verdict BEFORE any download.
+# ---------------------------------------------------------------------
+def build_pinned_row(
+    ref: str,
+    cards: Optional[list],
+    fit_check_bin: Optional[str],
+    host_use: str,
+    context: Optional[int],
+    fit_check_args: list,
+    residency: str = "resident",
+    engine_build_commit: Optional[str] = None,
+    mtp_launch: bool = False,
+    kv_reserve_gib: Optional[float] = None,
+    host_hardware_class: Optional[Callable[[], Optional[str]]] = None,
+) -> dict:
+    """Resolve one ``--pinned <repo>@<sha>`` ref to a classified row, fetching
+    its Hugging Face revision manifest (``downloader.fetch_api`` +
+    ``validated_entries``) only AFTER every option refusal below has passed,
+    then classifying it with ``_classify_pinned_row`` -- the same core
+    ``classify_pinned_entries`` runs over entries a caller already holds.
+    See ``_classify_pinned_row`` for the full contract."""
+
+    def fetch_entries() -> list:
+        repo, revision = validate_pinned_reference(ref)
+        document, _api_data = downloader.fetch_api(repo, revision)
+        return downloader.validated_entries(document, repo, revision)
+
+    return _classify_pinned_row(
+        ref,
+        fetch_entries,
+        cards,
+        fit_check_bin,
+        host_use,
+        context,
+        fit_check_args,
+        residency=residency,
+        engine_build_commit=engine_build_commit,
+        mtp_launch=mtp_launch,
+        kv_reserve_gib=kv_reserve_gib,
+        host_hardware_class=host_hardware_class,
+    )
+
+
+def classify_pinned_entries(
+    ref: str,
+    entries: list,
+    cards: Optional[list],
+    host_use: str,
+    context: Optional[int],
+    fit_check_args: list,
+    kv_reserve_gib: Optional[float],
+    residency: str = "resident",
+    fit_check_bin: Optional[str] = None,
+    engine_build_commit: Optional[str] = None,
+    mtp_launch: bool = False,
+    host_hardware_class: Optional[Callable[[], Optional[str]]] = None,
+) -> dict:
+    """Classify one pinned ref from manifest ``entries`` the caller ALREADY
+    holds (``downloader.validated_entries`` output) -- nothing is fetched or
+    written. Returns exactly the row ``build_pinned_row`` returns for the
+    same manifest (same card lookup, sizing, status and ``next_step``); this
+    is how ``fastmlx pull --kv-reserve-gib`` judges the manifest it is about
+    to download without a second fetch. Never raises."""
+    return _classify_pinned_row(
+        ref,
+        lambda: entries,
+        cards,
+        fit_check_bin,
+        host_use,
+        context,
+        fit_check_args,
+        residency=residency,
+        engine_build_commit=engine_build_commit,
+        mtp_launch=mtp_launch,
+        kv_reserve_gib=kv_reserve_gib,
+        host_hardware_class=host_hardware_class,
+    )
+
+
+def load_default_card_store(notice_prefix: str) -> list:
+    """The cards of the default store ``recommend``/``serve`` resolve (the
+    newest eligible pulled store, else the bundled one), with the same
+    integrity checks. Unlike ``recommend``'s fail-open-to-"no card" default,
+    a store that cannot be resolved or read raises ``launch.LaunchRefusal``:
+    a caller that asked for a card verdict must not get "uncarded" because
+    the store silently failed to load."""
+    path, source, notices = launch.resolve_quality_card_store(
+        None, notice_prefix=notice_prefix
+    )
+    for notice in notices:
+        print(notice, file=sys.stderr)
+    raw_sha256, cards, _identity = launch._inspect_quality_card_store(path)
+    launch.enforce_pulled_store_identity(path, source, raw_sha256)
+    if cards is None:
+        raise launch.LaunchRefusal(
+            3, f"the quality-card store {path} is missing or is not a quality-card manifest"
+        )
+    return cards
+
+
+def _classify_pinned_row(
+    ref: str,
+    fetch_entries: Callable[[], list],
+    cards: Optional[list],
+    fit_check_bin: Optional[str],
+    host_use: str,
+    context: Optional[int],
+    fit_check_args: list,
+    residency: str = "resident",
+    engine_build_commit: Optional[str] = None,
+    mtp_launch: bool = False,
+    kv_reserve_gib: Optional[float] = None,
+    host_hardware_class: Optional[Callable[[], Optional[str]]] = None,
+) -> dict:
+    """Classify one ``<repo>@<sha>`` ref into a row from its Hugging Face
+    revision manifest -- no file is downloaded and nothing is written to
+    disk. ``ref`` must already have passed ``validate_pinned_reference``.
+    ``fetch_entries`` yields the manifest entries and is called only after
+    every option refusal has passed. Never raises: a manifest that cannot be
+    fetched or validated, a pack this sizer cannot size, and every
+    unsupported option below becomes an ``error`` row naming the reason.
+
+    The card is resolved by the same lookup as a local row, keyed by the ref's
+    repo and its pinned revision (``hfPin``). The fit comes from the built-in
+    safetensors sizer (``fastmlx_safetensors_fit.compute_fit``) fed the
+    manifest's file sizes (``weights_from_manifest``) instead of a directory
+    walk, in-process -- never a subprocess. Refused as ``error`` rows (the
+    manifest cannot answer them): ``--residency expert-stream`` (the
+    safetensors sizer has no expert-stream sizing), an explicit
+    ``--fit-check-bin`` or an engine profile's ``fitCheck.bin`` (an
+    arbitrary binary needs a local directory), and a missing
+    ``--kv-reserve-gib`` (same refusal as a local auto-selected sizer).
+    A GGUF pack is not sized here: it has no ``*.safetensors`` in its
+    manifest, or a >= 1 GiB unnamed non-safetensors file, so it errors.
+    """
+    resolved_host_hardware_class = (
+        host_hardware_class if host_hardware_class is not None else launch.host_hardware_class
+    )
+    repo, revision = validate_pinned_reference(ref)
+    row: dict = {
+        "path": None,
+        "name": ref,
+        "repo": repo,
+        "revision": revision,
+        "residency": residency,
+        "status": None,
+        "fit": None,
+        "card": None,
+        "message": None,
+        "accept_quality_flag": None,
+        "engineBuild": None,
+        "mtp": None,
+        "tiebreakNotice": None,
+        "verdictNotice": None,
+        "source": SOURCE_REVISION_MANIFEST,
+        "downloaded": False,
+        "ref": ref,
+        "sizing": None,
+        "next_step": None,
+    }
+
+    card, resolved_ok = _resolve_card_into_row(
+        row,
+        cards,
+        repo,
+        revision,
+        residency,
+        engine_build_commit,
+        mtp_launch,
+        resolved_host_hardware_class,
+    )
+    if not resolved_ok:
+        return row
+
+    def refuse(message: str) -> dict:
+        row["status"] = STATUS_ERROR
         row["card"] = _card_summary(card)
         row["message"] = message
-        row["accept_quality_flag"] = f"--accept-quality {card.get('id')}"
-    else:  # "admit_unmeasured": no card, or an UNMEASURED/unrecognized verdict
-        row["status"] = STATUS_UNCARDED
-        row["card"] = _card_summary(card)
-        # A card WITH an unrecognized verdict is a different fact than "no
-        # measured quality card at all" (no card, or an explicit
-        # UNMEASURED) -- show the verdict notice instead of the generic
-        # message so an operator can tell a misspelled/malformed verdict
-        # apart from a pack that was simply never measured.
-        row["message"] = row["verdictNotice"] or "not recommended: no measured quality card"
+        return row
 
+    if residency != "resident":
+        return refuse(
+            f"fit check could not run: --residency {residency} cannot be "
+            "judged from a revision manifest (the safetensors sizer has no "
+            "expert-stream sizing); pull the pack and run recommend on the "
+            "local directory"
+        )
+    if fit_check_bin:
+        return refuse(
+            "fit check could not run: --pinned sizes the revision manifest "
+            "with the built-in safetensors sizer and cannot run an explicit "
+            "--fit-check-bin or an engine profile's fitCheck.bin (those need "
+            "a local pack directory); drop it, or pull the pack and run "
+            "recommend on the local directory"
+        )
+    if kv_reserve_gib is None:
+        return refuse(_kv_reserve_required_message("builtin:safetensors"))
+
+    sizer_argv = [
+        "--model-path",
+        "<revision-manifest>",
+        "--host-use",
+        host_use,
+        "--fit-check-only",
+    ]
+    if context is not None:
+        sizer_argv += ["--context", str(context)]
+    sizer_argv += list(fit_check_args) + ["--kv-reserve-gib", str(kv_reserve_gib)]
+    parser = _safetensors_fit.build_arg_parser()
+    parser_stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(parser_stderr):
+            sizer_args = parser.parse_args(sizer_argv)
+    except SystemExit:
+        tail = parser_stderr.getvalue().strip().splitlines()
+        return refuse(
+            "fit check could not run: the sizer refused the --fit-check-arg "
+            "values" + (f": {tail[-1]}" if tail else "")
+        )
+    if sizer_args.residency not in (None, "resident"):
+        return refuse(
+            f"fit check could not run: --fit-check-arg names --residency "
+            f"{sizer_args.residency}, which cannot be judged from a revision manifest"
+        )
+
+    try:
+        entries = fetch_entries()
+    except Exception as error:  # noqa: BLE001 -- any fetch failure is an error row
+        return refuse(
+            f"could not fetch the revision manifest for {ref}: {error}"
+        )
+
+    try:
+        weights = _safetensors_fit.weights_from_manifest(
+            entries, getattr(sizer_args, "mmap_side_file", None)
+        )
+        result = _safetensors_fit.compute_fit(sizer_args, weights=weights)
+    except _safetensors_fit.MissingKvReserveError:  # pragma: no cover -- guarded above
+        return refuse(_kv_reserve_required_message("builtin:safetensors"))
+    except (
+        _safetensors_fit.FitCheckError,
+        _safetensors_fit.SafetensorsFormatError,
+        _safetensors_fit._GGUF.FitCheckError,
+    ) as error:
+        return refuse(f"fit check could not run: {error}")
+
+    row["sizing"] = {
+        "weights_bytes": result["weights_bytes"],
+        "kv_reserve_bytes": result["kv_reserve_bytes"],
+        "total_bytes": result["total_bytes"],
+        "ceiling_bytes": result["ceiling_bytes"],
+    }
+    if result["fit"] != "green":
+        row["status"] = STATUS_DOES_NOT_FIT
+        row["fit"] = {"verdict": "RED", "context": context}
+        row["card"] = _card_summary(card)
+        row["message"] = result["reason_text"]
+        return row
+
+    row["fit"] = {"verdict": "GREEN", "context": context}
+    _classify_fitting_row(row, card)
+    next_step = f"fastmlx pull {ref} --dest <dir>"
+    if row["accept_quality_flag"]:
+        next_step += f"  (then, to serve it: {row['accept_quality_flag']})"
+    row["next_step"] = next_step
     return row
 
 
@@ -573,7 +919,12 @@ def exit_code_for(rows: list) -> int:
 # ---------------------------------------------------------------------
 def _format_row_text(rank: int, row: dict) -> str:
     head = [f"{rank}. {row['name']}"]
-    if row["repo"]:
+    pinned = row.get("source") == SOURCE_REVISION_MANIFEST
+    if pinned:
+        # The name IS the full <repo>@<sha> ref; repeating it as repo=...
+        # would only add noise.
+        head.append("source=revision-manifest (not downloaded)")
+    elif row["repo"]:
         rev = row["revision"]
         short_rev = f"@{rev[:12]}" if rev else ""
         head.append(f"repo={row['repo']}{short_rev}")
@@ -664,6 +1015,8 @@ def _format_row_text(rank: int, row: dict) -> str:
     if verdict_notice and verdict_notice not in (row.get("message") or ""):
         tail += f" {verdict_notice}"
     lines.append(tail)
+    if row.get("next_step"):
+        lines.append(f"    next: {row['next_step']}")
     return "\n".join(lines)
 
 
@@ -711,6 +1064,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "a directory whose immediate model-pack subdirectories are all "
             "added as candidates (repeatable)"
+        ),
+    )
+    recommend.add_argument(
+        "--pinned",
+        action="append",
+        default=[],
+        metavar="REPO@SHA",
+        help=(
+            "a Hugging Face '<repo>@<40-hex lowercase commit sha>' to judge "
+            "BEFORE downloading it (repeatable, combinable with local "
+            "candidates): its fit comes from the revision manifest's file "
+            "sizes and its card from the repo/pin lookup. The row is marked "
+            "source=revision-manifest, downloaded=false and prints the next "
+            "step, `fastmlx pull <ref> --dest <dir>`. Nothing is downloaded "
+            "or written. Needs --kv-reserve-gib; not available with "
+            "--residency expert-stream, --fit-check-bin or an engine "
+            "profile's fitCheck.bin (those become error rows). A branch "
+            "name, short sha, or uppercase hex is a usage error"
         ),
     )
     recommend.add_argument(
@@ -812,11 +1183,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _run_recommend(args) -> int:
+    # Validate every --pinned ref FIRST: a malformed ref is a usage error
+    # (exit 2) before any manifest fetch, card load, or other work.
+    pinned_refs: list = []
+    for pinned_text in args.pinned:
+        try:
+            validate_pinned_reference(pinned_text)
+        except PinnedReferenceError as error:
+            print(
+                f"fastmlx recommend: --pinned {pinned_text!r}: {error}", file=sys.stderr
+            )
+            return 2
+        if pinned_text not in pinned_refs:
+            pinned_refs.append(pinned_text)
+
     candidates = discover_candidates(args.model_path, args.models_dir)
-    if not candidates:
+    if not candidates and not pinned_refs:
         print(
-            "fastmlx recommend: no model candidates found; pass --model-path "
-            "and/or --models-dir",
+            "fastmlx recommend: no model candidates found; pass --model-path, "
+            "--models-dir and/or --pinned",
             file=sys.stderr,
         )
         return 2
@@ -937,6 +1322,21 @@ def _run_recommend(args) -> int:
             kv_reserve_gib=args.kv_reserve_gib,
         )
         for candidate in candidates
+    ]
+    rows += [
+        build_pinned_row(
+            ref=ref,
+            cards=cards,
+            fit_check_bin=fit_check_bin,
+            host_use=args.host_use,
+            context=args.context,
+            fit_check_args=combined_fit_check_args,
+            residency=args.residency,
+            engine_build_commit=engine_build_commit,
+            mtp_launch=mtp_launch,
+            kv_reserve_gib=args.kv_reserve_gib,
+        )
+        for ref in pinned_refs
     ]
     rows = rank_rows(rows)
 

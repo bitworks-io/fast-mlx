@@ -2412,4 +2412,103 @@ final class QualityAdmissionTests: XCTestCase {
         XCTAssertEqual(withMissing.droppedCardCount, 1)
         XCTAssertEqual(withMissing.cards.map(\.id), ["u"])
     }
+
+    // MARK: - dropped-card hints (docs/task-inbox/2026-10-05-PREDECLARATION-default-path-refuses-a-dropped-card-naming-the-served-model.md)
+
+    /// A card that fails `QualityCard.init(from:)` because `config` is junk (a string, not an object), yet
+    /// still names `repo` / `hfPin` in its `model` object -- the usual drop cause.
+    private func junkConfigCardJSON(
+        id: String = "junk", repoJSON: String = "null", hfPinJSON: String = "null"
+    ) -> String {
+        """
+        {
+          "id": \(id.debugDescription),
+          "model": { "repo": \(repoJSON), "hfPin": \(hfPinJSON) },
+          "verdict": "NO_GO",
+          "config": "junk",
+          "admission": { "default": false, "optIn": true, "reason": "fixture" },
+          "legible": { "tier": "Noticeable", "headline": "h" }
+        }
+        """
+    }
+
+    private static let fullRevision = "abcdefab0123456789abcdefab0123456789abcd"
+
+    /// A3 (R) -- the dropped card is tied to the served repo and ONLY to it; the element index is the
+    /// card's position in the raw `cards` array (well-formed cards count toward the index).
+    func testD1DroppedCardsNamingReturnsHintForServedRepoAndNothingForAnotherRepo() throws {
+        let result = try decodeManifest(cardsJSON: [
+            unrecognizedCardJSON(id: "ok", repo: "org/other", verdictJSON: "\"PASS\""),
+            junkConfigCardJSON(id: "dropped-m", repoJSON: "\"org/served\""),
+            junkConfigCardJSON(id: "dropped-n", repoJSON: "\"org/unrelated\""),
+        ])
+        XCTAssertEqual(result.droppedCardCount, 2)
+        XCTAssertEqual(result.cards.map(\.id), ["ok"])
+        XCTAssertEqual(result.droppedCards.count, 2)
+        let named = QualityCardStore.droppedCardsNaming(
+            repo: "org/served", revision: nil, in: result.droppedCards)
+        XCTAssertEqual(named.map(\.elementIndex), [1])
+        XCTAssertEqual(named.first?.repo, "org/served")
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/unrelated", revision: nil, in: result.droppedCards
+            ).map(\.elementIndex), [2])
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/nobody", revision: nil, in: result.droppedCards), [])
+    }
+
+    /// A3 (hfPin arm) -- a dropped card with no repo is tied by `hfPin` under EXACTLY the rule
+    /// `hfPinMatchesRevision` applies to a live card: full 40-hex revision, >= 8-hex pin, case-insensitive
+    /// prefix.
+    func testD2DroppedCardsNamingMatchesHfPinPrefixUnderTheLiveCardRule() throws {
+        let result = try decodeManifest(cardsJSON: [
+            junkConfigCardJSON(id: "pin", hfPinJSON: "\"ABCDEFAB\""),
+            junkConfigCardJSON(id: "short", hfPinJSON: "\"abcdef\""),
+            junkConfigCardJSON(id: "nonhex", hfPinJSON: "\"zzzzzzzz\""),
+        ])
+        XCTAssertEqual(result.droppedCards.count, 3)
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/served", revision: Self.fullRevision, in: result.droppedCards
+            ).map(\.elementIndex), [0], "only the usable, prefix-matching pin names the revision")
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/served", revision: "abcdefab", in: result.droppedCards), [],
+            "a non-40-hex revision never ties a pin")
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/served", revision: nil, in: result.droppedCards), [])
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/served", revision: String(repeating: "1", count: 40), in: result.droppedCards),
+            [])
+    }
+
+    /// A5 (unit arm) -- elements that cannot be tied to any model still drop and count, never throw, never
+    /// hang the unkeyed-container loop, and carry nil hints that name nothing.
+    func testD3UnidentifiableDroppedElementsCarryNilHintsAndNameNothing() throws {
+        let result = try decodeManifest(cardsJSON: [
+            "42", "\"str\"", "null", "{}", #"{"model": "x"}"#,
+            #"{"model": {"repo": 7, "hfPin": ["a"]}}"#,
+        ])
+        XCTAssertEqual(result.cards, [])
+        XCTAssertEqual(result.droppedCardCount, 6)
+        XCTAssertEqual(result.droppedCards.map(\.elementIndex), [0, 1, 2, 3, 4, 5])
+        XCTAssertTrue(result.droppedCards.allSatisfy { $0.repo == nil && $0.hfPin == nil })
+        XCTAssertEqual(
+            QualityCardStore.droppedCardsNaming(
+                repo: "org/served", revision: Self.fullRevision, in: result.droppedCards), [])
+    }
+
+    /// A well-formed manifest carries no hints, so the new field cannot change today's happy path.
+    func testD4WellFormedManifestCarriesNoDroppedCardHints() throws {
+        let result = try decodeManifest(cardsJSON: [
+            unrecognizedCardJSON(id: "ok", verdictJSON: "\"NO_GO\"")
+        ])
+        XCTAssertEqual(result.droppedCardCount, 0)
+        XCTAssertEqual(result.droppedCards, [])
+        XCTAssertEqual(
+            QualityCardManifestLoadResult(cards: [], droppedCardCount: 0).droppedCards, [])
+    }
 }

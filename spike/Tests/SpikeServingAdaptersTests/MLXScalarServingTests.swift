@@ -2089,6 +2089,226 @@ final class MLXScalarServingTests: XCTestCase {
             result.stderr.contains("1 card"),
             "expected the drop count named in the refusal: \(result.stderr)")
     }
+
+    // MARK: - Black-box CLI coverage: a dropped card that names the served model refuses on the DEFAULT
+    // path (docs/task-inbox/2026-10-05-PREDECLARATION-default-path-refuses-a-dropped-card-naming-the-
+    // served-model.md). Rows: A1/A2 (refuse), A4 (existing test above:
+    // `testServeCLIDefaultManifestOneMalformedCardAnnouncesDroppedCountInStartupLine`), A5 (no `model`
+    // object still serves), A6 (existing explicit-path test above, plus the naming variant below), A7
+    // (`.ambiguous` pins).
+
+    /// Like `runServe`, but runs in `currentDirectory` and BOUNDS the wait: before the refusal exists the
+    /// binary would serve forever, and the unbounded `readDataToEndOfFile` harness would hang the suite
+    /// instead of reporting RED. On timeout the process is killed and the result carries exit status -1.
+    private func runServeBounded(
+        arguments: [String], currentDirectory: URL, timeout: TimeInterval = 20
+    ) throws -> ServeCLIResult {
+        let binary = Self.serveURL
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: binary.path),
+            "fastmlx-serve binary missing at \(binary.path)")
+        let process = Process()
+        process.executableURL = binary
+        process.arguments = arguments
+        process.currentDirectoryURL = currentDirectory
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        var timedOut = false
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            process.terminate()
+            _ = exited.wait(timeout: .now() + 10)
+        }
+        let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+        let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
+        return ServeCLIResult(
+            exitStatus: timedOut ? -1 : process.terminationStatus,
+            stdout: String(decoding: stdoutData, as: UTF8.self),
+            stderr: String(decoding: stderrData, as: UTF8.self))
+    }
+
+    /// A fresh working directory containing `site/quality-guides.json` with the given `cards` JSON.
+    private func makeDefaultManifestDirectory(cardsJSON: [String]) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("quality-cards-c205-\(UUID().uuidString)", isDirectory: true)
+        let siteDirectory = directory.appendingPathComponent("site", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: siteDirectory, withIntermediateDirectories: true)
+        let json = """
+            {"schema": "fast-mlx-quality-card-v1", "generatedAt": "2026-10-05T00:00:00Z",
+             "cards": [\(cardsJSON.joined(separator: ","))]}
+            """
+        try Data(json.utf8).write(to: siteDirectory.appendingPathComponent("quality-guides.json"))
+        return directory
+    }
+
+    /// NO_GO card whose `config` is junk (a string): fails `QualityCard.init(from:)`, so it is DROPPED,
+    /// but its raw `model` object still names the repo / pin.
+    private func junkConfigNoGoCardJSON(
+        id: String = "c205-secret-card-id", repoJSON: String, hfPinJSON: String = "null"
+    ) -> String {
+        """
+        {"id": "\(id)", "model": {"repo": \(repoJSON), "hfPin": \(hfPinJSON)},
+         "verdict": "NO_GO", "config": "junk",
+         "admission": {"default": false, "optIn": true, "reason": "fixture"},
+         "legible": {"tier": "Noticeable", "headline": "h"}}
+        """
+    }
+
+    private static let c205ServedModel = "org/c205-served-model"
+    private static let c205Revision = "abcdefab0123456789abcdefab0123456789abcd"
+
+    private func assertQualityCardUndecodableRefusal(
+        _ result: ServeCLIResult, element: Int, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)", file: file, line: line)
+        XCTAssertTrue(
+            result.stderr.contains(
+                "fastmlx-serve configuration=refused reason=quality_card_undecodable detail=card element \(element) in "
+            ), "unexpected stderr: \(result.stderr)", file: file, line: line)
+        XCTAssertTrue(
+            result.stderr.contains(
+                "site/quality-guides.json names \(Self.c205ServedModel) and failed to decode\n"),
+            "unexpected stderr: \(result.stderr)", file: file, line: line)
+        XCTAssertFalse(
+            result.stderr.contains("c205-secret-card-id"),
+            "the raw card id must not be echoed: \(result.stderr)", file: file, line: line)
+    }
+
+    /// A1 (R): default path, a NO_GO card with a junk `config` whose `model.repo` is the served model.
+    /// Today it is dropped, counted, and the model serves as UNMEASURED.
+    func testServeCLIDefaultManifestDroppedCardNamingServedRepoRefusesWithExitTwo() throws {
+        let directory = try makeDefaultManifestDirectory(cardsJSON: [
+            junkConfigNoGoCardJSON(repoJSON: "\"\(Self.c205ServedModel)\"")
+        ])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let result = try runServeBounded(
+            arguments: [
+                "--scripted", "--model", Self.c205ServedModel, "--host", "127.0.0.1", "--port", "0",
+            ], currentDirectory: directory)
+        assertQualityCardUndecodableRefusal(result, element: 0)
+    }
+
+    /// A2 (R): same, tied ONLY by `model.hfPin` against a full-hex `--model-revision` (the card names no
+    /// repo). The element index is the raw array position (1: a well-formed card precedes it).
+    func testServeCLIDefaultManifestDroppedCardNamingServedPinRefusesWithExitTwo() throws {
+        let wellFormed = """
+            {"id": "c205-ok", "model": {"repo": "org/c205-unrelated"}, "verdict": "PASS",
+             "admission": {"default": false, "optIn": true, "reason": "fixture"},
+             "legible": {"tier": "Noticeable", "headline": "h"}}
+            """
+        let directory = try makeDefaultManifestDirectory(cardsJSON: [
+            wellFormed, junkConfigNoGoCardJSON(repoJSON: "null", hfPinJSON: "\"abcdefab\""),
+        ])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let result = try runServeBounded(
+            arguments: [
+                "--scripted", "--model", Self.c205ServedModel, "--model-revision", Self.c205Revision,
+                "--host", "127.0.0.1", "--port", "0",
+            ], currentDirectory: directory)
+        assertQualityCardUndecodableRefusal(result, element: 1)
+    }
+
+    /// A5 (control): a dropped card with NO `model` object cannot be tied to any model, so today's
+    /// announce-and-serve behaviour is kept (`quality_cards_dropped=1`).
+    func testServeCLIDefaultManifestDroppedCardWithNoModelObjectStillServesAndAnnounces() throws {
+        let noModel = """
+            {"id": "c205-no-model", "verdict": "NO_GO", "config": "junk",
+             "legible": {"tier": "Noticeable", "headline": "h"}}
+            """
+        let directory = try makeDefaultManifestDirectory(cardsJSON: [noModel])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let line = try runLongLivedServeAndCaptureLine(
+            arguments: [
+                "--scripted", "--model", Self.c205ServedModel, "--model-revision", Self.c205Revision,
+                "--host", "127.0.0.1", "--port", "0",
+            ], currentDirectory: directory, containing: "quality_cards_dropped=1")
+        XCTAssertTrue(line.contains("quality_cards_dropped=1"), "got: \(line)")
+    }
+
+    /// A6 (naming variant): the EXPLICIT path still refuses first, under `quality_cards_dropped`, even
+    /// when the dropped card names the served model -- never under the new default-path reason.
+    func testServeCLIExplicitManifestDroppedCardNamingServedModelRefusesAsQualityCardsDropped() throws {
+        let directory = try makeDefaultManifestDirectory(cardsJSON: [
+            junkConfigNoGoCardJSON(repoJSON: "\"\(Self.c205ServedModel)\"")
+        ])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let manifest = directory.appendingPathComponent("site/quality-guides.json")
+        let result = try runServeBounded(
+            arguments: [
+                "--scripted", "--model", Self.c205ServedModel, "--quality-cards", manifest.path,
+                "--host", "127.0.0.1", "--port", "0",
+            ], currentDirectory: directory)
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("reason=quality_cards_dropped"), "stderr: \(result.stderr)")
+        XCTAssertFalse(
+            result.stderr.contains("quality_card_undecodable"), "stderr: \(result.stderr)")
+    }
+
+    private func c205WellFormedCardJSON(
+        id: String, repoJSON: String, hfPin: String, admissionJSON: String
+    ) -> String {
+        """
+        {"id": "\(id)", "model": {"repo": \(repoJSON), "hfPin": "\(hfPin)"}, "verdict": "PASS",
+         "admission": \(admissionJSON),
+         "legible": {"tier": "Noticeable", "headline": "h"}}
+        """
+    }
+
+    /// A7 (test-only pin): a repo-matched card and a pin-matched card (naming different cards) make the
+    /// resolution `.ambiguous`, which the default path refuses as `quality_card_ambiguous`.
+    func testServeCLIDefaultManifestRepoAndPinNamingDifferentCardsRefusesAsAmbiguous() throws {
+        let admission = #"{"default": false, "optIn": true, "reason": "fixture"}"#
+        let directory = try makeDefaultManifestDirectory(cardsJSON: [
+            c205WellFormedCardJSON(
+                id: "c205-repo-card", repoJSON: "\"\(Self.c205ServedModel)\"", hfPin: "11111111",
+                admissionJSON: admission),
+            c205WellFormedCardJSON(
+                id: "c205-pin-card", repoJSON: "null", hfPin: "abcdefab", admissionJSON: admission),
+        ])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let result = try runServeBounded(
+            arguments: [
+                "--scripted", "--model", Self.c205ServedModel, "--model-revision", Self.c205Revision,
+                "--host", "127.0.0.1", "--port", "0",
+            ], currentDirectory: directory)
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("configuration=refused reason=quality_card_ambiguous"),
+            "stderr: \(result.stderr)")
+        XCTAssertFalse(result.stderr.contains("quality_card_undecodable"), "stderr: \(result.stderr)")
+    }
+
+    /// A7 (variant): the pinned card is malformed ONLY in `admission`. `QualityCard` decodes `admission`
+    /// via `try?`, so that card is NOT dropped and still takes part in resolution: the outcome is the
+    /// same `quality_card_ambiguous` refusal, and it is not the new undecodable reason.
+    func testServeCLIDefaultManifestPinnedCardMalformedOnlyInAdmissionStillRefusesAsAmbiguous() throws {
+        let directory = try makeDefaultManifestDirectory(cardsJSON: [
+            c205WellFormedCardJSON(
+                id: "c205-repo-card", repoJSON: "\"\(Self.c205ServedModel)\"", hfPin: "11111111",
+                admissionJSON: #"{"default": false, "optIn": true, "reason": "fixture"}"#),
+            c205WellFormedCardJSON(
+                id: "c205-pin-card", repoJSON: "null", hfPin: "abcdefab",
+                admissionJSON: #"{"default": "not-a-bool"}"#),
+        ])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let result = try runServeBounded(
+            arguments: [
+                "--scripted", "--model", Self.c205ServedModel, "--model-revision", Self.c205Revision,
+                "--host", "127.0.0.1", "--port", "0",
+            ], currentDirectory: directory)
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("configuration=refused reason=quality_card_ambiguous"),
+            "stderr: \(result.stderr)")
+        XCTAssertFalse(result.stderr.contains("quality_card_undecodable"), "stderr: \(result.stderr)")
+    }
 }
 
 private enum FixtureTokenizerError: Error {

@@ -686,6 +686,7 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
 
     let cards: [QualityCard]
     let droppedCardCount: Int
+    let droppedCards: [DroppedCardHint]
     do {
         let loaded: QualityCardManifestLoadResult
         if let expectedSHA256 {
@@ -712,6 +713,7 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         }
         cards = loaded.cards
         droppedCardCount = loaded.droppedCardCount
+        droppedCards = loaded.droppedCards
     } catch {
         guard !explicit else {
             FileHandle.standardError.write(
@@ -746,6 +748,26 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     }
 
     let revision = modelRevisionArgument(rawArguments: rawArguments)
+    // Default path only (the explicit path already refused any drop above): refuse when a dropped
+    // card can be TIED to the served model by its raw `model.repo` or `model.hfPin`. A card that
+    // failed to decode never reaches `resolve`, so without this a malformed `NO_GO` card for the very
+    // model being served would admit as UNMEASURED. Only a card tied to THIS model refuses -- an
+    // unrelated malformed card must not refuse every model (it keeps dropping, counting, announcing
+    // `quality_cards_dropped=<n>`, and serving). The card id is deliberately not echoed.
+    if !explicit {
+        let naming = QualityCardStore.droppedCardsNaming(
+            repo: model, revision: revision, in: droppedCards)
+        if let first = naming.first {
+            FileHandle.standardError.write(
+                Data(
+                    """
+                    fastmlx-serve configuration=refused reason=quality_card_undecodable detail=\
+                    card element \(first.elementIndex) in \(manifestURL.path) names \(model) \
+                    and failed to decode\n
+                    """.utf8))
+            exit(2)
+        }
+    }
     let hostHardwareClass = QualityCardStore.hostHardwareClass()
     let cardResolution = QualityCardStore.resolve(
         repo: model, revision: revision, hostHardwareClass: hostHardwareClass, in: cards)
