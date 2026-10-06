@@ -82,7 +82,11 @@ class PublicDeploymentReceiptContractTests(unittest.TestCase):
         self.assertIn("permissions:\n      contents: read", verifier)
         self.assertNotIn("pages: write", verifier)
         self.assertNotIn("id-token: write", verifier)
-        self.assertIn("runs-on: ubuntu-latest", verifier)
+        self.assertIn(
+            "runs-on: ${{ github.event.repository.private && "
+            "fromJSON('[\"self-hosted\",\"bitworks-ci\"]') || 'ubuntu-latest' }}",
+            verifier,
+        )
         self.assertIn("timeout-minutes: 15", verifier)
         self.assertIn(
             "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6",

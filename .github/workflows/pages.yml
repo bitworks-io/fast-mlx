@@ -6,13 +6,15 @@ on:
 permissions:
   contents: read
 
+# Runner: a private repository (the mirror) uses its self-hosted runner (no hosted minutes);
+# every public repository or fork gets GitHub-hosted runners.
 jobs:
   build:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       pages: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","bitworks-ci"]') || 'ubuntu-latest' }}
     steps:
       - name: Check out validated source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -47,7 +49,7 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","bitworks-ci"]') || 'ubuntu-latest' }}
     needs: build
     outputs:
       page_url: ${{ steps.deployment.outputs.page_url }}
@@ -61,7 +63,7 @@ jobs:
     needs: deploy
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","bitworks-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Check out exact deployed source

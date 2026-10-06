@@ -62,7 +62,10 @@ staging directory is renamed to ``--dest``. The receipt is the usual shape
 plus ``"acquisition": "hub-cache"`` and ``"hub_cache_dir"``. Any refusal
 removes the staging directory it created and writes no dest and no receipt.
 The cache is read-only: no blob is modified, moved, or linked. Not combinable
-with ``--adopt``; ``--kv-reserve-gib`` runs before any copy.
+with ``--adopt``; ``--kv-reserve-gib`` runs before any copy, then the same
+free-space floor as a download (``--min-free-bytes`` or total size times the
+downloader's safety multiplier) is checked before the staging directory exists.
+``--max-attempts`` is a usage error here (an import makes one copy).
 
 ``--kv-reserve-gib N`` (with optional ``--context C`` and ``--host-use
 {shared,dedicated-serving}``) turns on a pre-download judgment: from the
@@ -233,6 +236,39 @@ def _snapshot_regular_files(root: Path) -> dict[str, tuple[int, int]]:
     return snapshot
 
 
+def _check_free_space(
+    dest: Path,
+    total_bytes: int,
+    min_free_bytes: Optional[int],
+    disk_usage_bytes: Optional[Callable[[Path], int]],
+) -> None:
+    """Refuse with ``PullError`` unless the volume ``dest`` will land on has
+    the required free bytes: ``min_free_bytes`` when given, else ``total_bytes``
+    times the downloader's own safety multiplier.
+
+    ``dest.parent`` may not exist yet (it is created later), and the real probe
+    ``statvfs()``es it, so the NEAREST EXISTING ANCESTOR is probed instead: the
+    same volume the directory will be created on. The probe is looked up at call
+    time so a test patching ``downloader.probe_free_space_bytes`` is honored.
+    """
+    required_free_bytes = (
+        min_free_bytes
+        if min_free_bytes is not None
+        else int(total_bytes * downloader.FREE_SPACE_SAFETY_MULTIPLIER)
+    )
+    probe = disk_usage_bytes if disk_usage_bytes is not None else downloader.probe_free_space_bytes
+    probe_path = dest.parent
+    while not probe_path.exists() and probe_path != probe_path.parent:
+        probe_path = probe_path.parent
+    available_free_bytes = probe(probe_path)
+    if available_free_bytes < required_free_bytes:
+        raise PullError(
+            "insufficient free space at "
+            f"{dest.parent}: need >= {required_free_bytes} bytes, "
+            f"have {available_free_bytes} bytes"
+        )
+
+
 def pull(
     repo_id: str,
     revision: str,
@@ -271,19 +307,7 @@ def pull(
         preflight(entries)
     total_bytes = sum(entry["size"] for entry in entries)
 
-    required_free_bytes = (
-        min_free_bytes
-        if min_free_bytes is not None
-        else int(total_bytes * downloader.FREE_SPACE_SAFETY_MULTIPLIER)
-    )
-    probe = disk_usage_bytes if disk_usage_bytes is not None else downloader.probe_free_space_bytes
-    available_free_bytes = probe(dest.parent)
-    if available_free_bytes < required_free_bytes:
-        raise PullError(
-            "insufficient free space at "
-            f"{dest.parent}: need >= {required_free_bytes} bytes, "
-            f"have {available_free_bytes} bytes"
-        )
+    _check_free_space(dest, total_bytes, min_free_bytes, disk_usage_bytes)
 
     manifest_path = manifest_path_for(dest)
     # A staging tree can survive a killed *process* (SIGKILL, laptop
@@ -646,6 +670,8 @@ def import_from_hub_cache(
     dest: Path,
     hub_dir: Path,
     preflight: Optional[Callable[[list], None]] = None,
+    min_free_bytes: Optional[int] = None,
+    disk_usage_bytes: Optional[Callable[[Path], int]] = None,
 ) -> Path:
     """Import a pinned pack from the local Hugging Face hub cache into the
     fresh ``dest`` (see the module docstring), verified like ``adopt()``, and
@@ -655,6 +681,12 @@ def import_from_hub_cache(
 
     ``preflight``, when given, is called with the manifest entries before any
     copy (``--kv-reserve-gib``); it refuses by raising ``PreflightRefused``.
+
+    After the preflight and the cache-blob containment checks, and before any
+    staging directory or ``dest`` exists, free space on ``dest``'s volume is
+    checked exactly as ``pull()`` does (``min_free_bytes`` or the manifest's
+    total size times the downloader's safety multiplier); a shortfall refuses
+    with ``PullError`` and nothing written.
     """
     dest = dest.expanduser().absolute()
     hub_dir = Path(hub_dir).expanduser()
@@ -690,6 +722,13 @@ def import_from_hub_cache(
         entry["name"]: _resolve_cache_blob(snapshot, blobs_real, entry["name"], repo_label)
         for entry in entries
     }
+
+    _check_free_space(
+        dest,
+        sum(entry["size"] for entry in entries),
+        min_free_bytes,
+        disk_usage_bytes,
+    )
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     staging: Optional[Path] = None
@@ -794,11 +833,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-attempts",
         type=int,
-        default=DEFAULT_MAX_ATTEMPTS,
+        default=None,
         help=(
             "how many times to invoke the downloader before giving up, "
             f"resuming from the previous attempt's preserved staging tree "
-            f"each retry (default {DEFAULT_MAX_ATTEMPTS})"
+            f"each retry (default {DEFAULT_MAX_ATTEMPTS}; not allowed with "
+            "--from-hub-cache, which makes a single copy)"
         ),
     )
     parser.add_argument(
@@ -808,7 +848,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "override the preflight free-space floor, in bytes (default: "
             "the revision's total planned size times the downloader's own "
-            "safety multiplier)"
+            "safety multiplier); applies to a download and to --from-hub-cache"
         ),
     )
     mode = parser.add_mutually_exclusive_group()
@@ -970,6 +1010,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             "verifies a directory that already exists and downloads nothing, "
             "so there is nothing to check before a download"
         )
+    if args.from_hub_cache is not None and args.max_attempts is not None:
+        parser.error(
+            "--max-attempts has no effect with --from-hub-cache: an import "
+            "makes a single copy, with no download to retry"
+        )
     try:
         repo_id, revision = validate_pinned_reference(args.pinned_reference)
     except PinnedReferenceError as error:
@@ -995,13 +1040,18 @@ def main(argv: Optional[list[str]] = None) -> None:
                     dest=args.dest,
                     hub_dir=resolve_hub_cache_dir(args.from_hub_cache),
                     preflight=preflight,
+                    min_free_bytes=args.min_free_bytes,
                 )
                 return
             pull(
                 repo_id=repo_id,
                 revision=revision,
                 dest=args.dest,
-                max_attempts=args.max_attempts,
+                max_attempts=(
+                    args.max_attempts
+                    if args.max_attempts is not None
+                    else DEFAULT_MAX_ATTEMPTS
+                ),
                 min_free_bytes=args.min_free_bytes,
                 preflight=preflight,
             )

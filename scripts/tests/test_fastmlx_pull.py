@@ -607,6 +607,59 @@ class PullSupervisorTests(unittest.TestCase):
                         disk_usage_bytes=lambda path: available,
                     )
 
+    # F0: a --dest whose parent does not exist yet must not escape the real
+    # free-space probe as a raw FileNotFoundError (the probe statvfs()s the
+    # parent). The nearest existing ancestor is probed instead.
+    # The downloader itself never creates the output parent, so a plain pull
+    # into a missing parent still fails -- but as a PullError naming the
+    # parent, not as a raw FileNotFoundError out of the free-space probe.
+    def test_f0_missing_dest_parent_is_a_pull_error_not_a_raw_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "not" / "yet" / "model"
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(
+                DOWNLOADER, "https_opener", return_value=opener
+            ), mock.patch.object(DOWNLOADER.time, "sleep", return_value=None):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.pull(
+                        repo_id=repo.repo_id, revision=repo.revision, dest=dest
+                    )
+
+            self.assertIn("missing output parent", str(ctx.exception))
+            self.assertFalse(dest.exists())
+
+    def test_f0_missing_dest_parent_with_insufficient_space_is_a_pull_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "not" / "yet" / "model"
+            opener = self.opener_for(repo)
+
+            with mock.patch.object(DOWNLOADER, "https_opener", return_value=opener):
+                with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                    FASTMLX_PULL.pull(
+                        repo_id=repo.repo_id,
+                        revision=repo.revision,
+                        dest=dest,
+                        min_free_bytes=1 << 62,
+                    )
+
+            self.assertIn("insufficient free space", str(ctx.exception))
+            self.assertFalse((root / "not").exists())
+
+    # F3: plain pull keeps an effective --max-attempts default of 3, and an
+    # explicit value still reaches pull().
+    def test_f3_plain_pull_keeps_default_max_attempts_three(self):
+        argv_base = [f"{REPO_ID}@{REVISION}", "--dest", "/nonexistent-dest/model"]
+        with mock.patch.object(FASTMLX_PULL, "pull") as pull_mock:
+            FASTMLX_PULL.main(list(argv_base))
+            self.assertEqual(pull_mock.call_args.kwargs["max_attempts"], 3)
+            FASTMLX_PULL.main(argv_base + ["--max-attempts", "5"])
+            self.assertEqual(pull_mock.call_args.kwargs["max_attempts"], 5)
+
     # ------------------------------------------------------------------
     # Acceptance criterion 5: refuse to overwrite an existing receipt.
     # ------------------------------------------------------------------
@@ -1038,14 +1091,21 @@ class HubCacheImportTests(unittest.TestCase):
             link.parent.mkdir(parents=True, exist_ok=True)
             os.symlink(os.path.relpath(blob, link.parent), link)
 
-    def run_import(self, hub=None, preflight=None):
+    def run_import(self, hub=None, preflight=None, dest=None, **kwargs):
         return FASTMLX_PULL.import_from_hub_cache(
             repo_id=self.repo.repo_id,
             revision=self.repo.revision,
-            dest=self.dest,
+            dest=dest or self.dest,
             hub_dir=hub or self.hub,
             preflight=preflight,
+            **kwargs,
         )
+
+    def total_bytes(self):
+        return sum(len(d) for d in self.repo.content_by_name.values())
+
+    def default_required(self):
+        return int(self.total_bytes() * DOWNLOADER.FREE_SPACE_SAFETY_MULTIPLIER)
 
     def assert_nothing_written(self):
         self.assertEqual(sorted(self.work.iterdir()), [])
@@ -1382,6 +1442,154 @@ class HubCacheImportTests(unittest.TestCase):
         self.assertIn("simulated does-not-fit", stderr.getvalue())
         self.assertEqual(calls, [(self.repo.repo_id, self.repo.revision, 0.5, None, "shared")])
         self.assert_nothing_written()
+
+    # --- F0: dest parent does not exist, real probe -----------------------
+    def test_f0_import_into_a_missing_dest_parent_with_the_real_probe(self):
+        dest = self.work / "not" / "yet" / "model"
+        receipt_path = self.run_import(dest=dest)
+        self.assertEqual(receipt_path, FASTMLX_PULL.receipt_path_for(dest))
+        self.assertTrue(dest.is_dir())
+        self.assertTrue(receipt_path.is_file())
+
+    def test_f0_import_refusal_into_a_missing_dest_parent_creates_no_directories(self):
+        dest = self.work / "not" / "yet" / "model"
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import(dest=dest, min_free_bytes=1 << 62)
+        self.assertIn("insufficient free space", str(ctx.exception))
+        self.assert_nothing_written()
+
+    # --- F1: insufficient free space refuses, leaves nothing ---------------
+    def test_f1_insufficient_free_space_refuses_and_leaves_nothing(self):
+        needed = self.default_required()
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import(disk_usage_bytes=lambda path: needed - 1)
+        message = str(ctx.exception)
+        self.assertIn("insufficient free space", message)
+        self.assertIn(str(needed), message)
+        self.assertIn(str(needed - 1), message)
+        self.assert_nothing_written()
+        self.assertFalse(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    def test_f1_exactly_the_floor_is_admitted(self):
+        needed = self.default_required()
+        self.run_import(disk_usage_bytes=lambda path: needed)
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).is_file())
+
+    def test_f1_cli_refusal_exits_1_with_the_reason_and_writes_nothing(self):
+        stderr = io.StringIO()
+        with mock.patch.object(
+            DOWNLOADER, "probe_free_space_bytes", return_value=1
+        ), contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                    str(self.hub),
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("insufficient free space", stderr.getvalue())
+        self.assert_nothing_written()
+
+    # --- F2: --min-free-bytes overrides the floor in both directions -------
+    def test_f2_min_free_bytes_above_available_refuses(self):
+        available = self.default_required() * 10  # far above the default floor
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import(
+                min_free_bytes=available + 1, disk_usage_bytes=lambda path: available
+            )
+        message = str(ctx.exception)
+        self.assertIn("insufficient free space", message)
+        self.assertIn(str(available + 1), message)
+        self.assert_nothing_written()
+
+    def test_f2_min_free_bytes_below_available_admits_despite_the_default_floor(self):
+        available = self.default_required() - 1  # would refuse by default
+        self.run_import(min_free_bytes=available, disk_usage_bytes=lambda path: available)
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).is_file())
+
+    def test_f2_cli_min_free_bytes_reaches_the_import(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                    str(self.hub),
+                    "--min-free-bytes",
+                    str(1 << 62),
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("insufficient free space", stderr.getvalue())
+        self.assert_nothing_written()
+
+    # --- F3: --max-attempts has no meaning for an import -------------------
+    def test_f3_explicit_max_attempts_with_from_hub_cache_is_a_usage_error(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                    str(self.hub),
+                    "--max-attempts",
+                    "3",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--max-attempts", stderr.getvalue())
+        self.fetch_api.assert_not_called()
+        self.assert_nothing_written()
+
+    # --- F4: ordering ------------------------------------------------------
+    def test_f4_preflight_refusal_fires_before_the_probe_is_called(self):
+        probe_calls = []
+
+        def probe(path):
+            probe_calls.append(path)
+            return 1 << 62
+
+        def refuse(entries):
+            raise FASTMLX_PULL.PreflightRefused("does not fit")
+
+        with self.assertRaises(FASTMLX_PULL.PreflightRefused):
+            self.run_import(preflight=refuse, disk_usage_bytes=probe)
+        self.assertEqual(probe_calls, [])
+        self.assert_nothing_written()
+
+    def test_f4_probe_runs_after_preflight_and_before_any_staging_or_copy(self):
+        events = []
+        work = self.work
+
+        def preflight(entries):
+            events.append("preflight")
+
+        def probe(path):
+            events.append("probe")
+            self.assertEqual(path, work)
+            self.assertEqual(sorted(work.iterdir()), [])  # no staging, no dest
+            return 1 << 62
+
+        self.run_import(preflight=preflight, disk_usage_bytes=probe)
+        self.assertEqual(events, ["preflight", "probe"])
+
+    def test_f4_probe_sees_the_nearest_existing_ancestor_of_a_missing_parent(self):
+        seen = []
+        dest = self.work / "not" / "yet" / "model"
+
+        def probe(path):
+            seen.append(path)
+            return 1 << 62
+
+        self.run_import(dest=dest, disk_usage_bytes=probe)
+        self.assertEqual(seen, [self.work])
 
     # --- H7 -----------------------------------------------------------
     def test_h7_launcher_receipt_reader_resolves_repo_and_revision(self):

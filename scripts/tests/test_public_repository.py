@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -631,9 +632,106 @@ class PublicRepositoryLicenseTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("runs-on: macos-26", workflow)
+        projected = workflow.split("\n  projected-test-suites:\n", 1)[1].split(
+            "\n  pages:\n", 1
+        )[0]
+
+        self.assertIn(
+            "runs-on: ${{ github.event.repository.private && "
+            "fromJSON('[\"self-hosted\",\"bitworks-ci\"]') || 'macos-26' }}",
+            projected,
+        )
         self.assertNotIn("runs-on: macos-15", workflow)
         self.assertIn("swift --version", workflow)
+
+    SELF_HOSTED_LABELS = "fromJSON('[\"self-hosted\",\"bitworks-ci\"]')"
+    PRIVATE_REPOSITORY_TEST = "github.event.repository.private"
+
+    @property
+    def WORKFLOW_NAMES(self) -> tuple[str, ...]:
+        names = tuple(
+            sorted(
+                path.name
+                for path in (REPOSITORY_ROOT / ".github/workflows").iterdir()
+                if path.suffix in (".yml", ".yaml")
+            )
+        )
+        self.assertIn("quality.yml", names)
+        self.assertIn("pages.yml", names)
+        return names
+
+    def workflow_text(self, name: str) -> str:
+        return (REPOSITORY_ROOT / ".github/workflows" / name).read_text(
+            encoding="utf-8"
+        )
+
+    def test_every_job_runs_on_a_hosted_runner_in_the_public_repository(self) -> None:
+        hosted_labels = ("ubuntu-latest", "macos-26")
+        for name in self.WORKFLOW_NAMES:
+            runs_on_lines = [
+                line.strip()
+                for line in self.workflow_text(name).splitlines()
+                if line.strip().startswith("runs-on:")
+            ]
+            self.assertTrue(runs_on_lines, name)
+            for line in runs_on_lines:
+                with self.subTest(workflow=name, line=line):
+                    match = re.fullmatch(
+                        r"runs-on: \$\{\{ "
+                        + re.escape(self.PRIVATE_REPOSITORY_TEST)
+                        + r" && "
+                        + re.escape(self.SELF_HOSTED_LABELS)
+                        + r" \|\| '([a-z0-9.-]+)' \}\}",
+                        line,
+                    )
+                    self.assertIsNotNone(match, "bare or unconditional runs-on")
+                    self.assertIn(match.group(1), hosted_labels)
+
+    def test_workflows_name_self_hosted_only_in_the_private_mirror_fallback(
+        self,
+    ) -> None:
+        for name in self.WORKFLOW_NAMES:
+            code_lines = [
+                line
+                for line in self.workflow_text(name).splitlines()
+                if not line.lstrip().startswith("#")
+            ]
+            for line in code_lines:
+                if "self-hosted" not in line:
+                    continue
+                with self.subTest(workflow=name, line=line):
+                    self.assertTrue(line.strip().startswith("runs-on: ${{ "))
+                    self.assertIn(
+                        self.PRIVATE_REPOSITORY_TEST + " && " + self.SELF_HOSTED_LABELS + " || '",
+                        line,
+                    )
+
+    def test_workflows_do_not_publish_private_runner_details(self) -> None:
+        for name in self.WORKFLOW_NAMES:
+            text = self.workflow_text(name)
+            # Concatenated so this projected test does not itself publish them.
+            for marker in ("gh" + "runner", "." + "250", "192" + ".168", "M4" + " Mac"):
+                with self.subTest(workflow=name, marker=marker):
+                    self.assertNotIn(marker, text)
+
+    def test_developer_dir_is_set_only_for_the_private_mirror(self) -> None:
+        guard = "if: github.event.repository.private"
+        for name in self.WORKFLOW_NAMES:
+            text = self.workflow_text(name)
+            if "DEVELOPER_DIR" not in text:
+                continue
+            for match in re.finditer(r"DEVELOPER_DIR", text):
+                with self.subTest(workflow=name, offset=match.start()):
+                    step_start = text.rfind("\n      - name:", 0, match.start())
+                    self.assertNotEqual(step_start, -1)
+                    step_end = text.find("\n      - name:", match.start())
+                    step = text[step_start : step_end if step_end != -1 else None]
+                    self.assertIn(guard, step)
+                    self.assertIn('>> "$GITHUB_ENV"', step)
+                    self.assertNotIn("\n    env:", step)
+        quality = self.workflow_text("quality.yml")
+        self.assertIn("DEVELOPER_DIR=/Applications/Xcode.app", quality)
+        self.assertNotIn("      DEVELOPER_DIR:", quality)
 
     def test_pages_deployment_is_called_after_complete_main_quality(self) -> None:
         pages = (REPOSITORY_ROOT / ".github/workflows/pages.yml").read_text(

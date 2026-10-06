@@ -12,9 +12,11 @@ concurrency:
   group: public-source-quality-${{ github.ref }}
   cancel-in-progress: true
 
+# Runner: a private repository (the mirror) uses its self-hosted runner (no hosted minutes);
+# every public repository or fork gets GitHub-hosted runners.
 jobs:
   public-boundary:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","bitworks-ci"]') || 'ubuntu-latest' }}
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
@@ -59,9 +61,16 @@ jobs:
   # after its first run on this runner showed 8/8 OK. It replaced a job that only
   # built three library targets; building the test targets builds those too.
   projected-test-suites:
-    runs-on: macos-26
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","bitworks-ci"]') || 'macos-26' }}
     timeout-minutes: 90
     steps:
+      # The private mirror's self-hosted runner defaults to the Command Line Tools
+      # (Swift 6.4); this gate was promoted on Xcode 26.6 / Swift 6.3.3. A public
+      # repository's hosted macos-26 runner keeps its default toolchain.
+      - name: Pin the Xcode toolchain on the private mirror runner
+        if: github.event.repository.private
+        run: echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> "$GITHUB_ENV"
+
       - name: Check out source
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
