@@ -207,6 +207,13 @@ python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --de
 # content hash) and writes the same receipt a real pull would, instead of downloading anything.
 python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b --adopt
 
+# Already in your Hugging Face cache? Copy that exact revision out of it, verified, instead of downloading it again.
+python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b --from-hub-cache
+
+# See which models carry a measured quality card before downloading anything (offline).
+python3 scripts/fastmlx.py cards list
+python3 scripts/fastmlx.py cards list --model mlx-community/Qwen3-8B-8bit
+
 # Rank the local packs that fit this Mac, with each one's measured quality card.
 python3 scripts/fastmlx.py recommend --models-dir ./models
 

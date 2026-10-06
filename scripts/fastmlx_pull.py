@@ -49,6 +49,21 @@ same exclusive, never-overwritten write as a normal pull, plus
 ``"acquisition": "adopted"`` (a normal ``pull()`` receipt now carries
 ``"acquisition": "downloaded"`` for the same reason).
 
+``--from-hub-cache [DIR]`` (2026-10-06): import a pinned pack that is already
+in the local Hugging Face hub cache (``DIR`` defaults to ``$HF_HUB_CACHE``, else
+``$HF_HOME/hub``, else ``~/.cache/huggingface/hub``) into a FRESH ``--dest``
+without downloading it again. The same pinned manifest is fetched as for
+``--adopt``. For every manifest entry,
+``DIR/models--<owner>--<name>/snapshots/<revision>/<name>`` must resolve to a
+regular file whose real path lies inside that repo's own ``blobs/``; the
+resolved blob (never the link) is copied into a sibling staging directory,
+verified with the ``--adopt`` verifier (size + content identity), and the
+staging directory is renamed to ``--dest``. The receipt is the usual shape
+plus ``"acquisition": "hub-cache"`` and ``"hub_cache_dir"``. Any refusal
+removes the staging directory it created and writes no dest and no receipt.
+The cache is read-only: no blob is modified, moved, or linked. Not combinable
+with ``--adopt``; ``--kv-reserve-gib`` runs before any copy.
+
 ``--kv-reserve-gib N`` (with optional ``--context C`` and ``--host-use
 {shared,dedicated-serving}``) turns on a pre-download judgment: from the
 revision manifest ``pull`` has just fetched (never a second fetch), and
@@ -79,6 +94,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import stat
 import sys
 from pathlib import Path
@@ -379,7 +395,7 @@ def pull(
 # 2b. Adopt: verify an already-staged directory against a pinned revision's
 #     manifest instead of downloading it, then write the same receipt shape.
 # ---------------------------------------------------------------------
-def _verify_adopted_entry(dest: Path, entry: dict) -> dict:
+def _verify_adopted_entry(dest: Path, entry: dict, label: str = "--adopt") -> dict:
     """Verify one manifest ``entry`` against the file already on disk at
     ``dest / entry['name']``, returning the receipt fragment for it.
 
@@ -401,16 +417,16 @@ def _verify_adopted_entry(dest: Path, entry: dict) -> dict:
     try:
         info = file_path.lstat()
     except OSError as error:
-        raise PullError(f"--adopt refused: missing file in {dest}: {name}") from error
+        raise PullError(f"{label} refused: missing file in {dest}: {name}") from error
     if not stat.S_ISREG(info.st_mode):
         raise PullError(
-            f"--adopt refused: {name} in {dest} is not a regular file "
+            f"{label} refused: {name} in {dest} is not a regular file "
             "(symlink, directory, or device); it is refused even if it "
             "targets correct content"
         )
     if info.st_size != entry["size"]:
         raise PullError(
-            f"--adopt refused: size mismatch for {name}: the pinned revision "
+            f"{label} refused: size mismatch for {name}: the pinned revision "
             f"declares {entry['size']} bytes, {dest} has {info.st_size} bytes"
         )
 
@@ -427,11 +443,11 @@ def _verify_adopted_entry(dest: Path, entry: dict) -> dict:
         )
     except downloader.AcquisitionError as error:
         raise PullError(
-            f"--adopt refused: could not verify {name} in {dest}: {error}"
+            f"{label} refused: could not verify {name} in {dest}: {error}"
         ) from error
     if observed_identity != expected_identity:
         raise PullError(
-            f"--adopt refused: content mismatch for {name}: {dest} does not "
+            f"{label} refused: content mismatch for {name}: {dest} does not "
             "hold the bytes the pinned revision declares"
         )
     # An LFS identity IS the plain file sha256, so reuse it rather than read
@@ -563,6 +579,193 @@ def adopt(repo_id: str, revision: str, dest: Path) -> Path:
     return receipt_path
 
 
+def resolve_hub_cache_dir(explicit: Optional[str], environ=None) -> Path:
+    """The hub cache directory: ``explicit`` (a non-empty ``--from-hub-cache``
+    value) > ``HF_HUB_CACHE`` > ``HF_HOME/hub`` > ``~/.cache/huggingface/hub``.
+    Empty environment values count as unset. ``environ`` is a parameter so
+    tests need not touch the process environment."""
+    env = os.environ if environ is None else environ
+    if explicit:
+        return Path(explicit).expanduser()
+    if env.get("HF_HUB_CACHE"):
+        return Path(env["HF_HUB_CACHE"]).expanduser()
+    if env.get("HF_HOME"):
+        return Path(env["HF_HOME"]).expanduser() / "hub"
+    home = env.get("HOME") or os.path.expanduser("~")
+    return Path(home) / ".cache" / "huggingface" / "hub"
+
+
+def _resolve_cache_blob(snapshot: Path, blobs_real: str, name: str, repo_label: str) -> str:
+    """The real path of the cache blob behind ``snapshot / name``, refusing
+    (naming ``name``) a name that could leave the snapshot, a missing entry,
+    a real path outside this repo's own ``blobs/``, and a non-regular file."""
+    parts = Path(name).parts
+    if Path(name).is_absolute() or ".." in parts or not parts:
+        raise PullError(
+            f"--from-hub-cache refused: manifest name {name!r} is not a "
+            "relative path inside the snapshot"
+        )
+    link = snapshot / name
+    if not os.path.lexists(link):
+        raise PullError(
+            f"--from-hub-cache refused: {name} is missing from the cached "
+            f"snapshot {snapshot}; the cache does not hold this pinned "
+            f"revision completely -- run a plain 'fastmlx pull {repo_label} "
+            "--dest <dir>' instead"
+        )
+    real = os.path.realpath(link)
+    try:
+        inside = (
+            os.path.commonpath([real, blobs_real]) == blobs_real and real != blobs_real
+        )
+    except ValueError:
+        inside = False
+    if not inside:
+        raise PullError(
+            f"--from-hub-cache refused: {name} resolves to {real}, which is "
+            f"not inside this repository's cache blobs/ directory ({blobs_real})"
+        )
+    try:
+        info = os.lstat(real)
+    except OSError as error:
+        raise PullError(
+            f"--from-hub-cache refused: {name} is a dangling cache link "
+            f"({real} is missing)"
+        ) from error
+    if not stat.S_ISREG(info.st_mode):
+        raise PullError(
+            f"--from-hub-cache refused: {name} does not resolve to a regular "
+            f"file in the cache blobs/ directory ({real})"
+        )
+    return real
+
+
+def import_from_hub_cache(
+    repo_id: str,
+    revision: str,
+    dest: Path,
+    hub_dir: Path,
+    preflight: Optional[Callable[[list], None]] = None,
+) -> Path:
+    """Import a pinned pack from the local Hugging Face hub cache into the
+    fresh ``dest`` (see the module docstring), verified like ``adopt()``, and
+    write a receipt marked ``"acquisition": "hub-cache"``. Nothing is
+    downloaded; the cache is only read. On any failure the staging directory
+    this call created is removed and no dest or receipt is left.
+
+    ``preflight``, when given, is called with the manifest entries before any
+    copy (``--kv-reserve-gib``); it refuses by raising ``PreflightRefused``.
+    """
+    dest = dest.expanduser().absolute()
+    hub_dir = Path(hub_dir).expanduser()
+    receipt_path = receipt_path_for(dest)
+    if receipt_path.exists() or receipt_path.is_symlink():
+        raise PullError(
+            f"refusing to overwrite an existing pull receipt: {receipt_path}"
+        )
+    if os.path.lexists(dest):
+        raise PullError(
+            f"--from-hub-cache requires a fresh destination, but {dest} "
+            "already exists"
+        )
+
+    repo_label = f"{repo_id}@{revision}"
+    repo_dir = hub_dir / ("models--" + repo_id.replace("/", "--"))
+    snapshot = repo_dir / "snapshots" / revision
+    if not snapshot.is_dir():
+        raise PullError(
+            f"--from-hub-cache refused: no cached snapshot for {repo_label} "
+            f"under {hub_dir} (expected {snapshot}); run a plain "
+            f"'fastmlx pull {repo_label} --dest {dest}' to download it"
+        )
+    blobs_real = os.path.realpath(repo_dir / "blobs")
+
+    document, _api_data = downloader.fetch_api(repo_id, revision)
+    entries = downloader.validated_entries(document, repo_id, revision)
+    if preflight is not None:
+        preflight(entries)
+
+    # Resolve and contain every entry BEFORE anything is copied.
+    sources = {
+        entry["name"]: _resolve_cache_blob(snapshot, blobs_real, entry["name"], repo_label)
+        for entry in entries
+    }
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging: Optional[Path] = None
+    counter = 0
+    while staging is None:
+        candidate = dest.parent / f".{dest.name}.hub-import-{os.getpid()}-{counter}"
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            counter += 1
+            continue
+        staging = candidate
+
+    try:
+        files_receipt: dict[str, dict[str, object]] = {}
+        for index, entry in enumerate(entries, start=1):
+            name = entry["name"]
+            print(
+                f"hub-cache copy file={index}/{len(entries)} name={name}",
+                file=sys.stderr,
+                flush=True,
+            )
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with open(sources[name], "rb") as source, open(target, "xb") as sink:
+                    shutil.copyfileobj(source, sink, _RECEIPT_HASH_CHUNK_BYTES)
+            except OSError as error:
+                raise PullError(
+                    f"--from-hub-cache refused: could not copy {name} from "
+                    f"the cache: {error}"
+                ) from error
+        for entry in entries:
+            files_receipt[entry["name"]] = _verify_adopted_entry(
+                staging, entry, label="--from-hub-cache"
+            )
+        if os.path.lexists(dest):
+            raise PullError(
+                f"--from-hub-cache requires a fresh destination, but {dest} "
+                "appeared during the import"
+            )
+        os.rename(staging, dest)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    total_bytes = sum(entry["size"] for entry in entries)
+    receipt = {
+        "format_version": 1,
+        "repo_id": repo_id,
+        "revision": revision,
+        "dest": str(dest),
+        "attempts": 1,
+        "max_attempts": 1,
+        "total_files": len(entries),
+        "total_bytes": total_bytes,
+        "reused_files": 0,
+        "reused_bytes": 0,
+        "downloader_script_sha256": downloader_script_sha256(),
+        "files": files_receipt,
+        "acquisition": "hub-cache",
+        "hub_cache_dir": str(hub_dir),
+        "ignored_local_paths": [],
+    }
+    receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
+    try:
+        downloader.write_exclusive(receipt_path, receipt_bytes)
+    except BaseException:
+        # The dest was created by this call a moment ago; do not leave it
+        # without the receipt that vouches for it.
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    print(f"hub-cache import complete: {receipt_path}", flush=True)
+    return receipt_path
+
+
 # ---------------------------------------------------------------------
 # 3. CLI
 # ---------------------------------------------------------------------
@@ -583,8 +786,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
         help=(
-            "the destination directory: where a fresh download lands, or "
-            "the existing directory --adopt verifies in place"
+            "the destination directory: where a fresh download or a "
+            "--from-hub-cache import lands, or the existing directory "
+            "--adopt verifies in place"
         ),
     )
     parser.add_argument(
@@ -607,7 +811,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "safety multiplier)"
         ),
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--from-hub-cache",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help=(
+            "import the pinned pack from the local Hugging Face hub cache "
+            "into the fresh --dest instead of downloading it: each manifest "
+            "file must resolve to a regular file inside that repo's cache "
+            "blobs/; blobs are copied (never linked), verified like --adopt, "
+            "and a receipt marked acquisition: hub-cache is written. DIR "
+            "defaults to $HF_HUB_CACHE, else $HF_HOME/hub, else "
+            "~/.cache/huggingface/hub. The cache is only read. Not "
+            "combinable with --adopt; --kv-reserve-gib applies"
+        ),
+    )
+    mode.add_argument(
         "--adopt",
         action="store_true",
         help=(
@@ -766,6 +988,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                     args.context,
                     args.host_use or "shared",
                 )
+            if args.from_hub_cache is not None:
+                import_from_hub_cache(
+                    repo_id=repo_id,
+                    revision=revision,
+                    dest=args.dest,
+                    hub_dir=resolve_hub_cache_dir(args.from_hub_cache),
+                    preflight=preflight,
+                )
+                return
             pull(
                 repo_id=repo_id,
                 revision=revision,

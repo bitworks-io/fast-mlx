@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """``fastmlx cards pull``: fetch a digest-pinned quality-card store that may
-only ADD to the bundled one.
+only ADD to the bundled one; ``fastmlx cards list``: say, offline, which
+models carry a quality card.
 
 Predeclaration (frozen contract, rules R1-R7):
 docs/task-inbox/2026-10-03-PREDECLARATION-fastmlx-cards-pull-fetches-a-pinned-monotonic-card-store.md
@@ -31,7 +32,25 @@ path imports it. They only READ the stores it writes: without
 re-run rules R1-R7, which live in ``fastmlx_launch.check_card_store_rules``
 and are re-exported here.
 
-Exit codes: 0 OK; 1 network/IO failure (including a non-HTTPS or cross-host
+``fastmlx cards list [--model REPO] [--revision REV] [--quality-cards P]
+[--quality-cards-sha256 H] [--json]`` never opens the network. It resolves
+the store exactly as ``recommend`` does (pulled store, else bundled; pin
+enforced the same way), prints ``card store: source=<s> <identity>`` and one
+row per card (id, verdict, default-eligible vs opt-in, repo, revision prefix,
+residency, hardware class vs this host). Predeclaration:
+docs/task-inbox/2026-10-06-PREDECLARATION-cards-list-answers-which-models-are-carded-before-download.md
+``--model`` matches ``model.repo`` exactly; ``--revision`` (a full 40-hex
+commit) matches ``model.hfPin`` by prefix, the way ``serve`` matches a pack by
+its pinned revision (a card with no ``model.repo`` is found only that way); both
+together select the union. ``list`` exit codes: 0 listed; 1 nothing matched
+(``serve`` would admit it UNMEASURED, except that a ``--model`` alone cannot
+rule out a pin-only card, and the message then says so); 2 usage, including a
+malformed ``--revision``; 3 store or pin refusal, or ANY card in the store the
+built-in engine cannot decode, shown or not (reported after the listing; only
+the built-in engine, i.e. ``fastmlx serve`` without a custom engine profile,
+refuses on it).
+
+``pull`` exit codes: 0 OK; 1 network/IO failure (including a non-HTTPS or cross-host
 redirect and an oversize body); 2 argparse error or malformed ``--commit``;
 3 malformed ``--sha256``, digest mismatch, any R1-R7 refusal, a card the
 built-in engine cannot decode (``engine_undecodable_card_reason``), or a
@@ -44,6 +63,7 @@ import argparse
 import hashlib
 import http.client
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -280,11 +300,54 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fastmlx cards",
         description=(
-            "Manage the quality-card store: fetch a digest-pinned store that "
-            "may only add to the bundled one."
+            "Manage the quality-card store: list which models carry a card "
+            "(offline), or fetch a digest-pinned store that may only add to "
+            "the bundled one."
         ),
     )
     subparsers = parser.add_subparsers(dest="cards_command", required=True)
+    list_parser = subparsers.add_parser(
+        "list",
+        help="list which models carry a quality card (offline, nothing downloaded)",
+        description=(
+            "List the quality cards in the store `fastmlx recommend` and "
+            "`fastmlx serve` read (a pulled store, else the bundled one): "
+            "verdict, whether the card admits by default or needs "
+            "--accept-quality, repo, revision, residency and hardware class. "
+            "Never opens the network."
+        ),
+    )
+    list_parser.add_argument(
+        "--model",
+        default=None,
+        metavar="REPO",
+        help="show only the card(s) whose model.repo is exactly REPO",
+    )
+    list_parser.add_argument(
+        "--revision",
+        default=None,
+        metavar="REV",
+        help=(
+            "also show the card(s) whose model.hfPin is a prefix of this full "
+            "40-hex pinned revision (how serve finds a card with no model.repo)"
+        ),
+    )
+    list_parser.add_argument(
+        "--quality-cards",
+        default=None,
+        help="path to a card store to list (default: resolved like `fastmlx recommend`)",
+    )
+    list_parser.add_argument(
+        "--quality-cards-sha256",
+        default=None,
+        help=(
+            "pin the store by the sha256 of its raw bytes (64 hex characters); "
+            "a mismatch or a store that does not resolve exits 3"
+        ),
+    )
+    list_parser.add_argument(
+        "--json", action="store_true", help="print one JSON document instead of text rows"
+    )
     pull = subparsers.add_parser(
         "pull",
         help="fetch a pinned card store at a public commit, verify it, and write it",
@@ -368,8 +431,230 @@ def _run_pull(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------
+_CELL_MAX_LEN = 80
+_SAFE_CELL_RE = re.compile(r"[A-Za-z0-9._@+/\-]{1,80}")
+_LIST_PREFIX = "fastmlx cards list"
+
+
+def _cell(value) -> str:
+    """A card-sourced string made safe for one ``" | "``-delimited line: an
+    ordinary id/repo/revision prints bare; anything else (spaces, control
+    characters, a non-string, over-long) goes through the launcher's
+    ``_bounded_repr`` so a hostile card can never forge or extend a row."""
+    if isinstance(value, str) and _SAFE_CELL_RE.fullmatch(value):
+        return value
+    return launch._bounded_repr(value, _CELL_MAX_LEN)
+
+
+def _host_tag(card_class: Optional[str], host_class: Optional[str]) -> str:
+    if card_class is None:
+        return "unrecorded"
+    if host_class is None:
+        return "host unknown"
+    return "this host" if card_class == host_class else "other hardware"
+
+
+def _list_row(index: int, card, host_class: Optional[str]) -> tuple:
+    """``(text, record)`` for one card. ``record`` is the ``--json`` shape."""
+    undecodable = launch.engine_undecodable_card_reason(card)
+    if not isinstance(card, dict):
+        record = {
+            "id": None, "verdict": None, "admission": None, "repo": None,
+            "hfPin": None, "residency": None, "hardwareClass": None,
+            "host": "unrecorded", "undecodable": undecodable,
+        }
+        return f"<element {index}> | UNDECODABLE {undecodable}", record
+
+    card_id = card.get("id")
+    verdict = card.get("verdict")
+    model = card.get("model")
+    model = model if isinstance(model, dict) else None
+    config = card.get("config") if isinstance(card.get("config"), dict) else {}
+
+    outcome, _ = launch.decide_admission(card, False)
+    opt_in = outcome == "refuse_quality_flagged"
+    admission_text = (
+        f"opt-in: --accept-quality {_cell(card_id)}" if opt_in else "default-eligible"
+    )
+    if verdict in launch._RECOGNIZED_VERDICTS:
+        verdict_text = verdict
+    else:
+        raw = "(absent)" if "verdict" not in card else launch._bounded_repr(verdict)
+        verdict_text = f"UNRECOGNIZED {raw} (admits as UNMEASURED)"
+
+    repo = model.get("repo") if model is not None else None
+    if model is None:
+        repo_text = "repo unreadable"
+    elif repo is None:
+        repo_text = "repo=none (local pack)"
+    else:
+        repo_text = _cell(repo)
+    hf_pin = model.get("hfPin") if model is not None else None
+    revision_text = (
+        f"revision begins {_cell(hf_pin)}"
+        if isinstance(hf_pin, str) and hf_pin
+        else "revision unrecorded"
+    )
+
+    raw_residency = config.get("residency")
+    if raw_residency is None:
+        residency_text = "residency unrecorded"
+    elif launch.card_residency(card) is not None:
+        residency_text = f"residency {launch.card_residency(card)}"
+    else:
+        residency_text = f"residency unrecognized {launch._bounded_repr(raw_residency)}"
+
+    hardware_class = launch.card_hardware_class(card)
+    tag = _host_tag(hardware_class, host_class)
+    hardware_text = (
+        "hardware unrecorded"
+        if hardware_class is None
+        else f"hardware {_cell(hardware_class)} ({tag})"
+    )
+
+    cells = [
+        _cell(card_id), verdict_text, admission_text, repo_text,
+        revision_text, residency_text, hardware_text,
+    ]
+    if undecodable is not None:
+        cells.append(f"UNDECODABLE {undecodable}")
+    record = {
+        "id": card_id if isinstance(card_id, str) else None,
+        "verdict": verdict if isinstance(verdict, str) else None,
+        "admission": {"default": not opt_in, "optIn": opt_in},
+        "repo": repo if isinstance(repo, str) else None,
+        "hfPin": hf_pin if isinstance(hf_pin, str) else None,
+        "residency": raw_residency if isinstance(raw_residency, str) else None,
+        "hardwareClass": hardware_class,
+        "host": tag,
+        "undecodable": undecodable,
+    }
+    return " | ".join(cells), record
+
+
+def _list_refuse(exit_code: int, message: str) -> NoReturn:
+    print(f"{_LIST_PREFIX}: {message}", file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def _run_list(args: argparse.Namespace) -> int:
+    # Resolve and verify the store exactly as `fastmlx recommend` does
+    # (fastmlx_recommend.py), so both read the identical store with identical
+    # refusal messages. Nothing here opens the network.
+    try:
+        pin = launch.parse_quality_cards_pin(args.quality_cards_sha256)
+        path, source, notices = launch.resolve_quality_card_store(
+            args.quality_cards, notice_prefix=_LIST_PREFIX
+        )
+        for notice in notices:
+            print(notice, file=sys.stderr)
+        raw_sha256, cards, identity = launch._inspect_quality_card_store(path)
+        launch.enforce_pulled_store_identity(path, source, raw_sha256)
+        launch.enforce_quality_cards_pin(pin, path, raw_sha256, cards)
+    except launch.LaunchRefusal as refusal:
+        _list_refuse(refusal.exit_code, refusal.message)
+    if cards is None or identity is None:
+        _list_refuse(
+            3, f"the card store {path} is missing or is not a quality-card manifest"
+        )
+
+    if args.revision is not None and not launch._is_full_hex_revision(args.revision):
+        _list_refuse(
+            2,
+            f"--revision must be exactly 40 hexadecimal characters, got "
+            f"{launch._bounded_repr(args.revision, _CELL_MAX_LEN)}",
+        )
+
+    selected = list(enumerate(cards))
+    if args.model is not None or args.revision is not None:
+        matched = set()
+        if args.model is not None:
+            matched |= {id(c) for c in launch.find_cards_by_repo(cards, args.model)}
+        if args.revision is not None:
+            matched |= {id(c) for c in launch.find_cards_by_pin(cards, args.revision)}
+        selected = [(i, card) for i, card in selected if id(card) in matched]
+
+    host_class = launch.host_hardware_class()
+    rendered = [_list_row(i, card, host_class) for i, card in selected]
+    # The built-in engine refuses if ANY card in the store is undecodable, so
+    # this looks at the whole store, not only the rows a filter let through.
+    undecodable = launch.first_engine_undecodable_card(cards)
+
+    no_match = (args.model is not None or args.revision is not None) and not rendered
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "cardStore": {**identity, "source": source},
+                    "cards": [record for _, record in rendered],
+                }
+            )
+        )
+    else:
+        print(f"card store: source={source} {launch.card_store_fields(identity)}")
+        for text, _ in rendered:
+            print(text)
+    if undecodable is not None:
+        index, named, reason = undecodable
+        print(
+            f"{_LIST_PREFIX}: {named}(element {index}) cannot be decoded by the "
+            f"built-in engine: {reason}; the built-in engine (`fastmlx serve` "
+            "without a custom engine profile) would refuse every launch with "
+            "this store",
+            file=sys.stderr,
+        )
+        return 3
+    if no_match:
+        target = (
+            f"{_cell(args.model)} or revision {args.revision}"
+            if args.model is not None and args.revision is not None
+            else _cell(args.model) if args.revision is None else f"revision {args.revision}"
+        )
+        pin_only = 0
+        repo_keyed = 0
+        for card in cards:
+            model = card.get("model") if isinstance(card, dict) else None
+            if not isinstance(model, dict):
+                continue
+            if isinstance(model.get("repo"), str):
+                repo_keyed += 1
+            elif isinstance(model.get("hfPin"), str) and model.get("hfPin"):
+                pin_only += 1
+        if args.revision is not None:
+            pin_only = 0
+        if args.model is not None:
+            repo_keyed = 0
+        if pin_only:
+            print(
+                f"{_LIST_PREFIX}: no quality card names {target} by repo; "
+                f"{pin_only} card(s) in this store are matched only by the "
+                "pack's pinned revision, so pass `--revision <40-hex>` to check",
+                file=sys.stderr,
+            )
+        elif repo_keyed:
+            print(
+                f"{_LIST_PREFIX}: no quality card is pinned to {target}; "
+                f"{repo_keyed} card(s) in this store are matched by repo, so "
+                "pass `--model <repo>` as well to check",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"{_LIST_PREFIX}: no quality card names {target}; serve would "
+                "admit it UNMEASURED",
+                file=sys.stderr,
+            )
+        return 1
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
+    if args.cards_command == "list":
+        raise SystemExit(_run_list(args))
     raise SystemExit(_run_pull(args))
 
 

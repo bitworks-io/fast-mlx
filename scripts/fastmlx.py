@@ -17,9 +17,10 @@ Subcommands:
 - ``fastmlx recommend ...`` -> ``fastmlx_recommend.main`` with the
   ``recommend`` subcommand word prepended (rank local packs by fit +
   measured quality).
-- ``fastmlx cards ...``     -> ``fastmlx_cards.main`` (``cards pull``: fetch a
-  digest-pinned quality-card store that may only add to the bundled one; the
-  only subcommand that touches the network for card data).
+- ``fastmlx cards ...``     -> ``fastmlx_cards.main`` (``cards list``: say, offline,
+  which models carry a quality card; ``cards pull``: fetch a digest-pinned
+  quality-card store that may only add to the bundled one; the only
+  subcommand that touches the network for card data).
 - ``fastmlx capacity ...``  -> exec the ``fastmlx-capacity`` binary found
   next to this dispatcher's own install (a sibling ``bin`` dir) or on
   ``PATH``, argv passthrough, never through a shell.
@@ -30,7 +31,7 @@ Subcommands:
 - ``fastmlx bench ...``     -> ``fastmlx_bench.main`` (measure decode
   throughput against any OpenAI-compatible endpoint).
 
-``cards`` has its own ``pull`` subparser, so this dispatcher passes its
+``cards`` has its own ``list``/``pull`` subparsers, so this dispatcher passes its
 arguments through unchanged (``cards pull ...`` -> ``fastmlx_cards.main(["pull", ...])``).
 
 ``pull`` and ``bench`` each have no subparser of their own (each is a bare
@@ -99,7 +100,7 @@ subcommands:
   pull        pull a pinned Hugging Face model snapshot
   serve       fit-check, admit, then serve an OpenAI-compatible engine
   recommend   rank local model packs that fit this host by measured quality
-  cards       fetch a digest-pinned quality-card store (cards pull)
+  cards       quality cards: `cards list` (which models, offline), `cards pull` (pinned store)
   capacity    run the capacity-check binary directly
   engine      run the Swift serving engine binary directly (escape hatch)
   bench       measure decode throughput against any OpenAI-compatible endpoint

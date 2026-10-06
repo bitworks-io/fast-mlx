@@ -1115,5 +1115,561 @@ class ServeAndRecommendNeverFetchTests(unittest.TestCase):
                 self.assertNotIn("raw.githubusercontent.com", text)
 
 
+
+# ---------------------------------------------------------------------
+# ``fastmlx cards list``: which models carry a quality card, offline.
+# Predeclaration rows A1-A8:
+# docs/task-inbox/2026-10-06-PREDECLARATION-cards-list-answers-which-models-are-carded-before-download.md
+# ---------------------------------------------------------------------
+GUIDES_PATH = REPO_ROOT / "site" / "quality-guides.json"
+QWEN3_8B_8BIT_REPO = "mlx-community/Qwen3-8B-8bit"
+HEADER_PREFIX = "card store: "
+
+
+def _raise_network(*args, **kwargs):
+    raise AssertionError("cards list touched the network")
+
+
+class CardsListTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
+
+    def run_list(self, *argv, host_class="apple-m3-ultra"):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, {"HOME": str(self.home)}))
+            # `list` is offline: any fetch path raising proves it never calls one.
+            stack.enter_context(patch.object(CARDS, "fetch", _raise_network))
+            stack.enter_context(patch.object(CARDS, "https_opener", _raise_network))
+            stack.enter_context(patch.object(urllib.request, "urlopen", _raise_network))
+            stack.enter_context(
+                patch.object(CARDS.launch, "host_hardware_class", lambda: host_class)
+            )
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            stack.enter_context(contextlib.redirect_stderr(stderr))
+            with self.assertRaises(SystemExit) as ctx:
+                CARDS.main(["list", *argv])
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    @staticmethod
+    def split_output(stdout):
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        header = lines[0] if lines else ""
+        return header, lines[1:]
+
+    @staticmethod
+    def row_for(rows, card_id):
+        found = [row for row in rows if row.startswith(card_id + " ")]
+        assert len(found) == 1, (card_id, rows)
+        return found[0]
+
+    def write_store(self, cards, name="store.json"):
+        document = bundled_document()
+        document["cards"] = cards
+        path = self.root / name
+        path.write_bytes(serialize(document))
+        return path
+
+
+class CardsListBundledStoreTests(CardsListTestCase):
+    def test_a1_bundled_store_lists_every_card_with_the_store_identity(self):
+        code, stdout, stderr = self.run_list()
+        self.assertEqual(code, 0, stderr)
+        header, rows = self.split_output(stdout)
+        guides = json.loads(GUIDES_PATH.read_text(encoding="utf-8"))
+        ids = [card["id"] for card in guides["cards"]]
+        self.assertEqual(len(rows), 13)
+        self.assertEqual([row.split(" ")[0] for row in rows], ids)  # store order
+        self.assertTrue(header.startswith(HEADER_PREFIX + "source=default "), header)
+        self.assertIn(
+            "sha256=" + hashlib.sha256(GUIDES_PATH.read_bytes()).hexdigest(), header
+        )
+        self.assertIn("cards=13", header)
+        self.assertEqual(stderr, "")
+
+    def test_a1_every_row_names_verdict_admission_repo_revision_residency_hardware(self):
+        _, stdout, _ = self.run_list()
+        _, rows = self.split_output(stdout)
+        no_go = self.row_for(rows, "qwen3-8b-4bit@m5")
+        self.assertIn("| NO_GO |", no_go)
+        self.assertIn("opt-in: --accept-quality qwen3-8b-4bit@m5", no_go)
+        self.assertNotIn("default-eligible", no_go)
+        self.assertIn("mlx-community/Qwen3-8B-4bit", no_go)
+        self.assertIn("revision begins 545dc425", no_go)
+        self.assertIn("residency resident", no_go)
+        self.assertIn("hardware apple-m5", no_go)
+        # A local pack carries no repo; a card with no residency says so.
+        local = self.row_for(rows, "qwen38-flash-next-mixed-4-8bit@m3ultra")
+        self.assertIn("repo=none (local pack)", local)
+        self.assertIn("residency unrecorded", local)
+        self.assertIn("revision begins ef5b919d31534faa1997666f1a22d362cd6383cd", local)
+        # A card with no hfPin says so.
+        unpinned = self.row_for(rows, "qwen38-27b-mtp@m3ultra")
+        self.assertIn("revision unrecorded", unpinned)
+        self.assertIn("| EXACT |", unpinned)
+        self.assertIn("default-eligible", unpinned)
+
+    def test_a2_model_filter_selects_the_one_measured_pass_card(self):
+        code, stdout, stderr = self.run_list("--model", QWEN3_8B_8BIT_REPO)
+        self.assertEqual(code, 0, stderr)
+        header, rows = self.split_output(stdout)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0].startswith("qwen3-8b-8bit@m3ultra "), rows[0])
+        self.assertIn("| PASS |", rows[0])
+        self.assertIn("default-eligible", rows[0])
+        self.assertIn("revision begins 48a0b75b", rows[0])
+        self.assertIn("cards=13", header)  # the header names the whole store
+
+    def test_a3_model_with_no_card_exits_1_and_does_not_claim_unmeasured_on_bundled(self):
+        # The bundled store holds pin-only (repo null) Flash Next cards, so a
+        # repo miss cannot prove serve admits UNMEASURED; it points at --revision.
+        code, stdout, stderr = self.run_list("--model", "nobody/x")
+        self.assertEqual(code, 1)
+        self.assertIn("no quality card names nobody/x by repo", stderr)
+        self.assertIn("--revision", stderr)
+        self.assertNotIn("UNMEASURED", stderr)
+        self.assertEqual(self.split_output(stdout)[1], [])  # no card rows
+
+    def test_a3_model_filter_is_exact_not_prefix_or_substring(self):
+        for model in ("mlx-community/Qwen3-8B", "Qwen3-8B-8bit", "8bit", "mlx-community/"):
+            with self.subTest(model=model):
+                code, stdout, stderr = self.run_list("--model", model)
+                self.assertEqual(code, 1, stdout)
+                self.assertIn("no quality card names", stderr)
+                self.assertEqual(self.split_output(stdout)[1], [])
+
+    def test_a4_hardware_class_is_tagged_against_this_host(self):
+        code, stdout, stderr = self.run_list(host_class="apple-m5")
+        self.assertEqual(code, 0, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertIn("hardware apple-m5 (this host)", self.row_for(rows, "qwen3-0p6b-4bit@m5"))
+        other = self.row_for(rows, "qwen3-0p6b-4bit@m3ultra")
+        self.assertIn("hardware apple-m3-ultra (other hardware)", other)
+        self.assertNotIn("this host", other)
+
+    def test_a4_unknown_host_is_not_called_other_hardware(self):
+        _, stdout, _ = self.run_list(host_class=None)
+        _, rows = self.split_output(stdout)
+        row = self.row_for(rows, "qwen3-0p6b-4bit@m5")
+        self.assertIn("hardware apple-m5 (host unknown)", row)
+        self.assertNotIn("other hardware", row)
+
+    def test_a4_card_without_hardware_class_reads_unrecorded(self):
+        card = new_card("nohw@test", "example/NoHw", "PASS")
+        store = self.write_store([card])
+        _, stdout, _ = self.run_list("--quality-cards", str(store))
+        _, rows = self.split_output(stdout)
+        self.assertIn("hardware unrecorded", self.row_for(rows, "nohw@test"))
+
+
+class CardsListFixtureStoreTests(CardsListTestCase):
+    def test_a5_unrecognized_verdict_is_flagged_and_admits_as_unmeasured(self):
+        card = new_card("odd@test", "example/Odd", "no_go")
+        store = self.write_store([card])
+        code, stdout, stderr = self.run_list("--quality-cards", str(store))
+        self.assertEqual(code, 0, stderr)
+        header, rows = self.split_output(stdout)
+        self.assertIn("source=explicit", header)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("UNRECOGNIZED 'no_go' (admits as UNMEASURED)", rows[0])
+        self.assertIn("default-eligible", rows[0])
+        self.assertNotIn("opt-in", rows[0])
+
+    def test_a5_hostile_verdict_is_bounded_to_a_single_line(self):
+        card = new_card("hostile@test", "example/Hostile", "x\nFORGED row\r" + "A" * 500)
+        store = self.write_store([card])
+        code, stdout, stderr = self.run_list("--quality-cards", str(store))
+        self.assertEqual(code, 0, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertEqual(len(rows), 1, stdout)
+        self.assertNotIn("\r", stdout)
+        self.assertLess(len(rows[0]), 400)
+        self.assertIn("UNRECOGNIZED", rows[0])
+
+    def test_a5_undecodable_card_prints_its_reason_and_exits_3_after_the_listing(self):
+        good = new_card("good@test", "example/Good", "PASS")
+        junk = new_card("junk@test", "example/Junk", "PASS")
+        junk["config"] = "junk"
+        store = self.write_store([good, junk])
+        code, stdout, stderr = self.run_list("--quality-cards", str(store))
+        self.assertEqual(code, 3)
+        _, rows = self.split_output(stdout)
+        self.assertEqual(len(rows), 2)  # both listed first
+        self.assertNotIn("UNDECODABLE", self.row_for(rows, "good@test"))
+        self.assertIn("UNDECODABLE config is not an object", self.row_for(rows, "junk@test"))
+        self.assertIn("cannot be decoded by the built-in engine", stderr)
+
+    def test_a5_non_object_element_is_undecodable_not_a_crash(self):
+        store = self.write_store([new_card("good@test", "example/Good", "PASS"), 7])
+        code, stdout, stderr = self.run_list("--quality-cards", str(store))
+        self.assertEqual(code, 3, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertEqual(len(rows), 2)
+        self.assertIn("UNDECODABLE element is not a JSON object", rows[1])
+
+    def test_a5_model_filter_is_exact_on_repos_that_share_a_prefix(self):
+        store = self.write_store(
+            [
+                new_card("x@test", "example/X", "PASS"),
+                new_card("x-8bit@test", "example/X-8bit", "NO_GO"),
+            ]
+        )
+        common = ["--quality-cards", str(store)]
+        code, stdout, stderr = self.run_list(*common, "--model", "example/X")
+        self.assertEqual(code, 0, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertEqual([row.split(" ")[0] for row in rows], ["x@test"])
+        code, stdout, stderr = self.run_list(*common, "--model", "example/X-8bit")
+        self.assertEqual(code, 0, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertEqual([row.split(" ")[0] for row in rows], ["x-8bit@test"])
+        self.assertIn("opt-in: --accept-quality x-8bit@test", rows[0])
+        for partial in ("example/X-", "example/X-8", "X"):
+            with self.subTest(partial=partial):
+                code, _, stderr = self.run_list(*common, "--model", partial)
+                self.assertEqual(code, 1)
+                self.assertIn("serve would admit it UNMEASURED", stderr)
+
+
+class CardsListRevisionAndStoreWideTests(CardsListTestCase):
+    """Review defects D1-D3: pin-only cards, store-wide undecodable, wording."""
+
+    PIN = "abcdef12"
+    REVISION = "abcdef12" + "0123456789abcdef0123456789abcdef"[:32]
+
+    def pin_only_card(self, card_id="pinonly@test"):
+        card = new_card(card_id, "example/PinOnly", "PASS")
+        card["model"]["repo"] = None
+        card["model"]["hfPin"] = self.PIN
+        return card
+
+    def test_t1_revision_selects_a_pin_only_card(self):
+        self.assertEqual(len(self.REVISION), 40)
+        store = self.write_store(
+            [new_card("other@test", "example/Other", "PASS"), self.pin_only_card()]
+        )
+        code, stdout, stderr = self.run_list(
+            "--quality-cards", str(store), "--revision", self.REVISION
+        )
+        self.assertEqual(code, 0, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertEqual([row.split(" ")[0] for row in rows], ["pinonly@test"])
+
+    def test_t1_revision_and_model_select_the_union_in_store_order_without_duplicates(self):
+        both = new_card("both@test", "example/Both", "PASS")
+        both["model"]["hfPin"] = self.PIN
+        store = self.write_store(
+            [self.pin_only_card(), new_card("other@test", "example/Other", "PASS"), both]
+        )
+        code, stdout, stderr = self.run_list(
+            "--quality-cards", str(store), "--revision", self.REVISION,
+            "--model", "example/Both",
+        )
+        self.assertEqual(code, 0, stderr)
+        _, rows = self.split_output(stdout)
+        self.assertEqual([row.split(" ")[0] for row in rows], ["pinonly@test", "both@test"])
+
+    def test_revision_alone_matching_nothing_points_at_model_not_unmeasured(self):
+        # serve also matches by repo, so a pin miss alone cannot prove UNMEASURED.
+        store = self.write_store([new_card("other@test", "example/Other", "PASS")])
+        code, _, stderr = self.run_list(
+            "--quality-cards", str(store), "--revision", "f" * 40
+        )
+        self.assertEqual(code, 1)
+        self.assertNotIn("UNMEASURED", stderr)
+        self.assertIn("--model", stderr)
+        # Both axes given and both miss: now UNMEASURED is provable.
+        code, _, stderr = self.run_list(
+            "--quality-cards", str(store), "--revision", "f" * 40,
+            "--model", "nobody/x",
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("serve would admit it UNMEASURED", stderr)
+
+    def test_t1_model_matching_nothing_by_repo_points_at_revision_not_unmeasured(self):
+        store = self.write_store(
+            [new_card("other@test", "example/Other", "PASS"), self.pin_only_card()]
+        )
+        code, stdout, stderr = self.run_list(
+            "--quality-cards", str(store), "--model", "some/Repo"
+        )
+        self.assertEqual(code, 1)
+        self.assertNotIn("UNMEASURED", stderr)
+        self.assertIn("--revision", stderr)
+        self.assertIn("some/Repo", stderr)
+        self.assertIn("1 card(s)", stderr)
+        self.assertEqual(self.split_output(stdout)[1], [])
+
+    def test_t1_revision_matching_nothing_keeps_the_unmeasured_message(self):
+        store = self.write_store([self.pin_only_card()])
+        code, _, stderr = self.run_list(
+            "--quality-cards", str(store), "--revision", "f" * 40
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("serve would admit it UNMEASURED", stderr)
+        self.assertIn("f" * 40, stderr)
+
+    def test_t2_bundled_store_model_with_a_card_still_exits_0_with_one_row(self):
+        code, stdout, stderr = self.run_list("--model", QWEN3_8B_8BIT_REPO)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(self.split_output(stdout)[1]), 1)
+
+    def test_t2_bundled_store_unknown_model_points_at_revision(self):
+        code, stdout, stderr = self.run_list("--model", "nobody/x")
+        self.assertEqual(code, 1)
+        self.assertIn("--revision", stderr)
+        self.assertNotIn("UNMEASURED", stderr)
+        self.assertIn("no quality card names nobody/x", stderr)
+        self.assertEqual(self.split_output(stdout)[1], [])
+
+    def test_t2_bundled_flash_next_card_is_found_by_its_full_revision(self):
+        code, stdout, stderr = self.run_list(
+            "--revision", "ef5b919d31534faa1997666f1a22d362cd6383cd"
+        )
+        self.assertEqual(code, 0, stderr)
+        ids = [row.split(" ")[0] for row in self.split_output(stdout)[1]]
+        self.assertIn("qwen38-flash-next-mixed-4-8bit@m3ultra", ids)
+
+    def test_t3_store_without_pin_only_cards_keeps_the_unmeasured_message(self):
+        store = self.write_store([new_card("other@test", "example/Other", "PASS")])
+        code, _, stderr = self.run_list(
+            "--quality-cards", str(store), "--model", "nobody/x"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("serve would admit it UNMEASURED", stderr)
+        self.assertNotIn("--revision", stderr)
+
+    def test_t3_a_repo_less_card_with_no_pin_is_not_pin_only(self):
+        card = new_card("nopin@test", "example/NoPin", "PASS")
+        card["model"]["repo"] = None
+        del card["model"]["hfPin"]
+        store = self.write_store([card])
+        code, _, stderr = self.run_list(
+            "--quality-cards", str(store), "--model", "nobody/x"
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("serve would admit it UNMEASURED", stderr)
+
+    def test_t4_malformed_revision_is_a_usage_error_before_any_row(self):
+        for bad in ("nothex", "abcdef12", "g" * 40, "a" * 41):
+            with self.subTest(revision=bad):
+                code, stdout, stderr = self.run_list("--revision", bad)
+                self.assertEqual(code, 2)
+                self.assertEqual(stdout, "")
+                self.assertIn("fastmlx cards list:", stderr)
+
+    def test_t4_uppercase_hex_revision_is_accepted(self):
+        store = self.write_store([self.pin_only_card()])
+        code, stdout, stderr = self.run_list(
+            "--quality-cards", str(store), "--revision", self.REVISION.upper()
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(self.split_output(stdout)[1]), 1)
+
+    def test_t5_filter_does_not_hide_a_store_wide_undecodable_card(self):
+        good = new_card("good@test", "good/Repo", "PASS")
+        junk = new_card("junk@test", "example/Junk", "PASS")
+        junk["config"] = "junk"
+        store = self.write_store([good, junk])
+        code, stdout, stderr = self.run_list(
+            "--quality-cards", str(store), "--model", "good/Repo"
+        )
+        self.assertEqual(code, 3)
+        _, rows = self.split_output(stdout)
+        self.assertEqual([row.split(" ")[0] for row in rows], ["good@test"])
+        self.assertNotIn("UNDECODABLE", rows[0])
+        self.assertIn("junk@test", stderr)
+        self.assertIn("config is not an object", stderr)
+        code, _, stderr = self.run_list("--quality-cards", str(store))
+        self.assertEqual(code, 3)
+
+    def test_t5_undecodable_takes_precedence_over_no_match(self):
+        good = new_card("good@test", "good/Repo", "PASS")
+        junk = new_card("junk@test", "example/Junk", "PASS")
+        junk["config"] = "junk"
+        store = self.write_store([good, junk])
+        code, stdout, stderr = self.run_list(
+            "--quality-cards", str(store), "--model", "nobody/x"
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(self.split_output(stdout)[1], [])
+        self.assertIn("junk@test", stderr)
+
+    def test_t5_json_mode_stdout_stays_one_document_when_undecodable_hidden(self):
+        good = new_card("good@test", "good/Repo", "PASS")
+        junk = new_card("junk@test", "example/Junk", "PASS")
+        junk["config"] = "junk"
+        store = self.write_store([good, junk])
+        code, stdout, _ = self.run_list(
+            "--json", "--quality-cards", str(store), "--model", "good/Repo"
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual([c["id"] for c in json.loads(stdout)["cards"]], ["good@test"])
+
+    def test_t6_undecodable_message_scopes_the_refusal_to_the_built_in_engine(self):
+        junk = new_card("junk@test", "example/Junk", "PASS")
+        junk["config"] = "junk"
+        store = self.write_store([junk])
+        code, _, stderr = self.run_list("--quality-cards", str(store))
+        self.assertEqual(code, 3)
+        self.assertIn("built-in engine", stderr)
+        self.assertIn("without a custom engine profile", stderr)
+        self.assertNotIn("`fastmlx serve` would refuse every launch", stderr)
+
+
+class CardsListPinAndStoreTests(CardsListTestCase):
+    def test_a6_wrong_pin_exits_3_before_any_row(self):
+        code, stdout, stderr = self.run_list("--quality-cards-sha256", "0" * 64)
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        self.assertIn("does not match --quality-cards-sha256", stderr)
+
+    def test_a6_malformed_pin_exits_3(self):
+        code, stdout, stderr = self.run_list("--quality-cards-sha256", "xyz")
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        self.assertIn("must be exactly 64 hexadecimal characters", stderr)
+
+    def test_a6_matching_pin_lists_the_store(self):
+        digest = hashlib.sha256(GUIDES_PATH.read_bytes()).hexdigest()
+        code, stdout, stderr = self.run_list("--quality-cards-sha256", digest.upper())
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(len(self.split_output(stdout)[1]), 13)
+
+    def test_a6_pin_refusal_text_is_the_launcher_text_recommend_prints(self):
+        launch = CARDS.launch
+        raw, cards, _ = launch._inspect_quality_card_store(GUIDES_PATH)
+        with self.assertRaises(launch.LaunchRefusal) as expected:
+            launch.enforce_quality_cards_pin("0" * 64, GUIDES_PATH, raw, cards)
+        code, _, stderr = self.run_list("--quality-cards-sha256", "0" * 64)
+        self.assertEqual(code, expected.exception.exit_code)
+        self.assertEqual(stderr.strip(), "fastmlx cards list: " + expected.exception.message)
+
+    def test_a6_unreadable_or_non_manifest_explicit_store_exits_3(self):
+        missing = self.root / "missing.json"
+        code, stdout, stderr = self.run_list("--quality-cards", str(missing))
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        self.assertIn("missing or is not a quality-card manifest", stderr)
+        junk = self.root / "junk.json"
+        junk.write_text("[1, 2]", encoding="utf-8")
+        code, stdout, stderr = self.run_list("--quality-cards", str(junk))
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+
+    def test_a6_pulled_store_is_read_like_recommend_reads_it(self):
+        body = serialize(honest_document())
+        digest = hashlib.sha256(body).hexdigest()
+        pulled_dir = self.home / ".fastmlx" / "cards"
+        pulled_dir.mkdir(parents=True)
+        (pulled_dir / f"{digest}.json").write_bytes(body)
+        code, stdout, stderr = self.run_list()
+        self.assertEqual(code, 0, stderr)
+        header, rows = self.split_output(stdout)
+        self.assertIn("source=pulled", header)
+        self.assertIn(f"sha256={digest}", header)
+        self.assertEqual(len(rows), 14)
+        self.assertIn(NEW_CARD_ID + " ", rows[-1])
+
+    def test_a6_pulled_store_that_fails_its_integrity_check_refuses_with_exit_3(self):
+        body = serialize(honest_document())
+        pulled_dir = self.home / ".fastmlx" / "cards"
+        pulled_dir.mkdir(parents=True)
+        (pulled_dir / ("f" * 64 + ".json")).write_bytes(body)  # name != digest
+        code, stdout, stderr = self.run_list()
+        self.assertEqual(code, 3)
+        self.assertEqual(stdout, "")
+        self.assertIn("does not match its file name", stderr)
+
+    def test_a6_list_never_calls_a_network_function(self):
+        # run_list patches fetch/https_opener/urlopen to raise AssertionError;
+        # a clean exit 0 proves none was reached.
+        code, _, stderr = self.run_list()
+        self.assertEqual(code, 0, stderr)
+        text = Path(CARDS.__file__).read_text(encoding="utf-8")
+        body = text[text.index("def _run_list") :]
+        body = body[: body.index("\ndef ", 1)] if "\ndef " in body[1:] else body
+        for forbidden in ("fetch(", "https_opener", "urlopen"):
+            self.assertNotIn(forbidden, body)
+
+
+class CardsListDispatchAndJsonTests(CardsListTestCase):
+    def test_a7_cards_with_no_subcommand_still_exits_2(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                CARDS.main([])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("list", stderr.getvalue())
+        self.assertIn("pull", stderr.getvalue())
+
+    def test_a7_list_rejects_unknown_flags_with_usage_exit_2(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                CARDS.main(["list", "--nope"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_a8_json_parses_and_ids_match_the_text_rows(self):
+        _, text_out, _ = self.run_list(host_class="apple-m5")
+        _, rows = self.split_output(text_out)
+        code, stdout, stderr = self.run_list("--json", host_class="apple-m5")
+        self.assertEqual(code, 0, stderr)
+        document = json.loads(stdout)
+        self.assertEqual(
+            [card["id"] for card in document["cards"]], [row.split(" ")[0] for row in rows]
+        )
+        guide_sha = hashlib.sha256(GUIDES_PATH.read_bytes()).hexdigest()
+        self.assertEqual(document["cardStore"]["sha256"], guide_sha)
+        self.assertEqual(document["cardStore"]["cards"], 13)
+        by_id = {card["id"]: card for card in document["cards"]}
+        pass_card = by_id["qwen3-8b-8bit@m3ultra"]
+        self.assertEqual(pass_card["verdict"], "PASS")
+        self.assertEqual(pass_card["admission"], {"default": True, "optIn": False})
+        self.assertEqual(pass_card["repo"], QWEN3_8B_8BIT_REPO)
+        self.assertEqual(pass_card["hfPin"], "48a0b75b")
+        self.assertIsNone(pass_card["residency"])
+        self.assertEqual(pass_card["hardwareClass"], "apple-m3-ultra")
+        self.assertEqual(pass_card["host"], "other hardware")
+        no_go = by_id["qwen3-0p6b-4bit@m5"]
+        self.assertEqual(no_go["admission"], {"default": False, "optIn": True})
+        self.assertEqual(no_go["residency"], "resident")
+        self.assertEqual(no_go["host"], "this host")
+        self.assertIsNone(by_id["qwen38-flash-next-mixed-4-8bit@m3ultra"]["repo"])
+
+    def test_a8_json_model_filter_and_no_match(self):
+        code, stdout, _ = self.run_list("--json", "--model", QWEN3_8B_8BIT_REPO)
+        self.assertEqual(code, 0)
+        self.assertEqual([c["id"] for c in json.loads(stdout)["cards"]], ["qwen3-8b-8bit@m3ultra"])
+        code, stdout, stderr = self.run_list("--json", "--model", "nobody/x")
+        self.assertEqual(code, 1)
+        self.assertIn("no quality card names nobody/x by repo", stderr)
+        self.assertNotIn("UNMEASURED", stderr)
+        self.assertEqual(json.loads(stdout)["cards"], [])
+        # stdout stays one parseable JSON document even when nothing matches.
+        self.assertEqual(json.loads(stdout)["cards"], [])
+
+    def test_a8_json_undecodable_card_exits_3_after_printing(self):
+        junk = new_card("junk@test", "example/Junk", "PASS")
+        junk["config"] = "junk"
+        store = self.write_store([junk])
+        code, stdout, _ = self.run_list("--json", "--quality-cards", str(store))
+        self.assertEqual(code, 3)
+        row = json.loads(stdout)["cards"][0]
+        self.assertEqual(row["undecodable"], "config is not an object")
+
+    def test_a8_dispatcher_usage_mentions_cards_list(self):
+        spec = importlib.util.spec_from_file_location(
+            "fastmlx_dispatch", Path(__file__).resolve().parents[1] / "fastmlx.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertIn("cards list", module.USAGE)
+        self.assertIn("cards pull", module.USAGE)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1050,6 +1050,8 @@ class FastmlxRecommendTestCase(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(stdout, "")
         self.assertIn("no model candidates found", stderr)
+        # A8: a user with nothing downloaded is pointed at the offline card catalog.
+        self.assertIn("fastmlx cards list", stderr)
 
     def test_exit_code_1_when_nothing_recommended_but_something_fits(self):
         model_dir = self.make_model_dir("no-go-model", repo=NO_GO_REPO)

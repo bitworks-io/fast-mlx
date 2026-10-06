@@ -1201,7 +1201,8 @@ def _run_recommend(args) -> int:
     if not candidates and not pinned_refs:
         print(
             "fastmlx recommend: no model candidates found; pass --model-path, "
-            "--models-dir and/or --pinned",
+            "--models-dir and/or --pinned; to see which models carry a quality "
+            "card before downloading anything, run `fastmlx cards list`",
             file=sys.stderr,
         )
         return 2

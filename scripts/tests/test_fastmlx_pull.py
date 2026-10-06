@@ -992,6 +992,420 @@ class AdoptTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# `fastmlx pull --from-hub-cache [DIR]`: import a pinned pack from the local
+# Hugging Face hub cache (blobs/ + snapshots/<rev>/ relative symlinks) into a
+# fresh directory as REGULAR files, verified like --adopt. The cache is only
+# ever read. No network: fetch_api is stubbed, acquire/https_opener raise.
+# ---------------------------------------------------------------------
+class HubCacheImportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.hub = self.root / "hub"
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.dest = self.work / "model"
+        self.repo = SyntheticRepo()
+        self.repo_dir = self.hub / ("models--" + self.repo.repo_id.replace("/", "--"))
+        self.blobs = self.repo_dir / "blobs"
+        self.snapshot = self.repo_dir / "snapshots" / self.repo.revision
+        self.blob_for = {}
+        self.build_hub()
+
+        self.fetch_api = mock.patch.object(
+            DOWNLOADER, "fetch_api", return_value=(self.repo.document, b"")
+        ).start()
+        self.acquire = mock.patch.object(
+            DOWNLOADER,
+            "acquire",
+            side_effect=AssertionError("the downloader must never be invoked"),
+        ).start()
+        self.opener = mock.patch.object(
+            DOWNLOADER,
+            "https_opener",
+            side_effect=AssertionError("no network request may be made"),
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def build_hub(self):
+        self.blobs.mkdir(parents=True)
+        for name, data in self.repo.content_by_name.items():
+            blob = self.blobs / hashlib.sha256(b"blob:" + name.encode() + data).hexdigest()
+            blob.write_bytes(data)
+            self.blob_for[name] = blob
+            link = self.snapshot / name
+            link.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(os.path.relpath(blob, link.parent), link)
+
+    def run_import(self, hub=None, preflight=None):
+        return FASTMLX_PULL.import_from_hub_cache(
+            repo_id=self.repo.repo_id,
+            revision=self.repo.revision,
+            dest=self.dest,
+            hub_dir=hub or self.hub,
+            preflight=preflight,
+        )
+
+    def assert_nothing_written(self):
+        self.assertEqual(sorted(self.work.iterdir()), [])
+
+    def cache_fingerprint(self):
+        out = {}
+        for path in sorted(self.blobs.iterdir()):
+            info = path.lstat()
+            out[path.name] = (
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                info.st_nlink,
+                info.st_ino,
+                info.st_mtime_ns,
+            )
+        return out
+
+    # --- H1 -----------------------------------------------------------
+    def test_h1_imports_regular_files_and_writes_a_hub_cache_receipt(self):
+        before = self.cache_fingerprint()
+        receipt_path = self.run_import()
+        self.assertEqual(receipt_path, FASTMLX_PULL.receipt_path_for(self.dest))
+        for name, data in self.repo.content_by_name.items():
+            target = self.dest / name
+            self.assertFalse(target.is_symlink(), name)
+            self.assertTrue(target.is_file(), name)
+            self.assertEqual(target.read_bytes(), data)
+            self.assertEqual(target.lstat().st_nlink, 1, name)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(receipt["repo_id"], self.repo.repo_id)
+        self.assertEqual(receipt["revision"], self.repo.revision)
+        self.assertEqual(receipt["acquisition"], "hub-cache")
+        self.assertEqual(receipt["hub_cache_dir"], str(self.hub))
+        self.assertEqual(receipt["dest"], str(self.dest.absolute()))
+        self.assertEqual(receipt["total_files"], 3)
+        self.assertEqual(
+            receipt["total_bytes"],
+            sum(len(d) for d in self.repo.content_by_name.values()),
+        )
+        self.assertEqual(receipt["ignored_local_paths"], [])
+        for name, data in self.repo.content_by_name.items():
+            self.assertEqual(receipt["files"][name]["sha256"], hashlib.sha256(data).hexdigest())
+            self.assertEqual(receipt["files"][name]["size"], len(data))
+        # Only the dest and its receipt exist; no staging dir is left.
+        self.assertEqual(
+            sorted(path.name for path in self.work.iterdir()),
+            ["model", "model.pull-receipt.json"],
+        )
+        # The cache was only read.
+        self.assertEqual(self.cache_fingerprint(), before)
+        self.acquire.assert_not_called()
+        self.opener.assert_not_called()
+
+    def test_h1_nested_manifest_names_import_into_subdirectories(self):
+        nested = NestedRepo()
+        self.repo = nested
+        self.fetch_api.return_value = (nested.document, b"")
+        self.repo_dir = self.hub / ("models--" + nested.repo_id.replace("/", "--"))
+        self.blobs = self.repo_dir / "blobs"
+        self.snapshot = self.repo_dir / "snapshots" / nested.revision
+        # Fresh hub: drop the default fixture's tree, build the nested one.
+        import shutil as _shutil
+
+        _shutil.rmtree(self.hub)
+        self.build_hub()
+        self.run_import()
+        for name, data in nested.content_by_name.items():
+            self.assertEqual((self.dest / name).read_bytes(), data)
+            self.assertFalse((self.dest / name).is_symlink())
+
+    # --- H2 -----------------------------------------------------------
+    def test_h2_missing_file_is_named_and_nothing_is_left(self):
+        (self.snapshot / "README.md").unlink()
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("README.md", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_h2_dangling_link_is_named_and_nothing_is_left(self):
+        self.blob_for["config.json"].unlink()
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("config.json", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_h2_later_failure_removes_the_staging_dir_it_created(self):
+        # model.safetensors is verified after the earlier files were copied;
+        # corrupt it so the failure happens mid-way, not at the first file.
+        blob = self.blob_for["model.safetensors"]
+        blob.write_bytes(b"Z" * blob.stat().st_size)
+        with self.assertRaises(FASTMLX_PULL.PullError):
+            self.run_import()
+        self.assert_nothing_written()
+
+    # --- H3 -----------------------------------------------------------
+    def test_h3_same_size_different_bytes_is_a_content_mismatch(self):
+        for name in ("model.safetensors", "config.json"):
+            with self.subTest(name=name):
+                blob = self.blob_for[name]
+                original = blob.read_bytes()
+                blob.write_bytes(b"Z" * len(original))
+                try:
+                    with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                        self.run_import()
+                finally:
+                    blob.write_bytes(original)
+                self.assertIn("content mismatch", str(ctx.exception))
+                self.assertIn(name, str(ctx.exception))
+                self.assert_nothing_written()
+
+    def test_h3_wrong_size_is_refused(self):
+        blob = self.blob_for["config.json"]
+        blob.write_bytes(blob.read_bytes() + b"x")
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("size mismatch", str(ctx.exception))
+        self.assert_nothing_written()
+
+    # --- H4 -----------------------------------------------------------
+    def test_h4_link_escaping_blobs_is_refused(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        evil = outside / "config.json"
+        evil.write_bytes(self.repo.content_by_name["config.json"])  # correct bytes
+        link = self.snapshot / "config.json"
+        link.unlink()
+        os.symlink(evil, link)
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("config.json", str(ctx.exception))
+        self.assertIn("blobs", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_h4_link_into_another_repos_blobs_is_refused(self):
+        other_blobs = self.hub / "models--other--repo" / "blobs"
+        other_blobs.mkdir(parents=True)
+        other = other_blobs / "abc"
+        other.write_bytes(self.repo.content_by_name["config.json"])
+        link = self.snapshot / "config.json"
+        link.unlink()
+        os.symlink(other, link)
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("config.json", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_h4_a_plain_file_in_the_snapshot_is_refused(self):
+        link = self.snapshot / "config.json"
+        link.unlink()
+        link.write_bytes(self.repo.content_by_name["config.json"])
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("config.json", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_h4_path_traversal_manifest_name_is_refused(self):
+        entries = [
+            {
+                "name": "../escape.json",
+                "size": 1,
+                "blob_id": "0" * 40,
+                "lfs_sha256": None,
+            }
+        ]
+        with mock.patch.object(DOWNLOADER, "validated_entries", return_value=entries):
+            with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                self.run_import()
+        self.assertIn("escape.json", str(ctx.exception))
+        self.assert_nothing_written()
+
+    # --- H5 -----------------------------------------------------------
+    def test_h5_absent_snapshot_refuses_and_suggests_a_plain_pull(self):
+        import shutil as _shutil
+
+        _shutil.rmtree(self.repo_dir / "snapshots")
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        message = str(ctx.exception)
+        self.assertIn(self.repo.revision, message)
+        self.assertIn("fastmlx pull", message)
+        self.assertIn("--dest", message)
+        self.assert_nothing_written()
+
+    def test_h5_absent_hub_dir_refuses_and_suggests_a_plain_pull(self):
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import(hub=self.root / "no-such-hub")
+        self.assertIn("fastmlx pull", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_h5_adopt_with_from_hub_cache_is_a_usage_error(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--adopt",
+                    "--from-hub-cache",
+                    str(self.hub),
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("not allowed with", stderr.getvalue())
+        self.fetch_api.assert_not_called()
+        self.assert_nothing_written()
+
+    # --- fresh-destination refusals ------------------------------------
+    def test_existing_dest_is_refused_and_left_untouched(self):
+        self.dest.mkdir()
+        (self.dest / "keep.txt").write_text("mine")
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("already exists", str(ctx.exception))
+        self.assertEqual((self.dest / "keep.txt").read_text(), "mine")
+        self.assertEqual(
+            sorted(path.name for path in self.work.iterdir()), ["model"]
+        )
+
+    def test_existing_receipt_is_never_overwritten(self):
+        receipt = FASTMLX_PULL.receipt_path_for(self.dest)
+        receipt.write_text("old")
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("existing pull receipt", str(ctx.exception))
+        self.assertEqual(receipt.read_text(), "old")
+        self.assertFalse(self.dest.exists())
+
+    # --- H6 -----------------------------------------------------------
+    def test_h6_hub_dir_precedence(self):
+        resolve = FASTMLX_PULL.resolve_hub_cache_dir
+        env = {"HF_HUB_CACHE": "/a/hubcache", "HF_HOME": "/b/home", "HOME": "/c"}
+        self.assertEqual(resolve("/x/explicit", env), Path("/x/explicit"))
+        self.assertEqual(resolve("", env), Path("/a/hubcache"))
+        self.assertEqual(resolve(None, env), Path("/a/hubcache"))
+        del env["HF_HUB_CACHE"]
+        self.assertEqual(resolve("", env), Path("/b/home/hub"))
+        del env["HF_HOME"]
+        self.assertEqual(resolve("", env), Path("/c/.cache/huggingface/hub"))
+        # Empty env values do not count as set.
+        self.assertEqual(
+            resolve("", {"HF_HUB_CACHE": "", "HF_HOME": "", "HOME": "/c"}),
+            Path("/c/.cache/huggingface/hub"),
+        )
+
+    def test_h6_cli_flag_without_value_uses_the_environment(self):
+        with mock.patch.dict(os.environ, {"HF_HUB_CACHE": str(self.hub)}):
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                ]
+            )
+        receipt = json.loads(
+            FASTMLX_PULL.receipt_path_for(self.dest).read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["acquisition"], "hub-cache")
+        self.assertEqual(receipt["hub_cache_dir"], str(self.hub))
+        self.acquire.assert_not_called()
+
+    def test_h6_cli_explicit_dir_beats_the_environment(self):
+        with mock.patch.dict(os.environ, {"HF_HUB_CACHE": str(self.root / "nowhere")}):
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                    str(self.hub),
+                ]
+            )
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    def test_cli_refusal_exits_1_and_writes_nothing(self):
+        (self.snapshot / "README.md").unlink()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                    str(self.hub),
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("README.md", stderr.getvalue())
+        self.assert_nothing_written()
+
+    # --- preflight ------------------------------------------------------
+    def test_preflight_runs_before_any_copy_and_can_refuse(self):
+        seen = []
+
+        def refuse(entries):
+            seen.append([entry["name"] for entry in entries])
+            self.assertEqual(sorted(self.work.iterdir()), [])  # nothing copied yet
+            raise FASTMLX_PULL.PreflightRefused("does not fit")
+
+        with self.assertRaises(FASTMLX_PULL.PreflightRefused):
+            self.run_import(preflight=refuse)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(sorted(seen[0]), sorted(self.repo.content_by_name))
+        self.assert_nothing_written()
+
+    def test_cli_kv_reserve_gib_builds_and_runs_the_preflight(self):
+        calls = []
+
+        def fake_builder(repo_id, revision, kv, context, host_use):
+            calls.append((repo_id, revision, kv, context, host_use))
+
+            def preflight(entries):
+                raise FASTMLX_PULL.PreflightRefused("simulated does-not-fit")
+
+            return preflight
+
+        stderr = io.StringIO()
+        with mock.patch.object(
+            FASTMLX_PULL, "_build_fit_and_card_preflight", side_effect=fake_builder
+        ), contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as ctx:
+            FASTMLX_PULL.main(
+                [
+                    f"{self.repo.repo_id}@{self.repo.revision}",
+                    "--dest",
+                    str(self.dest),
+                    "--from-hub-cache",
+                    str(self.hub),
+                    "--kv-reserve-gib",
+                    "0.5",
+                ]
+            )
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("simulated does-not-fit", stderr.getvalue())
+        self.assertEqual(calls, [(self.repo.repo_id, self.repo.revision, 0.5, None, "shared")])
+        self.assert_nothing_written()
+
+    # --- H7 -----------------------------------------------------------
+    def test_h7_launcher_receipt_reader_resolves_repo_and_revision(self):
+        self.run_import()
+        launch_spec = importlib.util.spec_from_file_location(
+            "fastmlx_launch",
+            Path(__file__).resolve().parents[1] / "fastmlx_launch.py",
+        )
+        assert launch_spec is not None and launch_spec.loader is not None
+        launch_module = importlib.util.module_from_spec(launch_spec)
+        launch_spec.loader.exec_module(launch_module)
+        receipt = launch_module._load_pull_receipt(self.dest)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt["acquisition"], "hub-cache")
+        args = argparse.Namespace(model_revision=None, model_repo=None)
+        self.assertEqual(
+            launch_module._resolve_model_revision(args, self.dest), self.repo.revision
+        )
+        self.assertEqual(
+            launch_module._resolve_model_repo(args, self.dest), self.repo.repo_id
+        )
+
+
+# ---------------------------------------------------------------------
 # `fastmlx pull --kv-reserve-gib N`: judge fit and the quality card from the
 # manifest pull already fetched, BEFORE the free-space probe and any staging
 # directory. No real network: `downloader.fetch_api`, `acquire` and the
