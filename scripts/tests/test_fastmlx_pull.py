@@ -1044,6 +1044,67 @@ class AdoptTests(unittest.TestCase):
                 FASTMLX_PULL.receipt_path_for(dest).read_text(encoding="utf-8")
             )
             self.assertEqual(receipt["acquisition"], "adopted")
+            # A3: --adopt alone still succeeds, and records the single
+            # (verify-only) attempt it makes.
+            self.assertEqual(receipt["max_attempts"], 1)
+
+    # ------------------------------------------------------------------
+    # --adopt downloads nothing and copies nothing, so --max-attempts and
+    # --min-free-bytes can never mean anything there: both are usage errors
+    # (exit 2), refused on presence rather than value, before any manifest
+    # fetch, with adopt() never called and nothing written.
+    # ------------------------------------------------------------------
+    def assert_adopt_refuses_flag(self, flag, value, staged):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = SyntheticRepo()
+            dest = root / "model"
+            if staged:
+                self.stage_correctly(dest, repo)
+            stderr = io.StringIO()
+            with mock.patch.object(
+                DOWNLOADER, "https_opener", side_effect=AssertionError("fetched")
+            ) as https_opener, mock.patch.object(
+                FASTMLX_PULL, "adopt"
+            ) as adopt_mock, contextlib.redirect_stderr(
+                stderr
+            ), self.assertRaises(
+                SystemExit
+            ) as ctx:
+                FASTMLX_PULL.main(
+                    [
+                        f"{repo.repo_id}@{repo.revision}",
+                        "--dest",
+                        str(dest),
+                        "--adopt",
+                        flag,
+                        value,
+                    ]
+                )
+            self.assertEqual(ctx.exception.code, 2)
+            # The argparse usage line names every flag, so assert on the
+            # error line itself, not on the whole of stderr.
+            error_lines = [
+                line for line in stderr.getvalue().splitlines() if "error:" in line
+            ]
+            self.assertEqual(len(error_lines), 1, stderr.getvalue())
+            self.assertIn(f"{flag} has no effect with --adopt", error_lines[0])
+            adopt_mock.assert_not_called()
+            https_opener.assert_not_called()
+            self.assertFalse(FASTMLX_PULL.receipt_path_for(dest).exists())
+            self.assertEqual(dest.exists(), staged)
+
+    def test_adopt_with_max_attempts_is_a_usage_error(self):
+        self.assert_adopt_refuses_flag("--max-attempts", "5", staged=True)
+        self.assert_adopt_refuses_flag("--max-attempts", "5", staged=False)
+
+    def test_adopt_with_max_attempts_equal_to_the_recorded_value_is_still_refused(self):
+        # adopt() records max_attempts: 1; passing 1 explicitly is refused too.
+        self.assert_adopt_refuses_flag("--max-attempts", "1", staged=True)
+
+    def test_adopt_with_min_free_bytes_is_a_usage_error(self):
+        self.assert_adopt_refuses_flag("--min-free-bytes", "1", staged=True)
+        self.assert_adopt_refuses_flag("--min-free-bytes", "1", staged=False)
 
 
 # ---------------------------------------------------------------------

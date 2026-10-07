@@ -47,7 +47,10 @@ never descended into and are instead recorded in the receipt's
 ``ignored_local_paths``. The receipt this writes has the same shape and the
 same exclusive, never-overwritten write as a normal pull, plus
 ``"acquisition": "adopted"`` (a normal ``pull()`` receipt now carries
-``"acquisition": "downloaded"`` for the same reason).
+``"acquisition": "downloaded"`` for the same reason). ``--adopt`` downloads
+nothing and copies nothing, so ``--max-attempts`` (nothing to retry) and
+``--min-free-bytes`` (no pack bytes written, so no free-space floor) are usage
+errors with it (exit 2, before any manifest fetch), refused whatever their value.
 
 ``--from-hub-cache [DIR]`` (2026-10-06): import a pinned pack that is already
 in the local Hugging Face hub cache (``DIR`` defaults to ``$HF_HUB_CACHE``, else
@@ -908,7 +911,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "how many times to invoke the downloader before giving up, "
             f"resuming from the previous attempt's preserved staging tree "
             f"each retry (default {DEFAULT_MAX_ATTEMPTS}; not allowed with "
-            "--from-hub-cache, which makes a single copy)"
+            "--from-hub-cache, which makes a single copy, or with --adopt, "
+            "which downloads nothing)"
         ),
     )
     parser.add_argument(
@@ -918,7 +922,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "override the preflight free-space floor, in bytes (default: "
             "the revision's total planned size times the downloader's own "
-            "safety multiplier); applies to a download and to --from-hub-cache"
+            "safety multiplier); applies to a download and to "
+            "--from-hub-cache; not allowed with --adopt, which writes no "
+            "pack bytes"
         ),
     )
     mode = parser.add_mutually_exclusive_group()
@@ -1085,6 +1091,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         parser.error(
             "--max-attempts has no effect with --from-hub-cache: an import "
             "makes a single copy, with no download to retry"
+        )
+    if args.adopt and args.max_attempts is not None:
+        parser.error(
+            "--max-attempts has no effect with --adopt: --adopt verifies a "
+            "directory that already exists and downloads nothing, so there "
+            "is nothing to retry"
+        )
+    if args.adopt and args.min_free_bytes is not None:
+        parser.error(
+            "--min-free-bytes has no effect with --adopt: --adopt verifies a "
+            "directory in place and writes no pack bytes, so there is no "
+            "free-space floor to check"
         )
     try:
         repo_id, revision = validate_pinned_reference(args.pinned_reference)
