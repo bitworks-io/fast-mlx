@@ -395,34 +395,31 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-11",
-                "title": "Publish v0.1.11: recommend and pull judge fit and quality card before any download, cards list and a hub-cache import are added, and the engine refuses past a dropped card for its model",
-                "publishedAt": "2026-10-07T00:23:37Z",
+                "id": "tagged-distribution-v0-1-12",
+                "title": "Publish v0.1.12: fastmlx-serve accepts ignore_eos, a hub-cache import clones blobs copy-on-write, and the bundled card store adds a 14B card",
+                "publishedAt": "2026-10-07T11:23:19Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.11 arm64 macOS distribution: fastmlx "
-                    "recommend --pinned judges whether a pinned Hugging Face revision "
-                    "fits and which quality card applies from its revision manifest "
-                    "before any download; fastmlx pull --kv-reserve-gib refuses a "
-                    "pack that cannot fit before any byte is written; fastmlx cards "
-                    "list says offline which models carry a quality card and whether "
-                    "serve admits each by default; fastmlx pull --from-hub-cache "
-                    "imports a verified pinned pack from the local Hugging Face cache "
-                    "without downloading, checking free space first; and the "
-                    "fastmlx-serve default path refuses with exit 2 and "
-                    "reason=quality_card_undecodable when a dropped quality card "
-                    "names the served model, instead of admitting it unmeasured. The "
-                    "engine still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.12 arm64 macOS distribution: fastmlx-serve "
+                    "accepts ignore_eos on /v1/completions and /v1/chat/completions, so"
+                    " the model's own stop tokens no longer end generation and the stop"
+                    " token is returned with its logprobs, on the scalar and "
+                    "continuous-batching routes, while speculative MTP routes refuse it"
+                    " with ignore_eos_unsupported and a non-boolean value is a 400; "
+                    "fastmlx pull --from-hub-cache clones each cached blob copy-on-"
+                    "write on APFS and falls back to a copy, still verifying every "
+                    "imported file; and the bundled card store adds "
+                    "qwen3-14b-8bit@m3ultra, for 14 cards. The engine still links mlx-"
+                    "swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
                     "with its SHA-256 checksum only; the binaries are unsigned and not "
-                    "notarized, and no performance, quality, model-support, "
-                    "host-qualification, deployment, or production-promotion claim "
-                    "follows."
+                    "notarized, and no performance, quality, model-support, host-"
+                    "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
+                "publicCommit": "449ff559582f82265049ee01e8d7505b807bdb9e",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -439,6 +436,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "449ff559582f82265049ee01e8d7505b807bdb9e",
                 "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
                 "c5be493f132c618f7c083dfd73c5157d938791fb",
                 "0bac07f61dca748e92bbd4ece009b1f1de276a1c",
