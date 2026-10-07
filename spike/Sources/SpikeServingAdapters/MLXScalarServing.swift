@@ -147,6 +147,13 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
     public func decodeSingleToken(_ tokenID: Int) -> String {
         tokenizer.decode(tokenIds: [tokenID], skipSpecialTokens: false)
     }
+
+    /// The tokenizer's own vocabulary string for `tokenID` (e.g. `"</s>"`), used as the fallback
+    /// token text for a generated stop token under `ignore_eos` (see
+    /// `ScalarServingTextCodec.vocabularyText(forTokenID:)`).
+    public func vocabularyText(forTokenID tokenID: Int) -> String? {
+        tokenizer.convertIdToToken(tokenID)
+    }
 }
 
 /// Translates a Jinja chat-template's own `raise_exception(...)` refusal — surfaced to Swift as

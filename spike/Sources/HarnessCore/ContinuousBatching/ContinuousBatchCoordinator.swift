@@ -196,19 +196,25 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
     public let stopTokenIDs: Set<Int>
     public let architecture: BatchArchitectureClass
     public let requestsSpeculation: Bool
+    /// The `ignore_eos` request field: when `true`, `stopTokenIDs` no longer ends this request. A
+    /// stop token is published like any other token and only `maxOutputTokens` (or cancellation)
+    /// ends it. `stopTokenIDs` is still validated. Defaults to `false` (every prior submission).
+    public let ignoresStopTokens: Bool
 
     public init(
         promptTokens: [Int],
         maxOutputTokens: Int,
         stopTokenIDs: Set<Int>,
         architecture: BatchArchitectureClass,
-        requestsSpeculation: Bool = false
+        requestsSpeculation: Bool = false,
+        ignoresStopTokens: Bool = false
     ) {
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
         self.stopTokenIDs = stopTokenIDs
         self.architecture = architecture
         self.requestsSpeculation = requestsSpeculation
+        self.ignoresStopTokens = ignoresStopTokens
     }
 
     public init(
@@ -216,14 +222,16 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         maxOutputTokens: Int,
         eosToken: Int,
         architecture: BatchArchitectureClass,
-        requestsSpeculation: Bool = false
+        requestsSpeculation: Bool = false,
+        ignoresStopTokens: Bool = false
     ) {
         self.init(
             promptTokens: promptTokens,
             maxOutputTokens: maxOutputTokens,
             stopTokenIDs: [eosToken],
             architecture: architecture,
-            requestsSpeculation: requestsSpeculation)
+            requestsSpeculation: requestsSpeculation,
+            ignoresStopTokens: ignoresStopTokens)
     }
 }
 
@@ -852,7 +860,9 @@ public actor ContinuousBatchCoordinator {
         var finished = result.finished
 
         for token in result.tokens {
-            if state.submission.stopTokenIDs.contains(token) {
+            if !state.submission.ignoresStopTokens,
+                state.submission.stopTokenIDs.contains(token)
+            {
                 finished = true
                 break
             }

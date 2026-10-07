@@ -276,8 +276,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # other than exactly `--model`'s own redacted value) before either file could ever carry one; the
 # build-time loader re-runs the identical check against the committed files themselves.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1006,
-    "pathModeSha256": "7adaead48acc64decdf9efc475c66db739786de67bc79101f1c95d5f61445b84",
+    "pathCount": 1008,
+    "pathModeSha256": "3a2e6cd0342da71683af5931936fa58adaead08e3b04043f44072f1e1b4b5acf",
 }
 
 

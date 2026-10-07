@@ -285,6 +285,18 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
                 param: "logprobs",
                 code: "logprobs_unsupported")
         }
+        // `ignore_eos` asks the engine to generate THROUGH the model's stop ids. The draft-model
+        // speculative loop ends on those ids inside the vendored iterator and has no per-request
+        // seam to disable them, so this backend refuses the field with a typed reason instead of
+        // silently stopping at the stop token. Refused before the fallback decision (like the
+        // logprobs guard above) so the same request never behaves differently depending on whether
+        // it happened to be speculation-eligible.
+        guard !request.ignoreEOS else {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not support ignore_eos on the loaded backend",
+                param: "ignore_eos",
+                code: "ignore_eos_unsupported")
+        }
         guard request.model == launchedModel else {
             return try await scalarFallback.start(request)
         }

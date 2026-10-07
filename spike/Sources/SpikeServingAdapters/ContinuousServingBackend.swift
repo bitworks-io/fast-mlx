@@ -84,6 +84,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let promptTokens: [Int]
         let maximumCompletionTokens: Int
         let stopStrings: Set<String>
+        /// `ignore_eos`: the coordinator submission must not end this request on a model stop id.
+        let ignoreEOS: Bool
         let activeTools: [OpenAIToolSpec]
         let completionBudgetResolution: ServingCompletionBudgetResolution?
         let outputTokenTraceLimit: Int?
@@ -309,6 +311,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             promptTokens: promptTokens,
             maximumCompletionTokens: maximumCompletionTokens,
             stopStrings: modelStopStrings.union(request.stop),
+            ignoreEOS: request.ignoreEOS,
             activeTools: activeTools,
             completionBudgetResolution: completionBudgetResolution,
             outputTokenTraceLimit: outputTokenTraceLimit,
@@ -704,7 +707,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maxOutputTokens: prepared.maximumCompletionTokens,
             stopTokenIDs: stopTokenIDs,
             architecture: .denseAttention,
-            requestsSpeculation: route == .soloPLD)
+            requestsSpeculation: route == .soloPLD,
+            ignoresStopTokens: prepared.ignoreEOS)
     }
 
     private func submitToCoordinator(

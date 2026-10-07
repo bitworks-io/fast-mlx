@@ -192,6 +192,12 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     public var frequencyPenalty: Double?
     /// HF-style repetition penalty > 0 (nil = none; 1.0 = no penalty).
     public var repetitionPenalty: Double?
+    /// vLLM-compatible `ignore_eos` (default false). When true, the model-derived stop token ids do
+    /// not end generation: the stop token is generated, streamed and (when logprobs are requested)
+    /// reported like any other token. User `stop` strings and the completion budget still apply.
+    /// HONORED, never listed in `ignoredFields`; a serving backend that cannot honor it must refuse
+    /// the request with a typed reason rather than ignore it.
+    public var ignoreEOS: Bool
     /// Client opt-in (`stream_options.include_usage`) for a terminal usage-only SSE chunk on the
     /// streaming path (ignored when `stream` is false). Defaults to false so every non-streaming
     /// caller and every streaming caller that never sent `stream_options` is unaffected.
@@ -238,6 +244,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         presencePenalty: Double? = nil,
         frequencyPenalty: Double? = nil,
         repetitionPenalty: Double? = nil,
+        ignoreEOS: Bool = false,
         includeUsage: Bool = false,
         ignoredFields: [String] = [],
         logprobsRequest: ServingLogprobsRequest? = nil,
@@ -264,6 +271,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
         self.repetitionPenalty = repetitionPenalty
+        self.ignoreEOS = ignoreEOS
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
         self.logprobsRequest = logprobsRequest
@@ -305,6 +313,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             "presence_penalty",
             "frequency_penalty",
             "repetition_penalty",
+            "ignore_eos",
             "user",
             "metadata",
             "store",
@@ -377,6 +386,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let presencePenalty = try optionalPresencePenalty(root["presence_penalty"])
         let frequencyPenalty = try optionalFrequencyPenalty(root["frequency_penalty"])
         let repetitionPenalty = try optionalRepetitionPenalty(root["repetition_penalty"])
+        let ignoreEOS = try optionalStrictBool(root["ignore_eos"], param: "ignore_eos") ?? false
 
         // Metadata-only OpenAI SDK fields: validated for type, then accepted and ignored — they
         // describe OpenAI-side bookkeeping (caller identity, storage, service tier) that this
@@ -463,6 +473,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             presencePenalty: presencePenalty,
             frequencyPenalty: frequencyPenalty,
             repetitionPenalty: repetitionPenalty,
+            ignoreEOS: ignoreEOS,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
             logprobsRequest: logprobsRequest,
@@ -498,6 +509,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
     public var presencePenalty: Double?
     public var frequencyPenalty: Double?
     public var repetitionPenalty: Double?
+    /// Same contract as `OpenAIChatCompletionRequest.ignoreEOS` (default false).
+    public var ignoreEOS: Bool
     public var includeUsage: Bool
     /// Same contract as `OpenAIChatCompletionRequest.ignoredFields`: sorted, dedup-free field
     /// NAMES only (never values) for accepted-but-ignored top-level fields. `logprobs` is never
@@ -521,6 +534,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         presencePenalty: Double? = nil,
         frequencyPenalty: Double? = nil,
         repetitionPenalty: Double? = nil,
+        ignoreEOS: Bool = false,
         includeUsage: Bool = false,
         ignoredFields: [String] = [],
         logprobsRequest: ServingLogprobsRequest? = nil
@@ -538,6 +552,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         self.presencePenalty = presencePenalty
         self.frequencyPenalty = frequencyPenalty
         self.repetitionPenalty = repetitionPenalty
+        self.ignoreEOS = ignoreEOS
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
         self.logprobsRequest = logprobsRequest
@@ -570,6 +585,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             "presence_penalty",
             "frequency_penalty",
             "repetition_penalty",
+            "ignore_eos",
             "user",
             "metadata",
             "logit_bias",
@@ -612,6 +628,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         let presencePenalty = try optionalPresencePenalty(root["presence_penalty"])
         let frequencyPenalty = try optionalFrequencyPenalty(root["frequency_penalty"])
         let repetitionPenalty = try optionalRepetitionPenalty(root["repetition_penalty"])
+        let ignoreEOS = try optionalStrictBool(root["ignore_eos"], param: "ignore_eos") ?? false
 
         let user = try optionalUser(root["user"])
         let metadata = try optionalMetadata(root["metadata"])
@@ -648,6 +665,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             presencePenalty: presencePenalty,
             frequencyPenalty: frequencyPenalty,
             repetitionPenalty: repetitionPenalty,
+            ignoreEOS: ignoreEOS,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
             logprobsRequest: logprobsRequest)
@@ -678,6 +696,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             presencePenalty: presencePenalty,
             frequencyPenalty: frequencyPenalty,
             repetitionPenalty: repetitionPenalty,
+            ignoreEOS: ignoreEOS,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
             logprobsRequest: logprobsRequest,
@@ -1760,6 +1779,19 @@ private func optionalBool(_ raw: Any?, param: String) throws -> Bool? {
         throw OpenAIServingError.invalidRequest("\(param) must be a boolean", param: param)
     }
     return bool
+}
+
+/// Strict boolean: accepts ONLY a JSON `true`/`false`. Unlike `optionalBool` (whose `as? Bool` cast
+/// also accepts the JSON numbers 0 and 1 because `JSONSerialization` bridges them through
+/// `NSNumber`), this refuses every number, string, and `null`. Used for `ignore_eos`, a new field
+/// whose contract is "a non-boolean is a 400"; existing fields keep `optionalBool` unchanged so
+/// their accepted inputs do not move.
+private func optionalStrictBool(_ raw: Any?, param: String) throws -> Bool? {
+    guard let raw else { return nil }
+    guard let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
+        throw OpenAIServingError.invalidRequest("\(param) must be a boolean", param: param)
+    }
+    return number.boolValue
 }
 
 private func optionalDouble(_ raw: Any?, param: String) throws -> Double? {

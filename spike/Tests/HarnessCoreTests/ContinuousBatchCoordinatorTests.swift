@@ -243,14 +243,16 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         _ prompt: [Int], maxTokens: Int = 16, eos: Int = 2,
         stopTokenIDs: Set<Int>? = nil,
         architecture: BatchArchitectureClass = .denseAttention,
-        speculation: Bool = false
+        speculation: Bool = false,
+        ignoresStopTokens: Bool = false
     ) -> ContinuousBatchSubmission {
         ContinuousBatchSubmission(
             promptTokens: prompt,
             maxOutputTokens: maxTokens,
             stopTokenIDs: stopTokenIDs ?? [eos],
             architecture: architecture,
-            requestsSpeculation: speculation)
+            requestsSpeculation: speculation,
+            ignoresStopTokens: ignoresStopTokens)
     }
 
     private func drain(_ coordinator: ContinuousBatchCoordinator) async throws {
@@ -382,6 +384,82 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         XCTAssertEqual(secondTokens, [201])
         let remaining = await coordinator.snapshots()
         XCTAssertTrue(remaining.isEmpty)
+    }
+
+    // E3 (`ignore_eos` predeclaration): the batched stop check honors a per-submission
+    // `ignoresStopTokens`. The fake model emits the stop token (2) after N = 2 tokens and keeps
+    // going; with the flag on and `maxOutputTokens = N + 3` the stop token is published like any
+    // token and the request ends by budget. Both requests share one decode batch, so a request
+    // WITHOUT the flag proves the gate is per request, not global.
+    func testIgnoresStopTokensPublishesStopTokenAndRunsToBudgetPerRequest() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(active: 2, prefill: 2, chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [
+                    10: [101, 102, 2, 103, 104, 105],
+                    20: [201, 202, 2, 203, 204, 205],
+                ]),
+            automaticDrive: false)
+        let handles = try await coordinator.submitBatch([
+            submission([10], maxTokens: 5, ignoresStopTokens: true),
+            submission([20], maxTokens: 5),
+        ])
+
+        try await drain(coordinator)
+
+        let ignoring = try await collect(handles[0].tokens)
+        let defaulted = try await collect(handles[1].tokens)
+        XCTAssertEqual(ignoring, [101, 102, 2, 103, 104])
+        XCTAssertEqual(defaulted, [201, 202])
+        let remaining = await coordinator.snapshots()
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testIgnoresStopTokensDisablesEveryConfiguredStopTokenAndStillHonorsBudget() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 99, 2, 102, 103]]),
+            automaticDrive: false)
+        let handle = try await coordinator.submit(
+            submission([10], maxTokens: 4, stopTokenIDs: [2, 99], ignoresStopTokens: true))
+
+        try await drain(coordinator)
+
+        let tokens = try await collect(handle.tokens)
+        XCTAssertEqual(tokens, [101, 99, 2, 102])
+    }
+
+    // A multi-token (speculative solo) result containing the stop token is gated the same way.
+    func testIgnoresStopTokensAppliesToMultiTokenSoloResults() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(chunk: 8),
+            runtime: ScriptedBatchRuntime(
+                scriptsByPromptHead: [10: [101, 2, 102, 103, 104]],
+                speculativeSoloWidth: 3),
+            automaticDrive: false)
+        let handle = try await coordinator.submit(
+            submission([10], maxTokens: 4, speculation: true, ignoresStopTokens: true))
+
+        try await drain(coordinator)
+
+        let tokens = try await collect(handle.tokens)
+        XCTAssertEqual(tokens, [101, 2, 102, 103])
+    }
+
+    func testInvalidStopTokenSetStillFailsWhenStopTokensAreIgnored() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: configuration(chunk: 8),
+            runtime: ScriptedBatchRuntime(scriptsByPromptHead: [10: [101, 2]]),
+            automaticDrive: false)
+        do {
+            _ = try await coordinator.submit(
+                submission([10], stopTokenIDs: [], ignoresStopTokens: true))
+            XCTFail("Expected empty stop-token rejection")
+        } catch let error as ContinuousBatchCoordinatorError {
+            XCTAssertEqual(error, .invalidStopTokenIDs)
+        }
+        await coordinator.shutdown()
     }
 
     func testInvalidStopTokenSetFailsBeforeAdmissionAndDoesNotConsumeID() async throws {

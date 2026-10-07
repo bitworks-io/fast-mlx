@@ -312,6 +312,43 @@ final class ExactQwen35MTPServingBackendTests: XCTestCase {
         XCTAssertEqual(scalar.snapshot().startCount, 0)
     }
 
+    // E7 (`ignore_eos` predeclaration): the draft-model speculative loop stops on the model's own
+    // stop ids inside the vendored iterator, with no per-request seam to disable them. A request
+    // carrying `ignore_eos: true` must therefore be refused with a typed reason BEFORE the fallback
+    // decision (the scalar fallback would honor it, but the same request would then behave
+    // differently depending on speculative eligibility) and without starting either route. Absent or
+    // `false` stays eligible and unchanged.
+    func testIgnoreEOSRequestIsRefusedWithoutCallingRunnerOrScalarFallback() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+
+        var ignoreEOSRequest = request(maxTokens: 4)
+        ignoreEOSRequest.ignoreEOS = true
+
+        do {
+            _ = try await backend.start(ignoreEOSRequest)
+            XCTFail("MTP route must refuse ignore_eos instead of silently ignoring it")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, let param, let code) = error else {
+                XCTFail("expected invalidRequestWithCode, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "ignore_eos")
+            XCTAssertEqual(code, "ignore_eos_unsupported")
+        }
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        XCTAssertEqual(scalar.snapshot().startCount, 0)
+
+        // Control: `ignore_eos: false` (the default) is still served by the MTP route.
+        var explicitFalse = request(maxTokens: 4)
+        explicitFalse.ignoreEOS = false
+        let handle = try await backend.start(explicitFalse)
+        _ = try await collect(handle.mailbox)
+        XCTAssertEqual(handle.route, .exactQwen35MTP)
+        XCTAssertEqual(runner.snapshot().startCount, 1)
+    }
+
     func testConstructionRejectsScalarFallbackThatMayShareRawTarget() {
         XCTAssertThrowsError(
             try makeBackend(

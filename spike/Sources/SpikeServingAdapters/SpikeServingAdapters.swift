@@ -78,9 +78,18 @@ public protocol ScalarServingTextCodec: Sendable {
     /// check (`InferenceActor.supportsLogprobs()`) has already admitted a logprobs request, so the
     /// default below never fires in production — see the extension's doc comment.
     func decodeSingleToken(_ tokenID: Int) -> String
+    /// The literal vocabulary string for a token ID (e.g. `"</s>"`), or `nil` when the codec cannot
+    /// report one. Only consulted for the generated stop token of an `ignore_eos` request whose
+    /// `decodeSingleToken` came back empty, so a client can tell that logprob entry apart. The
+    /// default below returns `nil`, leaving every codec that predates it unchanged.
+    func vocabularyText(forTokenID tokenID: Int) -> String?
 }
 
 extension ScalarServingTextCodec {
+    public func vocabularyText(forTokenID tokenID: Int) -> String? {
+        nil
+    }
+
     /// Fail-closed default: a codec that has not implemented raw-text tokenization cannot honestly
     /// serve `/v1/completions` (it would otherwise silently run the prompt through a chat template,
     /// or crash). Only `MLXScalarTextCodec` overrides this today.
@@ -397,6 +406,18 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         }
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ScalarServingBackendError.invalidStopTokenIDs
+        }
+        // `ignore_eos` disables the model stop ids in `InferenceActor.generateBounded`, which is only
+        // proven for the plain scalar decoders. The in-checkpoint MTP speculative decoder verifies
+        // drafts against the model's own stop handling and has no evidence past a stop token, so a
+        // speculative route refuses the field with a typed reason rather than silently stopping at
+        // the stop token while the caller believes it was ignored. `isNonSpeculativeScalarRoute`
+        // defaults to `false` (fail closed), so a construction site must opt in explicitly.
+        if request.ignoreEOS, !configuration.isNonSpeculativeScalarRoute {
+            throw OpenAIServingError.invalidRequestWithCode(
+                "This server does not support ignore_eos on the loaded decoding route",
+                param: "ignore_eos",
+                code: "ignore_eos_unsupported")
         }
         // Real per-token logprobs require the bound decoder to conform to `SpikeCore.
         // LogprobDecoding` (today: a plain `MLXDecoder` — see `MLXScalarServing.swift`'s
@@ -820,6 +841,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 penalties: request.penalties,
                 logprobTopN: request.logprobsRequest?.topLogprobs,
                 responseFormatConstraint: request.responseFormatConstraint,
+                ignoreStopTokens: request.request.ignoreEOS,
                 onLogprob: onLogprobCallback
             ) { [weak self] token in
                 guard let self else {
@@ -932,8 +954,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 tokenText: codec.decodeSingleToken(candidate.tokenID),
                 logprob: Double(candidate.logprob))
         }
+        var generatedText = codec.decodeSingleToken(logprob.tokenID)
+        // Under `ignore_eos` a model stop token is a generated token. A stop token is usually a
+        // special token whose decode can come back empty, which would leave a client unable to tell
+        // that entry apart, so fall back to its literal vocabulary text (e.g. "</s>"). Scoped to
+        // the generated stop token only: every other entry keeps today's decode result.
+        if current.request.request.ignoreEOS, generatedText.isEmpty,
+            stopTokenIDs.contains(logprob.tokenID),
+            let vocabularyText = codec.vocabularyText(forTokenID: logprob.tokenID)
+        {
+            generatedText = vocabularyText
+        }
         let served = ServingTokenLogprob(
-            tokenText: codec.decodeSingleToken(logprob.tokenID),
+            tokenText: generatedText,
             logprob: Double(logprob.logprob),
             topCandidates: candidates)
         try await current.request.mailbox.send(.tokenLogprobs([served]))

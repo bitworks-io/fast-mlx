@@ -450,6 +450,13 @@ public actor InferenceActor {
 
     /// Generate one scalar request and stop before publishing any configured stop token.
     ///
+    /// `ignoreStopTokens` (default `false`, byte-for-byte the prior behavior) is the engine half of
+    /// the `ignore_eos` request field: when `true`, `stopTokenIDs` no longer ends generation. A
+    /// stop token is then an ordinary generated token (reported to `onLogprob`, published to
+    /// `consume`, counted) and only the consumer's `.stopGeneration` or `maxTokens` ends the run
+    /// (`.consumerStop` / `.length`). `stopTokenIDs` is still validated (non-empty, non-negative)
+    /// so the flag cannot be used to smuggle in a malformed set.
+    ///
     /// `logprobTopN` defaults to `nil`, the byte-for-byte-unchanged path: every existing call site
     /// predating this parameter keeps calling the ORIGINAL `decoder.prefill`/`.step` (never the
     /// `LogprobDecoding` variants) and pays zero added cost. When non-nil, a decoder that does not
@@ -467,6 +474,7 @@ public actor InferenceActor {
         penalties: DecoderPenalties = .none,
         logprobTopN: Int? = nil,
         responseFormatConstraint: (any LogitProcessor)? = nil,
+        ignoreStopTokens: Bool = false,
         onLogprob: (@Sendable (DecodedTokenLogprob) async throws -> Void)? = nil,
         consume: @escaping @Sendable (Int) async throws -> InferenceTokenDisposition
     ) async throws -> InferenceRunSummary {
@@ -590,7 +598,7 @@ public actor InferenceActor {
 
         while true {
             try Task.checkCancellation()
-            if stopTokenIDs.contains(token) {
+            if !ignoreStopTokens, stopTokenIDs.contains(token) {
                 return runSummary(
                     generatedTokenCount: generatedTokenCount, finishReason: .endOfSequence)
             }

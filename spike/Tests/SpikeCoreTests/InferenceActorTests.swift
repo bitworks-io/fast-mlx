@@ -278,6 +278,138 @@ final class InferenceActorTests: XCTestCase {
         XCTAssertEqual(summary.finishReason, .endOfSequence)
     }
 
+    // MARK: - `ignoreStopTokens` (the engine half of the `ignore_eos` request field; E2)
+
+    /// The fake model emits EOS (2) after N = 2 tokens and then keeps going. With the flag on and
+    /// `maxTokens = N + 3`, the stop token is an ordinary generated token (published to `consume`),
+    /// generation runs to the budget, and the run ends by `.length`.
+    func testIgnoreStopTokensEmitsStopTokenAndRunsToTheBudget() async throws {
+        let actor = InferenceActor(
+            decoder: ScriptedDecoder(script: [5, 6, 2, 7, 8, 9, 10], eos: 2))
+        let recorder = TokenRecorder()
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [1],
+            maxTokens: 5,
+            stopTokenIDs: [2],
+            ignoreStopTokens: true
+        ) { token in
+            await recorder.append(token)
+            return .continueGeneration
+        }
+
+        let values = await recorder.values
+        XCTAssertEqual(values, [5, 6, 2, 7, 8])
+        XCTAssertEqual(summary.generatedTokenCount, 5)
+        XCTAssertEqual(summary.finishReason, .length)
+    }
+
+    /// Control for the test above: the identical script and budget WITHOUT the flag still stops at
+    /// the EOS, intercepted (not published), exactly as before the flag existed.
+    func testDefaultStillStopsAtEOSOnTheSameScript() async throws {
+        let actor = InferenceActor(
+            decoder: ScriptedDecoder(script: [5, 6, 2, 7, 8, 9, 10], eos: 2))
+        let recorder = TokenRecorder()
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [1],
+            maxTokens: 5,
+            stopTokenIDs: [2]
+        ) { token in
+            await recorder.append(token)
+            return .continueGeneration
+        }
+
+        let values = await recorder.values
+        XCTAssertEqual(values, [5, 6])
+        XCTAssertEqual(summary.generatedTokenCount, 2)
+        XCTAssertEqual(summary.finishReason, .endOfSequence)
+    }
+
+    /// Every model-derived stop id is disabled, not just the first one in the set.
+    func testIgnoreStopTokensDisablesEveryConfiguredStopTokenID() async throws {
+        let actor = InferenceActor(
+            decoder: ScriptedDecoder(script: [4, 77, 99, 5, 6], eos: 99))
+        let recorder = TokenRecorder()
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [1],
+            maxTokens: 4,
+            stopTokenIDs: [77, 99],
+            ignoreStopTokens: true
+        ) { token in
+            await recorder.append(token)
+            return .continueGeneration
+        }
+
+        let values = await recorder.values
+        XCTAssertEqual(values, [4, 77, 99, 5])
+        XCTAssertEqual(summary.finishReason, .length)
+    }
+
+    /// The consumer (which owns the user `stop` strings) still ends generation with the flag on.
+    func testIgnoreStopTokensStillHonorsConsumerStop() async throws {
+        let actor = InferenceActor(
+            decoder: ScriptedDecoder(script: [5, 6, 2, 7, 8], eos: 2))
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [1],
+            maxTokens: 5,
+            stopTokenIDs: [2],
+            ignoreStopTokens: true
+        ) { token in
+            token == 2 ? .stopGeneration : .continueGeneration
+        }
+
+        XCTAssertEqual(summary.generatedTokenCount, 3)
+        XCTAssertEqual(summary.finishReason, .consumerStop)
+    }
+
+    /// The flag does not relax validation of the stop-token set itself.
+    func testIgnoreStopTokensStillValidatesTheStopTokenSet() async throws {
+        let actor = InferenceActor(decoder: ScriptedDecoder(script: [5, 2], eos: 2))
+        do {
+            _ = try await actor.generateBounded(
+                promptTokens: [1], maxTokens: 2, stopTokenIDs: [], ignoreStopTokens: true
+            ) { _ in .continueGeneration }
+            XCTFail("expected invalidEndOfSequence")
+        } catch let error as InferenceActorError {
+            XCTAssertEqual(error, .invalidEndOfSequence)
+        }
+    }
+
+    /// The stop token's logprob entry is reported (immediately before its `consume`) like any
+    /// other generated token's.
+    func testIgnoreStopTokensReportsTheStopTokensLogprobBeforeItsConsume() async throws {
+        let actor = InferenceActor(
+            decoder: ScriptedLogprobDecoder(script: [5, 6, 2, 7, 8], eos: 2))
+        let events = EventRecorder()
+
+        let summary = try await actor.generateBounded(
+            promptTokens: [1],
+            maxTokens: 4,
+            stopTokenIDs: [2],
+            logprobTopN: 2,
+            ignoreStopTokens: true,
+            onLogprob: { logprob in
+                await events.append("logprob:\(logprob.tokenID)")
+            }
+        ) { token in
+            await events.append("consume:\(token)")
+            return .continueGeneration
+        }
+
+        let values = await events.values
+        XCTAssertEqual(
+            values,
+            [
+                "logprob:5", "consume:5", "logprob:6", "consume:6",
+                "logprob:2", "consume:2", "logprob:7", "consume:7",
+            ])
+        XCTAssertEqual(summary.finishReason, .length)
+        XCTAssertEqual(summary.generatedTokenCount, 4)
+    }
+
     // MARK: - Logprobs plumbing (`logprobTopN`/`onLogprob`)
 
     /// A non-nil `logprobTopN` against a decoder that does not conform to `LogprobDecoding`

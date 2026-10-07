@@ -1296,6 +1296,45 @@ final class ContinuousServingBackendTests: XCTestCase {
         XCTAssertEqual(finalSnapshot.maxReservedKVBytes, 4_096)
     }
 
+    // E3 (`ignore_eos` predeclaration), through the serving adapter: the request flag reaches the
+    // coordinator submission, so the model stop token (99) is generated like any token and the
+    // request ends by budget with finish_reason `length`. The same script without the flag is
+    // `testContinuousRoutePublishesExactTextUsageAndResolvedStopSet` (stops at 99, finish `stop`).
+    func testContinuousRouteIgnoreEOSGeneratesPastTheStopTokenAndEndsByLength() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 2, 99, 3, 4, 5]],
+                recorder: recorder),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["hello": [10, 11]],
+            pieces: [1: "a", 2: "b", 99: "</s>", 3: "c", 4: "d", 5: "e"],
+            stopTokenIDs: [2_048, 99],
+            mailboxCapacity: .init(maxDeltas: 16, maxBytes: 4_096))
+
+        var ignoring = request(text: "hello", maxTokens: 5)
+        ignoring.ignoreEOS = true
+        let handle = try await backend.start(ignoring)
+        let events = try await collect(handle.mailbox)
+
+        XCTAssertEqual(
+            events,
+            [
+                .text("a"), .text("b"), .text("</s>"), .text("c"), .text("d"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .length,
+                        usage: OpenAIChatUsage(promptTokens: 2, completionTokens: 5))),
+            ])
+        await waitUntil {
+            await backend.snapshot().activeRequests == 0
+        }
+    }
+
     func testSnapshotReportsActiveRequestResourcesMLXMemoryAndPromptFreeJSON()
         async throws
     {
