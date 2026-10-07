@@ -395,26 +395,25 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-10",
-                "title": "Publish v0.1.10: serve and cards pull refuse a card store the built-in engine cannot decode, and an unrecognized verdict is announced",
-                "publishedAt": "2026-10-05T21:42:18Z",
+                "id": "tagged-distribution-v0-1-11",
+                "title": "Publish v0.1.11: recommend and pull judge fit and quality card before any download, cards list and a hub-cache import are added, and the engine refuses past a dropped card for its model",
+                "publishedAt": "2026-10-07T00:23:37Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.10 arm64 macOS distribution: with the "
-                    "built-in engine profile, fastmlx serve checks every card in "
-                    "the store against the shape the engine decodes before the fit "
-                    "check and before any admitted line, including under --dry-run, "
-                    "and exits 3 naming the first card and field that do not "
-                    "decode; fastmlx cards pull refuses such a store before writing "
-                    "it, and a pulled store refused at launch names the file to "
-                    "remove and the bundled store to pass with --quality-cards; "
-                    "fastmlx-serve prints one stderr line naming the card and the "
-                    "raw verdict when a card verdict is not one of the five "
-                    "recognized values, which still admits as unmeasured; and the "
-                    "release packaging script refuses a binary or metallib that "
-                    "embeds the builder's home directory or a non-temporary "
-                    "checkout path."
+                    "Publishes the v0.1.11 arm64 macOS distribution: fastmlx "
+                    "recommend --pinned judges whether a pinned Hugging Face revision "
+                    "fits and which quality card applies from its revision manifest "
+                    "before any download; fastmlx pull --kv-reserve-gib refuses a "
+                    "pack that cannot fit before any byte is written; fastmlx cards "
+                    "list says offline which models carry a quality card and whether "
+                    "serve admits each by default; fastmlx pull --from-hub-cache "
+                    "imports a verified pinned pack from the local Hugging Face cache "
+                    "without downloading, checking free space first; and the "
+                    "fastmlx-serve default path refuses with exit 2 and "
+                    "reason=quality_card_undecodable when a dropped quality card "
+                    "names the served model, instead of admitting it unmeasured. The "
+                    "engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -423,7 +422,7 @@ class PublicSiteTests(unittest.TestCase):
                     "host-qualification, deployment, or production-promotion claim "
                     "follows."
                 ),
-                "publicCommit": "c5be493f132c618f7c083dfd73c5157d938791fb",
+                "publicCommit": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -440,6 +439,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
                 "c5be493f132c618f7c083dfd73c5157d938791fb",
                 "0bac07f61dca748e92bbd4ece009b1f1de276a1c",
                 "c08aeb1bbe0f21261a245757007e9c7808aa3d7a",

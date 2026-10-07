@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-10-05",
+  "updatedAt": "2026-10-07",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-11",
+      "title": "Publish v0.1.11: recommend and pull judge fit and quality card before any download, cards list and a hub-cache import are added, and the engine refuses past a dropped card for its model",
+      "publishedAt": "2026-10-07T00:23:37Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.11 arm64 macOS distribution: fastmlx recommend --pinned judges whether a pinned Hugging Face revision fits and which quality card applies from its revision manifest before any download; fastmlx pull --kv-reserve-gib refuses a pack that cannot fit before any byte is written; fastmlx cards list says offline which models carry a quality card and whether serve admits each by default; fastmlx pull --from-hub-cache imports a verified pinned pack from the local Hugging Face cache without downloading, checking free space first; and the fastmlx-serve default path refuses with exit 2 and reason=quality_card_undecodable when a dropped quality card names the served model, instead of admitting it unmeasured. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-10",
       "title": "Publish v0.1.10: serve and cards pull refuse a card store the built-in engine cannot decode, and an unrecognized verdict is announced",
