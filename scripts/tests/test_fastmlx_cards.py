@@ -372,7 +372,9 @@ class RuleTests(CardsPullTestCase):
         self.assertEqual(stdout, "")
 
     def test_r2_generated_at_within_24_hours_ahead_is_allowed(self):
-        now = datetime(2026, 10, 3, 12, 0, 0)
+        # One hour past the bundled store's own stamp, so a document dated 23-24 h ahead
+        # of `now` is newer than the bundled store (R2's rollback check) whatever it holds.
+        now = datetime.strptime(bundled_document()["generatedAt"], TIME_FORMAT) + timedelta(hours=1)
         for delta in (timedelta(hours=23), timedelta(hours=24)):
             with self.subTest(delta=delta):
                 document = honest_document()
@@ -1182,13 +1184,13 @@ class CardsListBundledStoreTests(CardsListTestCase):
         header, rows = self.split_output(stdout)
         guides = json.loads(GUIDES_PATH.read_text(encoding="utf-8"))
         ids = [card["id"] for card in guides["cards"]]
-        self.assertEqual(len(rows), 13)
+        self.assertEqual(len(rows), 14)
         self.assertEqual([row.split(" ")[0] for row in rows], ids)  # store order
         self.assertTrue(header.startswith(HEADER_PREFIX + "source=default "), header)
         self.assertIn(
             "sha256=" + hashlib.sha256(GUIDES_PATH.read_bytes()).hexdigest(), header
         )
-        self.assertIn("cards=13", header)
+        self.assertIn("cards=14", header)
         self.assertEqual(stderr, "")
 
     def test_a1_every_row_names_verdict_admission_repo_revision_residency_hardware(self):
@@ -1222,7 +1224,7 @@ class CardsListBundledStoreTests(CardsListTestCase):
         self.assertIn("| PASS |", rows[0])
         self.assertIn("default-eligible", rows[0])
         self.assertIn("revision begins 48a0b75b", rows[0])
-        self.assertIn("cards=13", header)  # the header names the whole store
+        self.assertIn("cards=14", header)  # the header names the whole store
 
     def test_a3_model_with_no_card_exits_1_and_does_not_claim_unmeasured_on_bundled(self):
         # The bundled store holds pin-only (repo null) Flash Next cards, so a
@@ -1538,7 +1540,7 @@ class CardsListPinAndStoreTests(CardsListTestCase):
         digest = hashlib.sha256(GUIDES_PATH.read_bytes()).hexdigest()
         code, stdout, stderr = self.run_list("--quality-cards-sha256", digest.upper())
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(len(self.split_output(stdout)[1]), 13)
+        self.assertEqual(len(self.split_output(stdout)[1]), 14)
 
     def test_a6_pin_refusal_text_is_the_launcher_text_recommend_prints(self):
         launch = CARDS.launch
@@ -1572,7 +1574,7 @@ class CardsListPinAndStoreTests(CardsListTestCase):
         header, rows = self.split_output(stdout)
         self.assertIn("source=pulled", header)
         self.assertIn(f"sha256={digest}", header)
-        self.assertEqual(len(rows), 14)
+        self.assertEqual(len(rows), 15)
         self.assertIn(NEW_CARD_ID + " ", rows[-1])
 
     def test_a6_pulled_store_that_fails_its_integrity_check_refuses_with_exit_3(self):
@@ -1624,7 +1626,7 @@ class CardsListDispatchAndJsonTests(CardsListTestCase):
         )
         guide_sha = hashlib.sha256(GUIDES_PATH.read_bytes()).hexdigest()
         self.assertEqual(document["cardStore"]["sha256"], guide_sha)
-        self.assertEqual(document["cardStore"]["cards"], 13)
+        self.assertEqual(document["cardStore"]["cards"], 14)
         by_id = {card["id"]: card for card in document["cards"]}
         pass_card = by_id["qwen3-8b-8bit@m3ultra"]
         self.assertEqual(pass_card["verdict"], "PASS")

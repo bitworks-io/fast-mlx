@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-10-01T01:54:24Z",
+  "generatedAt": "2026-10-07T04:59:27Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -1007,6 +1007,93 @@
       },
       "boundary": {
         "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: on an Apple M5 the same build and pack, teacher-forced on this card's BF16 trajectory, picked a different top-1 token than this host at 0.63% of positions (Wilson [0.50%, 0.81%]) and agreed with BF16 99.14% (Wilson [98.94%, 99.30%]), which neither clears nor fails 99%; short-context only: near-lossless rests on 64 new tokens per prompt (160 prompts, 4096 served context), clearing 99% by 0.007 points; over 256 new tokens it is not established (top-1 98.98%, Wilson [98.87%, 99.07%]; tokens 129-256 98.80%)",
+        "measuredNewTokens": 64,
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-14b-8bit@m3ultra",
+      "model": {
+        "family": "Qwen3-14B",
+        "repo": "mlx-community/Qwen3-14B-8bit",
+        "hfPin": "da33cf28"
+      },
+      "config": {
+        "quant": {
+          "bits": 8,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "PASS",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "Near-lossless, default-eligible: top-1 99.44% (95% Wilson lower 99.27%), pooled teacher-forced ppl delta 0.1384% (bounds 0.0509% to 0.2260%) against the full-precision (BF16) build"
+      },
+      "legible": {
+        "tier": "Near-lossless",
+        "headline": "About 1 word in 180 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-14B-bf16@1ccfce3b, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 180,
+          "top1AgreementPct": 99.4442
+        },
+        "regressionFocus": "list generation drifts most over the first 64 tokens (0.78% next-word drift); code explanations drift least (0.39%). Drift grows with depth: tokens 1-32 agree 99.66%, tokens 33-64 agree 99.22%, tokens 65-128 agree 98.90% (Wilson upper 99.09%). Over 256 tokens step-by-step reasoning drifts most (1.38%)",
+        "example": {
+          "status": "measured",
+          "prompt": "combines them back into a sorted order. Let me think about this step by step",
+          "referenceOutput": ".",
+          "configOutput": ".\n\n",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026combines them back into a sorted order. Let me think about this step by step', the BF16 build picks '.' and this pack picks '.\n\n'."
+        },
+        "benefit": {
+          "fit": "15.7 GB on disk; MLX peak 15.8 GB after the startup prompt (measured on the M3 Ultra host). Does not fit a 24 GiB Mac: the engine's modeled peak at 4096 context is 19.74 GiB (14.61 GiB weights), above a 24 GiB M5's 17.76 GiB Metal working set; plan on a 32 GB or larger Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 99.4442,
+        "top1WilsonLowerPct": 99.2738,
+        "top1WilsonUpperPct": 99.5748,
+        "pplDeltaPct": 0.1384,
+        "pplDeltaUpperPct": 0.225985,
+        "pplDeltaLowerPct": 0.050892,
+        "pplDeltaIsLowerBound": false,
+        "roundingBound": 0.0008742560330940873,
+        "unobservedLogprobs": 0,
+        "positions": 9536,
+        "disagreements": 53,
+        "candidatePpl": 1.119180024086542,
+        "referencePpl": 1.117633215216303,
+        "referenceRepo": "mlx-community/Qwen3-14B-bf16",
+        "referenceHfPin": "1ccfce3b",
+        "referencePrecision": "bf16",
+        "maxNewTokensFilter": 64,
+        "unfilteredPositions": 37945
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-14B-bf16@1ccfce3b, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated thinking pack: all 64 measured tokens per prompt are reasoning-phase (in every measured prompt thinking continues well past token 64), not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. One 256-token run (2026-10-07) authored this card from its first 64 tokens per prompt, a scope fixed before the run; its overall 256-token figure neither clears nor fails 99%, so near-lossless is not established for longer answers. 11 of 160 prompts were skipped because the 8-bit pack stopped before the BF16 trajectory ended (9 summarization, 2 instruction-following), so summarization is under-sampled and those positions are unmeasured, which biases agreement upward. Each skipped prompt holds at least one divergence (the early stop itself); even if all 11 fell in tokens 1-64 the Wilson lower bound would be 99.20%, and the 64-token result would fall below 99% only if the 704 missing positions held 30 or more disagreements (4.3%, about 7.7 times the observed rate). Summarization's 64-token figure rests on 15 of its 24 prompts. Prompt clustering does not move the result (design effect 1.00; prompt-clustered lower bound 99.29%). Measured on the v0.1.11 engine; on that engine the Qwen3-8B 8-bit card's observations (82/10240) reproduced byte-identically. Rig sha256 prefix 01a5bbcf6c866c70, emitter emit_quality_card_teacher.py sha256 416bcec54b4ff1de\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-K8.json",
+        "measuredAt": "2026-10-07T04:56:32Z",
+        "engineBuild": {
+          "commit": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: for the Qwen3-8B 8-bit pack an Apple M5 picked a different top-1 token than the M3 Ultra at 0.63% of positions, larger than this card's 0.27-point margin; short-context only: near-lossless rests on the first 64 new tokens per prompt (149 of 160 prompts, 4096 served context), clearing 99% by 0.27 points; over 256 new tokens it is not established (top-1 99.07%, Wilson [98.97%, 99.17%]; tokens 65-128 98.90%, Wilson [98.67%, 99.09%]; tokens 129-256 98.98%, Wilson [98.82%, 99.11%])",
         "measuredNewTokens": 64,
         "unmeasured": [
           "decode throughput (speedX)",

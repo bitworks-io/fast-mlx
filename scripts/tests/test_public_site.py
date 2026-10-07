@@ -7313,6 +7313,9 @@ class PublicSiteTests(unittest.TestCase):
         # Added 2026-10-01 (cycle 182): the first PASS card, Qwen3-8B 8-bit vs its BF16 build,
         # measured on the M3 Ultra with the same v0.1.6 release binary.
         "qwen3-8b-8bit@m3ultra": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d",
+        # Added 2026-10-07 (cycle 211): the second PASS card, Qwen3-14B 8-bit vs its BF16 build,
+        # measured on the M3 Ultra with the v0.1.11 release binary (tag fa44eb08).
+        "qwen3-14b-8bit@m3ultra": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
     }
 
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:

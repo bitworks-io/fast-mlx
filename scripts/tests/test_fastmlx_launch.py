@@ -4562,8 +4562,8 @@ class RealShippedManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(
             len(cards),
-            13,
-            f"expected exactly 13 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
+            14,
+            f"expected exactly 14 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
         )
         no_go_ids = sorted(
             card.get("id") for card in cards if card.get("verdict") == "NO_GO"
@@ -4582,7 +4582,8 @@ class RealShippedManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(
             pass_ids,
-            ["qwen3-8b-8bit@m3ultra"],
+            # Added 2026-10-07 (cycle 211): the second PASS card, Qwen3-14B 8-bit vs BF16.
+            ["qwen3-14b-8bit@m3ultra", "qwen3-8b-8bit@m3ultra"],
             f"unexpected PASS cards in {REAL_QUALITY_GUIDES_PATH}: {pass_ids}",
         )
 
