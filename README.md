@@ -207,7 +207,7 @@ python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --de
 # content hash) and writes the same receipt a real pull would, instead of downloading anything.
 python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b --adopt
 
-# Already in your Hugging Face cache? Copy that exact revision out of it, verified, instead of downloading it again.
+# Already in your Hugging Face cache? That exact revision is cloned copy-on-write where the volume supports it (else copied), verified, instead of downloaded again.
 python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b --from-hub-cache
 
 # See which models carry a measured quality card before downloading anything (offline).

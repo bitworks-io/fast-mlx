@@ -56,15 +56,18 @@ without downloading it again. The same pinned manifest is fetched as for
 ``--adopt``. For every manifest entry,
 ``DIR/models--<owner>--<name>/snapshots/<revision>/<name>`` must resolve to a
 regular file whose real path lies inside that repo's own ``blobs/``; the
-resolved blob (never the link) is copied into a sibling staging directory,
-verified with the ``--adopt`` verifier (size + content identity), and the
-staging directory is renamed to ``--dest``. The receipt is the usual shape
+resolved blob (never the link) is cloned copy-on-write where the volume
+supports it (macOS ``clonefile(2)``), otherwise copied, into a sibling staging
+directory, verified with the ``--adopt`` verifier (size + content identity),
+and the staging directory is renamed to ``--dest``. The receipt is the usual shape
 plus ``"acquisition": "hub-cache"`` and ``"hub_cache_dir"``. Any refusal
 removes the staging directory it created and writes no dest and no receipt.
-The cache is read-only: no blob is modified, moved, or linked. Not combinable
+The cache is read-only: no blob is modified, moved, or linked (a clone is an
+independent file, never a hard link). Not combinable
 with ``--adopt``; ``--kv-reserve-gib`` runs before any copy, then the same
 free-space floor as a download (``--min-free-bytes`` or total size times the
-downloader's safety multiplier) is checked before the staging directory exists.
+downloader's safety multiplier) is checked before the staging directory exists
+and does not assume a clone will succeed.
 ``--max-attempts`` is a usage error here (an import makes one copy).
 
 ``--kv-reserve-gib N`` (with optional ``--context C`` and ``--host-use
@@ -92,6 +95,7 @@ and it does not add any new token/credential handling.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -664,6 +668,39 @@ def _resolve_cache_blob(snapshot: Path, blobs_real: str, name: str, repo_label: 
     return real
 
 
+# clonefile(2) flag: do not follow a symlink at the source.
+_CLONE_NOFOLLOW = 0x0001
+
+
+def _clone_file(src: str, dst: str) -> None:
+    """Clone ``src`` to the new file ``dst`` with libc ``clonefile(2)`` (macOS:
+    an independent copy-on-write file, never a link). ``dst`` must not exist.
+    Raises ``OSError`` carrying ``errno`` on failure."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    clonefile = libc.clonefile
+    clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    clonefile.restype = ctypes.c_int
+    if clonefile(os.fsencode(src), os.fsencode(dst), _CLONE_NOFOLLOW) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), dst)
+
+
+def _resolve_clone_primitive() -> Optional[Callable[[str, str], None]]:
+    """The copy-on-write clone primitive, or ``None`` when this platform or
+    libc has none (not macOS, or ``clonefile`` is missing)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        getattr(ctypes.CDLL(None), "clonefile")
+    except (ImportError, OSError, AttributeError):
+        return None
+    return _clone_file
+
+
 def import_from_hub_cache(
     repo_id: str,
     revision: str,
@@ -744,23 +781,56 @@ def import_from_hub_cache(
 
     try:
         files_receipt: dict[str, dict[str, object]] = {}
+        clone = _resolve_clone_primitive()
         for index, entry in enumerate(entries, start=1):
             name = entry["name"]
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            method = "copy"
+            if clone is not None:
+                try:
+                    clone(str(sources[name]), str(target))
+                    method = "clone"
+                except OSError as error:
+                    if error.errno == errno.EEXIST:
+                        raise PullError(
+                            f"--from-hub-cache refused: cloning {name} found "
+                            f"{target} already present in the private "
+                            f"staging directory: {error}"
+                        ) from error
+                    # Unsupported volume, cross-device, permission, ...: this
+                    # file falls back to a byte copy (drop a partial target).
+                    if os.path.lexists(target):
+                        os.unlink(target)
             print(
-                f"hub-cache copy file={index}/{len(entries)} name={name}",
+                f"hub-cache {method} file={index}/{len(entries)} name={name}",
                 file=sys.stderr,
                 flush=True,
             )
-            target = staging / name
-            target.parent.mkdir(parents=True, exist_ok=True)
+            if method == "copy":
+                try:
+                    with open(sources[name], "rb") as source, open(
+                        target, "xb"
+                    ) as sink:
+                        shutil.copyfileobj(source, sink, _RECEIPT_HASH_CHUNK_BYTES)
+                except OSError as error:
+                    raise PullError(
+                        f"--from-hub-cache refused: could not copy {name} from "
+                        f"the cache: {error}"
+                    ) from error
+            # Never a link: the import must be an independent file.
             try:
-                with open(sources[name], "rb") as source, open(target, "xb") as sink:
-                    shutil.copyfileobj(source, sink, _RECEIPT_HASH_CHUNK_BYTES)
+                imported, cached = os.stat(target), os.stat(sources[name])
             except OSError as error:
                 raise PullError(
-                    f"--from-hub-cache refused: could not copy {name} from "
-                    f"the cache: {error}"
+                    f"--from-hub-cache refused: {name} was not imported "
+                    f"from the cache: {error}"
                 ) from error
+            if (imported.st_dev, imported.st_ino) == (cached.st_dev, cached.st_ino):
+                raise PullError(
+                    f"--from-hub-cache refused: {name} is a link to the cache "
+                    "blob; refusing"
+                )
         for entry in entries:
             files_receipt[entry["name"]] = _verify_adopted_entry(
                 staging, entry, label="--from-hub-cache"
@@ -862,8 +932,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "import the pinned pack from the local Hugging Face hub cache "
             "into the fresh --dest instead of downloading it: each manifest "
             "file must resolve to a regular file inside that repo's cache "
-            "blobs/; blobs are copied (never linked), verified like --adopt, "
-            "and a receipt marked acquisition: hub-cache is written. DIR "
+            "blobs/; blobs are cloned copy-on-write where the volume "
+            "supports it, otherwise copied; never linked. Each is verified "
+            "like --adopt, and a receipt marked acquisition: hub-cache is written. DIR "
             "defaults to $HF_HUB_CACHE, else $HF_HOME/hub, else "
             "~/.cache/huggingface/hub. The cache is only read. Not "
             "combinable with --adopt; --kv-reserve-gib applies"

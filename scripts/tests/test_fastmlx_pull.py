@@ -1,10 +1,12 @@
 import argparse
 import contextlib
+import errno
 import hashlib
 import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -1367,6 +1369,243 @@ class HubCacheImportTests(unittest.TestCase):
         self.assertEqual(receipt["hub_cache_dir"], str(self.hub))
         self.acquire.assert_not_called()
 
+    # ---------------------------------------------------------------------
+    # `--from-hub-cache` clones each blob copy-on-write where the volume supports
+    # it (macOS clonefile(2)), else byte-copies it; never links. The clone
+    # primitive is resolved by `_resolve_clone_primitive()` (None when
+    # unavailable), so these tests inject fake primitives through that seam.
+    # ---------------------------------------------------------------------
+    def patch_primitive(self, primitive):
+        # create=True keeps a missing seam a behavioural RED, not an AttributeError.
+        patcher = mock.patch.object(
+            FASTMLX_PULL,
+            "_resolve_clone_primitive",
+            return_value=primitive,
+            create=True,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_capturing_stderr(self, dest=None):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            receipt_path = self.run_import(dest=dest)
+        return receipt_path, stderr.getvalue()
+
+    def progress_methods(self, stderr_text):
+        methods = {}
+        for line in stderr_text.splitlines():
+            match = re.match(r"hub-cache (clone|copy) file=\d+/\d+ name=(.+)$", line)
+            if match:
+                methods[match.group(2)] = match.group(1)
+        return methods
+
+    def full_fingerprint(self):
+        out = {}
+        for path in sorted(self.blobs.iterdir()):
+            info = path.lstat()
+            out[path.name] = (
+                path.read_bytes(),
+                info.st_size,
+                info.st_mtime_ns,
+                info.st_nlink,
+                info.st_ino,
+            )
+        return out
+
+    @staticmethod
+    def copying_primitive(calls=None):
+        def clone(src, dst):
+            if calls is not None:
+                calls.append((src, dst))
+            with open(src, "rb") as source, open(dst, "xb") as sink:
+                sink.write(source.read())
+
+        return clone
+
+    # --- C1 -----------------------------------------------------------
+    def test_c1_clone_path_imports_every_file_and_keeps_the_receipt_shape(self):
+        calls = []
+        self.patch_primitive(self.copying_primitive(calls))
+        receipt_path, stderr_text = self.run_capturing_stderr()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(
+            self.progress_methods(stderr_text),
+            {name: "clone" for name in self.repo.content_by_name},
+        )
+        self.assertNotIn("hub-cache copy", stderr_text)
+        for name, data in self.repo.content_by_name.items():
+            self.assertEqual((self.dest / name).read_bytes(), data)
+
+        # Same receipt as the byte-copy path, apart from the dest it names.
+        copy_dest = self.work / "model-copy"
+        self.patch_primitive(None)
+        copy_receipt_path, _ = self.run_capturing_stderr(dest=copy_dest)
+        cloned = json.loads(receipt_path.read_text(encoding="utf-8"))
+        copied = json.loads(copy_receipt_path.read_text(encoding="utf-8"))
+        self.assertEqual(cloned["acquisition"], "hub-cache")
+        self.assertEqual(sorted(cloned), sorted(copied))
+        self.assertEqual(cloned.pop("dest"), str(self.dest.absolute()))
+        self.assertEqual(copied.pop("dest"), str(copy_dest.absolute()))
+        self.assertEqual(cloned, copied)
+
+    # --- C2 -----------------------------------------------------------
+    def test_c2_clone_failure_falls_back_to_a_byte_copy_for_that_file(self):
+        for code in (errno.ENOTSUP, errno.EXDEV, errno.EPERM):
+            with self.subTest(errno=errno.errorcode[code]):
+                good = self.copying_primitive()
+
+                def clone(src, dst, good=good, code=code):
+                    if dst.endswith("config.json"):
+                        raise OSError(code, os.strerror(code), dst)
+                    good(src, dst)
+
+                self.patch_primitive(clone)
+                dest = self.work / f"model-{errno.errorcode[code]}"
+                receipt_path, stderr_text = self.run_capturing_stderr(dest=dest)
+                methods = self.progress_methods(stderr_text)
+                self.assertEqual(methods["config.json"], "copy")
+                self.assertEqual(methods["README.md"], "clone")
+                self.assertEqual(methods["model.safetensors"], "clone")
+                for name, data in self.repo.content_by_name.items():
+                    self.assertEqual((dest / name).read_bytes(), data)
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                self.assertEqual(receipt["acquisition"], "hub-cache")
+
+    def test_c2_a_partial_target_left_by_a_failed_clone_is_replaced(self):
+        def clone(src, dst):
+            with open(dst, "xb") as sink:
+                sink.write(b"partial")
+            raise OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP), dst)
+
+        self.patch_primitive(clone)
+        _, stderr_text = self.run_capturing_stderr()
+        self.assertEqual(
+            self.progress_methods(stderr_text),
+            {name: "copy" for name in self.repo.content_by_name},
+        )
+        for name, data in self.repo.content_by_name.items():
+            self.assertEqual((self.dest / name).read_bytes(), data)
+
+    # --- C3 -----------------------------------------------------------
+    def test_c3_no_clone_primitive_byte_copies_every_file(self):
+        self.patch_primitive(None)
+        _, stderr_text = self.run_capturing_stderr()
+        self.assertEqual(
+            self.progress_methods(stderr_text),
+            {name: "copy" for name in self.repo.content_by_name},
+        )
+        self.assertNotIn("hub-cache clone", stderr_text)
+        for name, data in self.repo.content_by_name.items():
+            self.assertEqual((self.dest / name).read_bytes(), data)
+
+    def test_c3_the_primitive_is_unavailable_off_macos(self):
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertIsNone(FASTMLX_PULL._resolve_clone_primitive())
+
+    # --- C4 -----------------------------------------------------------
+    def test_c4_eexist_refuses_and_leaves_nothing(self):
+        good = self.copying_primitive()
+
+        def clone(src, dst):
+            if dst.endswith("config.json"):
+                raise OSError(errno.EEXIST, os.strerror(errno.EEXIST), dst)
+            good(src, dst)
+
+        self.patch_primitive(clone)
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("config.json", str(ctx.exception))
+        self.assert_nothing_written()
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    # --- C5 -----------------------------------------------------------
+    def test_c5_imported_files_never_share_an_inode_with_the_cache(self):
+        for label, primitive in (
+            ("clone", self.copying_primitive()),
+            ("copy", None),
+        ):
+            with self.subTest(method=label):
+                self.patch_primitive(primitive)
+                dest = self.work / f"model-{label}"
+                self.run_capturing_stderr(dest=dest)
+                for name in self.repo.content_by_name:
+                    mine = os.stat(dest / name)
+                    theirs = os.stat(self.blob_for[name])
+                    self.assertNotEqual(mine.st_ino, theirs.st_ino, name)
+                    self.assertEqual(mine.st_nlink, 1, name)
+
+    def test_c5_a_hard_link_is_refused_and_leaves_nothing(self):
+        def link(src, dst):
+            os.link(src, dst)
+
+        self.patch_primitive(link)
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("link", str(ctx.exception))
+        self.assert_nothing_written()
+        for blob in self.blob_for.values():
+            self.assertEqual(blob.lstat().st_nlink, 1)
+
+    def test_c5_the_inode_guard_refuses_a_link_without_the_verifiers_help(self):
+        # The verifier also refuses multi-link files; stub it so the inode
+        # guard is the only defence in this case.
+        self.patch_primitive(lambda src, dst: os.link(src, dst))
+        with mock.patch.object(
+            FASTMLX_PULL, "_verify_adopted_entry", return_value={}
+        ):
+            with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+                self.run_import()
+        self.assertIn("link to the cache blob", str(ctx.exception))
+        self.assert_nothing_written()
+
+    # --- C6 -----------------------------------------------------------
+    def test_c6_the_cache_is_untouched_by_either_path(self):
+        for label, primitive in (
+            ("clone", self.copying_primitive()),
+            ("copy", None),
+        ):
+            with self.subTest(method=label):
+                self.patch_primitive(primitive)
+                before = self.full_fingerprint()
+                self.run_capturing_stderr(dest=self.work / f"model-{label}")
+                self.assertEqual(self.full_fingerprint(), before)
+
+    # --- C7 -----------------------------------------------------------
+    def test_c7_a_clone_that_writes_wrong_bytes_is_caught_by_the_verifier(self):
+        def clone(src, dst):
+            with open(dst, "xb") as sink:
+                sink.write(b"Z" * os.path.getsize(src))
+
+        self.patch_primitive(clone)
+        with self.assertRaises(FASTMLX_PULL.PullError) as ctx:
+            self.run_import()
+        self.assertIn("content mismatch", str(ctx.exception))
+        self.assert_nothing_written()
+
+    def test_c7_a_clone_that_reports_success_without_writing_is_refused(self):
+        self.patch_primitive(lambda src, dst: None)
+        with self.assertRaises(FASTMLX_PULL.PullError):
+            self.run_import()
+        self.assert_nothing_written()
+
+    # --- C8 -----------------------------------------------------------
+    @unittest.skipUnless(sys.platform == "darwin", "clonefile(2) is macOS-only")
+    def test_c8_a_real_clonefile_import_uses_the_clone_method(self):
+        before = self.full_fingerprint()
+        _, stderr_text = self.run_capturing_stderr()
+        self.assertEqual(
+            self.progress_methods(stderr_text),
+            {name: "clone" for name in self.repo.content_by_name},
+        )
+        for name, data in self.repo.content_by_name.items():
+            self.assertEqual((self.dest / name).read_bytes(), data)
+            self.assertNotEqual(
+                os.stat(self.dest / name).st_ino, os.stat(self.blob_for[name]).st_ino
+            )
+        self.assertEqual(self.full_fingerprint(), before)
+
     def test_h6_cli_explicit_dir_beats_the_environment(self):
         with mock.patch.dict(os.environ, {"HF_HUB_CACHE": str(self.root / "nowhere")}):
             FASTMLX_PULL.main(
@@ -1930,3 +2169,4 @@ class PullPreflightTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
