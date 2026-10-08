@@ -2309,6 +2309,178 @@ final class MLXScalarServingTests: XCTestCase {
             "stderr: \(result.stderr)")
         XCTAssertFalse(result.stderr.contains("quality_card_undecodable"), "stderr: \(result.stderr)")
     }
+
+    // MARK: - Black-box CLI coverage: the engine judges a pack by the identity its directory carries
+    // (docs/task-inbox/2026-10-08-PREDECLARATION-engine-judges-a-pack-by-its-own-identity.md).
+    // Synthetic family-neutral repo ids and a temporary `--quality-cards` store only. The wiring of
+    // every site (`--model-path`, pick-only winner, both serve resolution sites) runs the REAL binary.
+
+    private static let packRevision = String(repeating: "c3", count: 20)
+
+    private struct PackFixture {
+        let root: URL
+        let store: URL
+        let noGoPack: URL
+        let passPack: URL
+        let arbitraryDirectory: URL
+        let hugeNoGoPack: URL
+    }
+
+    private func packConfigJSON() -> String {
+        """
+        {"model_type": "qwen3", "num_hidden_layers": 32, "num_attention_heads": 32,
+         "num_key_value_heads": 8, "head_dim": 128, "max_position_embeddings": 40960,
+         "quantization": {"group_size": 64, "bits": 4}}
+        """
+    }
+
+    private func makePackDirectory(_ directory: URL, weightsBytes: UInt64) throws {
+        let fm = FileManager.default
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data(packConfigJSON().utf8).write(to: directory.appendingPathComponent("config.json"))
+        let shard = directory.appendingPathComponent("model.safetensors")
+        XCTAssertTrue(fm.createFile(atPath: shard.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: shard)
+        try handle.truncate(atOffset: weightsBytes)
+        try handle.close()
+    }
+
+    private func makePackFixture() throws -> PackFixture {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pack-identity-\(UUID().uuidString)", isDirectory: true)
+        func snapshot(_ repoDir: String) -> URL {
+            root.appendingPathComponent("hub/\(repoDir)/snapshots/\(Self.packRevision)", isDirectory: true)
+        }
+        let gib: UInt64 = 1 << 30
+        let noGoPack = snapshot("models--example-org--Pack-4bit")
+        let passPack = snapshot("models--example-org--Pack-8bit")
+        let hugeNoGoPack = snapshot("models--example-org--Pack-Huge")
+        let arbitrary = root.appendingPathComponent("some-weights", isDirectory: true)
+        try makePackDirectory(noGoPack, weightsBytes: 2 * gib)
+        try makePackDirectory(passPack, weightsBytes: 3 * gib)
+        try makePackDirectory(hugeNoGoPack, weightsBytes: 4096 * gib)
+        try makePackDirectory(arbitrary, weightsBytes: 2 * gib)
+        func card(_ id: String, _ repo: String, _ verdict: String) -> String {
+            """
+            {"id": "\(id)", "model": {"repo": "\(repo)"}, "verdict": "\(verdict)",
+             "admission": {"default": false, "optIn": true, "reason": "fixture"},
+             "legible": {"tier": "Noticeable", "headline": "pack headline"}}
+            """
+        }
+        let store = root.appendingPathComponent("cards.json")
+        let json = """
+            {"schema": "fast-mlx-quality-card-v1", "generatedAt": "2026-10-08T00:00:00Z",
+             "cards": [\(card("pack-4bit@host", "example-org/Pack-4bit", "NO_GO")),
+                       \(card("pack-8bit@host", "example-org/Pack-8bit", "PASS")),
+                       \(card("pack-huge@host", "example-org/Pack-Huge", "NO_GO"))]}
+            """
+        try Data(json.utf8).write(to: store)
+        return PackFixture(
+            root: root, store: store, noGoPack: noGoPack, passPack: passPack,
+            arbitraryDirectory: arbitrary, hugeNoGoPack: hugeNoGoPack)
+    }
+
+    private func runPack(_ fixture: PackFixture, _ arguments: [String]) throws -> ServeCLIResult {
+        try runServeBounded(
+            arguments: arguments + ["--model", "my-model", "--quality-cards", fixture.store.path],
+            currentDirectory: fixture.root, timeout: 60)
+    }
+
+    func testServeCLIModelPathNoGoDerivedIdentityRefusesUnderUncardedAlias() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runPack(
+            fixture, ["--model-path", fixture.noGoPack.path, "--host", "127.0.0.1", "--port", "0"])
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("re-run with --accept-quality pack-4bit@host to elect it."),
+            "stderr: \(result.stderr)")
+    }
+
+    func testServeCLIModelPathNoGoDerivedIdentityIsAdmittedByAcceptQuality() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runPack(
+            fixture,
+            [
+                "--model-path", fixture.noGoPack.path, "--host", "127.0.0.1", "--port", "0",
+                "--accept-quality", "pack-4bit@host",
+            ])
+        // The gate admitted (flag line printed); whatever happens next (the synthetic dir has no real
+        // weights) is not a quality refusal.
+        XCTAssertTrue(result.stdout.contains("Noticeable: pack headline"), "stdout: \(result.stdout)")
+        XCTAssertFalse(result.stderr.contains("re-run with --accept-quality"), "stderr: \(result.stderr)")
+    }
+
+    func testServeCLIUncardedAliasWithArbitraryDirectoryIsNotRefusedOnQuality() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runPack(
+            fixture,
+            ["--model-path", fixture.arbitraryDirectory.path, "--host", "127.0.0.1", "--port", "0"])
+        XCTAssertFalse(result.stderr.contains("--accept-quality"), "stderr: \(result.stderr)")
+        XCTAssertFalse(result.stderr.contains("quality_card_identity_conflict"), "stderr: \(result.stderr)")
+        XCTAssertFalse(result.stdout.contains("Noticeable"), "stdout: \(result.stdout)")
+    }
+
+    func testServeCLIPickOnlyRefusesANoGoWinnerAndAcceptQualityAdmitsIt() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let candidates = ["--quant-pick-only", "--quant-candidates", fixture.noGoPack.path]
+        let refused = try runPack(fixture, candidates)
+        XCTAssertEqual(refused.exitStatus, 2, "stderr: \(refused.stderr)")
+        XCTAssertTrue(
+            refused.stderr.contains("re-run with --accept-quality pack-4bit@host to elect it."),
+            "stderr: \(refused.stderr)")
+        XCTAssertFalse(refused.stdout.contains("quant_pick"), "stdout: \(refused.stdout)")
+        let admitted = try runPack(fixture, candidates + ["--accept-quality", "pack-4bit@host"])
+        XCTAssertEqual(admitted.exitStatus, 0, "stderr: \(admitted.stderr)")
+        XCTAssertTrue(admitted.stdout.contains("quant_pick"), "stdout: \(admitted.stdout)")
+    }
+
+    func testServeCLIPickOnlyAdmitsAPassWinnerBesideANoGoLoser() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        // The 4 TiB NO_GO candidate cannot fit, so it loses the pick; it must not block the PASS winner.
+        let result = try runPack(
+            fixture,
+            [
+                "--quant-pick-only", "--quant-candidates",
+                "\(fixture.hugeNoGoPack.path),\(fixture.passPack.path)",
+            ])
+        XCTAssertEqual(result.exitStatus, 0, "stderr: \(result.stderr)")
+        XCTAssertTrue(result.stdout.contains("quant_pick"), "stdout: \(result.stdout)")
+        XCTAssertFalse(result.stderr.contains("--accept-quality"), "stderr: \(result.stderr)")
+    }
+
+    func testServeCLIScalarServeRefusesANoGoCandidatesWinnerBeforeLoad() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runPack(
+            fixture,
+            [
+                "--quant-candidates", fixture.noGoPack.path, "--host", "127.0.0.1", "--port", "0",
+            ])
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("re-run with --accept-quality pack-4bit@host to elect it."),
+            "stderr: \(result.stderr)")
+    }
+
+    func testServeCLIContinuousServeRefusesANoGoCandidatesWinnerBeforeLoad() throws {
+        let fixture = try makePackFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let result = try runPack(
+            fixture,
+            [
+                "--continuous-batch-no-spec", "--max-reserved-kv-bytes", "1073741824",
+                "--quant-candidates", fixture.noGoPack.path, "--host", "127.0.0.1", "--port", "0",
+            ])
+        XCTAssertEqual(result.exitStatus, 2, "stderr: \(result.stderr)")
+        XCTAssertTrue(
+            result.stderr.contains("re-run with --accept-quality pack-4bit@host to elect it."),
+            "stderr: \(result.stderr)")
+    }
 }
 
 private enum FixtureTokenizerError: Error {

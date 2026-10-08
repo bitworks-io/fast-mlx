@@ -168,8 +168,14 @@ struct FastMLXServe {
         // defect where a server launched from an unexpected working directory silently ran with no
         // gate. An EXPLICIT `--quality-cards` path that does not exist or fails to decode refuses
         // startup instead of failing open (see `QualityCardsManifestResolver`'s doc comment).
+        //
+        // The pack is also judged by the identity its directory carries (pull receipt / HF hub-cache
+        // path, `PackIdentity`), not only by `--model`: `--model-path` is judged here. With
+        // `--quant-candidates` the WINNER is judged after the pick (`resolveServedDirectory` /
+        // `runQuantPickOnly`), so a NO_GO candidate that loses the pick does not block.
         let qualityCardsAnnounce = applyQualityAdmissionGate(
-            model: arguments.model, rawArguments: CommandLine.arguments)
+            model: arguments.model, rawArguments: CommandLine.arguments,
+            packDirectory: modelPathArgument(rawArguments: CommandLine.arguments))
 
         let hostReport = detectedServingHostReport(arguments)
         // Apply the operator's own `--memory-limit-bytes` as a further planning bound on top of the
@@ -566,6 +572,9 @@ private func runQuantPickOnly(
     guard let winnerLine = resolution.machineReadableWinnerLine() else {
         throw FitCheckRefusal(lines: resolution.summaryLines())
     }
+    if let winner = resolution.winnerDirectory {
+        applyQualityAdmissionGateToWinner(arguments, winner: winner)
+    }
     print(winnerLine)
 }
 
@@ -607,6 +616,27 @@ private func modelRevisionArgument(rawArguments: [String]) -> String? {
         return nil
     }
     return rawArguments[index + 1]
+}
+
+/// The `--model-path <dir>` value as a directory URL, scanned off the raw arguments with the same
+/// idiom as `modelRevisionArgument` (the parser already validated it is absolute). `nil` when absent.
+private func modelPathArgument(rawArguments: [String]) -> URL? {
+    guard let index = rawArguments.firstIndex(of: "--model-path"), index + 1 < rawArguments.count
+    else {
+        return nil
+    }
+    return URL(fileURLWithPath: rawArguments[index + 1], isDirectory: true)
+}
+
+/// Judge the quant auto-pick's WINNER by the identity its directory carries (`PackIdentity`), under
+/// the `--model` alias, after the pick. Re-runs the shared admission gate with the winner as the pack
+/// directory: a NO_GO winner refuses (exit 2) unless elected with `--accept-quality`; a NO_GO candidate
+/// that lost the pick never reaches here. A no-op when no quality-card manifest is active.
+private func applyQualityAdmissionGateToWinner(
+    _ arguments: FastMLXServeArguments, winner: URL
+) {
+    _ = applyQualityAdmissionGate(
+        model: arguments.model, rawArguments: CommandLine.arguments, packDirectory: winner)
 }
 
 /// The quality-guidance moat's pre-load admission hook. Resolves the effective manifest path once
@@ -656,7 +686,9 @@ private func modelRevisionArgument(rawArguments: [String]) -> String? {
 /// and pin lookups named different cards) is a hard refusal — exit 2, the same configuration-refusal
 /// exit code every other refusal in this gate already uses (the Python launcher exits 3 for this
 /// case; this binary stays self-consistent on 2 instead of introducing a second refusal exit code).
-private func applyQualityAdmissionGate(model: String, rawArguments: [String]) -> String {
+private func applyQualityAdmissionGate(
+    model: String, rawArguments: [String], packDirectory: URL? = nil
+) -> String {
     let explicitPath = qualityCardsExplicitPathArgument(rawArguments: rawArguments)
     // `--quality-cards-sha256` pins the exact bytes of an EXPLICIT store: it is meaningless (and a
     // silent no-op would hide a launcher/engine disagreement) without `--quality-cards`, so refuse.
@@ -755,8 +787,14 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
     // unrelated malformed card must not refuse every model (it keeps dropping, counting, announcing
     // `quality_cards_dropped=<n>`, and serving). The card id is deliberately not echoed.
     if !explicit {
-        let naming = QualityCardStore.droppedCardsNaming(
+        var naming = QualityCardStore.droppedCardsNaming(
             repo: model, revision: revision, in: droppedCards)
+        // A pack identity that cannot be derived (or conflicts) is judged by `PackAdmission.judge`
+        // below, which refuses a conflict; here it simply adds no extra naming.
+        if let packDirectory, let identity = try? PackIdentity.derive(directory: packDirectory) {
+            naming += QualityCardStore.droppedCardsNaming(
+                repo: identity.repo, revision: identity.revision, in: droppedCards)
+        }
         if let first = naming.first {
             FileHandle.standardError.write(
                 Data(
@@ -769,41 +807,20 @@ private func applyQualityAdmissionGate(model: String, rawArguments: [String]) ->
         }
     }
     let hostHardwareClass = QualityCardStore.hostHardwareClass()
-    let cardResolution = QualityCardStore.resolve(
-        repo: model, revision: revision, hostHardwareClass: hostHardwareClass, in: cards)
+    // One pure judgement (alias AND derived pack identity, notices, NO_GO/opt-in outcome). The
+    // hardware-mismatch and unrecognized-verdict notices are their own stderr lines, printed before
+    // the outcome (so also before a refusal); they never change the outcome or exit code.
+    let judgement = PackAdmission.judge(
+        alias: model, aliasRevision: revision, directory: packDirectory,
+        hostHardwareClass: hostHardwareClass, cards: cards, optIn: QualityOptIn.parse(rawArguments))
     let card: QualityCard?
-    switch cardResolution {
-    case .none:
-        card = nil
-    case .resolved(let resolvedCard):
-        card = resolvedCard
-    case .ambiguous(let repoCardIDs, let pinCardIDs):
-        let detail = QualityAdmission.ambiguousRefusalDetail(
-            model: model, revision: revision, repoCardIDs: repoCardIDs, pinCardIDs: pinCardIDs)
-        FileHandle.standardError.write(
-            Data("fastmlx-serve configuration=refused reason=quality_card_ambiguous detail=\(detail)\n".utf8))
-        exit(2)
-    }
-    // Notice only: its own stderr line, before the outcome switch (so also before a refusal). Never
-    // folded into the refusal text and never changes the outcome or exit code.
-    if let notice = QualityAdmission.hostMismatchNotice(
-        card: card, hostHardwareClass: hostHardwareClass)
-    {
-        FileHandle.standardError.write(Data("fastmlx-serve: \(notice)\n".utf8))
-    }
-    // Same shape: an unrecognized verdict string still admits as UNMEASURED, but is announced.
-    if let notice = QualityAdmission.unrecognizedVerdictNotice(card: card) {
-        FileHandle.standardError.write(Data("fastmlx-serve: \(notice)\n".utf8))
-    }
-    let optIn = QualityOptIn.parse(rawArguments)
-    let outcome = QualityAdmission.decide(
-        card: card, optIn: optIn.isElected(card: card))
-    switch outcome {
-    case .admit, .admitUnmeasured:
-        break
-    case .admitWithQualityFlag(let message):
-        print(message)
-    case .refuseQualityFlagged(let message):
+    switch judgement {
+    case .admit(let admittedCard, let notices, let flagMessage):
+        card = admittedCard
+        for notice in notices { FileHandle.standardError.write(Data((notice + "\n").utf8)) }
+        if let flagMessage { print(flagMessage) }
+    case .refuse(_, let notices, _, let message):
+        for notice in notices { FileHandle.standardError.write(Data((notice + "\n").utf8)) }
         FileHandle.standardError.write(Data((message + "\n").utf8))
         exit(2)
     }
@@ -1099,6 +1116,7 @@ private func resolveServedDirectory(
     guard resolution.shouldProceed, let winner = resolution.winnerDirectory else {
         throw FitCheckRefusal(lines: resolution.summaryLines())
     }
+    applyQualityAdmissionGateToWinner(arguments, winner: winner)
     return (winner, resolution.winnerParsed)
 }
 

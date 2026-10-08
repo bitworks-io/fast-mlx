@@ -223,10 +223,12 @@ resolve_quant_and_serve() {
   # announce on STDERR — the operator sees the announce live while we capture just the machine line).
   local cand_csv; cand_csv="$(IFS=,; echo "${cand_dirs[*]}")"
   echo "[fast-mlx] fit-checking ${#cand_dirs[@]} candidate(s) against this host…" >&2
-  local pick_out winner_dir
-  if ! pick_out="$("$BIN" ${ARGS[@]+"${ARGS[@]}"} --quant-candidates "$cand_csv" --quant-pick-only)"; then
-    echo "[fast-mlx] no quant fits this host — the fit-check refused every candidate." >&2
-    exit 1
+  local pick_out winner_dir pick_rc=0
+  pick_out="$("$BIN" ${ARGS[@]+"${ARGS[@]}"} --quant-candidates "$cand_csv" --quant-pick-only)" || pick_rc=$?
+  if [ "$pick_rc" -ne 0 ]; then
+    # The engine's fit-check refusal and its winner-card refusal both exit 2, so stay neutral about which.
+    echo "[fast-mlx] the engine refused the pick: no candidate fits this host, or the winner's quality card refused it (the engine's reason is above; --accept-quality <id> opts in to a carded pack)." >&2
+    exit "$pick_rc"
   fi
   if ! winner_dir="$(printf '%s\n' "$pick_out" | python3 "$prefetch" parse-winner)"; then
     echo "[fast-mlx] could not parse the winning quant from the fit-check output." >&2

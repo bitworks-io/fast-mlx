@@ -1372,11 +1372,13 @@ final class QualityAdmissionTests: XCTestCase {
                 return line
             }
             .joined(separator: "\n")
+        // The admission call site is `PackAdmission.judge` (alias AND derived pack identity), which
+        // resolves cards through `QualityCardStore.resolve(... hostHardwareClass:)` internally.
         let pattern =
-            "QualityCardStore\\.resolve\\(\\s*repo:\\s*model,\\s*revision:[^,]+,\\s*hostHardwareClass:"
+            "PackAdmission\\.judge\\(\\s*alias:\\s*model,\\s*aliasRevision:[^,]+,\\s*directory:\\s*packDirectory,\\s*hostHardwareClass:"
         XCTAssertNotNil(
             stripped.range(of: pattern, options: .regularExpression),
-            "the admission call site (QualityCardStore.resolve(repo: model, revision:, ...)) must pass hostHardwareClass: — comment-stripped source did not match"
+            "the admission call site (PackAdmission.judge(alias: model, aliasRevision:, directory: packDirectory, hostHardwareClass:, ...)) must pass the pack directory and hostHardwareClass: — comment-stripped source did not match"
         )
     }
 
@@ -2510,5 +2512,320 @@ final class QualityAdmissionTests: XCTestCase {
         XCTAssertEqual(result.droppedCards, [])
         XCTAssertEqual(
             QualityCardManifestLoadResult(cards: [], droppedCardCount: 0).droppedCards, [])
+    }
+}
+
+// MARK: - pack identity (docs/task-inbox/2026-10-08-PREDECLARATION-engine-judges-a-pack-by-its-own-identity.md)
+
+/// The engine judges a pack by the identity its directory carries (pull receipt or HF hub-cache layout),
+/// not only by `--model`. Synthetic family-neutral repo ids and temporary directories only.
+final class PackIdentityTests: XCTestCase {
+    private static let revA = String(repeating: "a1", count: 20)
+    private static let revB = String(repeating: "b2", count: 20)
+
+    private var scratch: URL!
+
+    override func setUpWithError() throws {
+        scratch = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pack-identity-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: scratch, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: scratch)
+    }
+
+    @discardableResult
+    private func makeSnapshot(repoDir: String, snapshot: String, under root: URL? = nil) throws -> URL {
+        let dir = (root ?? scratch).appendingPathComponent("hub", isDirectory: true)
+            .appendingPathComponent(repoDir, isDirectory: true)
+            .appendingPathComponent("snapshots", isDirectory: true)
+            .appendingPathComponent(snapshot, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func makePlainDirectory(_ name: String) throws -> URL {
+        let dir = scratch.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func writeReceipt(for directory: URL, json: String) throws {
+        let receipt = URL(fileURLWithPath: directory.path + ".pull-receipt.json")
+        try json.write(to: receipt, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: derive
+
+    func testHubPathGivesRepoAndRevision() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        let identity = try PackIdentity.derive(directory: snapshot)
+        XCTAssertEqual(identity, PackIdentity(repo: "example-org/Pack-4bit", revision: Self.revA))
+    }
+
+    func testSymlinkToSnapshotGivesTheSameIdentity() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        let link = scratch.appendingPathComponent("served-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: snapshot)
+        let identity = try PackIdentity.derive(directory: link)
+        XCTAssertEqual(identity, PackIdentity(repo: "example-org/Pack-4bit", revision: Self.revA))
+    }
+
+    func testNonHexSnapshotGivesRepoOnly() throws {
+        for name in ["main", String(Self.revA.dropLast()), Self.revA.uppercased(), String(repeating: "g", count: 40)] {
+            let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: name)
+            let identity = try PackIdentity.derive(directory: snapshot)
+            XCTAssertEqual(identity, PackIdentity(repo: "example-org/Pack-4bit", revision: nil), name)
+        }
+    }
+
+    func testArbitraryDirectoryGivesNil() throws {
+        let dir = try makePlainDirectory("some-weights")
+        XCTAssertNil(try PackIdentity.derive(directory: dir))
+        let notHub = try makeSnapshot(repoDir: "datasets--example-org--Pack", snapshot: Self.revA)
+        XCTAssertNil(try PackIdentity.derive(directory: notHub))
+    }
+
+    func testReceiptWithMatchingDestIsUsed() throws {
+        let dir = try makePlainDirectory("pulled")
+        try writeReceipt(
+            for: dir,
+            json: #"{"repo_id":"example-org/Pack-4bit","revision":"\#(Self.revA)","dest":"\#(dir.path)"}"#)
+        let identity = try PackIdentity.derive(directory: dir)
+        XCTAssertEqual(identity, PackIdentity(repo: "example-org/Pack-4bit", revision: Self.revA))
+    }
+
+    func testReceiptWithNonMatchingDestIsIgnored() throws {
+        let dir = try makePlainDirectory("pulled")
+        let other = try makePlainDirectory("elsewhere")
+        try writeReceipt(
+            for: dir,
+            json: #"{"repo_id":"example-org/Pack-4bit","revision":"\#(Self.revA)","dest":"\#(other.path)"}"#)
+        XCTAssertNil(try PackIdentity.derive(directory: dir))
+    }
+
+    func testReceiptWithoutDestIsTrustedAndMalformedReceiptIsIgnored() throws {
+        let dir = try makePlainDirectory("pulled")
+        try writeReceipt(for: dir, json: #"{"repo_id":"example-org/Pack-4bit"}"#)
+        XCTAssertEqual(
+            try PackIdentity.derive(directory: dir), PackIdentity(repo: "example-org/Pack-4bit", revision: nil))
+        try writeReceipt(for: dir, json: "not json")
+        XCTAssertNil(try PackIdentity.derive(directory: dir))
+        try writeReceipt(for: dir, json: "[1,2]")
+        XCTAssertNil(try PackIdentity.derive(directory: dir))
+    }
+
+    func testReceiptThatDisagreesWithTheHubPathIsAConflict() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        try writeReceipt(
+            for: snapshot,
+            json: #"{"repo_id":"other-org/Other-8bit","revision":"\#(Self.revB)","dest":"\#(snapshot.path)"}"#)
+        XCTAssertThrowsError(try PackIdentity.derive(directory: snapshot)) { error in
+            XCTAssertEqual(
+                error as? PackIdentityConflict,
+                PackIdentityConflict(receiptRepo: "other-org/Other-8bit", pathRepo: "example-org/Pack-4bit"))
+        }
+    }
+
+    func testReceiptThatAgreesWithTheHubPathIsNotAConflict() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        try writeReceipt(
+            for: snapshot,
+            json: #"{"repo_id":"example-org/Pack-4bit","revision":"\#(Self.revB)","dest":"\#(snapshot.path)"}"#)
+        XCTAssertEqual(
+            try PackIdentity.derive(directory: snapshot),
+            PackIdentity(repo: "example-org/Pack-4bit", revision: Self.revB))
+    }
+
+    // MARK: gate (judge)
+
+    private func card(
+        id: String, repo: String, verdict: QualityVerdict, hfPin: String? = nil
+    ) -> QualityCard {
+        QualityCard(
+            id: id, model: .init(repo: repo, hfPin: hfPin), verdict: verdict,
+            admission: .init(default: false, optIn: true, reason: "fixture"),
+            legible: .init(tier: "Noticeable", headline: "About 1 word in 12 differs."))
+    }
+
+    private var cards: [QualityCard] {
+        [
+            card(id: "pack-4bit@host", repo: "example-org/Pack-4bit", verdict: .noGo),
+            card(id: "pack-8bit@host", repo: "example-org/Pack-8bit", verdict: .pass),
+            card(id: "alias-bad@host", repo: "alias-org/Alias", verdict: .noGo),
+        ]
+    }
+
+    private func judge(
+        alias: String, directory: URL?, accept: [String] = [], revision: String? = nil
+    ) -> PackAdmission.Judgement {
+        PackAdmission.judge(
+            alias: alias, aliasRevision: revision, directory: directory, hostHardwareClass: nil,
+            cards: cards, optIn: QualityOptIn(acceptedIDs: Set(accept)))
+    }
+
+    private func assertRefusedNoGo(
+        _ judgement: PackAdmission.Judgement, id: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard case .refuse(let card, _, let reason, let message) = judgement else {
+            return XCTFail("expected refusal, got \(judgement)", file: file, line: line)
+        }
+        XCTAssertEqual(card?.id, id, file: file, line: line)
+        XCTAssertNil(reason, file: file, line: line)
+        XCTAssertTrue(message.hasSuffix("re-run with --accept-quality \(id) to elect it."), file: file, line: line)
+    }
+
+    func testUncardedAliasWithNoGoDerivedIdentityIsRefusedWithOptInHint() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        assertRefusedNoGo(judge(alias: "my-model", directory: snapshot), id: "pack-4bit@host")
+    }
+
+    func testAcceptQualityAdmitsTheDerivedNoGoPack() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        let judgement = judge(alias: "my-model", directory: snapshot, accept: ["pack-4bit@host"])
+        guard case .admit(let card, _, let flag) = judgement else {
+            return XCTFail("expected admit, got \(judgement)")
+        }
+        XCTAssertEqual(card?.id, "pack-4bit@host")
+        XCTAssertEqual(flag, "Noticeable: About 1 word in 12 differs.")
+    }
+
+    func testCardedAliasWithDifferentDerivedCardIsAnIdentityConflict() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-8bit", snapshot: Self.revA)
+        let judgement = judge(
+            alias: "alias-org/Alias", directory: snapshot, accept: ["alias-bad@host", "pack-8bit@host"])
+        guard case .refuse(_, _, let reason, let message) = judgement else {
+            return XCTFail("expected refusal, got \(judgement)")
+        }
+        XCTAssertEqual(reason, "quality_card_identity_conflict")
+        XCTAssertTrue(
+            message.hasPrefix("fastmlx-serve configuration=refused reason=quality_card_identity_conflict detail="),
+            message)
+    }
+
+    func testAliasEqualToDerivedRepoBehavesAsBefore() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        let viaBoth = judge(alias: "example-org/Pack-4bit", directory: snapshot)
+        let aliasOnly = judge(alias: "example-org/Pack-4bit", directory: nil)
+        XCTAssertEqual(viaBoth, aliasOnly)
+        assertRefusedNoGo(viaBoth, id: "pack-4bit@host")
+    }
+
+    func testUncardedAliasWithArbitraryDirectoryKeepsQualityCardNone() throws {
+        let dir = try makePlainDirectory("some-weights")
+        let judgement = judge(alias: "my-model", directory: dir)
+        guard case .admit(let card, let notices, let flag) = judgement else {
+            return XCTFail("expected admit, got \(judgement)")
+        }
+        XCTAssertNil(card)
+        XCTAssertEqual(notices, [])
+        XCTAssertNil(flag)
+        XCTAssertEqual(QualityAdmission.announceFragment(card: card), "quality_card=none")
+    }
+
+    func testCardedAliasWithArbitraryDirectoryStillUsesTheAliasCard() throws {
+        let dir = try makePlainDirectory("some-weights")
+        assertRefusedNoGo(judge(alias: "alias-org/Alias", directory: dir), id: "alias-bad@host")
+    }
+
+    func testModelNeverOverridesTheDerivedIdentity() throws {
+        // The alias names a PASS pack; the directory is the NO_GO pack. The alias must not win.
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        let judgement = judge(alias: "example-org/Pack-8bit", directory: snapshot)
+        guard case .refuse(_, _, let reason, _) = judgement else {
+            return XCTFail("expected refusal, got \(judgement)")
+        }
+        XCTAssertEqual(reason, "quality_card_identity_conflict")
+    }
+
+    func testDerivedRevisionMatchesAnHfPinOnlyCard() throws {
+        var withPin = cards
+        withPin.append(card(id: "pinned@host", repo: "unrelated/Repo", verdict: .noGo, hfPin: String(Self.revB.prefix(12))))
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Unknown", snapshot: Self.revB)
+        let judgement = PackAdmission.judge(
+            alias: "my-model", aliasRevision: nil, directory: snapshot, hostHardwareClass: nil,
+            cards: withPin, optIn: QualityOptIn())
+        assertRefusedNoGo(judgement, id: "pinned@host")
+    }
+
+    func testReceiptVersusPathDisagreementRefusesAsIdentityConflict() throws {
+        let snapshot = try makeSnapshot(repoDir: "models--example-org--Pack-8bit", snapshot: Self.revA)
+        try writeReceipt(
+            for: snapshot, json: #"{"repo_id":"example-org/Pack-4bit","dest":"\#(snapshot.path)"}"#)
+        let judgement = judge(alias: "my-model", directory: snapshot)
+        guard case .refuse(_, _, let reason, _) = judgement else {
+            return XCTFail("expected refusal, got \(judgement)")
+        }
+        XCTAssertEqual(reason, "quality_card_identity_conflict")
+    }
+
+    // MARK: candidates (the gate is applied to the WINNER)
+
+    func testNoGoWinnerUnderAnAliasIsRefusedAndNoGoLoserBesideAPassWinnerIsAdmitted() throws {
+        let loser = try makeSnapshot(repoDir: "models--example-org--Pack-4bit", snapshot: Self.revA)
+        let winner = try makeSnapshot(repoDir: "models--example-org--Pack-8bit", snapshot: Self.revA)
+        // The caller judges ONLY the pick's winner. A NO_GO winner refuses ...
+        assertRefusedNoGo(judge(alias: "my-model", directory: loser), id: "pack-4bit@host")
+        // ... a PASS winner admits with the PASS card even though a NO_GO loser sat in the set.
+        let judgement = judge(alias: "my-model", directory: winner)
+        guard case .admit(let card, _, let flag) = judgement else {
+            return XCTFail("expected admit, got \(judgement)")
+        }
+        XCTAssertEqual(card?.id, "pack-8bit@host")
+        XCTAssertEqual(QualityAdmission.announceFragment(card: card), "quality_card=pack-8bit@host verdict=PASS")
+        XCTAssertNil(flag)
+    }
+
+    // MARK: wiring pins (the executable target cannot be imported by a unit test)
+
+    private func strippedFastMLXServeSource() throws -> String {
+        var dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        while !FileManager.default.fileExists(
+            atPath: dir.appendingPathComponent("spike/Sources/fastmlx-serve/FastMLXServe.swift").path)
+        {
+            let parent = dir.deletingLastPathComponent()
+            try XCTUnwrap(parent.path == dir.path ? nil : parent, "FastMLXServe.swift not found")
+            dir = parent
+        }
+        let source = try String(
+            contentsOf: dir.appendingPathComponent("spike/Sources/fastmlx-serve/FastMLXServe.swift"),
+            encoding: .utf8)
+        return source.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                if let range = line.range(of: "//") { return line[line.startIndex..<range.lowerBound] }
+                return line
+            }
+            .joined(separator: "\n")
+    }
+
+    /// The text of one top-level `private func <name>(` up to the next top-level `private func`.
+    private func body(of name: String, in source: String) throws -> String {
+        let start = try XCTUnwrap(source.range(of: "private func \(name)("), "missing \(name)")
+        let rest = source[start.lowerBound...].dropFirst()
+        let end = rest.range(of: "\nprivate func ")?.lowerBound ?? rest.endIndex
+        return String(rest[..<end])
+    }
+
+    func testEverySiteJudgesThePackByItsDirectoryIdentity() throws {
+        let source = try strippedFastMLXServeSource()
+        // --model-path: the pre-load gate is handed the --model-path directory.
+        XCTAssertNotNil(
+            source.range(
+                of: "applyQualityAdmissionGate\\(\\s*model:\\s*arguments\\.model,\\s*rawArguments:\\s*CommandLine\\.arguments,\\s*packDirectory:\\s*modelPathArgument\\(",
+                options: .regularExpression))
+        // --quant-candidates: the WINNER is judged after the pick at BOTH the pick-only seam and the
+        // serve resolution seam (resolveServedDirectory covers both serve call sites).
+        for site in ["runQuantPickOnly", "resolveServedDirectory"] {
+            let text = try body(of: site, in: source)
+            XCTAssertTrue(
+                text.contains("applyQualityAdmissionGateToWinner(arguments, winner:"),
+                "\(site) must judge the pick's winner")
+        }
+        let serve = try body(of: "resolveServedDirectory", in: source)
+        let pick = try XCTUnwrap(serve.range(of: "resolution.winnerDirectory"))
+        let judge = try XCTUnwrap(serve.range(of: "applyQualityAdmissionGateToWinner"))
+        XCTAssertLessThan(pick.lowerBound, judge.lowerBound, "judge after the winner is chosen")
+        XCTAssertTrue(serve.contains("return (winner, resolution.winnerParsed)"))
     }
 }

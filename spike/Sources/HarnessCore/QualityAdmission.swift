@@ -250,7 +250,7 @@ public enum QualityAdmission {
     /// One-line safety for a field interpolated into the host-mismatch notice: every unicode scalar
     /// outside printable ASCII `0x20...0x7E` becomes `?`, then the result is truncated to its first 80
     /// scalars. The identical rule runs on the Python side (`scripts/fastmlx_launch.py`).
-    private static func noticeSafe(_ value: String) -> String {
+    fileprivate static func noticeSafe(_ value: String) -> String {
         var out = String.UnicodeScalarView()
         for scalar in value.unicodeScalars.prefix(80) {
             out.append((0x20...0x7E).contains(scalar.value) ? scalar : "?")
@@ -965,5 +965,202 @@ public struct QualityOptIn: Sendable, Equatable {
             }
         }
         return QualityOptIn(acceptedIDs: ids)
+    }
+}
+
+/// What a pack directory says about its own origin: the HF repo and the pinned commit revision it
+/// was pulled from. Cards carry only `model.repo` and `model.hfPin` (no weight digests), so a pack can
+/// only be recognized by name; this derives that name from the directory instead of trusting `--model`
+/// alone. See docs/task-inbox/2026-10-08-PREDECLARATION-engine-judges-a-pack-by-its-own-identity.md.
+/// A renamed directory spoofs it: this guards against accidents, not an adversary.
+public struct PackIdentity: Sendable, Equatable {
+    public let repo: String?
+    public let revision: String?
+
+    public init(repo: String?, revision: String?) {
+        self.repo = repo
+        self.revision = revision
+    }
+
+    /// Derivation order: (1) the sibling `<dir>.pull-receipt.json` (`repo_id`, `revision`, `dest`),
+    /// used only when `dest` resolves to `directory` -- the same validity rule as
+    /// `scripts/fastmlx_launch.py` `_load_pull_receipt` (missing, unreadable, non-JSON, non-object,
+    /// or a `dest` that resolves elsewhere reads as "no receipt"; a receipt with no `dest` is
+    /// trusted); (2) the HF hub-cache layout `.../models--<org>--<name>/snapshots/<rev>` after
+    /// resolving symlinks, the revision kept only when it is exactly 40 lowercase hex characters;
+    /// (3) `nil`. A receipt and a hub path that name DIFFERENT repos throw `PackIdentityConflict`.
+    public static func derive(directory: URL) throws -> PackIdentity? {
+        let receipt = receiptIdentity(of: directory)
+        let path = hubPathIdentity(of: directory)
+        if let receiptRepo = receipt?.repo, let pathRepo = path?.repo, receiptRepo != pathRepo {
+            throw PackIdentityConflict(receiptRepo: receiptRepo, pathRepo: pathRepo)
+        }
+        let repo = receipt?.repo ?? path?.repo
+        let revision = receipt?.revision ?? path?.revision
+        if repo == nil, revision == nil { return nil }
+        return PackIdentity(repo: repo, revision: revision)
+    }
+
+    private static func receiptIdentity(of directory: URL) -> PackIdentity? {
+        let absolute = URL(fileURLWithPath: directory.path)
+        let receiptURL = URL(fileURLWithPath: absolute.path + ".pull-receipt.json")
+        guard let data = try? Data(contentsOf: receiptURL),
+            let object = try? JSONSerialization.jsonObject(with: data),
+            let receipt = object as? [String: Any]
+        else { return nil }
+        if let recordedDest = receipt["dest"] as? String {
+            let recorded = URL(fileURLWithPath: recordedDest).resolvingSymlinksInPath().path
+            guard recorded == absolute.resolvingSymlinksInPath().path else { return nil }
+        }
+        let repo = (receipt["repo_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        let revision = (receipt["revision"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        if repo == nil, revision == nil { return nil }
+        return PackIdentity(repo: repo, revision: revision)
+    }
+
+    private static func hubPathIdentity(of directory: URL) -> PackIdentity? {
+        let components = directory.resolvingSymlinksInPath().pathComponents
+        guard components.count >= 3 else { return nil }
+        for index in stride(from: components.count - 3, through: 0, by: -1) {
+            let name = components[index]
+            guard name.hasPrefix("models--"), components[index + 1] == "snapshots" else { continue }
+            let encoded = String(name.dropFirst("models--".count))
+            let repo: String
+            if let separator = encoded.range(of: "--") {
+                let org = encoded[..<separator.lowerBound]
+                let model = encoded[separator.upperBound...]
+                guard !org.isEmpty, !model.isEmpty else { continue }
+                repo = "\(org)/\(model)"
+            } else {
+                guard !encoded.isEmpty else { continue }
+                repo = encoded
+            }
+            let snapshot = components[index + 2]
+            let isFullLowercaseHex =
+                snapshot.utf8.count == 40
+                && snapshot.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
+            return PackIdentity(repo: repo, revision: isFullLowercaseHex ? snapshot : nil)
+        }
+        return nil
+    }
+}
+
+/// A pull receipt and the HF hub-cache path of the same directory name different repos.
+public struct PackIdentityConflict: Error, Sendable, Equatable, CustomStringConvertible {
+    public let receiptRepo: String
+    public let pathRepo: String
+
+    public init(receiptRepo: String, pathRepo: String) {
+        self.receiptRepo = receiptRepo
+        self.pathRepo = pathRepo
+    }
+
+    public var description: String {
+        "pull receipt names repo \(QualityAdmission.noticeSafe(receiptRepo)) but the directory path names repo \(QualityAdmission.noticeSafe(pathRepo))"
+    }
+}
+
+/// The pre-load admission judgement for a served pack: the card is looked up under BOTH the
+/// `--model` alias (+ `--model-revision`) and the identity the pack directory carries
+/// (`PackIdentity`). `--model` never overrides the derived identity. Pure: the caller maps the
+/// result onto stdout/stderr/exit code.
+public enum PackAdmission {
+    public static let identityConflictReason = "quality_card_identity_conflict"
+    public static let ambiguousReason = "quality_card_ambiguous"
+
+    public enum Judgement: Sendable, Equatable {
+        /// Serve. `flagMessage` is the opt-in one-line quality flag (`nil` otherwise). `notices` are
+        /// complete stderr lines to print first.
+        case admit(card: QualityCard?, notices: [String], flagMessage: String?)
+        /// Refuse (exit 2). `message` is the complete stderr line; `reason` is the
+        /// `configuration=refused reason=` token, `nil` for a plain NO_GO refusal (whose message is the
+        /// card's own tier/headline + the `--accept-quality` hint, exactly as before).
+        case refuse(card: QualityCard?, notices: [String], reason: String?, message: String)
+    }
+
+    private static func refusal(reason: String, detail: String) -> Judgement {
+        .refuse(
+            card: nil, notices: [], reason: reason,
+            message: "fastmlx-serve configuration=refused reason=\(reason) detail=\(detail)")
+    }
+
+    /// `directory == nil` judges the alias alone (today's behavior).
+    public static func judge(
+        alias: String, aliasRevision: String?, directory: URL?, hostHardwareClass: String?,
+        cards: [QualityCard], optIn: QualityOptIn
+    ) -> Judgement {
+        let identity: PackIdentity?
+        if let directory {
+            do {
+                identity = try PackIdentity.derive(directory: directory)
+            } catch {
+                return refusal(reason: identityConflictReason, detail: "\(error)")
+            }
+        } else {
+            identity = nil
+        }
+
+        let aliasCard: QualityCard?
+        switch QualityCardStore.resolve(
+            repo: alias, revision: aliasRevision, hostHardwareClass: hostHardwareClass, in: cards)
+        {
+        case .none: aliasCard = nil
+        case .resolved(let resolved): aliasCard = resolved
+        case .ambiguous(let repoCardIDs, let pinCardIDs):
+            return refusal(
+                reason: ambiguousReason,
+                detail: QualityAdmission.ambiguousRefusalDetail(
+                    model: alias, revision: aliasRevision, repoCardIDs: repoCardIDs,
+                    pinCardIDs: pinCardIDs))
+        }
+
+        var packCard: QualityCard?
+        if let identity {
+            switch QualityCardStore.resolve(
+                repo: identity.repo, revision: identity.revision,
+                hostHardwareClass: hostHardwareClass, in: cards)
+            {
+            case .none: packCard = nil
+            case .resolved(let resolved): packCard = resolved
+            case .ambiguous(let repoCardIDs, let pinCardIDs):
+                let repo = QualityAdmission.noticeSafe(identity.repo ?? "nil")
+                return refusal(
+                    reason: ambiguousReason,
+                    detail:
+                        "pack directory repo \(repo) matches card(s) \(repoCardIDs) but its revision matches different card(s) \(pinCardIDs)"
+                )
+            }
+        }
+
+        let card: QualityCard?
+        switch (aliasCard, packCard) {
+        case (let fromAlias?, let fromPack?) where fromAlias != fromPack:
+            let repo = QualityAdmission.noticeSafe(identity?.repo ?? "nil")
+            return refusal(
+                reason: identityConflictReason,
+                detail:
+                    "--model \(QualityAdmission.noticeSafe(alias)) resolves card \(QualityAdmission.noticeSafe(fromAlias.id)) but the pack directory (repo \(repo)) resolves card \(QualityAdmission.noticeSafe(fromPack.id))"
+            )
+        case (let fromAlias?, _): card = fromAlias
+        case (nil, let pack): card = pack
+        }
+
+        var notices: [String] = []
+        if let notice = QualityAdmission.hostMismatchNotice(
+            card: card, hostHardwareClass: hostHardwareClass)
+        {
+            notices.append("fastmlx-serve: \(notice)")
+        }
+        if let notice = QualityAdmission.unrecognizedVerdictNotice(card: card) {
+            notices.append("fastmlx-serve: \(notice)")
+        }
+        switch QualityAdmission.decide(card: card, optIn: optIn.isElected(card: card)) {
+        case .admit, .admitUnmeasured:
+            return .admit(card: card, notices: notices, flagMessage: nil)
+        case .admitWithQualityFlag(let message):
+            return .admit(card: card, notices: notices, flagMessage: message)
+        case .refuseQualityFlagged(let message):
+            return .refuse(card: card, notices: notices, reason: nil, message: message)
+        }
     }
 }
