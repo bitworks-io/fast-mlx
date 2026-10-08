@@ -7314,6 +7314,9 @@ class PublicSiteTests(unittest.TestCase):
         # Added 2026-10-07 (cycle 211): the second PASS card, Qwen3-14B 8-bit vs its BF16 build,
         # measured on the M3 Ultra with the v0.1.11 release binary (tag fa44eb08).
         "qwen3-14b-8bit@m3ultra": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
+        # Added 2026-10-08 (cycle 216): the Mistral-Nemo-12B 4-bit vs BF16 card (NO_GO),
+        # measured on the M3 Ultra with engine build 449ff559.
+        "mistral-nemo-12b-4bit@m3ultra": "449ff559582f82265049ee01e8d7505b807bdb9e",
     }
 
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:

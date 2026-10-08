@@ -1,6 +1,6 @@
 {
   "schema": "fast-mlx-quality-card-v1",
-  "generatedAt": "2026-10-07T04:59:27Z",
+  "generatedAt": "2026-10-08T01:14:05Z",
   "cards": [
     {
       "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
@@ -1094,6 +1094,93 @@
       },
       "boundary": {
         "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: for the Qwen3-8B 8-bit pack an Apple M5 picked a different top-1 token than the M3 Ultra at 0.63% of positions, larger than this card's 0.27-point margin; short-context only: near-lossless rests on the first 64 new tokens per prompt (149 of 160 prompts, 4096 served context), clearing 99% by 0.27 points; over 256 new tokens it is not established (top-1 99.07%, Wilson [98.97%, 99.17%]; tokens 65-128 98.90%, Wilson [98.67%, 99.09%]; tokens 129-256 98.98%, Wilson [98.82%, 99.11%])",
+        "measuredNewTokens": 64,
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+      }
+    },
+    {
+      "id": "mistral-nemo-12b-4bit@m3ultra",
+      "model": {
+        "family": "Mistral-Nemo-12B",
+        "repo": "mlx-community/Mistral-Nemo-Instruct-2407-4bit",
+        "hfPin": "647ca075"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "top-1 91.92% (95% Wilson lower 91.35%), pooled teacher-forced ppl delta 5.9007% (bounds 5.7039% to unbounded) against the full-precision (BF16) build; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 12 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Mistral-Nemo-Instruct-2407-bf16@ff5dcad4, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 12,
+          "top1AgreementPct": 91.9156
+        },
+        "regressionFocus": "instruction-following drifts most over the first 64 tokens (11.31% next-word drift), with summarization close behind (11.26%); code explanations drift least (4.69%). Drift grows only slowly with depth and stays far from the 99% line: tokens 1-32 agree 92.18%, tokens 33-64 agree 91.62%, tokens 65-128 agree 91.57%, tokens 129-256 agree 91.21% (Wilson upper 91.65%). Over 256 tokens instruction-following still drifts most (11.85%) and code explanations least (5.01%); overall top-1 agreement is 91.50% (Wilson [91.20%, 91.80%])",
+        "example": {
+          "status": "measured",
+          "prompt": "A Bloom filter is a probabilistic data structure that",
+          "referenceOutput": " is",
+          "configOutput": " can",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026A Bloom filter is a probabilistic data structure that', the BF16 build picks ' is' and this pack picks ' can'."
+        },
+        "benefit": {
+          "fit": "6.9 GB on disk; MLX peak 6.99 GB after the startup prompt (measured on the M3 Ultra host). Fits a 24 GiB Mac: the engine's modeled peak at 4096 context is 11.54 GiB (6.42 GiB weights), below a 24 GiB M5's 17.76 GiB Metal working set",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 91.9156,
+        "top1WilsonLowerPct": 91.3495,
+        "top1WilsonUpperPct": 92.4476,
+        "pplDeltaPct": 5.900669,
+        "pplDeltaUpperPct": null,
+        "pplDeltaLowerPct": 5.70394,
+        "pplDeltaIsLowerBound": true,
+        "roundingBound": 0.0018593962022685753,
+        "unobservedLogprobs": 6,
+        "positions": 9475,
+        "disagreements": 766,
+        "candidatePpl": 1.3056074409269174,
+        "referencePpl": 1.232860431248934,
+        "referenceRepo": "mlx-community/Mistral-Nemo-Instruct-2407-bf16",
+        "referenceHfPin": "ff5dcad4",
+        "referencePrecision": "bf16",
+        "maxNewTokensFilter": 64,
+        "unfilteredPositions": 33111
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Mistral-Nemo-Instruct-2407-bf16@ff5dcad4, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated instruct pack (the [INST] template with a BOS token): the measured tokens are answer text, not a reasoning phase. Both arms are measured in the identical regime, so the comparison is sound. Scored with EOS decisions visible (`ignore_eos` instrument, rig `d3a81119`) on the BF16 trajectory recorded 2026-10-07; a byte-identical 8-bit bridge re-run showed the environment unchanged. At all 25 BF16 end-of-sequence positions in tokens 1-64 (38 of 38 over 256 tokens) the 4-bit pack also picks `</s>`, and it never picks `</s>` anywhere else, so end-of-sequence decisions are not a source of the drift. One 256-token run (2026-10-07) authored this card from its first 64 tokens per prompt, a scope fixed before the run; its overall figure gives the same verdict: top-1 91.50% (Wilson [91.20%, 91.80%], 33111 positions). 4 of 160 prompts were skipped because the server tokenized a forced trajectory prefix differently than the BF16 trajectory implied (1 code explanation, 1 factual recall, 2 instruction-following), so those positions are unmeasured; even if all 256 of their first-64-token positions had been agreements, the 64-token Wilson upper bound would be 92.65%, far below 99%. Prompt clustering widens the interval but does not change the result (design effect 1.71; prompt-clustered 95% interval 91.17% to 92.61%). 6 of the 9475 logprobs in tokens 1-64 (33 of 33111 over 256 tokens) are unobserved, the BF16 token falling outside the 4-bit pack's top-5 (none at an end-of-sequence position), so the perplexity delta is a lower bound: +5.90% at the point estimate, at least +5.70%. Measured on the v0.1.12 engine (build 449ff559); rig sha256 prefix d3a81119, emitter emit_quality_card_teacher.py sha256 416bcec54b4ff1de\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-K4.json",
+        "measuredAt": "2026-10-07T23:19:34Z",
+        "engineBuild": {
+          "commit": "449ff559582f82265049ee01e8d7505b807bdb9e"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: for the Qwen3-8B 8-bit pack an Apple M5 picked a different top-1 token than the M3 Ultra at 0.63% of positions, so another class is unmeasured even though that floor is small next to the 6.6 points between this card's Wilson upper bound (92.45%) and 99%; short-context only: the verdict rests on the first 64 new tokens per prompt (156 of 160 prompts, 4096 served context); over 256 new tokens top-1 is 91.50% (Wilson [91.20%, 91.80%]; tokens 65-128 91.57%, Wilson [90.95%, 92.15%]; tokens 129-256 91.21%, Wilson [90.75%, 91.65%])",
         "measuredNewTokens": 64,
         "unmeasured": [
           "decode throughput (speedX)",

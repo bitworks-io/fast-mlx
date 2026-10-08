@@ -4562,16 +4562,16 @@ class RealShippedManifestTestCase(unittest.TestCase):
         )
         self.assertEqual(
             len(cards),
-            14,
-            f"expected exactly 14 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
+            15,
+            f"expected exactly 15 cards in {REAL_QUALITY_GUIDES_PATH}, got {len(cards)}",
         )
         no_go_ids = sorted(
             card.get("id") for card in cards if card.get("verdict") == "NO_GO"
         )
         self.assertEqual(
             len(no_go_ids),
-            10,
-            f"expected exactly 10 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
+            11,
+            f"expected exactly 11 NO_GO cards in {REAL_QUALITY_GUIDES_PATH}, "
             f"got {len(no_go_ids)}: {no_go_ids}",
         )
         # Added 2026-10-01 (cycle 182): the first measured PASS card, the Qwen3-8B 8-bit pack
