@@ -67,8 +67,13 @@ checkout runnable with one command.)
 
 ```sh
 # fast-mlx fetches the model for you — just name a Hugging Face repo:
-./scripts/serve.sh --model mlx-community/Qwen3-8B-4bit
+./scripts/serve.sh --model mlx-community/Qwen3-8B-8bit
 ```
+
+The 8-bit pack has a PASS quality card, so it is served by default; `serve.sh` applies the bundled
+card store (`site/quality-guides.json`) on every run. `mlx-community/Qwen3-8B-4bit` is the smaller
+download and suits 16 GB Macs, but it is carded NO_GO and is refused unless you opt in with
+`--accept-quality qwen3-8b-4bit@m5`.
 
 That builds `fastmlx-serve`, downloads the model on first run (cached afterward), colocates the
 shipped metallib, and serves on `127.0.0.1:8080`. Already have the weights locally? Pass

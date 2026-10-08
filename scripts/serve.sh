@@ -42,7 +42,7 @@ CONFIG="${FASTMLX_CONFIG:-release}"
 
 # Fill in sensible defaults so the operator only has to name a model.
 ARGS=("$@")
-have() { local f; for f in "${ARGS[@]}"; do [ "$f" = "$1" ] && return 0; done; return 1; }
+have() { local f; for f in ${ARGS[@]+"${ARGS[@]}"}; do [ "$f" = "$1" ] && return 0; done; return 1; }
 # Returns (via stdout) the value following an exact-token flag, mirroring `have`'s exact-match
 # scan (this codebase always requires "--flag value" as separate tokens — see validate_host_use's
 # explicit rejection of "--flag=value" — so no combined form needs handling here). Prints nothing
@@ -138,6 +138,24 @@ validate_host_use() {
 }
 
 validate_host_use
+
+# Apply the bundled quality-card store. The engine looks for its default store at
+# site/quality-guides.json relative to ITS working directory, and we cd into spike/ below, where
+# that path does not exist, so a NO_GO pack would be served with no card gate. Resolve the store to an
+# absolute path BEFORE the cd and pass it explicitly, unless the operator named their own store
+# (--quality-cards X or --quality-cards=X). Injected here, ahead of every engine call (including the
+# --quant-pick-only fit-check), so they all see the same store. An explicit path is strict in the
+# engine: a bundled store that is missing or undecodable refuses startup rather than failing open.
+QUALITY_STORE="$(cd "$SCRIPT_DIR/.." && pwd)/site/quality-guides.json"
+OPERATOR_QUALITY_CARDS=0
+for qc_arg in ${ARGS[@]+"${ARGS[@]}"}; do
+  case "$qc_arg" in
+    --quality-cards|--quality-cards=*) OPERATOR_QUALITY_CARDS=1 ;;
+  esac
+done
+if [ "$OPERATOR_QUALITY_CARDS" -eq 0 ] && [ -f "$QUALITY_STORE" ]; then
+  ARGS+=(--quality-cards "$QUALITY_STORE")
+fi
 
 cd "$SPIKE_DIR"
 
