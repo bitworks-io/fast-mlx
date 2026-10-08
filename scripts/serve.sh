@@ -193,16 +193,20 @@ if have --exact-qwen35-mtp; then
   fi
 fi
 
-# resolve_quant_and_serve <candidate-repos-csv> <model-name-or-empty>: the shared "sourcing half"
+# resolve_quant_and_serve <candidate-repos-csv>: the shared "sourcing half"
 # body for both --quant-repos (explicit ids) and --auto-quant (ids enumerated from a base). Fetch ONLY
 # each candidate's sizing metadata (config.json + *.safetensors.index.json — no weights), run the
 # pre-load fit-check to pick the best-fitting quant for THIS host, then download the FULL weights for
-# the WINNER alone and append its --model-path (+ --model when the operator gave none) to the global
-# ARGS so it serves as an ordinary local load. A red-only / all-excluded / no-fit set exits non-zero
-# (there is no --force in candidates mode). scripts/quant-prefetch.py owns the HF downloads and the
-# machine-line parse so this wrapper never re-implements the HF naming or the machine contract.
+# the WINNER alone and append its --model-path to the global ARGS so it serves as an ordinary local
+# load under the operator's --model (the name clients request; both callers require it). The engine's
+# card gate keys on --model, so the pick (made under the operator's alias) never judges the winner's own
+# quality card: before the download, the winner is re-checked alone under ITS repo id with the engine's
+# own pick-only call, and a refusal exits with the engine's rc and downloads nothing. A red-only /
+# all-excluded / no-fit set exits non-zero (there is no --force in candidates mode).
+# scripts/quant-prefetch.py owns the HF downloads and the machine-line parse so this wrapper never
+# re-implements the HF naming or the machine contract.
 resolve_quant_and_serve() {
-  local qrepos="$1" qmodel="$2"
+  local qrepos="$1"
   local prefetch="$SCRIPT_DIR/quant-prefetch.py"
   echo "[fast-mlx] fetching sizing metadata (config + index only) for: $qrepos" >&2
   local cand_dirs=() cand_repos=() st repo dir
@@ -220,7 +224,7 @@ resolve_quant_and_serve() {
   local cand_csv; cand_csv="$(IFS=,; echo "${cand_dirs[*]}")"
   echo "[fast-mlx] fit-checking ${#cand_dirs[@]} candidate(s) against this host…" >&2
   local pick_out winner_dir
-  if ! pick_out="$("$BIN" "${ARGS[@]}" --quant-candidates "$cand_csv" --quant-pick-only)"; then
+  if ! pick_out="$("$BIN" ${ARGS[@]+"${ARGS[@]}"} --quant-candidates "$cand_csv" --quant-pick-only)"; then
     echo "[fast-mlx] no quant fits this host — the fit-check refused every candidate." >&2
     exit 1
   fi
@@ -240,6 +244,23 @@ resolve_quant_and_serve() {
     exit 1
   fi
 
+  # Judge the winner by its OWN quality card before downloading it: the same engine pick-only call, on
+  # the winner alone, with --model set to the winner's repo id instead of the operator's alias. The
+  # engine makes the judgment, so --accept-quality / --quality-cards / --quality-cards-sha256 apply
+  # unchanged. Stdout (the winner line) is discarded; stderr (the engine's refusal reason) reaches the
+  # operator. A refusal exits with the engine's rc and nothing is downloaded.
+  local recheck_args=() skip_model=0 a recheck_rc=0
+  for a in ${ARGS[@]+"${ARGS[@]}"}; do
+    if [ "$skip_model" = "1" ]; then skip_model=0; continue; fi
+    if [ "$a" = "--model" ]; then skip_model=1; continue; fi
+    recheck_args+=("$a")
+  done
+  "$BIN" ${recheck_args[@]+"${recheck_args[@]}"} --model "$winner_repo" --quant-candidates "$winner_dir" --quant-pick-only >/dev/null || recheck_rc=$?
+  if [ "$recheck_rc" -ne 0 ]; then
+    echo "[fast-mlx] the winning quant $winner_repo was refused by its quality card (the engine's reason is above; --accept-quality <id> opts in); nothing was downloaded." >&2
+    exit "$recheck_rc"
+  fi
+
   echo "[fast-mlx] winning quant: $winner_repo — downloading full weights…" >&2
   local full_dir
   if ! full_dir="$(python3 "$prefetch" full --repo "$winner_repo")"; then
@@ -247,7 +268,6 @@ resolve_quant_and_serve() {
     exit 1
   fi
   ARGS+=(--model-path "$full_dir")
-  if [ -z "$qmodel" ]; then ARGS+=(--model "$winner_repo"); fi
   echo "[fast-mlx] serving $winner_repo from $full_dir" >&2
 }
 
@@ -266,25 +286,29 @@ if have --quant-repos; then
   fi
   QREPOS=""; QMODEL=""
   for i in "${!ARGS[@]}"; do
-    if [ "${ARGS[$i]}" = "--quant-repos" ]; then QREPOS="${ARGS[$((i + 1))]}"; fi
-    if [ "${ARGS[$i]}" = "--model" ]; then QMODEL="${ARGS[$((i + 1))]}"; fi
+    if [ "${ARGS[$i]}" = "--quant-repos" ]; then QREPOS="${ARGS[$((i + 1))]-}"; fi
+    if [ "${ARGS[$i]}" = "--model" ]; then QMODEL="${ARGS[$((i + 1))]-}"; fi
   done
   if [ -z "$QREPOS" ]; then
     echo "[fast-mlx] error: --quant-repos needs a comma-separated list of HF repo ids." >&2
     exit 2
   fi
+  if [ -z "$QMODEL" ]; then
+    echo "[fast-mlx] error: --quant-repos needs --model <name> (the model name clients request); the picked quant is served under it." >&2
+    exit 2
+  fi
 
   # Strip the consumed --quant-repos <value> so the binary never receives an unknown flag.
   NEWARGS=(); skip_next=0
-  for a in "${ARGS[@]}"; do
+  for a in ${ARGS[@]+"${ARGS[@]}"}; do
     if [ "$skip_next" = "1" ]; then skip_next=0; continue; fi
     if [ "$a" = "--quant-repos" ]; then skip_next=1; continue; fi
     NEWARGS+=("$a")
   done
-  ARGS=("${NEWARGS[@]}")
+  ARGS=(${NEWARGS[@]+"${NEWARGS[@]}"})
 
   echo "[fast-mlx] --quant-repos: resolving best-fitting quant for this host…" >&2
-  resolve_quant_and_serve "$QREPOS" "$QMODEL"
+  resolve_quant_and_serve "$QREPOS"
 fi
 
 # --auto-quant <base>: the same sourcing half, but the candidate quant repos are ENUMERATED from a
@@ -301,11 +325,15 @@ if have --auto-quant && ! have --quant-pick-only; then
   fi
   ABASE=""; AMODEL=""
   for i in "${!ARGS[@]}"; do
-    if [ "${ARGS[$i]}" = "--auto-quant" ]; then ABASE="${ARGS[$((i + 1))]}"; fi
-    if [ "${ARGS[$i]}" = "--model" ]; then AMODEL="${ARGS[$((i + 1))]}"; fi
+    if [ "${ARGS[$i]}" = "--auto-quant" ]; then ABASE="${ARGS[$((i + 1))]-}"; fi
+    if [ "${ARGS[$i]}" = "--model" ]; then AMODEL="${ARGS[$((i + 1))]-}"; fi
   done
   if [ -z "$ABASE" ]; then
     echo "[fast-mlx] error: --auto-quant needs a base HF repo id (e.g. mlx-community/Qwen3-8B)." >&2
+    exit 2
+  fi
+  if [ -z "$AMODEL" ]; then
+    echo "[fast-mlx] error: --auto-quant needs --model <name> (the model name clients request); the picked quant is served under it." >&2
     exit 2
   fi
   PREFETCH="$SCRIPT_DIR/quant-prefetch.py"
@@ -313,12 +341,12 @@ if have --auto-quant && ! have --quant-pick-only; then
   # Strip the consumed --auto-quant <base> so the eventual served load never receives it (it is a
   # dry-run-only flag in the binary; the winner serves as a plain --model-path load).
   NEWARGS=(); skip_next=0
-  for a in "${ARGS[@]}"; do
+  for a in ${ARGS[@]+"${ARGS[@]}"}; do
     if [ "$skip_next" = "1" ]; then skip_next=0; continue; fi
     if [ "$a" = "--auto-quant" ]; then skip_next=1; continue; fi
     NEWARGS+=("$a")
   done
-  ARGS=("${NEWARGS[@]}")
+  ARGS=(${NEWARGS[@]+"${NEWARGS[@]}"})
 
   echo "[fast-mlx] --auto-quant: enumerating candidate quant repos for base '$ABASE'…" >&2
   if ! ENUM_OUT="$("$BIN" --auto-quant "$ABASE" --quant-pick-only)"; then
@@ -330,7 +358,7 @@ if have --auto-quant && ! have --quant-pick-only; then
     exit 1
   fi
   echo "[fast-mlx] candidates: $ACANDS" >&2
-  resolve_quant_and_serve "$ACANDS" "$AMODEL"
+  resolve_quant_and_serve "$ACANDS"
 fi
 
 # Resolve the model directory. An explicit --model-path (a local model dir) always wins; otherwise
