@@ -395,23 +395,25 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-12",
-                "title": "Publish v0.1.12: fastmlx-serve accepts ignore_eos, a hub-cache import clones blobs copy-on-write, and the bundled card store adds a 14B card",
-                "publishedAt": "2026-10-07T11:23:19Z",
+                "id": "tagged-distribution-v0-1-13",
+                "title": "Publish v0.1.13: quality cards follow the pack; fastmlx-serve and fastmlx serve identify a pack by its pull receipt or Hugging Face cache path, and serve.sh applies the bundled card store",
+                "publishedAt": "2026-10-09T15:46:07Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.12 arm64 macOS distribution: fastmlx-serve "
-                    "accepts ignore_eos on /v1/completions and /v1/chat/completions, so"
-                    " the model's own stop tokens no longer end generation and the stop"
-                    " token is returned with its logprobs, on the scalar and "
-                    "continuous-batching routes, while speculative MTP routes refuse it"
-                    " with ignore_eos_unsupported and a non-boolean value is a 400; "
-                    "fastmlx pull --from-hub-cache clones each cached blob copy-on-"
-                    "write on APFS and falls back to a copy, still verifying every "
-                    "imported file; and the bundled card store adds "
-                    "qwen3-14b-8bit@m3ultra, for 14 cards. The engine still links mlx-"
-                    "swift 0.31.6."
+                    "Publishes the v0.1.13 arm64 macOS distribution: fastmlx-serve "
+                    "judges a pack by the identity its directory carries (its pull "
+                    "receipt, else its Hugging Face cache path), so a pack carded "
+                    "NO_GO is refused under an uncarded alias unless opted in with "
+                    "--accept-quality, an auto-picked quant is judged after the pick, "
+                    "and a name or receipt that resolves a different card than the "
+                    "directory refuses with quality_card_identity_conflict; fastmlx "
+                    "serve uses the same identity; scripts/serve.sh applies the "
+                    "bundled card store and judges an auto-picked quant by its own "
+                    "card before downloading it; fastmlx pull --adopt refuses "
+                    "--max-attempts and --min-free-bytes; and the bundled card store "
+                    "adds mistral-nemo-12b-4bit@m3ultra (NO_GO, opt-in), for 15 "
+                    "cards. The engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -419,7 +421,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "449ff559582f82265049ee01e8d7505b807bdb9e",
+                "publicCommit": "2bbc3c1035d32a63247ebc005161d26560c32b7d",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -436,6 +438,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "2bbc3c1035d32a63247ebc005161d26560c32b7d",
                 "449ff559582f82265049ee01e8d7505b807bdb9e",
                 "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",
                 "c5be493f132c618f7c083dfd73c5157d938791fb",

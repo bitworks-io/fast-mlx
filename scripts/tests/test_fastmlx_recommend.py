@@ -2272,6 +2272,154 @@ class RecommendNoIdentityHintFlagsTestCase(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# Shared pack identity: `fastmlx recommend` must judge a candidate by the
+# SAME `(repo, revision)` `fastmlx serve` and the engine do
+# (`launch.derive_pack_identity`: pull receipt, else the Hugging Face
+# hub-cache path; a receipt and a path naming different repos refuse with
+# `quality_card_identity_conflict`). Before this, recommend read the
+# receipt only, so a hub snapshot was listed uncarded ("no model identity")
+# while the gate that would then run refused it.
+# ---------------------------------------------------------------------
+HUB_SNAPSHOT_REVISION = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+HUB_QWEN_DIR_NAME = "models--mlx-community--Qwen3-0.6B-4bit"
+
+
+class RecommendSharedPackIdentityTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.real_cards = _load_real_quality_guides_manifest()["cards"]
+
+    def hub_dir(self, repo_dir_name: str, revision: str = HUB_SNAPSHOT_REVISION) -> Path:
+        """``<root>/hub/models--<org>--<name>/snapshots/<revision>`` with a config.json."""
+        path = self.root / "hub" / repo_dir_name / "snapshots" / revision
+        path.mkdir(parents=True)
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        return path
+
+    def plain_dir(self, name: str) -> Path:
+        path = self.root / name
+        path.mkdir()
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        return path
+
+    def build_row(self, model_dir: Path, cards, host_class: str = "apple-m5") -> tuple:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            row = FASTMLX_RECOMMEND.build_row(
+                model_path=model_dir,
+                cards=cards,
+                fit_check_bin=str(self.green_fit_bin),
+                host_use="shared",
+                context=None,
+                fit_check_args=[],
+                host_hardware_class=lambda: host_class,
+            )
+        return row, stderr.getvalue()
+
+    def run_json(self, model_dirs: list) -> tuple:
+        argv = ["recommend", "--quality-cards", str(self.manifest_path)]
+        for path in model_dirs:
+            argv += ["--model-path", str(path)]
+        argv += ["--fit-check-bin", str(self.green_fit_bin), "--json"]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, json.loads(stdout.getvalue()), stderr.getvalue()
+
+    # A1: a receipt-less hub snapshot of a bundled NO_GO repo is carded.
+    def test_a1_hub_snapshot_without_receipt_is_judged_by_its_path_identity(self):
+        model_dir = self.hub_dir(HUB_QWEN_DIR_NAME)
+        row, stderr = self.build_row(model_dir, self.real_cards)
+        self.assertEqual(row["repo"], P3_SHARED_REPO_AND_PIN_REPO)
+        self.assertEqual(row["revision"], HUB_SNAPSHOT_REVISION)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_OPT_IN)
+        self.assertEqual(row["card"]["id"], "qwen3-0p6b-4bit@m5")
+        self.assertEqual(row["card"]["verdict"], "NO_GO")
+        self.assertEqual(row["accept_quality_flag"], "--accept-quality qwen3-0p6b-4bit@m5")
+        self.assertNotIn("no model identity", stderr)
+
+    def test_a1_hub_snapshot_through_main_is_carded_and_prints_no_identity_line(self):
+        model_dir = self.hub_dir("models--example--NoGoModel")
+        code, doc, stderr = self.run_json([model_dir])
+        self.assertEqual(code, 1)
+        row = doc["rows"][0]
+        self.assertEqual(row["repo"], NO_GO_REPO)
+        self.assertEqual(row["revision"], HUB_SNAPSHOT_REVISION)
+        self.assertEqual(row["status"], "opt-in")
+        self.assertEqual(row["card"]["id"], NO_GO_CARD_ID)
+        self.assertNotIn("no model identity", stderr)
+
+    # A2: a receipt and a hub path naming different repos refuse THAT row only.
+    def test_a2_receipt_and_path_naming_different_repos_make_only_that_row_an_error(self):
+        conflict_dir = self.hub_dir("models--example--NoGoModel")
+        write_pull_receipt(conflict_dir, repo_id=PASS_REPO, revision="e" * 40)
+        healthy_dir = self.plain_dir("healthy-pass")
+        write_pull_receipt(healthy_dir, repo_id=PASS_REPO, revision="e" * 40)
+        code, doc, _ = self.run_json([conflict_dir, healthy_dir])
+        rows = {row["path"]: row for row in doc["rows"]}
+        conflict = rows[str(conflict_dir)]
+        self.assertEqual(conflict["status"], "error")
+        self.assertIn("quality_card_identity_conflict", conflict["message"])
+        self.assertIn(PASS_REPO, conflict["message"])
+        self.assertIn(NO_GO_REPO, conflict["message"])
+        self.assertIsNone(conflict["card"])
+        healthy = rows[str(healthy_dir)]
+        self.assertEqual(healthy["status"], "recommended")
+        self.assertEqual(healthy["repo"], PASS_REPO)
+        self.assertEqual(healthy["card"]["id"], PASS_CARD_ID)
+        self.assertEqual(code, 0)
+
+    def test_a2_conflict_row_never_reaches_the_fit_check(self):
+        conflict_dir = self.hub_dir("models--example--NoGoModel")
+        write_pull_receipt(conflict_dir, repo_id=PASS_REPO, revision="e" * 40)
+        row, _ = self.build_row(conflict_dir, fixture_manifest()["cards"])
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_ERROR)
+        self.assertIsNone(row["fit"])
+
+    # A3: receipt behavior is unchanged; a missing receipt half comes from the path.
+    def test_a3_receipt_in_a_non_hub_directory_is_unchanged(self):
+        model_dir = self.plain_dir("receipted")
+        write_pull_receipt(model_dir, repo_id=NO_GO_REPO, revision="e" * 40)
+        row, stderr = self.build_row(model_dir, fixture_manifest()["cards"])
+        self.assertEqual(row["repo"], NO_GO_REPO)
+        self.assertEqual(row["revision"], "e" * 40)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_OPT_IN)
+        self.assertNotIn("no model identity", stderr)
+
+    def test_a3_receipt_without_revision_inside_a_hub_snapshot_takes_the_snapshot_revision(self):
+        model_dir = self.hub_dir("models--example--NoGoModel")
+        write_pull_receipt(model_dir, repo_id=NO_GO_REPO, revision=None)
+        row, stderr = self.build_row(model_dir, fixture_manifest()["cards"])
+        self.assertEqual(row["repo"], NO_GO_REPO)
+        self.assertEqual(row["revision"], HUB_SNAPSHOT_REVISION)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_OPT_IN)
+        self.assertNotIn("no model identity", stderr)
+
+    # A4: a plain directory outside the hub layout is still uncarded, hint once.
+    def test_a4_plain_directory_without_receipt_prints_the_hint_once_and_is_uncarded(self):
+        model_dir = self.plain_dir("plain-no-receipt")
+        code, doc, stderr = self.run_json([model_dir])
+        row = doc["rows"][0]
+        self.assertEqual(row["status"], "uncarded")
+        self.assertIsNone(row["repo"])
+        self.assertIsNone(row["revision"])
+        self.assertEqual(stderr.count("no model identity"), 1)
+        self.assertIn(f"fastmlx recommend: {model_dir}: no model identity", stderr)
+
+    def test_a4_hint_text_mentions_the_hub_cache_alternative(self):
+        self.assertIn(
+            "no pull receipt, not a Hugging Face cache snapshot",
+            FASTMLX_RECOMMEND.RECOMMEND_NO_MODEL_IDENTITY_HINT,
+        )
+
+
+# ---------------------------------------------------------------------
 # tiebreakNotice: `fastmlx recommend` must surface the SAME same-verdict
 # lowest-id tiebreak notice `fastmlx serve` already surfaces (see
 # `resolve_card`'s docstring and `tiebreak_notice` in fastmlx_launch.py) --

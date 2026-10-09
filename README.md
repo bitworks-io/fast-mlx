@@ -227,7 +227,7 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 ```
 
 `pull` writes a receipt next to the model directory that records the exact revision. `serve` and
-`recommend` read it to find the model's quality card; `serve` also identifies a snapshot in your Hugging
+`recommend` read it to find the model's quality card; both also identify a snapshot in your Hugging
 Face cache by its path (`.../models--<org>--<name>/snapshots/<revision>`), the same way `fastmlx-serve`
 does. A pack whose card says NO_GO is refused until you opt in with `--accept-quality <card-id>`, so a
 measured quality cost is never applied silently. A `--model-repo` or `--card-id` that names a different

@@ -232,7 +232,8 @@ def _resolve_fit_check_bin(explicit: Optional[str], profile_fit_check: Optional[
 # accepted flag set from its own parser so this text can never silently
 # drift back to naming a flag recommend does not accept.
 RECOMMEND_NO_MODEL_IDENTITY_HINT = (
-    "no model identity (no pull receipt); no quality card was consulted -- "
+    "no model identity (no pull receipt, not a Hugging Face cache snapshot); "
+    "no quality card was consulted -- "
     "run 'fastmlx pull <repo>@<revision> --dest <dir> --adopt' to pin a "
     "hand-staged pack"
 )
@@ -497,22 +498,29 @@ def build_row(
         )
         return row
 
-    receipt = launch._load_pull_receipt(model_path)
-    model_repo = receipt.get("repo_id") if receipt else None
-    model_repo = model_repo if isinstance(model_repo, str) else None
-    model_revision = receipt.get("revision") if receipt else None
-    model_revision = model_revision if isinstance(model_revision, str) else None
+    # The SAME identity `fastmlx serve` and the engine judge a pack by: the
+    # sibling pull receipt, else the Hugging Face hub-cache path. A receipt
+    # and a path naming different repos refuse (`quality_card_identity_conflict`)
+    # -- reported on THIS row only, like a `resolve_card` refusal below.
+    try:
+        identity = launch.derive_pack_identity(model_path)
+    except launch.LaunchRefusal as refusal:
+        row["status"] = STATUS_ERROR
+        row["message"] = refusal.message
+        return row
+    model_repo, model_revision = identity if identity is not None else (None, None)
     row["repo"] = model_repo
     row["revision"] = model_revision
 
-    # No repo and no pinned revision at all means no card could ever match
-    # this candidate by repo or by hfPin -- made visible here for the same
+    # No repo and no pinned revision at all (no receipt, not a hub-cache
+    # snapshot) means no card could ever match this candidate by repo or by
+    # hfPin -- made visible here for the same
     # reason `fastmlx serve` makes it visible (`launch.NO_MODEL_IDENTITY_HINT`),
     # but through recommend's OWN hint text, not the shared constant: the
     # shared one names --model-revision, a flag this command's parser does
     # not accept (see `RECOMMEND_NO_MODEL_IDENTITY_HINT`). The row's
     # classification is unchanged either way.
-    if model_repo is None and model_revision is None:
+    if identity is None:
         _print_recommend_no_model_identity_hint(str(model_path))
 
     card, resolved_ok = _resolve_card_into_row(
