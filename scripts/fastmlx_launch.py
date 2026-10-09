@@ -3034,29 +3034,125 @@ def _load_pull_receipt(model_path: Path) -> Optional[dict]:
     return receipt
 
 
+PACK_IDENTITY_CONFLICT_REASON = "quality_card_identity_conflict"
+_HUB_CACHE_REVISION_RE = re.compile(r"[0-9a-f]{40}")
+_IDENTITY_NOTICE_REPR_MAX_LEN = 120
+
+
+def _hub_path_identity(model_path: Path) -> Optional[tuple]:
+    """``(repo, revision)`` from the HF hub-cache layout
+    ``.../models--<org>--<name>/snapshots/<rev>`` of ``model_path`` after
+    resolving symlinks, or ``None``. Mirrors ``PackIdentity.hubPathIdentity``
+    in ``spike/Sources/HarnessCore/QualityAdmission.swift``: components are
+    walked from the end, the repo splits at the FIRST ``--`` after
+    ``models--`` (a single segment is the whole repo), a component with an
+    empty half is skipped, and the revision is kept only when it is exactly 40
+    lowercase hex characters.
+    """
+    try:
+        components = model_path.resolve().parts
+    except OSError:
+        return None
+    if len(components) < 3:
+        return None
+    for index in range(len(components) - 3, -1, -1):
+        name = components[index]
+        if not name.startswith("models--") or components[index + 1] != "snapshots":
+            continue
+        encoded = name[len("models--"):]
+        separator = encoded.find("--")
+        if separator >= 0:
+            org, model = encoded[:separator], encoded[separator + 2:]
+            if not org or not model:
+                continue
+            repo = f"{org}/{model}"
+        else:
+            if not encoded:
+                continue
+            repo = encoded
+        snapshot = components[index + 2]
+        revision = snapshot if _HUB_CACHE_REVISION_RE.fullmatch(snapshot) else None
+        return repo, revision
+    return None
+
+
+def derive_pack_identity(model_path: Path) -> Optional[tuple]:
+    """``(repo, revision)`` the pack directory says about its own origin, or
+    ``None``. The same rule as ``PackIdentity.derive`` in
+    ``spike/Sources/HarnessCore/QualityAdmission.swift``: (1) the sibling pull
+    receipt (``_load_pull_receipt``'s validity rule; ``repo_id`` / ``revision``
+    kept only when non-empty strings), else (2) the HF hub-cache layout (see
+    ``_hub_path_identity``), else ``None``. Either half may be ``None`` (a
+    receipt may carry a revision only). A receipt and a hub path that name
+    DIFFERENT repos refuse (exit 2, ``quality_card_identity_conflict``), as
+    the engine does; otherwise the receipt wins and a missing receipt half is
+    filled from the path. A renamed directory spoofs this -- it guards against
+    accidents, not an adversary.
+    """
+    receipt = _load_pull_receipt(model_path)
+    receipt_repo: Optional[str] = None
+    receipt_revision: Optional[str] = None
+    if receipt is not None:
+        repo_id = receipt.get("repo_id")
+        revision = receipt.get("revision")
+        receipt_repo = repo_id if isinstance(repo_id, str) and repo_id else None
+        receipt_revision = revision if isinstance(revision, str) and revision else None
+    path_repo, path_revision = _hub_path_identity(model_path) or (None, None)
+    if receipt_repo is not None and path_repo is not None and receipt_repo != path_repo:
+        raise LaunchRefusal(
+            2,
+            f"{PACK_IDENTITY_CONFLICT_REASON}: the pull receipt for {model_path} names "
+            f"repo {_bounded_repr(receipt_repo, _IDENTITY_NOTICE_REPR_MAX_LEN)} but the "
+            f"directory path names repo "
+            f"{_bounded_repr(path_repo, _IDENTITY_NOTICE_REPR_MAX_LEN)}; refusing to "
+            "judge the pack by either",
+        )
+    repo = receipt_repo if receipt_repo is not None else path_repo
+    revision = receipt_revision if receipt_revision is not None else path_revision
+    if repo is None and revision is None:
+        return None
+    return repo, revision
+
+
 def _resolve_model_repo(args, model_path: Path) -> Optional[str]:
     if args.model_repo:
         return args.model_repo
-    receipt = _load_pull_receipt(model_path)
-    if receipt is None:
-        return None
-    repo_id = receipt.get("repo_id")
-    return repo_id if isinstance(repo_id, str) else None
+    identity = derive_pack_identity(model_path)
+    return identity[0] if identity is not None else None
 
 
 def _resolve_model_revision(args, model_path: Path) -> Optional[str]:
     """The model's pinned HF revision, for hfPin-prefix card matching:
-    ``--model-revision`` if given, else the sibling pull receipt's
-    ``revision`` field (the 40-char lowercase hex sha ``fastmlx pull``
-    records there).
+    ``--model-revision`` if given, else the pack's derived identity's
+    revision (the sibling pull receipt's ``revision`` -- the 40-char
+    lowercase hex sha ``fastmlx pull`` records there -- else the hub-cache
+    snapshot name).
     """
     if args.model_revision:
         return args.model_revision
-    receipt = _load_pull_receipt(model_path)
-    if receipt is None:
-        return None
-    revision = receipt.get("revision")
-    return revision if isinstance(revision, str) else None
+    identity = derive_pack_identity(model_path)
+    return identity[1] if identity is not None else None
+
+
+def _identity_conflict_refusal(
+    override_card: dict, pack_card: dict, pack_repo: Optional[str]
+) -> LaunchRefusal:
+    """The refusal for an override (``--model-repo`` / ``--model-revision`` /
+    ``--card-id``) that resolves a DIFFERENT quality card than the pack's own
+    derived identity does -- the engine judges the pack by its own identity
+    (its alias card being empty under the launcher), so judging the override's
+    card here would let the two refusals contradict each other."""
+    return LaunchRefusal(
+        2,
+        f"{PACK_IDENTITY_CONFLICT_REASON}: the --model-repo/--model-revision/"
+        f"--card-id override resolves quality card "
+        f"{_bounded_repr(override_card.get('id'), _IDENTITY_NOTICE_REPR_MAX_LEN)} but the "
+        f"pack's own identity (repo "
+        f"{_bounded_repr(pack_repo, _IDENTITY_NOTICE_REPR_MAX_LEN)}) resolves quality card "
+        f"{_bounded_repr(pack_card.get('id'), _IDENTITY_NOTICE_REPR_MAX_LEN)}; the engine "
+        "judges the pack by its own identity, so drop the override or point it at the "
+        "pack's own repo",
+    )
 
 
 # Flags the launcher itself forwards to the built-in engine (see _run_serve).
@@ -3184,6 +3280,11 @@ def _run_serve(args, passthrough_args: list) -> int:
         raise LaunchRefusal(2, f"model path {model_path} {MODEL_DIR_REFUSAL_MESSAGE_SUFFIX}")
 
     model_id = args.model_id or model_path.resolve().name
+    # The pack's own identity (receipt, else hub-cache path), judged the way
+    # the engine judges it; the override flags only ever sit beside it.
+    pack_identity = derive_pack_identity(model_path)
+    pack_repo, pack_revision = pack_identity if pack_identity is not None else (None, None)
+    has_identity_override = bool(args.model_repo or args.model_revision)
     model_repo = _resolve_model_repo(args, model_path)
     model_revision = _resolve_model_revision(args, model_path)
     residency = args.residency
@@ -3539,6 +3640,23 @@ def _run_serve(args, passthrough_args: list) -> int:
                 f"model: its repo/hfPin do not match the resolved model "
                 f"identity (repo={model_repo!r}, revision={model_revision!r})",
             )
+        # An explicit --card-id is the override side: when the pack's own
+        # identity does not itself support this card, and resolves a
+        # different one, the engine would judge that other card -- refuse.
+        if (
+            has_identity_override
+            and pack_identity is not None
+            and not card_matches_model_identity(card, pack_repo, pack_revision)
+        ):
+            pack_card = resolve_card(
+                cards,
+                pack_repo,
+                pack_revision,
+                residency=residency,
+                engine_build_commit=launch_engine_build_commit,
+            )
+            if pack_card is not None and _card_identity(pack_card) != _card_identity(card):
+                raise _identity_conflict_refusal(card, pack_card, pack_repo)
         # An explicit --card-id must also carry the launch's own residency:
         # a resident card is not evidence for a streaming launch of the
         # same pack, and a streaming card is not evidence for a resident
@@ -3553,21 +3671,60 @@ def _run_serve(args, passthrough_args: list) -> int:
             )
     else:
         # No repo and no pinned revision at all (no --model-repo/
-        # --model-revision, and no usable sibling pull receipt) means no
-        # card could ever match this launch by repo or by hfPin -- a
-        # hand-staged pack (rsync'd or copied in, never `fastmlx pull`ed)
-        # silently falls through to admit_unmeasured otherwise. Made
+        # --model-revision, and no usable sibling pull receipt or hub-cache
+        # path) means no card could ever match this launch by repo or by
+        # hfPin -- a hand-staged pack (rsync'd or copied in, never `fastmlx
+        # pull`ed) silently falls through to admit_unmeasured otherwise. Made
         # visible here; the admission OUTCOME is unchanged either way.
         if model_repo is None and model_revision is None:
             print_no_model_identity_hint("fastmlx serve")
-        card = resolve_card(
-            cards,
-            model_repo,
-            model_revision,
-            residency=residency,
-            engine_build_commit=launch_engine_build_commit,
-            notices=resolve_notices,
-        )
+        if not has_identity_override:
+            card = resolve_card(
+                cards,
+                model_repo,
+                model_revision,
+                residency=residency,
+                engine_build_commit=launch_engine_build_commit,
+                notices=resolve_notices,
+            )
+        else:
+            # The engine's rule, with --model-repo/--model-revision in the
+            # alias's place: the override identity and the pack's own identity
+            # each resolve a card; one card -> that card, the same card ->
+            # unchanged, two different cards -> refuse rather than prefer one.
+            override_notices: list = []
+            pack_notices: list = []
+            override_card = resolve_card(
+                cards,
+                args.model_repo,
+                args.model_revision,
+                residency=residency,
+                engine_build_commit=launch_engine_build_commit,
+                notices=override_notices,
+            )
+            pack_card = (
+                resolve_card(
+                    cards,
+                    pack_repo,
+                    pack_revision,
+                    residency=residency,
+                    engine_build_commit=launch_engine_build_commit,
+                    notices=pack_notices,
+                )
+                if pack_identity is not None
+                else None
+            )
+            if override_card is not None and pack_card is not None:
+                if _card_identity(override_card) != _card_identity(pack_card):
+                    raise _identity_conflict_refusal(override_card, pack_card, pack_repo)
+                card, chosen_notices = pack_card, pack_notices
+            elif pack_card is not None:
+                card, chosen_notices = pack_card, pack_notices
+            else:
+                card, chosen_notices = override_card, override_notices
+            for chosen_notice in chosen_notices:
+                if chosen_notice not in resolve_notices:
+                    resolve_notices.append(chosen_notice)
 
     # --- engine-build status (never gates admission; see decide_admission
     # below) ------------------------------------------------------------

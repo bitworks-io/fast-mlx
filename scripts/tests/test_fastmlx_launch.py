@@ -8428,5 +8428,242 @@ class BuiltInEngineUndecodableCardStoreTestCase(unittest.TestCase):
                 self.assertIsNone(FASTMLX_LAUNCH.engine_undecodable_card_reason(build()))
 
 
+# ---------------------------------------------------------------------------
+# The launcher judges a pack by the same identity the engine does
+# (``PackIdentity.derive``): sibling pull receipt, else the HF hub-cache path.
+# Predeclaration: docs/task-inbox/2026-10-08-PREDECLARATION-launcher-judges-a-pack-by-the-engines-identity.md
+# ---------------------------------------------------------------------------
+HUB_REVISION = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+CONFLICT_REASON = "quality_card_identity_conflict"
+
+
+class PackIdentityLauncherTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    def plain_dir(self, name: str = "model") -> Path:
+        path = self.root / name
+        path.mkdir()
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        return path
+
+    def hub_dir(self, repo_dir_name: str, revision: str = HUB_REVISION) -> Path:
+        """``<root>/hub/models--<org>--<name>/snapshots/<revision>`` with a config.json."""
+        path = self.root / "hub" / repo_dir_name / "snapshots" / revision
+        path.mkdir(parents=True)
+        (path / "config.json").write_text("{}", encoding="utf-8")
+        return path
+
+    def argv(self, model_dir: Path, **extra) -> list:
+        args = {
+            "--model-path": str(model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--context": "2048",
+        }
+        args.update(extra)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv + ["--dry-run"]
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    # --- P1: receipt names NO_GO repo, --model-repo names a PASS repo ------
+    def test_p1_override_card_disagrees_with_receipt_card_is_refused(self):
+        model_dir = self.plain_dir()
+        write_pull_receipt(model_dir, repo_id=NO_GO_REPO, revision="e" * 40)
+        code, stdout, stderr = self.run_main(self.argv(model_dir, **{"--model-repo": PASS_REPO}))
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(CONFLICT_REASON, stderr)
+        self.assertIn(NO_GO_CARD_ID, stderr)
+        self.assertIn(PASS_CARD_ID, stderr)
+        self.assertIn(NO_GO_REPO, stderr)
+        self.assertEqual(stdout, "")  # no plan printed, engine never launched
+
+    # --- P2: hub snapshot of a NO_GO repo, no receipt, no override ---------
+    def test_p2_hub_snapshot_is_judged_by_its_card_and_no_identity_line_is_absent(self):
+        model_dir = self.hub_dir("models--example--NoGoModel")
+        code, stdout, stderr = self.run_main(self.argv(model_dir))
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(NO_GO_CARD_ID, stderr)
+        self.assertIn(NO_GO_HEADLINE, stderr)
+        self.assertIn("--accept-quality", stderr)
+        self.assertNotIn("no model identity", stderr)
+        self.assertEqual(stdout, "")
+
+        code, stdout, stderr = self.run_main(
+            self.argv(model_dir, **{"--accept-quality": NO_GO_CARD_ID})
+        )
+        self.assertEqual(code, 0, stderr)
+        plan = FastmlxLaunchTestCase.last_json_line(stdout)
+        self.assertEqual(plan["admission"], "admit_with_quality_flag")
+        self.assertEqual(plan["card"]["id"], NO_GO_CARD_ID)
+        self.assertNotIn("no model identity", stderr)
+
+    def test_p2_hub_snapshot_of_a_pass_repo_admits_and_prints_no_identity_hint(self):
+        model_dir = self.hub_dir("models--example--PassModel")
+        code, stdout, stderr = self.run_main(self.argv(model_dir))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+        self.assertNotIn("no model identity", stderr)
+
+    def test_hub_snapshot_of_an_uncarded_repo_still_admits_unmeasured_without_hint(self):
+        model_dir = self.hub_dir("models--example--Nobody")
+        code, stdout, stderr = self.run_main(self.argv(model_dir))
+        self.assertEqual(code, 0, stderr)
+        plan = FastmlxLaunchTestCase.last_json_line(stdout)
+        self.assertEqual(plan["admission"], "admit_unmeasured")
+        self.assertNotIn("no model identity", stderr)
+
+    def test_plain_dir_without_any_identity_still_prints_the_hint(self):
+        code, _, stderr = self.run_main(self.argv(self.plain_dir()))
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("no model identity", stderr)
+
+    # --- P3: receipt repo != hub-path repo ---------------------------------
+    def test_p3_receipt_and_hub_path_naming_different_repos_is_refused(self):
+        model_dir = self.hub_dir("models--example--NoGoModel")
+        write_pull_receipt(model_dir, repo_id=PASS_REPO, revision="e" * 40)
+        code, stdout, stderr = self.run_main(self.argv(model_dir))
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(CONFLICT_REASON, stderr)
+        self.assertIn(PASS_REPO, stderr)
+        self.assertIn(NO_GO_REPO, stderr)
+        self.assertEqual(stdout, "")
+
+    def test_receipt_and_hub_path_naming_the_same_repo_is_not_a_conflict(self):
+        model_dir = self.hub_dir("models--example--PassModel")
+        write_pull_receipt(model_dir, repo_id=PASS_REPO, revision="e" * 40)
+        code, stdout, stderr = self.run_main(self.argv(model_dir))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+
+    # --- P4: uncarded override over a carded pack --------------------------
+    def test_p4_uncarded_override_over_carded_pack_is_judged_by_the_pack_card(self):
+        model_dir = self.plain_dir()
+        write_pull_receipt(model_dir, repo_id=NO_GO_REPO, revision="e" * 40)
+        code, stdout, stderr = self.run_main(
+            self.argv(model_dir, **{"--model-repo": "example/Uncarded"})
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(NO_GO_CARD_ID, stderr)
+        self.assertNotIn(CONFLICT_REASON, stderr)
+        self.assertEqual(stdout, "")
+
+    def test_p4_carded_override_over_uncarded_pack_uses_the_override_card(self):
+        model_dir = self.plain_dir()
+        write_pull_receipt(model_dir, repo_id="example/Uncarded", revision="e" * 40)
+        code, stdout, stderr = self.run_main(
+            self.argv(model_dir, **{"--model-repo": PASS_REPO})
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+
+    # --- P5: same card on both sides is unchanged --------------------------
+    def test_p5_same_card_on_both_sides_is_unchanged(self):
+        model_dir = self.plain_dir()
+        write_pull_receipt(model_dir, repo_id=PASS_REPO, revision="e" * 40)
+        code, stdout, stderr = self.run_main(
+            self.argv(model_dir, **{"--model-repo": PASS_REPO})
+        )
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+
+    # --- P6: --card-id over a pack that resolves a different card ----------
+    def test_p6_card_id_over_a_pack_resolving_a_different_card_is_refused(self):
+        model_dir = self.plain_dir()
+        write_pull_receipt(model_dir, repo_id=NO_GO_REPO, revision="e" * 40)
+        code, stdout, stderr = self.run_main(
+            self.argv(
+                model_dir, **{"--card-id": PASS_CARD_ID, "--model-repo": PASS_REPO}
+            )
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(CONFLICT_REASON, stderr)
+        self.assertIn(PASS_CARD_ID, stderr)
+        self.assertIn(NO_GO_CARD_ID, stderr)
+        self.assertEqual(stdout, "")
+
+    def test_card_id_is_verified_against_the_derived_hub_identity_when_no_override(self):
+        model_dir = self.hub_dir("models--example--PassModel")
+        code, stdout, stderr = self.run_main(self.argv(model_dir, **{"--card-id": PASS_CARD_ID}))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+
+        code, _, stderr = self.run_main(
+            self.argv(self.hub_dir("models--example--Other", "f" * 40), **{"--card-id": PASS_CARD_ID})
+        )
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("cannot be verified", stderr)
+
+    # --- derive_pack_identity unit rows (engine PackIdentity.derive parity) -
+    def test_derive_hub_path_revision_kept_only_when_40_lowercase_hex(self):
+        derive = FASTMLX_LAUNCH.derive_pack_identity
+        self.assertEqual(
+            derive(self.hub_dir("models--org--name")), ("org/name", HUB_REVISION)
+        )
+        self.assertEqual(
+            derive(self.hub_dir("models--org--upper", HUB_REVISION.upper())), ("org/upper", None)
+        )
+        self.assertEqual(derive(self.hub_dir("models--org--main", "main")), ("org/main", None))
+
+    def test_derive_hub_path_splits_at_the_first_double_dash_and_handles_one_segment(self):
+        derive = FASTMLX_LAUNCH.derive_pack_identity
+        self.assertEqual(
+            derive(self.hub_dir("models--org--a--b")), ("org/a--b", HUB_REVISION)
+        )
+        self.assertEqual(derive(self.hub_dir("models--solo")), ("solo", HUB_REVISION))
+
+    def test_derive_hub_path_skips_components_with_an_empty_half(self):
+        derive = FASTMLX_LAUNCH.derive_pack_identity
+        self.assertIsNone(derive(self.hub_dir("models----name")))
+        self.assertIsNone(derive(self.hub_dir("models--org--")))
+
+    def test_derive_walks_from_the_end_and_accepts_a_deeper_directory(self):
+        derive = FASTMLX_LAUNCH.derive_pack_identity
+        deeper = self.hub_dir("models--org--name") / "sub"
+        deeper.mkdir()
+        self.assertEqual(derive(deeper), ("org/name", HUB_REVISION))
+
+    def test_derive_returns_none_for_a_plain_directory(self):
+        self.assertIsNone(FASTMLX_LAUNCH.derive_pack_identity(self.plain_dir()))
+
+    def test_derive_follows_symlinks_into_the_hub_cache(self):
+        link = self.root / "link"
+        link.symlink_to(self.hub_dir("models--org--name"))
+        self.assertEqual(FASTMLX_LAUNCH.derive_pack_identity(link), ("org/name", HUB_REVISION))
+
+    def test_derive_prefers_the_receipt_and_fills_a_missing_revision_from_the_path(self):
+        derive = FASTMLX_LAUNCH.derive_pack_identity
+        model_dir = self.hub_dir("models--org--name")
+        write_pull_receipt(model_dir, repo_id="org/name", revision="e" * 40)
+        self.assertEqual(derive(model_dir), ("org/name", "e" * 40))
+
+    def test_derive_conflict_raises_a_launch_refusal_naming_both_repos(self):
+        model_dir = self.hub_dir("models--org--name")
+        write_pull_receipt(model_dir, repo_id="other/repo", revision="e" * 40)
+        with self.assertRaises(FASTMLX_LAUNCH.LaunchRefusal) as ctx:
+            FASTMLX_LAUNCH.derive_pack_identity(model_dir)
+        self.assertEqual(ctx.exception.exit_code, 2)
+        self.assertIn(CONFLICT_REASON, ctx.exception.message)
+        self.assertIn("other/repo", ctx.exception.message)
+        self.assertIn("org/name", ctx.exception.message)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -227,8 +227,11 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 ```
 
 `pull` writes a receipt next to the model directory that records the exact revision. `serve` and
-`recommend` read it to find the model's quality card. A pack whose card says NO_GO is refused until
-you opt in with `--accept-quality <card-id>`, so a measured quality cost is never applied silently.
+`recommend` read it to find the model's quality card; `serve` also identifies a snapshot in your Hugging
+Face cache by its path (`.../models--<org>--<name>/snapshots/<revision>`), the same way `fastmlx-serve`
+does. A pack whose card says NO_GO is refused until you opt in with `--accept-quality <card-id>`, so a
+measured quality cost is never applied silently. A `--model-repo` or `--card-id` that names a different
+card than the pack's own receipt or path refuses with `quality_card_identity_conflict`.
 
 Newer cards without a release: `serve` prints a `fastmlx_launch=card_store` line naming the card store
 it admitted against (its sha256, `generatedAt`, card count; `fastmlx recommend` prints the same as a
@@ -331,8 +334,8 @@ says.
 A pack without a card is listed as uncarded and is never recommended over a carded one. `serve` refuses
 a model that does not fit unless you pass `--force`, and it refuses outright if the fit check cannot
 run. `--engine-profile` points `serve` at a different OpenAI-compatible engine; the default is this
-repository's `fastmlx-serve`. A model directory with no receipt and no `--model-revision` has no
-resolved identity, so no quality card can ever match it; `serve` prints one stderr line saying so
+repository's `fastmlx-serve`. A model directory with no receipt, outside the Hugging Face cache layout
+and with no `--model-revision` has no resolved identity, so no quality card can ever match it; `serve` prints one stderr line saying so
 (admission still proceeds as unmeasured) -- `pull ... --adopt` is how you give a hand-staged directory
 that identity without re-downloading it. `--adopt` also walks the whole directory tree (not just the
 top level): any file that is not an exact manifest entry, at any depth, is a refusal, and so is an
@@ -847,16 +850,16 @@ Behaviour to know:
   write so concurrent requests' lines cannot interleave. Headers and bodies, including
   `Authorization`, are never logged.
 
-### Install a prebuilt release (v0.1.12)
+### Install a prebuilt release (v0.1.13)
 
 Apple Silicon (arm64) macOS only — there is no Intel or Linux build. Download the tarball and its
 checksum file, verify, then extract:
 
 ```sh
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.12/fastmlx-0.1.12-arm64-macos.tar.gz
-curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.12/fastmlx-0.1.12-arm64-macos.tar.gz.sha256
-shasum -a 256 -c fastmlx-0.1.12-arm64-macos.tar.gz.sha256
-tar -xzf fastmlx-0.1.12-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.13/fastmlx-0.1.13-arm64-macos.tar.gz
+curl -LO https://github.com/bitworks-io/fast-mlx/releases/download/v0.1.13/fastmlx-0.1.13-arm64-macos.tar.gz.sha256
+shasum -a 256 -c fastmlx-0.1.13-arm64-macos.tar.gz.sha256
+tar -xzf fastmlx-0.1.13-arm64-macos.tar.gz
 ```
 
 The binaries are unsigned and not notarized. A `curl` download carries no quarantine attribute, so
@@ -864,14 +867,14 @@ nothing further is needed; a browser download does, and macOS will refuse to run
 the tarball until you clear it:
 
 ```sh
-xattr -dr com.apple.quarantine fastmlx-0.1.12-arm64-macos
+xattr -dr com.apple.quarantine fastmlx-0.1.13-arm64-macos
 ```
 
 Add the extracted `bin` directory to `PATH` (or symlink `bin/fastmlx` into a directory already on
 it), then run it:
 
 ```sh
-export PATH="$PWD/fastmlx-0.1.12-arm64-macos/bin:$PATH"
+export PATH="$PWD/fastmlx-0.1.13-arm64-macos/bin:$PATH"
 fastmlx --help
 fastmlx capacity --help
 ```
