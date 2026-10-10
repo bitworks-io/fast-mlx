@@ -1,0 +1,1240 @@
+{
+ "schema": "pack-identity-conformance-v1",
+ "doc": "Each case is built in a fresh temp root (unresolved temp path; on macOS the temp dir is itself a symlink that resolves elsewhere). Fields: modelDir (rel, created), extraDirs (rel, created), symlinks [{link,target}] (both rel to root, created after dirs), receipt (null | {text} | {base64}) written to <receiptBase or modelDir>.pull-receipt.json, inputPath (rel string appended verbatim to root; default modelDir) passed to derive. Placeholders in receipt text: {DIR}=root/modelDir unresolved, {DIR_RESOLVED}=its realpath, {OTHER}=an existing different dir, {ROOT}=root. expect: null | {repo,revision} | {conflict:{receiptRepo,pathRepo}}. knownPythonDivergence {pythonExpect,reason}, when present, is a documented Python-only difference (in the conservative direction) that the Python test pins instead of expect. Expectations are hand-authored from the documented rule except cases whose why says engine-observed. Checked by spike/Tests/HarnessCoreTests/PackIdentityConformanceTests.swift and scripts/tests/test_pack_identity_conformance.py.",
+ "cases": [
+  {
+   "id": "no-receipt-plain-dir",
+   "why": "No receipt and no hub layout: no identity.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-valid",
+   "why": "Valid receipt with dest naming the directory: repo and revision from the receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-dest-other-existing-dir",
+   "why": "dest resolves to a different existing directory: stale receipt reads as no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{OTHER}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-dest-nonexistent-dir",
+   "why": "dest names a path that does not exist and is not the pack: no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{DIR}-moved-away\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-dest-empty-string",
+   "why": "dest is an empty string (not the pack): treated as a mismatching string dest, no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-dest-other-dir-falls-to-hub-path",
+   "why": "A stale receipt (dest elsewhere) naming another repo must not conflict with the hub path; the path identity applies.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"other/repo\", \"revision\": \"r\", \"dest\": \"{OTHER}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "receipt-no-dest-trusted",
+   "why": "A receipt with no dest key is trusted (sibling naming ties it to the path).",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-dest-null-trusted",
+   "why": "dest: null is not a string, so no dest check: trusted.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"revision\":\"rev-1\",\"dest\":null}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-dest-number-trusted",
+   "why": "A non-string dest (number) is not checked: trusted.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"revision\":\"rev-1\",\"dest\":42}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-dest-resolved-form-trusted",
+   "why": "dest written as the symlink-resolved path (on macOS the temp dir resolves through a symlink) while the input is the unresolved path: both resolve equal, trusted.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{DIR_RESOLVED}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-dest-unresolved-form-trusted",
+   "why": "dest written as the unresolved temp path: resolves to the same directory, trusted.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-dest-via-symlink-trusted",
+   "why": "dest is a symlink that resolves to the pack directory: trusted.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{ROOT}/linkdest\"}"
+   },
+   "symlinks": [
+    {
+     "link": "linkdest",
+     "target": "plain/pack"
+    }
+   ],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-revision-only",
+   "why": "Receipt carrying only a revision: identity with null repo.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": null,
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-repo-only",
+   "why": "Receipt carrying only a repo: identity with null revision.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-empty-strings",
+   "why": "Empty-string repo_id and revision are not identity: no identity.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"\", \"revision\": \"\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-empty-repo-nonempty-revision",
+   "why": "Empty repo_id is dropped, a non-empty revision kept.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"\", \"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": null,
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-non-string-repo-id",
+   "why": "A numeric repo_id is ignored; the string revision is kept.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":7,\"revision\":\"rev-1\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": null,
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-non-string-both",
+   "why": "Array repo_id and object revision are ignored: no identity.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":[\"a\",\"b\"],\"revision\":{\"x\":1}}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-no-identity-keys",
+   "why": "A valid object receipt with neither repo_id nor revision: no identity.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"dest\":\"{DIR}\",\"other\":1}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-json-array",
+   "why": "A receipt that is a JSON array is not an object: no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "[{\"repo_id\":\"org/name\"}]"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-json-array-on-hub-path",
+   "why": "A non-object receipt does not suppress the hub path identity.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "[\"x\"]"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "receipt-json-null",
+   "why": "JSON null is not an object: no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "null"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-json-string",
+   "why": "A bare JSON string is not an object: no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "\"org/name\""
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-empty-file",
+   "why": "An empty receipt file is not JSON: no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": ""
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-malformed-json",
+   "why": "Truncated JSON: no receipt.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\""
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-trailing-comma",
+   "why": "A trailing comma is invalid JSON per the spec, but Foundation JSONSerialization accepts it. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   },
+   "knownPythonDivergence": {
+    "pythonExpect": null,
+    "reason": "Python json rejects trailing commas; mirroring Foundation leniency would need a tolerant parser. Conservative direction (Python reads no receipt where the engine reads one)."
+   }
+  },
+  {
+   "id": "receipt-invalid-utf8-lead-byte",
+   "why": "Invalid UTF-8 (0xFF) before the document: unreadable as JSON, no receipt, and no exception.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "/3sicmVwb19pZCI6Im9yZy9uYW1lIn0="
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-invalid-utf8-inside-string",
+   "why": "Invalid UTF-8 inside a string value of an otherwise valid document. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "eyJyZXBvX2lkIjoib3JnL25hbWUiLCJub3RlIjoi/yJ9"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-utf8-bom",
+   "why": "UTF-8 BOM before valid JSON: Foundation skips the BOM. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "77u/eyJyZXBvX2lkIjoib3JnL25hbWUiLCJyZXZpc2lvbiI6InJldi0xIn0="
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-nan-alongside-repo",
+   "why": "A bare NaN literal next to a valid repo_id (not strict JSON). Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"score\":NaN}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-duplicate-keys",
+   "why": "Duplicate repo_id keys: Foundation keeps the FIRST (Python json default keeps the last). Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"first/one\",\"repo_id\":\"second/two\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "first/one",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-trailing-garbage",
+   "why": "Valid object followed by trailing text. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\"} trailing"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-unicode-escape-repo",
+   "why": "A JSON \\u escape in repo_id decodes to the real character.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/nam\\u00e9\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/nam\u00e9",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-raw-control-char-in-string",
+   "why": "A raw TAB inside a JSON string (strict JSON forbids it). Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "eyJyZXBvX2lkIjoib3JnL25hCW1lIn0="
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-lone-surrogate-escape",
+   "why": "A lone surrogate escape in an unrelated string value. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"note\":\"\\ud800\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-overflow-number",
+   "why": "An out-of-range number 1e999 beside a valid repo_id. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"n\":1e999}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-leading-zero-number",
+   "why": "A number with a leading zero (invalid JSON). Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"n\":01}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-infinity-literal",
+   "why": "A bare Infinity literal beside a valid repo_id. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"n\":Infinity}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-deeply-nested",
+   "why": "600 nested arrays beside a valid repo_id. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"n\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-single-quoted",
+   "why": "Single-quoted JSON. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{'repo_id':'org/name'}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-comment",
+   "why": "A // comment inside the document. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\"} // c"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-duplicate-keys-first-non-string",
+   "why": "Duplicate repo_id where the first is a number and the second a string. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":7,\"repo_id\":\"second/two\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-duplicate-keys-three",
+   "why": "Three duplicate repo_id keys: the first wins in the engine. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"a/one\",\"repo_id\":\"b/two\",\"repo_id\":\"c/three\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "a/one",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-utf16le-with-bom",
+   "why": "UTF-16LE with BOM is accepted by Foundation. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "//57ACIAcgBlAHAAbwBfAGkAZAAiADoAIgBvAHIAZwAvAG4AYQBtAGUAIgAsACIAcgBlAHYAaQBzAGkAbwBuACIAOgAiAHIAZQB2AC0AMQAiAH0A"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   },
+   "knownPythonDivergence": {
+    "pythonExpect": null,
+    "reason": "Foundation auto-detects UTF-16/32 JSON; Python reads receipts as UTF-8 only. Conservative direction (Python reads no receipt where the engine reads one)."
+   }
+  },
+  {
+   "id": "receipt-utf16be-no-bom",
+   "why": "UTF-16BE without BOM is accepted by Foundation. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "AHsAIgByAGUAcABvAF8AaQBkACIAOgAiAG8AcgBnAC8AbgBhAG0AZQAiACwAIgByAGUAdgBpAHMAaQBvAG4AIgA6ACIAcgBlAHYALQAxACIAfQ=="
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   },
+   "knownPythonDivergence": {
+    "pythonExpect": null,
+    "reason": "Foundation auto-detects UTF-16/32 JSON; Python reads receipts as UTF-8 only. Conservative direction (Python reads no receipt where the engine reads one)."
+   }
+  },
+  {
+   "id": "receipt-utf16le-no-bom",
+   "why": "UTF-16LE without BOM is accepted by Foundation. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "ewAiAHIAZQBwAG8AXwBpAGQAIgA6ACIAbwByAGcALwBuAGEAbQBlACIALAAiAHIAZQB2AGkAcwBpAG8AbgAiADoAIgByAGUAdgAtADEAIgB9AA=="
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   },
+   "knownPythonDivergence": {
+    "pythonExpect": null,
+    "reason": "Foundation auto-detects UTF-16/32 JSON; Python reads receipts as UTF-8 only. Conservative direction (Python reads no receipt where the engine reads one)."
+   }
+  },
+  {
+   "id": "receipt-utf32le-with-bom",
+   "why": "UTF-32LE with BOM. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "//4AAHsAAAAiAAAAcgAAAGUAAABwAAAAbwAAAF8AAABpAAAAZAAAACIAAAA6AAAAIgAAAG8AAAByAAAAZwAAAC8AAABuAAAAYQAAAG0AAABlAAAAIgAAACwAAAAiAAAAcgAAAGUAAAB2AAAAaQAAAHMAAABpAAAAbwAAAG4AAAAiAAAAOgAAACIAAAByAAAAZQAAAHYAAAAtAAAAMQAAACIAAAB9AAAA"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-formfeed-whitespace",
+   "why": "A form feed as whitespace before the document. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "DHsicmVwb19pZCI6Im9yZy9uYW1lIiwicmV2aXNpb24iOiJyZXYtMSJ9"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-invalid-escape",
+   "why": "An invalid string escape \\x. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"note\":\"\\x\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-nul-after-document",
+   "why": "A NUL byte after the document. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "base64": "eyJyZXBvX2lkIjoib3JnL25hbWUiLCJyZXZpc2lvbiI6InJldi0xIn0A"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-huge-integer",
+   "why": "A 5000-digit integer beside a valid repo_id. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"n\":99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-recursion-depth-bomb",
+   "why": "5000 nested arrays: must read as no receipt without any exception. Expectation is engine-observed, not independent.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"n\":[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "receipt-escaped-backslash-then-surrogate-text",
+   "why": "A literal backslash followed by the text ud800 is NOT a surrogate escape: valid. Hand-authored.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"note\":\"\\\\ud800\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-valid-surrogate-pair",
+   "why": "A valid surrogate pair escape is fine: valid. Hand-authored.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\":\"org/name\",\"note\":\"\\ud83d\\ude00\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-basic",
+   "why": "Hub snapshot directory: repo org/name, revision is the 40-hex snapshot name.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-trailing-slash-input",
+   "why": "A trailing slash on the input path does not change the identity.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567/",
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-uppercase-hex-snapshot",
+   "why": "Uppercase hex is not a full lowercase 40-hex revision: revision null, repo kept.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789ABCDEF0123456789ABCDEF01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-snapshot-39-hex",
+   "why": "39 hex characters: revision null, repo kept.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef0123456",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-snapshot-41-hex",
+   "why": "41 hex characters: revision null, repo kept.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567a",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-snapshot-64-hex",
+   "why": "A 64-hex (sha256-length) snapshot is not a commit revision: revision null, repo kept.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef012345670123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-snapshot-40-non-hex",
+   "why": "40 characters with a non-hex letter: revision null, repo kept.",
+   "modelDir": "hub/models--org--name/snapshots/g123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-snapshot-label",
+   "why": "A named snapshot (not a hash): revision null, repo kept.",
+   "modelDir": "hub/models--org--name/snapshots/main",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-split-at-first-double-dash",
+   "why": "models--a--b--c splits at the FIRST -- after models--: repo a/b--c.",
+   "modelDir": "hub/models--a--b--c/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "a/b--c",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-single-segment",
+   "why": "models--single has no --: the whole segment is the repo.",
+   "modelDir": "hub/models--single/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "single",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-leading-dash-single",
+   "why": "models---a: encoded '-a' contains no --, whole segment is the repo.",
+   "modelDir": "hub/models---a/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "-a",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-triple-dash-split",
+   "why": "models--a---b: first -- at index 1 -> org a, model '-b'.",
+   "modelDir": "hub/models--a---b/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "a/-b",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-empty-org-skipped",
+   "why": "models----name has an empty org half: component skipped, no other candidate -> no identity.",
+   "modelDir": "hub/models----name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "hub-empty-model-skipped",
+   "why": "models--org-- has an empty model half: skipped -> no identity.",
+   "modelDir": "hub/models--org--/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "hub-bare-models-prefix-skipped",
+   "why": "models-- with nothing after: skipped -> no identity.",
+   "modelDir": "hub/models--/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "hub-empty-half-falls-to-outer",
+   "why": "An inner component with an empty half is skipped and the walk continues outward to an enclosing models--/snapshots pair (whose snapshot name 'outer' is not a hash).",
+   "modelDir": "hub/models--out--er/snapshots/outer/models----bad/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "out/er",
+    "revision": null
+   }
+  },
+  {
+   "id": "hub-nested-innermost-wins",
+   "why": "Two models--/snapshots pairs: walking from the end, the innermost wins (repo and revision).",
+   "modelDir": "hub/models--outer--repo/snapshots/fedcba9876543210fedcba9876543210fedcba98/models--inner--repo/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "inner/repo",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-pack-in-subdirectory-of-snapshot",
+   "why": "A pack directory below the snapshot: the enclosing snapshot still names repo and revision.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567/sub/pack",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-snapshots-without-models-prefix",
+   "why": "snapshots/<hex> under a directory not named models--*: no identity.",
+   "modelDir": "hub/org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "hub-models-dir-without-snapshots",
+   "why": "models--org--name/<hex> with no snapshots component: no identity.",
+   "modelDir": "hub/models--org--name/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": null,
+   "expect": null
+  },
+  {
+   "id": "hub-snapshots-dir-itself-via-dotdot",
+   "why": "Input 'snapshots/<hex>/..' resolves to the snapshots directory, which is not a snapshot: no identity.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567/..",
+   "expect": null
+  },
+  {
+   "id": "hub-dotdot-component-normalized",
+   "why": "A .. component is collapsed before the layout is read: snapshots/<hex>/../<hex> is the snapshot.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567/../0123456789abcdef0123456789abcdef01234567",
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-dotdot-escapes-to-plain-dir",
+   "why": "A .. path that leaves the hub tree for a plain directory carries no hub identity.",
+   "modelDir": "plain/pack",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [],
+   "inputPath": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567/../../../../plain/pack",
+   "extraDirs": [
+    "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567"
+   ],
+   "expect": null
+  },
+  {
+   "id": "hub-via-symlink-into-snapshot",
+   "why": "A symlink to a hub snapshot is resolved before the layout is read.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [
+    {
+     "link": "linkpack",
+     "target": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567"
+    }
+   ],
+   "inputPath": "linkpack",
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "hub-via-symlink-to-dir-in-symlinked-hub",
+   "why": "The hub dir itself is reached through a symlinked parent.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": null,
+   "symlinks": [
+    {
+     "link": "linkhub",
+     "target": "hub"
+    }
+   ],
+   "inputPath": "linkhub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "symlink-input-receipt-beside-link",
+   "why": "Receipt is a sibling of the symlink path the caller passes; dest names the real directory, which resolves equal: trusted.",
+   "modelDir": "real/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [
+    {
+     "link": "alias",
+     "target": "real/pack"
+    }
+   ],
+   "inputPath": "alias",
+   "receiptBase": "alias",
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "symlink-input-receipt-beside-target-ignored",
+   "why": "Receipt sits beside the link TARGET, not beside the path passed in: the sibling of the passed path is what is read, so no receipt.",
+   "modelDir": "real/pack",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [
+    {
+     "link": "alias",
+     "target": "real/pack"
+    }
+   ],
+   "inputPath": "alias",
+   "expect": null
+  },
+  {
+   "id": "receipt-and-hub-same-repo-receipt-revision-wins",
+   "why": "Same repo from both: the receipt revision wins over the path hash.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"revision\": \"deadbeef\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "deadbeef"
+   }
+  },
+  {
+   "id": "receipt-repo-only-hub-fills-revision",
+   "why": "Receipt names the repo only: the missing revision is filled from the path.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "0123456789abcdef0123456789abcdef01234567"
+   }
+  },
+  {
+   "id": "receipt-revision-only-hub-fills-repo",
+   "why": "Receipt names a revision only: the missing repo is filled from the path.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"revision\": \"deadbeef\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "deadbeef"
+   }
+  },
+  {
+   "id": "receipt-repo-hub-non-hash-snapshot-fills-nothing",
+   "why": "Same repo; the path snapshot is not a hash so it contributes no revision.",
+   "modelDir": "hub/models--org--name/snapshots/main",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/name\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": null
+   }
+  },
+  {
+   "id": "receipt-empty-repo-and-hub-no-conflict",
+   "why": "An empty receipt repo_id is not a repo, so it cannot conflict with the path.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"\", \"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "repo": "org/name",
+    "revision": "rev-1"
+   }
+  },
+  {
+   "id": "receipt-and-hub-different-repo-conflict",
+   "why": "Receipt and hub path name different repos: conflict.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"other/repo\", \"revision\": \"rev-1\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "conflict": {
+     "receiptRepo": "other/repo",
+     "pathRepo": "org/name"
+    }
+   }
+  },
+  {
+   "id": "receipt-repo-differs-in-case-conflict",
+   "why": "Repo comparison is exact: org/Name vs org/name conflict.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/Name\", \"dest\": \"{DIR}\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "conflict": {
+     "receiptRepo": "org/Name",
+     "pathRepo": "org/name"
+    }
+   }
+  },
+  {
+   "id": "receipt-no-dest-and-hub-different-repo-conflict",
+   "why": "A dest-less (trusted) receipt naming a different repo than the path conflicts.",
+   "modelDir": "hub/models--org--name/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"other/repo\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "conflict": {
+     "receiptRepo": "other/repo",
+     "pathRepo": "org/name"
+    }
+   }
+  },
+  {
+   "id": "hub-single-segment-vs-receipt-slash-repo-conflict",
+   "why": "Path repo 'single' vs receipt 'org/single': different, conflict.",
+   "modelDir": "hub/models--single/snapshots/0123456789abcdef0123456789abcdef01234567",
+   "createModelDir": true,
+   "receipt": {
+    "text": "{\"repo_id\": \"org/single\"}"
+   },
+   "symlinks": [],
+   "inputPath": null,
+   "expect": {
+    "conflict": {
+     "receiptRepo": "org/single",
+     "pathRepo": "single"
+    }
+   }
+  }
+ ]
+}

@@ -996,7 +996,7 @@ def validate_quality_card_document(document: object, label: str) -> Dict[str, ob
     # docs/quality-card-schema-v1.md "Engine build") -- refused here instead
     # of silently tying at runtime. hardwareClass is included because an
     # Ultra card and an M5 card for the same pack are two measurements of two
-    # different facts, not duplicates (docs/quality-card-schema-v1.md:31) --
+    # different facts, not duplicates (docs/quality-card-schema-v1.md § Card object, `config.hardwareClass`) --
     # but it is NEVER used to FILTER card admission (see "Engine build" in
     # that doc, which states the same never-filters contract); it only
     # disambiguates the key.

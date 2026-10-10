@@ -2997,6 +2997,70 @@ def print_no_model_identity_hint(prefix: str, subject: Optional[str] = None) -> 
     print(f"{lead}: {NO_MODEL_IDENTITY_HINT}", file=sys.stderr)
 
 
+# The deepest container nesting the engine's JSON reader (Foundation
+# JSONSerialization) accepts is 512 for objects and 513 for arrays; reject
+# above 512 so Python never reads a receipt the engine would refuse.
+_RECEIPT_JSON_MAX_DEPTH = 512
+
+
+def _receipt_json_reject_constant(name: str):
+    raise ValueError(f"non-standard JSON constant {name}")
+
+
+def _receipt_json_parse_float(text: str) -> float:
+    value = float(text)
+    if value in (float("inf"), float("-inf")):
+        raise ValueError(f"JSON number out of range: {text[:32]}")
+    return value
+
+
+def _receipt_json_first_key_wins(pairs) -> dict:
+    result: dict = {}
+    for key, value in pairs:
+        result.setdefault(key, value)
+    return result
+
+
+def _receipt_json_is_engine_readable(document) -> bool:
+    """``False`` when ``document`` nests deeper than the engine reads or holds
+    a string that is not valid Unicode (a lone surrogate escape)."""
+    stack = [(document, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, str):
+            try:
+                node.encode("utf-8")
+            except UnicodeEncodeError:
+                return False
+        elif isinstance(node, (dict, list)):
+            if depth > _RECEIPT_JSON_MAX_DEPTH:
+                return False
+            children = list(node.keys()) + list(node.values()) if isinstance(node, dict) else node
+            stack.extend((child, depth + 1) for child in children)
+    return True
+
+
+def _parse_receipt_json(data: bytes):
+    """Parse receipt bytes the way the engine's ``PackIdentity.derive`` does,
+    raising ``ValueError``/``RecursionError`` where the engine reads "no
+    receipt": a leading UTF-8 BOM is skipped; ``NaN`` / ``Infinity`` literals,
+    out-of-range numbers, invalid UTF-8, lone surrogates, and over-deep
+    nesting are refused; and with duplicate keys the FIRST wins. Known,
+    conservative difference: the engine also auto-detects UTF-16/32 JSON and
+    tolerates a trailing comma, which Python reads as no receipt (pinned in
+    ``pack-identity-conformance-v1.json``).
+    """
+    document = json.loads(
+        data.decode("utf-8-sig"),
+        parse_constant=_receipt_json_reject_constant,
+        parse_float=_receipt_json_parse_float,
+        object_pairs_hook=_receipt_json_first_key_wins,
+    )
+    if not _receipt_json_is_engine_readable(document):
+        raise ValueError("receipt JSON is not readable by the engine")
+    return document
+
+
 def _load_pull_receipt(model_path: Path) -> Optional[dict]:
     """Load the receipt ``fastmlx pull`` wrote for ``model_path``, if any.
 
@@ -3019,8 +3083,8 @@ def _load_pull_receipt(model_path: Path) -> Optional[dict]:
     if not receipt_path.is_file():
         return None
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        receipt = _parse_receipt_json(receipt_path.read_bytes())
+    except (OSError, ValueError, RecursionError):
         return None
     if not isinstance(receipt, dict):
         return None

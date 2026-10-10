@@ -275,9 +275,17 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # `_served_benchmark_marker_violation` rule, and -- AMENDMENT A1 -- a `<path>` placeholder anywhere
 # other than exactly `--model`'s own redacted value) before either file could ever carry one; the
 # build-time loader re-runs the identical check against the committed files themselves.
+# 2026-10-09, 1008 -> 1012: adds the shared pack-identity conformance table
+# (spike/Tests/HarnessCoreTests/Fixtures/pack-identity-conformance-v1.json), its Swift checker
+# (spike/Tests/HarnessCoreTests/PackIdentityConformanceTests.swift, projected with spike/Tests), its
+# Python checker scripts/tests/test_pack_identity_conformance.py, and
+# scripts/tests/test_no_schema_line_citations.py (live code cites docs by section, never by line).
+# Conscious decision to publish: all four were read; they hold only synthetic temp-dir layouts,
+# fake repo ids (org/name), receipt byte fixtures and a regex, and a marker scan found no private
+# host, IP, username, machine-local path, competitor/engine product name, or credential.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1008,
-    "pathModeSha256": "3a2e6cd0342da71683af5931936fa58adaead08e3b04043f44072f1e1b4b5acf",
+    "pathCount": 1012,
+    "pathModeSha256": "b5e76786790b131eaf22938cceae3b35081afe1d198979aed386bf1c3b95c04a",
 }
 
 

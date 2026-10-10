@@ -7289,7 +7289,7 @@ class PublicSiteTests(unittest.TestCase):
     # The Flash Next cards were measured on a third-party serving engine
     # (fa76a4b5); the consumer-class 0.6B card was measured on fast-mlx's
     # own fastmlx-serve release build. provenance.engineBuild is OPTIONAL
-    # on ANY card (docs/quality-card-schema-v1.md:362) -- what this test
+    # on ANY card (docs/quality-card-schema-v1.md § Engine build) -- what this test
     # pins is that no card acquires one by ACCIDENT, which is the live
     # hazard: emit_quality_card.py --engine-commit stamps every card that
     # run emits (scripts/emit_quality_card.py:946).
