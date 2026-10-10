@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 1012,
-    "pathModeSha256": "b5e76786790b131eaf22938cceae3b35081afe1d198979aed386bf1c3b95c04a"
+    "pathCount": 1015,
+    "pathModeSha256": "9815ed1833113e8d571cf07c620abfe21203520c19a053a50b2ef767517df181"
   },
   "files": [
     {
@@ -240,6 +240,10 @@
     {
       "source": "scripts/tests/test_no_schema_line_citations.py",
       "destination": "scripts/tests/test_no_schema_line_citations.py"
+    },
+    {
+      "source": "scripts/tests/test_card_resolution_conformance.py",
+      "destination": "scripts/tests/test_card_resolution_conformance.py"
     },
     {
       "source": "spike/Package.swift",

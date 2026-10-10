@@ -283,9 +283,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Conscious decision to publish: all four were read; they hold only synthetic temp-dir layouts,
 # fake repo ids (org/name), receipt byte fixtures and a regex, and a marker scan found no private
 # host, IP, username, machine-local path, competitor/engine product name, or credential.
+# 2026-10-09, 1012 -> 1015: adds the shared card-resolution conformance table
+# (spike/Tests/HarnessCoreTests/Fixtures/card-resolution-conformance-v1.json), its Swift checker
+# (spike/Tests/HarnessCoreTests/CardResolutionConformanceTests.swift, projected with spike/Tests) and its
+# Python checker scripts/tests/test_card_resolution_conformance.py. Conscious decision to publish: all
+# three were read; they hold only synthetic repo ids (org/pack-*), synthetic card ids and hex revisions,
+# and the tests themselves refuse an absolute path or a private-path prefix in the fixture.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1012,
-    "pathModeSha256": "b5e76786790b131eaf22938cceae3b35081afe1d198979aed386bf1c3b95c04a",
+    "pathCount": 1015,
+    "pathModeSha256": "9815ed1833113e8d571cf07c620abfe21203520c19a053a50b2ef767517df181",
 }
 
 

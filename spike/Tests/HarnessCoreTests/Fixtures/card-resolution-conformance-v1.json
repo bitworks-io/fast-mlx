@@ -1,0 +1,2539 @@
+{
+ "schema": "card-resolution-conformance-v1",
+ "doc": "Each case is a quality-card manifest (cards array, wrapped in a fast-mlx-quality-card-v1 envelope by each test) plus the launch identity (repo, revision, hostHardwareClass; null means absent / unrecognized host). expect is the ENGINE outcome: \"none\" | {\"card\": id} | {\"ambiguous\": {\"repo\": [ids], \"pin\": [ids]}} (id lists sorted). The Swift test loads the cards through the engine's own manifest decoder (QualityCardStore.loadManifestDetailed) and calls QualityCardStore.resolve(repo:revision:hostHardwareClass:in:); the Python test runs fastmlx_launch.resolve_card. SCOPE HELD FIXED: Python's engine_build_commit tiebreak and residency argument have no Swift counterpart in resolve, so the Python side runs every case with residency=\"resident\" and engine_build_commit=None, and the host class is injected on both sides; the table says nothing about those two inputs. knownPythonDivergence {pythonOutcome, reason}, when present, is a documented difference in the ONLY tolerated direction: Python refuses (LaunchRefusal exit 3) where the engine picks a card. Python returning a card where the engine returns none, ambiguous or a different card is never tolerated, and the Python test rejects any divergence entry that claims otherwise. Python's ambiguous outcome is also a refusal (exit 3, naming the sorted repo and pin ids). Repos, card ids and revisions are synthetic. Expectations are hand-authored from the documented rule in QualityAdmission.swift select/resolve; where the engine disagreed with a guess the why says engine-observed.",
+ "cases": [
+  {
+   "id": "repo-only-single-card",
+   "why": "A repo match with no revision: the single repo card.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "repo-only-no-matching-repo",
+   "why": "No card names this repo and no revision: none.",
+   "repo": "org/pack-z",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "repo-and-revision-both-absent",
+   "why": "Neither repo nor revision: nothing to match, none.",
+   "repo": null,
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a",
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "repo-only-revision-not-matching-pin",
+   "why": "A full-hex revision that is not any card's pin leaves the pin pool empty, so the repo card resolves without ambiguity.",
+   "repo": "org/pack-a",
+   "revision": "fedcba9876543210fedcba9876543210fedcba98",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a",
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "repo-only-card-with-null-repo-never-matches",
+   "why": "A card whose repo is null (pin-only card) is never matched by a repo lookup.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "pin-only-8-hex-prefix",
+   "why": "A pin-only card (repo null) whose 8-hex hfPin is a prefix of the full revision resolves by pin.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-p"
+   }
+  },
+  {
+   "id": "pin-only-repo-names-nothing",
+   "why": "A repo that names no card does not block a pin match: the pin pool becomes the candidates.",
+   "repo": "org/pack-z",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-p"
+   }
+  },
+  {
+   "id": "pin-only-revision-absent",
+   "why": "A pin-only card cannot match without a revision.",
+   "repo": null,
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "pin-40-hex-equal-to-revision",
+   "why": "A 40-hex hfPin equal to the revision is a prefix of it (prefix includes equality).",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "0123456789abcdef0123456789abcdef01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-p"
+   }
+  },
+  {
+   "id": "pin-12-hex-prefix",
+   "why": "A 12-hex hfPin is a longer-than-minimum prefix; matches by prefix, not equality.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "0123456789ab"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-p"
+   }
+  },
+  {
+   "id": "pin-7-hex-too-short",
+   "why": "A 7-hex hfPin is below the 8-hex minimum: never matches, though it is a true prefix.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "0123456"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "pin-8-hex-not-a-prefix",
+   "why": "An 8-hex hfPin that is not a prefix of the revision does not match.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "fedcba98"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "pin-non-hex-8-chars",
+   "why": "An 8-char hfPin containing a non-hex character is not a usable pin.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "0123456g"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "pin-41-chars-longer-than-revision",
+   "why": "An hfPin longer than the revision cannot be its prefix.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "0123456789abcdef0123456789abcdef01234567a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "pin-uppercase-hex-matches-lowercase-revision",
+   "why": "Pin comparison is case-insensitive: an uppercase 8-hex pin matches a lowercase revision.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-p"
+   }
+  },
+  {
+   "id": "revision-uppercase-matches-lowercase-pin",
+   "why": "An uppercase 40-hex revision still matches a lowercase pin.",
+   "repo": null,
+   "revision": "0123456789ABCDEF0123456789ABCDEF01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-p"
+   }
+  },
+  {
+   "id": "revision-39-hex-never-matches",
+   "why": "A 39-hex revision is not a full sha: the pin pool is empty.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef0123456",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "revision-41-hex-never-matches",
+   "why": "A 41-hex revision is not a full sha: the pin pool is empty.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567a",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "revision-40-with-non-hex-char",
+   "why": "A 40-char revision containing a non-hex character is not a full sha.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef0123456g",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "short-revision-does-not-block-repo-card",
+   "why": "A 39-hex revision empties the pin pool, so a pin-only sibling cannot cause ambiguity against the repo card.",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef0123456",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    },
+    {
+     "id": "card-p",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-p"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "repo-and-pin-agree-on-one-card",
+   "why": "One card matched both by repo and by pin: the same identity on both sides is not ambiguous.",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a",
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "repo-and-pin-agree-on-two-sibling-cards",
+   "why": "Two hardware siblings matched by both repo and pin form the same identity set on both sides, so the shared selection rule runs (lowest id with no host).",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a",
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-a@hw2",
+     "model": {
+      "repo": "org/pack-a",
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "repo-and-pin-name-different-cards",
+   "why": "The repo names card-a and the pin names card-b (a pin-only card): ambiguous, never a silent preference.",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    },
+    {
+     "id": "card-b",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b"
+     }
+    }
+   ],
+   "expect": {
+    "ambiguous": {
+     "repo": [
+      "card-a"
+     ],
+     "pin": [
+      "card-b"
+     ]
+    }
+   }
+  },
+  {
+   "id": "repo-and-pin-ambiguous-id-lists-sorted",
+   "why": "Ambiguous id lists are sorted ids: manifest order is c-then-a for the repo side.",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-c",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-c"
+     }
+    }
+   ],
+   "expect": {
+    "ambiguous": {
+     "repo": [
+      "card-a@hw1",
+      "card-a@hw2"
+     ],
+     "pin": [
+      "card-c"
+     ]
+    }
+   }
+  },
+  {
+   "id": "repo-card-is-subset-of-pin-cards",
+   "why": "The repo pool is {card-a} and the pin pool is {card-a, card-b}: different identity sets, ambiguous.",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a",
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    },
+    {
+     "id": "card-b",
+     "model": {
+      "repo": null,
+      "hfPin": "0123456789"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b"
+     }
+    }
+   ],
+   "expect": {
+    "ambiguous": {
+     "repo": [
+      "card-a"
+     ],
+     "pin": [
+      "card-a",
+      "card-b"
+     ]
+    }
+   }
+  },
+  {
+   "id": "repo-and-pin-same-id-different-verdict",
+   "why": "A PASS repo card and a NO_GO pin-only card published under one id: the id sets match but the identities differ, so it is still ambiguous (duplicate-id guard).",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-dup",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-dup"
+     }
+    },
+    {
+     "id": "card-dup",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-dup"
+     }
+    }
+   ],
+   "expect": {
+    "ambiguous": {
+     "repo": [
+      "card-dup"
+     ],
+     "pin": [
+      "card-dup"
+     ]
+    }
+   }
+  },
+  {
+   "id": "repo-resident-pin-only-expert-stream",
+   "why": "The pin-only card is expert-stream (filtered before ambiguity), so the repo card resolves.",
+   "repo": "org/pack-a",
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    },
+    {
+     "id": "card-b",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b"
+     },
+     "config": {
+      "residency": "expert-stream"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "residency-absent-config-missing",
+   "why": "No config object at all means measured resident: eligible.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "residency-absent-config-without-key",
+   "why": "A config object with no residency key means resident: eligible.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "residency-null",
+   "why": "config.residency null means resident: eligible.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "residency": null
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "residency-resident",
+   "why": "config.residency 'resident': eligible.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "residency": "resident"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "residency-expert-stream-only",
+   "why": "A lone expert-stream card never gates a resident launch: none.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "residency": "expert-stream"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "residency-unknown-only",
+   "why": "A lone card with an unrecognized residency string never matches a resident launch: none.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "residency": "streamed-v2"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "residency-expert-stream-no-go-beside-resident-pass",
+   "why": "A NO_GO expert-stream card is invisible; the resident PASS sibling resolves (engine behavior: filtered cards leave the pool even when NO_GO).",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a-pass",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass"
+     },
+     "config": {
+      "residency": "resident"
+     }
+    },
+    {
+     "id": "card-b-nogo",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo"
+     },
+     "config": {
+      "residency": "expert-stream"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a-pass"
+   }
+  },
+  {
+   "id": "residency-unknown-no-go-beside-resident-pass",
+   "why": "A NO_GO card with an unrecognized residency is invisible too: the resident PASS card resolves. Treating unknown as resident would let the NO_GO narrow the pool.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a-pass",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass"
+     },
+     "config": {
+      "residency": "resident"
+     }
+    },
+    {
+     "id": "card-b-nogo",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo"
+     },
+     "config": {
+      "residency": "streamed-v2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a-pass"
+   }
+  },
+  {
+   "id": "residency-empty-string-is-unknown",
+   "why": "An empty-string residency is not null and not 'resident': unrecognized, never matches.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "residency": ""
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "residency-mixed-case-is-unknown",
+   "why": "Residency matching is exact: 'Resident' is unrecognized, never matches.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     },
+     "config": {
+      "residency": "Resident"
+     }
+    }
+   ],
+   "expect": "none"
+  },
+  {
+   "id": "no-go-beside-pass-host-on-pass-class",
+   "why": "Host on the PASS card's class: hardwareClass is a tiebreak within the NO_GO pool, never a filter, so the NO_GO card still resolves (fail-closed).",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "no-go-beside-pass-host-on-no-go-class",
+   "why": "Host on the NO_GO card's class: the NO_GO card.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw2",
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "no-go-beside-pass-host-on-neither",
+   "why": "Host on neither class: the NO_GO pool's only member, even though the PASS card has the lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw3",
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "no-go-beside-pass-host-nil",
+   "why": "Unrecognized host: the NO_GO pool's only member.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "no-go-beside-pass-manifest-order-reversed",
+   "why": "Manifest order must never decide: same pair reversed.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "no-go-beside-exact-host-on-exact-class",
+   "why": "A NO_GO beats an EXACT sibling even with a host match on the EXACT card.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a-exact@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "EXACT",
+     "legible": {
+      "tier": "tier-EXACT",
+      "headline": "headline for card-a-exact@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "no-go-by-pin-beside-pass-by-pin",
+   "why": "The NO_GO narrowing applies equally to a pin-derived pool.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "two-no-go-one-pass-host-on-pass-class",
+   "why": "Two NO_GO siblings and a PASS: the pool is the two NO_GO cards; the PASS host match is excluded and the lowest NO_GO id wins.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-c-nogo@hw3",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-c-nogo@hw3"
+     },
+     "config": {
+      "hardwareClass": "hw3"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b-nogo@hw2"
+   }
+  },
+  {
+   "id": "two-no-go-one-pass-host-on-one-no-go",
+   "why": "Two NO_GO siblings and a PASS: a unique host match inside the NO_GO pool beats the lowest NO_GO id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw3",
+   "cards": [
+    {
+     "id": "card-a-pass@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a-pass@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b-nogo@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b-nogo@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-c-nogo@hw3",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-c-nogo@hw3"
+     },
+     "config": {
+      "hardwareClass": "hw3"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-c-nogo@hw3"
+   }
+  },
+  {
+   "id": "unique-host-match-beats-lowest-id",
+   "why": "Two PASS siblings; the host matches the higher-id one uniquely, so it wins over the lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw2",
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b@hw2"
+   }
+  },
+  {
+   "id": "unique-host-match-on-lowest-id-card",
+   "why": "Host matches the lower-id sibling uniquely.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "host-matches-neither-falls-to-lowest-id",
+   "why": "Host matches neither sibling: lowest id, not a refusal and not a filter.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw3",
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "host-nil-falls-to-lowest-id",
+   "why": "Unrecognized host: lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "several-host-matches-use-lowest-id-of-whole-pool",
+   "why": "The host matches two cards (not unique), so the host does not narrow and the lowest id of the whole tie pool wins (a@hw1), not the lowest id among the host matches (b@hw2).",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw2",
+   "cards": [
+    {
+     "id": "card-c@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-c@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "several-host-matches-all-same-class",
+   "why": "All siblings share the host's class: no unique match, lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-b@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "host-match-needs-recorded-class",
+   "why": "Cards with no recorded hardwareClass never host-match: lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-b",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b"
+     }
+    },
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "host-matches-the-one-card-with-a-class",
+   "why": "One card records the host's class and a sibling records none: the unique host match wins over the lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a"
+     }
+    },
+    {
+     "id": "card-b@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b@hw1"
+   }
+  },
+  {
+   "id": "host-match-by-pin-pool",
+   "why": "The host tiebreak runs the same over a pin-derived pool.",
+   "repo": null,
+   "revision": "0123456789abcdef0123456789abcdef01234567",
+   "hostHardwareClass": "hw2",
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": null,
+      "hfPin": "01234567"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b@hw2"
+   }
+  },
+  {
+   "id": "same-verdict-pass-lowest-id-manifest-order-scrambled",
+   "why": "Three PASS siblings listed c, a, b with no host: the lowest id regardless of manifest order.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-c@hw3",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-c@hw3"
+     },
+     "config": {
+      "hardwareClass": "hw3"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "same-verdict-no-go-lowest-id-unknown-host",
+   "why": "Two NO_GO hardware siblings, unrecognized host (the shipped multi-hardware shape): lowest id. Python used to refuse here; the 2026-09-26 DECISION made it take the same-verdict lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-x@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-x@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-x@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-x@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-x@hw1"
+   }
+  },
+  {
+   "id": "same-verdict-no-go-lowest-id-host-matches-neither",
+   "why": "Two NO_GO siblings, host on neither: lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw9",
+   "cards": [
+    {
+     "id": "card-x@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-x@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-x@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-x@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-x@hw1"
+   }
+  },
+  {
+   "id": "same-verdict-unmeasured-lowest-id",
+   "why": "UNMEASURED siblings share one verdict: lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "UNMEASURED",
+     "legible": {
+      "tier": "tier-UNMEASURED",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "UNMEASURED",
+     "legible": {
+      "tier": "tier-UNMEASURED",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "same-verdict-single-card-in-pool-after-residency",
+   "why": "Two cards, one filtered by residency: a single survivor is returned without any tiebreak.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1",
+      "residency": "expert-stream"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b@hw2"
+   }
+  },
+  {
+   "id": "duplicate-lowest-id-same-class-unknown-host",
+   "why": "Two structurally different cards share one id (differ only in hardwareClass). Engine: picks by id (either is that id). Python refuses because the lowest id is not unique.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-dup",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-dup"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-dup",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-dup"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-dup"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "the lowest id is shared by two structurally different cards; Python refuses (exit 3) where the engine's min-by-id picks one"
+   }
+  },
+  {
+   "id": "duplicate-lowest-id-host-disambiguates",
+   "why": "Same shared id, but the host uniquely matches one of them: both sides resolve it.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw2",
+   "cards": [
+    {
+     "id": "card-dup",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-dup"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-dup",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-dup"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-dup"
+   }
+  },
+  {
+   "id": "pass-vs-exact-host-nil",
+   "why": "PASS and EXACT siblings, no NO_GO, no host: the engine picks the lowest id; Python refuses because an arbitrary pick would change the reported verdict.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "EXACT",
+     "legible": {
+      "tier": "tier-EXACT",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "mixed non-NO_GO verdicts (PASS and EXACT) with no unique host match: Python refuses (exit 3) rather than pick by lowest id"
+   }
+  },
+  {
+   "id": "pass-vs-exact-host-on-neither",
+   "why": "Same pair, host on neither class: still no unique host match, so the same divergence.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw3",
+   "cards": [
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "EXACT",
+     "legible": {
+      "tier": "tier-EXACT",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "mixed non-NO_GO verdicts with host on neither class: Python refuses (exit 3)"
+   }
+  },
+  {
+   "id": "pass-vs-exact-host-on-exact-class",
+   "why": "A unique host match settles it before the verdict check: both sides pick the EXACT card.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw2",
+   "cards": [
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "EXACT",
+     "legible": {
+      "tier": "tier-EXACT",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b@hw2"
+   }
+  },
+  {
+   "id": "pass-vs-exact-host-on-pass-class",
+   "why": "A unique host match on the PASS card: both sides pick PASS.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "hw1",
+   "cards": [
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "EXACT",
+     "legible": {
+      "tier": "tier-EXACT",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  },
+  {
+   "id": "pass-vs-reference-host-nil",
+   "why": "PASS and REFERENCE siblings: same mixed-verdict divergence.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "REFERENCE",
+     "legible": {
+      "tier": "tier-REFERENCE",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "mixed non-NO_GO verdicts (REFERENCE and PASS) with no unique host match: Python refuses (exit 3)"
+   }
+  },
+  {
+   "id": "pass-vs-unmeasured-host-nil",
+   "why": "PASS and UNMEASURED siblings: same mixed-verdict divergence.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "UNMEASURED",
+     "legible": {
+      "tier": "tier-UNMEASURED",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "mixed non-NO_GO verdicts (UNMEASURED and PASS) with no unique host match: Python refuses (exit 3)"
+   }
+  },
+  {
+   "id": "unrecognized-verdict-single-card",
+   "why": "A lone card with an unrecognized verdict still resolves (the engine reads it as UNMEASURED; the card is returned, not dropped).",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "no_go",
+     "legible": {
+      "tier": "tier-no_go",
+      "headline": "headline for card-a"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a"
+   }
+  },
+  {
+   "id": "unrecognized-verdict-beside-no-go",
+   "why": "The recognized NO_GO sibling narrows the pool; a lowercase 'no_go' card is not NO_GO and is excluded from it.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "no_go",
+     "legible": {
+      "tier": "tier-no_go",
+      "headline": "headline for card-a"
+     }
+    },
+    {
+     "id": "card-b",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for card-b"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-b"
+   }
+  },
+  {
+   "id": "unrecognized-verdict-beside-pass",
+   "why": "An unrecognized verdict beside a PASS: the engine sees UNMEASURED and PASS siblings and picks the lowest id; Python sees two different raw verdict strings and refuses.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "no_go",
+     "legible": {
+      "tier": "tier-no_go",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "PASS",
+     "legible": {
+      "tier": "tier-PASS",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "an unrecognized raw verdict string differs from PASS: Python refuses (exit 3) where the engine picks the lowest id"
+   }
+  },
+  {
+   "id": "two-different-unrecognized-verdicts",
+   "why": "Two distinct unrecognized verdict strings both decode to UNMEASURED in the engine (lowest id); Python counts them as different verdicts and refuses.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "bogus-1",
+     "legible": {
+      "tier": "tier-bogus-1",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    },
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "bogus-2",
+     "legible": {
+      "tier": "tier-bogus-2",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   },
+   "knownPythonDivergence": {
+    "pythonOutcome": "refuses",
+    "reason": "two distinct unrecognized verdict strings: Python refuses (exit 3) where the engine reads both as UNMEASURED and picks the lowest id"
+   }
+  },
+  {
+   "id": "same-unrecognized-verdict-twice",
+   "why": "Two cards with the same unrecognized verdict string form one same-verdict pool in both implementations: lowest id.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": null,
+   "cards": [
+    {
+     "id": "card-b@hw2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "bogus-1",
+     "legible": {
+      "tier": "tier-bogus-1",
+      "headline": "headline for card-b@hw2"
+     },
+     "config": {
+      "hardwareClass": "hw2"
+     }
+    },
+    {
+     "id": "card-a@hw1",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "bogus-1",
+     "legible": {
+      "tier": "tier-bogus-1",
+      "headline": "headline for card-a@hw1"
+     },
+     "config": {
+      "hardwareClass": "hw1"
+     }
+    }
+   ],
+   "expect": {
+    "card": "card-a@hw1"
+   }
+  }
+ ]
+}
