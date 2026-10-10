@@ -207,6 +207,11 @@ named or found.
 python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit@<40-hex-commit> --dest ./models/qwen3-8b
 # Add --kv-reserve-gib 2 to refuse a pack that cannot fit this Mac before any byte is downloaded.
 
+# No commit to hand? Leave the revision off: `main` is resolved to its commit sha once, the sha is
+# printed with the exact `fastmlx pull <repo>@<sha>` command that reproduces it, and the pull then runs
+# as the pinned form does (the receipt records that sha). `@main` and short shas are still refused.
+python3 scripts/fastmlx.py pull mlx-community/Qwen3-8B-4bit --dest ./models/qwen3-8b
+
 # Adopt a directory that was staged by hand (rsync, a copy from another host, ...) instead of by
 # `fastmlx pull`: verifies every manifest file already there against the pinned revision (size +
 # content hash) and writes the same receipt a real pull would, instead of downloading anything.
@@ -226,7 +231,7 @@ python3 scripts/fastmlx.py recommend --models-dir ./models
 python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 ```
 
-`pull` writes a receipt next to the model directory that records the exact revision. `serve` and
+`pull` writes a receipt next to the model directory that records the exact revision (the resolved sha, when you gave a bare repository). `--adopt` always needs `<repo>@<sha>`. `serve` and
 `recommend` read it to find the model's quality card; both also identify a snapshot in your Hugging
 Face cache by its path (`.../models--<org>--<name>/snapshots/<revision>`), the same way `fastmlx-serve`
 does. A pack whose card says NO_GO is refused until you opt in with `--accept-quality <card-id>`, so a

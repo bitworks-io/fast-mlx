@@ -7,9 +7,21 @@ single-shot tool with no resume: on failure it leaves its staging tree
 behind under a unique ``.acquiring-*`` name and never looks at it again. All
 the resume behavior lives here, one layer up:
 
-- The pinned reference must be ``<repo>/<name>@<40-char-lowercase-hex-sha>``.
-  Branch/tag names (``main``), short shas, and uppercase hex are all
-  refused with a stated reason before any network request is made.
+- The reference is either ``<org>/<name>@<40-char-lowercase-hex-sha>`` or a
+  bare ``<org>/<name>`` (no ``@``). Branch/tag names (``<repo>@main``), short
+  shas, uppercase hex, and more than one ``@`` are refused with a stated
+  reason before any network request is made. A bare repository is resolved
+  ONCE through the existing revision API (``downloader.fetch_api(repo,
+  "main")``, no separate HTTP path): the answer's ``sha`` must be 40
+  lowercase hex, its ``id`` must equal the repository, and ``private`` must
+  be ``False``, else the pull is refused (exit 1, nothing written, no second
+  fetch). stderr then names the resolved sha and the reproducible command
+  ``fastmlx pull <repo>@<sha>``, and the pull continues exactly as the pinned
+  form does with that sha (the receipt records it). If a quality card names
+  the repo with an ``hfPin`` that is not a prefix of the resolved sha, a
+  notice is printed (never a refusal). A bare repository with ``--adopt`` is a
+  usage error (exit 2): adopting verifies a directory whose revision only the
+  user knows, so it must be named as ``<repo>@<sha>``.
 - A free-space floor is checked before the first attempt, using the
   revision API's total planned size (or an explicit ``--min-free-bytes``
   floor) plus the downloader's own safety margin.
@@ -98,9 +110,11 @@ and it does not add any new token/credential handling.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -188,6 +202,72 @@ def validate_pinned_reference(text: str) -> tuple[str, str]:
             "'main' are refused, and abbreviated shas are refused"
         )
     return repo_id, revision
+
+
+def is_bare_reference(text: str) -> bool:
+    """True for a bare ``<org>/<name>``: no ``@`` and a valid repository id.
+    Every other string (``@main``, a short sha, two ``@``, a malformed id)
+    goes through ``validate_pinned_reference`` and keeps its refusal."""
+    return "@" not in text and downloader.REPO_PATTERN.fullmatch(text) is not None
+
+
+def resolve_bare_reference(repo_id: str) -> str:
+    """Resolve ``main`` of ``repo_id`` to its 40-hex commit sha, once, through
+    ``downloader.fetch_api`` (the same API the pinned pull uses). Refuses
+    (``PinnedReferenceError``) unless the document's ``sha`` is 40 lowercase
+    hex, its ``id`` equals ``repo_id``, and ``private`` is ``False``."""
+    try:
+        document, _api_data = downloader.fetch_api(repo_id, "main")
+    except downloader.AcquisitionError as error:
+        raise PinnedReferenceError(
+            f"could not resolve 'main' of {repo_id} to a commit sha: {error}; "
+            "nothing was written (name a commit as <repo>@<sha> to skip this "
+            "lookup)"
+        ) from error
+    if document.get("id") != repo_id:
+        raise PinnedReferenceError(
+            f"resolving 'main' of {repo_id}: the API answered for repository id "
+            f"{document.get('id')!r}, not {repo_id!r}; nothing was written"
+        )
+    if document.get("private") is not False:
+        raise PinnedReferenceError(
+            f"resolving 'main' of {repo_id}: the API does not identify a public "
+            "repository (not public); nothing was written"
+        )
+    sha = document.get("sha")
+    if not isinstance(sha, str) or downloader.LOWER_HEX_40.fullmatch(sha) is None:
+        raise PinnedReferenceError(
+            f"resolving 'main' of {repo_id}: the API did not return a "
+            f"40-character lowercase hex commit sha (got {sha!r}); nothing "
+            "was written"
+        )
+    return sha
+
+
+def _notify_card_pin_mismatch(repo_id: str, sha: str) -> None:
+    """Print a stderr notice for each quality card that names ``repo_id`` with
+    an ``hfPin`` that is not a prefix of ``sha``. Advisory only: any failure
+    loading the card store is swallowed silently."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            recommend = _load_recommend_module()
+            cards = recommend.load_default_card_store("fastmlx pull")
+        for card in cards:
+            model = card.get("model") or {}
+            hf_pin = model.get("hfPin")
+            if model.get("repo") != repo_id or not isinstance(hf_pin, str) or not hf_pin:
+                continue
+            if not sha.startswith(hf_pin.lower()):
+                print(
+                    f"fastmlx pull: notice: quality card {card.get('id')} for "
+                    f"{repo_id} was measured at hfPin {hf_pin}, which is not a "
+                    f"prefix of the resolved sha {sha}; main has moved since "
+                    "that card, so its verdict may not describe this revision",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    except Exception:
+        return
 
 
 # ---------------------------------------------------------------------
@@ -891,7 +971,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "pinned_reference",
-        help="<org>/<name>@<40-character-lowercase-hex-commit-sha>",
+        help=(
+            "<org>/<name>@<40-character-lowercase-hex-commit-sha>, or a bare "
+            "<org>/<name>, which resolves main to a commit sha once (printed "
+            "with the reproducible pinned command; not allowed with --adopt)"
+        ),
     )
     parser.add_argument(
         "--dest",
@@ -1104,8 +1188,27 @@ def main(argv: Optional[list[str]] = None) -> None:
             "directory in place and writes no pack bytes, so there is no "
             "free-space floor to check"
         )
+    bare = is_bare_reference(args.pinned_reference)
+    if bare and args.adopt:
+        parser.error(
+            "--adopt needs the revision the directory was staged from: name "
+            "it as <repo>@<sha> (a bare repository would resolve main, which "
+            "may not be what that directory holds)"
+        )
     try:
-        repo_id, revision = validate_pinned_reference(args.pinned_reference)
+        if bare:
+            repo_id = args.pinned_reference
+            revision = resolve_bare_reference(repo_id)
+            print(
+                f"fastmlx pull: resolved {repo_id} main to {revision}; "
+                f"reproduce this exact pull with: fastmlx pull "
+                f"{repo_id}@{revision}",
+                file=sys.stderr,
+                flush=True,
+            )
+            _notify_card_pin_mismatch(repo_id, revision)
+        else:
+            repo_id, revision = validate_pinned_reference(args.pinned_reference)
     except PinnedReferenceError as error:
         print(f"fastmlx pull refused: {error}", file=sys.stderr)
         raise SystemExit(1)

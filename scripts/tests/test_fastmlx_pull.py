@@ -2228,6 +2228,293 @@ class PullPreflightTests(unittest.TestCase):
         self.assertEqual(pull_row["sizing"]["ceiling_bytes"], PREFLIGHT_CEILING_BYTES)
 
 
+# ---------------------------------------------------------------------
+# A bare ``<org>/<name>`` (no '@') resolves ``main`` once to a pinned sha and
+# then pulls exactly as the pinned form does. All network, the downloader, and
+# the free-space probe are faked; the card store is a local manifest.
+# ---------------------------------------------------------------------
+BARE_REPO = PREFLIGHT_PASS_REPO
+BARE_SHA = "c" * 40
+
+
+class BareReferenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.dest = self.work / "model"
+        self.cards_path = self.root / "quality-guides.json"
+        self.cards_path.write_text(json.dumps(preflight_card_manifest()), encoding="utf-8")
+        self.recommend = _recommend_module()
+        self.files = dict(SMALL_PACK)
+        # What the "main" lookup returns; tests overwrite it to break one field.
+        self.main_document = {"id": BARE_REPO, "sha": BARE_SHA, "private": False}
+
+        env = mock.patch.dict(
+            os.environ,
+            {"FASTMLX_WIRED_LIMIT_MIB": "4096", "FASTMLX_WIRED_MARGIN_GIB": "2"},
+        )
+        env.start()
+        self.fetch_api = mock.patch.object(
+            DOWNLOADER, "fetch_api", side_effect=self._fake_fetch
+        ).start()
+        self.acquire = mock.patch.object(
+            DOWNLOADER, "acquire", side_effect=self._fake_acquire
+        ).start()
+        self.probe = mock.patch.object(
+            DOWNLOADER, "probe_free_space_bytes", return_value=1 << 60
+        ).start()
+        self.loader = mock.patch.object(
+            FASTMLX_PULL, "_load_recommend_module", side_effect=_recommend_module
+        ).start()
+        self.store = mock.patch.object(
+            self.recommend.launch,
+            "resolve_quality_card_store",
+            return_value=(self.cards_path, "explicit", []),
+        ).start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _fake_fetch(self, repo_id, revision):
+        if revision == "main":
+            return dict(self.main_document), b""
+        return preflight_document(repo_id, revision, self.files), b""
+
+    def _fake_acquire(self, namespace):
+        output = Path(namespace.output)
+        output.mkdir()
+        for name, size in self.files.items():
+            (output / name).write_bytes(b"x" * size)
+
+    def run_main(self, *argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        code = None
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            try:
+                FASTMLX_PULL.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def run_bare(self, *extra, repo=BARE_REPO):
+        return self.run_main(repo, "--dest", str(self.dest), *extra)
+
+    def assert_nothing_written(self):
+        self.assertEqual(sorted(self.work.iterdir()), [])
+        self.acquire.assert_not_called()
+        self.probe.assert_not_called()
+
+    # --- A1 -----------------------------------------------------------
+    def test_a1_bare_resolves_main_first_then_pulls_the_resolved_sha(self):
+        code, _out, err = self.run_bare()
+        self.assertIsNone(code, err)
+        self.assertEqual(
+            self.fetch_api.call_args_list,
+            [mock.call(BARE_REPO, "main"), mock.call(BARE_REPO, BARE_SHA)],
+        )
+        self.acquire.assert_called_once()
+        namespace = self.acquire.call_args.args[0]
+        self.assertEqual(namespace.repo_id, BARE_REPO)
+        self.assertEqual(namespace.revision, BARE_SHA)
+        receipt = json.loads(
+            FASTMLX_PULL.receipt_path_for(self.dest).read_text(encoding="utf-8")
+        )
+        self.assertEqual(receipt["revision"], BARE_SHA)
+        self.assertEqual(receipt["repo_id"], BARE_REPO)
+        self.assertEqual(receipt["acquisition"], "downloaded")
+
+    def test_a1_fit_preflight_runs_with_the_resolved_sha(self):
+        spy = mock.patch.object(
+            self.recommend,
+            "classify_pinned_entries",
+            wraps=self.recommend.classify_pinned_entries,
+        ).start()
+        code, _out, err = self.run_bare("--kv-reserve-gib", "0.5")
+        self.assertIsNone(code, err)
+        self.assertEqual(spy.call_args.kwargs["ref"], f"{BARE_REPO}@{BARE_SHA}")
+
+    def test_a1_from_hub_cache_resolves_online_then_imports_the_resolved_sha(self):
+        hub = self.root / "hub"
+        with mock.patch.object(FASTMLX_PULL, "import_from_hub_cache") as importer:
+            code, _out, err = self.run_bare("--from-hub-cache", str(hub))
+        self.assertIsNone(code, err)
+        self.fetch_api.assert_called_once_with(BARE_REPO, "main")
+        importer.assert_called_once()
+        self.assertEqual(importer.call_args.kwargs["revision"], BARE_SHA)
+        self.assertEqual(importer.call_args.kwargs["repo_id"], BARE_REPO)
+
+    def test_a1_a_fetch_failure_while_resolving_main_refuses_with_nothing_written(self):
+        self.fetch_api.side_effect = DOWNLOADER.AcquisitionError("source API request failed")
+        code, _out, err = self.run_bare()
+        self.assertEqual(code, 1)
+        self.assertIn("main", err)
+        self.assertIn("source API request failed", err)
+        self.assert_nothing_written()
+        self.fetch_api.assert_called_once_with(BARE_REPO, "main")
+
+    # --- A2 -----------------------------------------------------------
+    def assert_refused_at_resolution(self, reason_fragment):
+        code, _out, err = self.run_bare()
+        self.assertEqual(code, 1, err)
+        self.assertIn("fastmlx pull refused", err)
+        self.assertIn(reason_fragment, err)
+        self.assert_nothing_written()
+        self.assertFalse(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+        self.fetch_api.assert_called_once_with(BARE_REPO, "main")
+
+    def test_a2_malformed_resolved_sha_is_refused(self):
+        for bad in ("A" * 40, "c" * 39, "c" * 41, "main", "", None, 7, "g" * 40):
+            with self.subTest(sha=bad):
+                self.fetch_api.reset_mock()
+                self.main_document = {"id": BARE_REPO, "sha": bad, "private": False}
+                self.assert_refused_at_resolution("commit sha")
+
+    def test_a2_missing_resolved_sha_is_refused(self):
+        self.main_document = {"id": BARE_REPO, "private": False}
+        self.assert_refused_at_resolution("commit sha")
+
+    def test_a2_resolved_id_mismatch_is_refused(self):
+        for bad in ("other/Repo", BARE_REPO.lower() + "x", None, ""):
+            with self.subTest(document_id=bad):
+                self.fetch_api.reset_mock()
+                self.main_document = {"id": bad, "sha": BARE_SHA, "private": False}
+                self.assert_refused_at_resolution("repository id")
+
+    def test_a2_private_not_false_is_refused(self):
+        for bad in (True, None, "false", 0):
+            with self.subTest(private=bad):
+                self.fetch_api.reset_mock()
+                self.main_document = {"id": BARE_REPO, "sha": BARE_SHA, "private": bad}
+                self.assert_refused_at_resolution("not public")
+
+    def test_a2_missing_private_key_is_refused(self):
+        self.main_document = {"id": BARE_REPO, "sha": BARE_SHA}
+        self.assert_refused_at_resolution("not public")
+
+    # --- A3 -----------------------------------------------------------
+    def test_a3_branch_short_uppercase_and_multi_at_never_resolve_a_branch(self):
+        cases = {
+            f"{BARE_REPO}@main": "40-character",
+            f"{BARE_REPO}@{'a' * 7}": "40-character",
+            f"{BARE_REPO}@{'A' * 40}": "not all lowercase",
+            f"{BARE_REPO}@{BARE_SHA}@{BARE_SHA}": "exactly one '@'",
+            f"{BARE_REPO}@": "40-character",
+        }
+        for reference, reason in cases.items():
+            with self.subTest(reference=reference):
+                code, _out, err = self.run_main(reference, "--dest", str(self.dest))
+                self.assertEqual(code, 1, err)
+                self.assertIn(reason, err)
+                self.fetch_api.assert_not_called()
+                self.assert_nothing_written()
+
+    def test_a3_a_bare_string_that_is_not_a_repo_id_is_refused_without_a_fetch(self):
+        for text in ("justaname", "a/b/c", "org/na me", "org/", "/name", ""):
+            with self.subTest(text=text):
+                code, _out, err = self.run_main(text, "--dest", str(self.dest))
+                self.assertEqual(code, 1, err)
+                self.assertIn("exactly one '@'", err)
+                self.fetch_api.assert_not_called()
+                self.assert_nothing_written()
+
+    def test_a3_a_pinned_reference_does_not_resolve_main(self):
+        code, _out, err = self.run_main(
+            f"{BARE_REPO}@{BARE_SHA}", "--dest", str(self.dest)
+        )
+        self.assertIsNone(code, err)
+        self.fetch_api.assert_called_once_with(BARE_REPO, BARE_SHA)
+        self.assertNotIn("resolved", err)
+
+    # --- A4 -----------------------------------------------------------
+    def test_a4_bare_with_adopt_is_a_usage_error_before_any_fetch(self):
+        self.dest.mkdir()
+        code, _out, err = self.run_bare("--adopt")
+        self.assertEqual(code, 2)
+        self.assertIn("--adopt", err)
+        self.assertIn("<repo>@<sha>", err)
+        self.fetch_api.assert_not_called()
+        self.assertEqual(sorted(self.work.iterdir()), [self.dest])
+        self.assertEqual(sorted(self.dest.iterdir()), [])
+
+    def test_a4_pinned_with_adopt_still_adopts(self):
+        self.dest.mkdir()
+        with mock.patch.object(FASTMLX_PULL, "adopt") as adopter:
+            code, _out, err = self.run_main(
+                f"{BARE_REPO}@{BARE_SHA}", "--dest", str(self.dest), "--adopt"
+            )
+        self.assertIsNone(code, err)
+        adopter.assert_called_once()
+        self.fetch_api.assert_not_called()
+
+    # --- A5 -----------------------------------------------------------
+    def test_a5_stderr_names_the_resolved_sha_and_the_reproducible_command(self):
+        code, _out, err = self.run_bare()
+        self.assertIsNone(code, err)
+        self.assertIn(BARE_SHA, err)
+        self.assertIn(f"fastmlx pull {BARE_REPO}@{BARE_SHA}", err)
+
+    def test_a5_the_resolution_line_is_printed_before_the_second_fetch(self):
+        seen = {}
+        stderr = io.StringIO()
+
+        def fetch(repo_id, revision):
+            seen[revision] = stderr.getvalue()
+            return self._fake_fetch(repo_id, revision)
+
+        self.fetch_api.side_effect = fetch
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            FASTMLX_PULL.main([BARE_REPO, "--dest", str(self.dest)])
+        self.assertNotIn(BARE_SHA, seen["main"])
+        self.assertIn(f"fastmlx pull {BARE_REPO}@{BARE_SHA}", seen[BARE_SHA])
+
+    # --- A6 -----------------------------------------------------------
+    def test_a6_card_hfpin_not_a_prefix_of_the_resolved_sha_prints_a_notice(self):
+        code, _out, err = self.run_bare()
+        self.assertIsNone(code, err)
+        self.assertIn(PREFLIGHT_PASS_CARD, err)
+        self.assertIn("cafebabe", err)
+        self.assertIn("not a prefix", err)
+        self.acquire.assert_called_once()  # a notice, never a refusal
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    def test_a6_card_hfpin_that_is_a_prefix_prints_no_notice(self):
+        self.main_document["sha"] = "cafebabe" + "0" * 32
+        code, _out, err = self.run_bare()
+        self.assertIsNone(code, err)
+        self.assertNotIn("not a prefix", err)
+
+    def test_a6_a_pinned_reference_never_prints_the_notice(self):
+        code, _out, err = self.run_main(
+            f"{BARE_REPO}@{BARE_SHA}", "--dest", str(self.dest)
+        )
+        self.assertIsNone(code, err)
+        self.assertNotIn("not a prefix", err)
+
+    def test_a6_an_uncarded_repo_prints_no_notice(self):
+        self.main_document = {
+            "id": PREFLIGHT_UNCARDED_REPO, "sha": BARE_SHA, "private": False,
+        }
+        code, _out, err = self.run_bare(repo=PREFLIGHT_UNCARDED_REPO)
+        self.assertIsNone(code, err)
+        self.assertNotIn("not a prefix", err)
+
+    def test_a6_a_card_store_load_failure_stays_silent_and_the_pull_proceeds(self):
+        self.store.side_effect = self.recommend.launch.LaunchRefusal(3, "simulated store failure")
+        code, _out, err = self.run_bare()
+        self.assertIsNone(code, err)
+        self.assertNotIn("simulated", err)
+        self.assertNotIn("not a prefix", err)
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+    def test_a6_any_exception_loading_the_recommend_module_is_swallowed(self):
+        self.loader.side_effect = RuntimeError("boom")
+        code, _out, err = self.run_bare()
+        self.assertIsNone(code, err)
+        self.assertNotIn("boom", err)
+        self.assertTrue(FASTMLX_PULL.receipt_path_for(self.dest).exists())
+
+
 if __name__ == "__main__":
     unittest.main()
 
