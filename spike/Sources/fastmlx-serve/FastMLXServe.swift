@@ -172,7 +172,8 @@ struct FastMLXServe {
         // The pack is also judged by the identity its directory carries (pull receipt / HF hub-cache
         // path, `PackIdentity`), not only by `--model`: `--model-path` is judged here. With
         // `--quant-candidates` the WINNER is judged after the pick (`resolveServedDirectory` /
-        // `runQuantPickOnly`), so a NO_GO candidate that loses the pick does not block.
+        // `runQuantPickOnly`), so a NO_GO candidate that loses the pick does not block. Each
+        // admission line (notice, opt-in flag line) prints once per process across both judgements.
         let qualityCardsAnnounce = applyQualityAdmissionGate(
             model: arguments.model, rawArguments: CommandLine.arguments,
             packDirectory: modelPathArgument(rawArguments: CommandLine.arguments))
@@ -639,6 +640,21 @@ private func applyQualityAdmissionGateToWinner(
         model: arguments.model, rawArguments: CommandLine.arguments, packDirectory: winner)
 }
 
+/// Process-wide record of the admission-gate lines already written (`AdmissionEmissionLedger`),
+/// lock-guarded because the gate may be reached from more than one call site.
+private final class AdmissionEmissionLedgerBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ledger = AdmissionEmissionLedger()
+
+    func unseen(_ lines: [String]) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return ledger.unseen(lines)
+    }
+}
+
+private let admissionEmissionLedger = AdmissionEmissionLedgerBox()
+
 /// The quality-guidance moat's pre-load admission hook. Resolves the effective manifest path once
 /// (`QualityCardsManifestResolver.resolve`, against the REAL process working directory — the only
 /// place in this file that reads it for this gate), loads the card for `model` if a manifest
@@ -817,10 +833,18 @@ private func applyQualityAdmissionGate(
     switch judgement {
     case .admit(let admittedCard, let notices, let flagMessage):
         card = admittedCard
-        for notice in notices { FileHandle.standardError.write(Data((notice + "\n").utf8)) }
-        if let flagMessage { print(flagMessage) }
+        // Each admission line prints once per process (the gate runs twice on `--quant-candidates`).
+        for notice in admissionEmissionLedger.unseen(notices) {
+            FileHandle.standardError.write(Data((notice + "\n").utf8))
+        }
+        if let flagMessage, !admissionEmissionLedger.unseen([flagMessage]).isEmpty {
+            print(flagMessage)
+        }
     case .refuse(_, let notices, _, let message):
-        for notice in notices { FileHandle.standardError.write(Data((notice + "\n").utf8)) }
+        for notice in admissionEmissionLedger.unseen(notices) {
+            FileHandle.standardError.write(Data((notice + "\n").utf8))
+        }
+        // The refusal message is never deduped: a refusal always says why.
         FileHandle.standardError.write(Data((message + "\n").utf8))
         exit(2)
     }

@@ -1164,3 +1164,22 @@ public enum PackAdmission {
         }
     }
 }
+
+/// Remembers which admission-gate output lines a process has already written. The quality admission
+/// gate runs twice on the `--quant-candidates` path (alias-level in `run()`, then again on the pick's
+/// winner), and both runs print the same notices and opt-in flag line; routing every line through one
+/// ledger makes each exact line print once per process. Pure value type: it only dedupes text and
+/// never decides admission, so a refusal and its exit code are unaffected.
+public struct AdmissionEmissionLedger: Sendable {
+    private var seen: Set<String> = []
+
+    public init() {}
+
+    /// The lines not recorded by an earlier call, in their original order (a repeat within `lines`
+    /// is returned once). Every returned line is recorded.
+    public mutating func unseen(_ lines: [String]) -> [String] {
+        var fresh: [String] = []
+        for line in lines where seen.insert(line).inserted { fresh.append(line) }
+        return fresh
+    }
+}

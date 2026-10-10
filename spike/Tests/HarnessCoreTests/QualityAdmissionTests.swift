@@ -2829,3 +2829,32 @@ final class PackIdentityTests: XCTestCase {
         XCTAssertTrue(serve.contains("return (winner, resolution.winnerParsed)"))
     }
 }
+
+/// The admission gate runs twice on the `--quant-candidates` path (alias-level, then on the winner);
+/// the ledger makes each output line print once per process. Pure value type, no I/O.
+final class AdmissionEmissionLedgerTests: XCTestCase {
+
+    func testLineSeenForTheFirstTimeIsReturned() {
+        var ledger = AdmissionEmissionLedger()
+        XCTAssertEqual(ledger.unseen(["Noticeable: one"]), ["Noticeable: one"])
+    }
+
+    func testLineAlreadyReturnedIsDroppedOnALaterCall() {
+        var ledger = AdmissionEmissionLedger()
+        _ = ledger.unseen(["a", "b"])
+        XCTAssertEqual(ledger.unseen(["b"]), [])
+        XCTAssertEqual(ledger.unseen(["a", "c"]), ["c"])
+    }
+
+    func testOrderOfUnseenLinesIsPreserved() {
+        var ledger = AdmissionEmissionLedger()
+        _ = ledger.unseen(["m"])
+        XCTAssertEqual(ledger.unseen(["z", "m", "a", "k"]), ["z", "a", "k"])
+    }
+
+    func testDistinctLinesAreKeptAndAWithinCallRepeatIsReturnedOnce() {
+        var ledger = AdmissionEmissionLedger()
+        XCTAssertEqual(ledger.unseen(["line 1", "line 2", "line 1"]), ["line 1", "line 2"])
+        XCTAssertEqual(ledger.unseen(["line 1", "line 2", "line 3"]), ["line 3"])
+    }
+}
