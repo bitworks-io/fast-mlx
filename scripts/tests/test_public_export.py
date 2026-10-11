@@ -24,7 +24,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen35.swift",
-        "sha256": "e9b3a174ed61aa172b0f1d4a51312ba9536f8d4cc09ccd0e3dbf28f06a94808f",
+        "sha256": "e8e5c562397ec38f3557f3cd862da1258bd606779be1a1facdfb68718abeda77",
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen3MoELazyModel.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/Qwen3MoELazyModel.swift",
@@ -44,7 +44,7 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
     },
     "spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Libraries/MLXVLM/Models/Qwen35.swift",
-        "sha256": "0e0cd9862862ab59759c1496db85b217a2adb195f4ae6f25ac18288ea378b275",
+        "sha256": "1de547e3c17b043ead83f3d18bddc0f0666b5e053e3982f7c31723f18bc30f83",
     },
     "spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/KVCacheTests.swift": {
         "source": "public/sanitized-projection/spike/Vendor/mlx-swift-lm/Tests/MLXLMTests/KVCacheTests.swift",
@@ -290,8 +290,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # three were read; they hold only synthetic repo ids (org/pack-*), synthetic card ids and hex revisions,
 # and the tests themselves refuse an absolute path or a private-path prefix in the fixture.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1015,
-    "pathModeSha256": "9815ed1833113e8d571cf07c620abfe21203520c19a053a50b2ef767517df181",
+    "pathCount": 1016,
+    "pathModeSha256": "9d3052ee1974a54ea60971797c778108a9520261982b80aa1ba6af60e136d53d",
 }
 
 
