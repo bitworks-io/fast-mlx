@@ -236,7 +236,11 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b
 Face cache by its path (`.../models--<org>--<name>/snapshots/<revision>`), the same way `fastmlx-serve`
 does. A pack whose card says NO_GO is refused until you opt in with `--accept-quality <card-id>`, so a
 measured quality cost is never applied silently. A `--model-repo` or `--card-id` that names a different
-card than the pack's own receipt or path refuses with `quality_card_identity_conflict`.
+card than the pack's own receipt or path refuses with `quality_card_identity_conflict`. `serve` also
+checks the pack's files against the receipt's recorded sizes and sha256 digests (files over 64 MiB by
+size only; unlisted dotfiles ignored); when the bytes no longer match and the receipt's own identity selected
+the card, it refuses with `quality_card_receipt_mismatch` (re-run `fastmlx pull`, or remove the stale
+receipt).
 
 Newer cards without a release: `serve` prints a `fastmlx_launch=card_store` line naming the card store
 it admitted against (its sha256, `generatedAt`, card count; `fastmlx recommend` prints the same as a

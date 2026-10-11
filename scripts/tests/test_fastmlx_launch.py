@@ -228,7 +228,12 @@ def write_custom_engine_profile(root: Path) -> Path:
 
 
 def write_pull_receipt(
-    model_dir: Path, repo_id, revision: str, dest: Path = None, recorded_dest: Path = None
+    model_dir: Path,
+    repo_id,
+    revision: str,
+    dest: Path = None,
+    recorded_dest: Path = None,
+    files=None,
 ) -> Path:
     """Write a receipt at exactly the path and in exactly the shape
     ``fastmlx_pull.pull()`` writes one for ``dest`` (defaulting to
@@ -250,7 +255,7 @@ def write_pull_receipt(
         "reused_files": 0,
         "reused_bytes": 0,
         "downloader_script_sha256": "0" * 64,
-        "files": {},
+        "files": files if files is not None else {},
     }
     receipt_bytes = json.dumps(receipt, indent=2, sort_keys=True).encode() + b"\n"
     FASTMLX_LAUNCH.pull.downloader.write_exclusive(receipt_path, receipt_bytes)
@@ -8663,6 +8668,302 @@ class PackIdentityLauncherTestCase(unittest.TestCase):
         self.assertIn(CONFLICT_REASON, ctx.exception.message)
         self.assertIn("other/repo", ctx.exception.message)
         self.assertIn("org/name", ctx.exception.message)
+
+
+# ---------------------------------------------------------------------------
+# ``fastmlx serve`` refuses to judge a pack by a receipt its bytes no longer
+# match. Predeclaration:
+# docs/task-inbox/2026-10-11-PREDECLARATION-serve-refuses-a-pack-that-drifted-from-its-receipt.md
+# ---------------------------------------------------------------------------
+RECEIPT_MISMATCH_REASON = "quality_card_receipt_mismatch"
+
+
+class ReceiptBindingLauncherTestCase(unittest.TestCase):
+    CONFIG_BYTES = b'{"model_type": "fixture", "n": 1}\n'
+    WEIGHT_BYTES = b"weights-v1-" * 8
+    TOKENIZER_BYTES = b'{"tokens": []}\n'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        self.green_fit_bin = write_script(self.root / "fit-green.py", GREEN_FIT_CHECK_BODY)
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    # --- fixtures ----------------------------------------------------------
+    @staticmethod
+    def entry(data: bytes) -> dict:
+        return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+    def make_pack(self, name: str = "model") -> Path:
+        pack = self.root / name
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "config.json").write_bytes(self.CONFIG_BYTES)
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES)
+        (pack / "tokenizer" / "tokenizer.json").write_bytes(self.TOKENIZER_BYTES)
+        return pack
+
+    def receipt_files(self) -> dict:
+        return {
+            "config.json": self.entry(self.CONFIG_BYTES),
+            "model.safetensors": self.entry(self.WEIGHT_BYTES),
+            "tokenizer/tokenizer.json": self.entry(self.TOKENIZER_BYTES),
+        }
+
+    def pulled_pack(self, repo_id: str = PASS_REPO, files=None, name: str = "model") -> Path:
+        pack = self.make_pack(name)
+        write_pull_receipt(
+            pack,
+            repo_id=repo_id,
+            revision="e" * 40,
+            files=self.receipt_files() if files is None else files,
+        )
+        return pack
+
+    def argv(self, model_dir: Path, **extra) -> list:
+        args = {
+            "--model-path": str(model_dir),
+            "--quality-cards": str(self.manifest_path),
+            "--fit-check-bin": str(self.green_fit_bin),
+            "--engine-bin": str(self.fake_engine_bin),
+            "--context": "2048",
+        }
+        args.update(extra)
+        argv = ["serve"]
+        for key, value in args.items():
+            if value is None:
+                continue
+            argv += [key, str(value)]
+        return argv + ["--dry-run"]
+
+    def run_main(self, argv: list):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_LAUNCH.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_refused(self, pack: Path, offending: str, difference: str = "", **extra):
+        code, stdout, stderr = self.run_main(self.argv(pack, **extra))
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(RECEIPT_MISMATCH_REASON, stderr)
+        self.assertIn(offending, stderr)
+        self.assertIn(str(FASTMLX_LAUNCH.pull.receipt_path_for(pack)), stderr)
+        self.assertIn("fastmlx pull", stderr)
+        if difference:
+            self.assertIn(difference, stderr)
+        self.assertEqual(stdout, "")  # no plan printed, engine never launched
+
+    # --- T1-T4: the carded receipt no longer describes the bytes ------------
+    def test_t1_a_listed_file_with_a_different_size_is_refused(self):
+        pack = self.pulled_pack()
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        self.assert_refused(pack, "model.safetensors", "size")
+
+    def test_t1_the_refusal_also_covers_an_explicit_card_id(self):
+        pack = self.pulled_pack()
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        self.assert_refused(pack, "model.safetensors", "size", **{"--card-id": PASS_CARD_ID})
+
+    def test_t2_one_flipped_byte_at_the_same_size_is_refused(self):
+        pack = self.pulled_pack()
+        flipped = bytearray(self.CONFIG_BYTES)
+        flipped[3] ^= 0x01
+        self.assertEqual(len(flipped), len(self.CONFIG_BYTES))
+        (pack / "config.json").write_bytes(bytes(flipped))
+        self.assert_refused(pack, "config.json", "sha256")
+
+    def test_t3_a_missing_listed_file_is_refused(self):
+        pack = self.pulled_pack()
+        (pack / "tokenizer" / "tokenizer.json").unlink()
+        self.assert_refused(pack, "tokenizer/tokenizer.json", "missing")
+
+    def test_t4_an_unlisted_safetensors_file_is_refused(self):
+        pack = self.pulled_pack()
+        (pack / "extra-00002.safetensors").write_bytes(b"unmeasured")
+        self.assert_refused(pack, "extra-00002.safetensors", "not listed")
+
+    def test_t4_an_unlisted_file_in_a_nested_directory_is_refused(self):
+        pack = self.pulled_pack()
+        (pack / "tokenizer" / "injected.py").write_bytes(b"print(1)\n")
+        self.assert_refused(pack, "tokenizer/injected.py", "not listed")
+
+    # --- A1/A2/A5: unchanged behaviour --------------------------------------
+    def test_a1_a_matching_pack_is_admitted_with_no_receipt_output(self):
+        pack = self.pulled_pack()
+        code, stdout, stderr = self.run_main(self.argv(pack))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+        self.assertNotIn("receipt", stderr)
+        self.assertNotIn(RECEIPT_MISMATCH_REASON, stderr)
+
+    def test_a2_dotfiles_and_dot_directories_change_nothing(self):
+        pack = self.pulled_pack()
+        (pack / ".DS_Store").write_bytes(b"\x00junk")
+        (pack / ".cache").mkdir()
+        (pack / ".cache" / "blob.safetensors").write_bytes(b"ignored")
+        (pack / "tokenizer" / ".hidden").write_bytes(b"ignored")
+        code, stdout, stderr = self.run_main(self.argv(pack))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+        self.assertNotIn("receipt", stderr)
+
+    def test_a5_a_pack_with_no_receipt_is_unchanged(self):
+        pack = self.make_pack()
+        code, stdout, stderr = self.run_main(self.argv(pack, **{"--model-repo": PASS_REPO}))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+        self.assertNotIn("receipt", stderr)
+
+    # --- A3: an uncheckable receipt is a notice, not a mismatch -------------
+    def assert_uncheckable_notice_only(self, pack: Path):
+        (pack / "model.safetensors").write_bytes(b"changed bytes of another size")
+        code, stdout, stderr = self.run_main(self.argv(pack))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+        self.assertIn("receipt", stderr)
+        self.assertIn(str(FASTMLX_LAUNCH.pull.receipt_path_for(pack)), stderr)
+        self.assertNotIn(RECEIPT_MISMATCH_REASON, stderr)
+
+    def test_a3_a_receipt_with_no_files_map_is_a_notice_only(self):
+        pack = self.make_pack()
+        receipt_path = write_pull_receipt(pack, repo_id=PASS_REPO, revision="e" * 40)
+        document = json.loads(receipt_path.read_text(encoding="utf-8"))
+        del document["files"]
+        receipt_path.unlink()  # write_exclusive leaves the receipt read-only
+        receipt_path.write_text(json.dumps(document), encoding="utf-8")
+        self.assert_uncheckable_notice_only(pack)
+
+    def test_a3_a_receipt_with_a_non_dict_files_map_is_a_notice_only(self):
+        pack = self.make_pack()
+        receipt_path = write_pull_receipt(pack, repo_id=PASS_REPO, revision="e" * 40)
+        document = json.loads(receipt_path.read_text(encoding="utf-8"))
+        document["files"] = ["config.json"]
+        receipt_path.unlink()
+        receipt_path.write_text(json.dumps(document), encoding="utf-8")
+        self.assert_uncheckable_notice_only(pack)
+
+    def test_a3_a_malformed_files_entry_is_a_notice_only(self):
+        for label, bad_entry in (
+            ("no sha256", {"size": len(self.CONFIG_BYTES)}),
+            ("no size", {"sha256": "0" * 64}),
+            ("short sha256", {"sha256": "abc", "size": len(self.CONFIG_BYTES)}),
+            ("non-hex sha256", {"sha256": "z" * 64, "size": len(self.CONFIG_BYTES)}),
+            ("string size", {"sha256": "0" * 64, "size": "12"}),
+            ("bool size", {"sha256": "0" * 64, "size": True}),
+            ("non-dict entry", "config.json"),
+        ):
+            with self.subTest(label):
+                pack = self.root / ("model-" + label.replace(" ", "-"))
+                pack = self.make_pack(pack.name)
+                files = self.receipt_files()
+                files["config.json"] = bad_entry
+                write_pull_receipt(pack, repo_id=PASS_REPO, revision="e" * 40, files=files)
+                self.assert_uncheckable_notice_only(pack)
+
+    # --- A4: no matching card -> the receipt is not the card's evidence -----
+    def test_a4_an_uncarded_receipt_identity_with_changed_bytes_is_a_notice_only(self):
+        pack = self.pulled_pack(repo_id="example/Uncarded")
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        code, stdout, stderr = self.run_main(self.argv(pack))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["admission"], "admit_unmeasured")
+        self.assertIn("model.safetensors", stderr)
+        self.assertNotIn(RECEIPT_MISMATCH_REASON, stderr)
+
+    def test_a4_a_card_chosen_by_an_override_not_the_receipt_is_a_notice_only(self):
+        pack = self.pulled_pack(repo_id="example/Uncarded")
+        (pack / "config.json").write_bytes(b"x" * len(self.CONFIG_BYTES))
+        code, stdout, stderr = self.run_main(self.argv(pack, **{"--model-repo": PASS_REPO}))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(FastmlxLaunchTestCase.last_json_line(stdout)["card"]["id"], PASS_CARD_ID)
+        self.assertIn("config.json", stderr)
+        self.assertNotIn(RECEIPT_MISMATCH_REASON, stderr)
+
+    # --- A6: the hash threshold ----------------------------------------------
+    def test_a6_a_file_above_the_threshold_is_never_hashed(self):
+        pack = self.pulled_pack()
+        hashed: list = []
+        real_hash = FASTMLX_LAUNCH._receipt_file_sha256
+
+        def counting_hash(path):
+            hashed.append(Path(path).name)
+            return real_hash(path)
+
+        # Threshold between config.json (34 bytes) / tokenizer.json (15 bytes)
+        # and model.safetensors (88 bytes).
+        with patch.object(FASTMLX_LAUNCH, "RECEIPT_HASH_MAX_BYTES", 40), patch.object(
+            FASTMLX_LAUNCH, "_receipt_file_sha256", counting_hash
+        ):
+            # Same size, different content on the large shard: undetected by
+            # design (size, not content, guards shards).
+            (pack / "model.safetensors").write_bytes(b"X" * len(self.WEIGHT_BYTES))
+            code, stdout, stderr = self.run_main(self.argv(pack))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(sorted(hashed), ["config.json", "tokenizer.json"])
+
+    def test_a6_the_threshold_constant_is_64_mib(self):
+        self.assertEqual(FASTMLX_LAUNCH.RECEIPT_HASH_MAX_BYTES, 64 * 1024 * 1024)
+
+    # --- verify_receipt_binding unit rows ------------------------------------
+    def receipt_for(self, files) -> dict:
+        return {"repo_id": PASS_REPO, "revision": "e" * 40, "files": files}
+
+    def test_verify_matching_pack_reports_ok(self):
+        pack = self.make_pack()
+        result = FASTMLX_LAUNCH.verify_receipt_binding(pack, self.receipt_for(self.receipt_files()))
+        self.assertEqual(result.status, FASTMLX_LAUNCH.RECEIPT_BINDING_OK)
+
+    def test_verify_reports_the_first_mismatch_in_sorted_order(self):
+        pack = self.make_pack()
+        (pack / "config.json").write_bytes(b"x" * len(self.CONFIG_BYTES))
+        (pack / "model.safetensors").unlink()
+        (pack / "aaa-extra.bin").write_bytes(b"x")
+        result = FASTMLX_LAUNCH.verify_receipt_binding(pack, self.receipt_for(self.receipt_files()))
+        self.assertEqual(result.status, FASTMLX_LAUNCH.RECEIPT_BINDING_MISMATCH)
+        # listed files are checked (sorted) before the unlisted-path walk
+        self.assertIn("config.json", result.detail)
+        self.assertNotIn("aaa-extra.bin", result.detail)
+
+    def test_verify_follows_a_symlinked_listed_file(self):
+        pack = self.make_pack()
+        real = self.root / "elsewhere.safetensors"
+        real.write_bytes(self.WEIGHT_BYTES)
+        (pack / "model.safetensors").unlink()
+        (pack / "model.safetensors").symlink_to(real)
+        result = FASTMLX_LAUNCH.verify_receipt_binding(pack, self.receipt_for(self.receipt_files()))
+        self.assertEqual(result.status, FASTMLX_LAUNCH.RECEIPT_BINDING_OK)
+
+    def test_verify_an_unlisted_symlink_is_unverified_content(self):
+        pack = self.make_pack()
+        real = self.root / "elsewhere.safetensors"
+        real.write_bytes(b"other")
+        (pack / "linked.safetensors").symlink_to(real)
+        result = FASTMLX_LAUNCH.verify_receipt_binding(pack, self.receipt_for(self.receipt_files()))
+        self.assertEqual(result.status, FASTMLX_LAUNCH.RECEIPT_BINDING_MISMATCH)
+        self.assertIn("linked.safetensors", result.detail)
+
+    def test_verify_an_empty_directory_that_is_not_listed_is_fine(self):
+        pack = self.make_pack()
+        (pack / "empty-dir").mkdir()
+        result = FASTMLX_LAUNCH.verify_receipt_binding(pack, self.receipt_for(self.receipt_files()))
+        self.assertEqual(result.status, FASTMLX_LAUNCH.RECEIPT_BINDING_OK)
+
+    def test_verify_uncheckable_receipts(self):
+        pack = self.make_pack()
+        for label, receipt in (
+            ("absent", {"repo_id": PASS_REPO}),
+            ("none", {"files": None}),
+            ("list", {"files": []}),
+            ("empty", {"files": {}}),
+            ("escaping name", {"files": {"../config.json": self.entry(self.CONFIG_BYTES)}}),
+            ("absolute name", {"files": {"/config.json": self.entry(self.CONFIG_BYTES)}}),
+        ):
+            with self.subTest(label):
+                result = FASTMLX_LAUNCH.verify_receipt_binding(pack, receipt)
+                self.assertEqual(result.status, FASTMLX_LAUNCH.RECEIPT_BINDING_UNCHECKABLE)
 
 
 if __name__ == "__main__":

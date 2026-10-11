@@ -57,7 +57,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -3178,6 +3178,179 @@ def derive_pack_identity(model_path: Path) -> Optional[tuple]:
     return repo, revision
 
 
+RECEIPT_MISMATCH_REASON = "quality_card_receipt_mismatch"
+# Files at or under this size are sha256-compared against the receipt; a larger
+# file is checked by size only and is NEVER opened (an accident guard, not an
+# adversary guard: a same-size in-place edit of a large shard goes undetected).
+RECEIPT_HASH_MAX_BYTES = 64 * 1024 * 1024
+RECEIPT_BINDING_OK = "ok"
+RECEIPT_BINDING_MISMATCH = "mismatch"
+RECEIPT_BINDING_UNCHECKABLE = "uncheckable"
+_RECEIPT_SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
+
+
+class ReceiptBindingResult(NamedTuple):
+    """``status`` is one of the ``RECEIPT_BINDING_*`` constants; ``detail`` is
+    ``None`` for ``ok`` and a short human description otherwise (for
+    ``mismatch`` the FIRST difference in a deterministic order)."""
+
+    status: str
+    detail: Optional[str]
+
+
+def _receipt_file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _receipt_listed_files(receipt: dict):
+    """``({name: (sha256, size)}, None)`` for a checkable receipt, else
+    ``(None, why)``: ``files`` must be a non-empty dict of relative, normal
+    posix names whose entries each carry an int ``size`` and a 64-hex
+    ``sha256``."""
+    files = receipt.get("files")
+    if not isinstance(files, dict) or not files:
+        return None, "it records no files map"
+    listed: dict = {}
+    for name, entry in files.items():
+        if not isinstance(name, str) or not name:
+            return None, "it lists a file with an unusable name"
+        parts = name.split("/")
+        if name.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            return None, f"it lists a file with an unusable name {_bounded_repr(name, 80)}"
+        if not isinstance(entry, dict):
+            return None, f"its entry for {_bounded_repr(name, 80)} is malformed"
+        size, sha256 = entry.get("size"), entry.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return None, f"its entry for {_bounded_repr(name, 80)} has no integer size"
+        if not isinstance(sha256, str) or not _RECEIPT_SHA256_RE.fullmatch(sha256):
+            return None, f"its entry for {_bounded_repr(name, 80)} has no sha256"
+        listed[name] = (sha256.lower(), size)
+    return listed, None
+
+
+def verify_receipt_binding(model_path: Path, receipt: dict) -> ReceiptBindingResult:
+    """Check ``model_path`` against the receipt's per-file ``files`` map, in two
+    directions: every listed file must exist (symlinks followed) with the
+    recorded size -- and, when that size is at most ``RECEIPT_HASH_MAX_BYTES``,
+    the recorded sha256 -- and the directory must hold no unlisted path outside
+    dot-components (the notion of unverified content ``fastmlx pull --adopt``
+    refuses on). Listed files are checked first, in sorted order, then the
+    unlisted-path walk in sorted order; the first difference is returned.
+    A receipt with no usable ``files`` map is ``uncheckable``, not a mismatch.
+    """
+    listed, why = _receipt_listed_files(receipt)
+    if listed is None:
+        return ReceiptBindingResult(RECEIPT_BINDING_UNCHECKABLE, why)
+    for name in sorted(listed):
+        sha256, size = listed[name]
+        path = model_path / name
+        label = _bounded_repr(name, 120)
+        try:
+            is_file = path.is_file()
+            observed_size = path.stat().st_size if is_file else None
+        except OSError as error:
+            return ReceiptBindingResult(
+                RECEIPT_BINDING_MISMATCH, f"{label} could not be read ({error.strerror or error})"
+            )
+        if not is_file or observed_size is None:
+            return ReceiptBindingResult(
+                RECEIPT_BINDING_MISMATCH, f"{label} is listed in the receipt but missing"
+            )
+        if observed_size != size:
+            return ReceiptBindingResult(
+                RECEIPT_BINDING_MISMATCH,
+                f"{label} size differs (receipt {size}, found {observed_size})",
+            )
+        if size <= RECEIPT_HASH_MAX_BYTES:
+            try:
+                observed_sha256 = _receipt_file_sha256(path)
+            except OSError as error:
+                return ReceiptBindingResult(
+                    RECEIPT_BINDING_MISMATCH,
+                    f"{label} could not be read ({error.strerror or error})",
+                )
+            if observed_sha256 != sha256:
+                return ReceiptBindingResult(
+                    RECEIPT_BINDING_MISMATCH,
+                    f"{label} sha256 differs (receipt {sha256[:12]}..., found "
+                    f"{observed_sha256[:12]}...)",
+                )
+
+    listed_prefixes = {
+        "/".join(name.split("/")[:depth])
+        for name in listed
+        for depth in range(1, len(name.split("/")))
+    }
+
+    def _unlisted(directory: Path, prefix: str) -> Optional[str]:
+        try:
+            children = sorted(os.scandir(directory), key=lambda child: child.name)
+        except OSError as error:
+            return f"{prefix or '.'} could not be listed ({error.strerror or error})"
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            relative = f"{prefix}/{child.name}" if prefix else child.name
+            if relative in listed:
+                continue
+            if relative in listed_prefixes or child.is_dir(follow_symlinks=False):
+                if child.is_dir():
+                    found = _unlisted(Path(child.path), relative)
+                    if found is not None:
+                        return found
+                    continue
+            return f"{_bounded_repr(relative, 120)} is in the pack but not listed in the receipt"
+        return None
+
+    extra = _unlisted(model_path, "")
+    if extra is not None:
+        return ReceiptBindingResult(RECEIPT_BINDING_MISMATCH, extra)
+    return ReceiptBindingResult(RECEIPT_BINDING_OK, None)
+
+
+def _enforce_receipt_binding(model_path: Path, card: Optional[dict]) -> None:
+    """Judge the pack by its receipt only while the receipt still describes the
+    pack's bytes. A mismatch refuses (exit 2, ``quality_card_receipt_mismatch``)
+    when the selected card matches the receipt's own identity -- the receipt is
+    then that card's evidence -- and is otherwise a one-line stderr notice. A
+    receipt that cannot be checked (no usable ``files`` map) is a notice only,
+    and a pack with no receipt is untouched."""
+    receipt = _load_pull_receipt(model_path)
+    if receipt is None:
+        return
+    result = verify_receipt_binding(model_path, receipt)
+    if result.status == RECEIPT_BINDING_OK:
+        return
+    receipt_path = pull.receipt_path_for(model_path.expanduser().absolute())
+    if result.status == RECEIPT_BINDING_UNCHECKABLE:
+        print(
+            f"fastmlx serve: pull receipt {receipt_path} cannot be checked against the "
+            f"pack's bytes ({result.detail})",
+            file=sys.stderr,
+        )
+        return
+    repo_id, revision = receipt.get("repo_id"), receipt.get("revision")
+    receipt_repo = repo_id if isinstance(repo_id, str) and repo_id else None
+    receipt_revision = revision if isinstance(revision, str) and revision else None
+    if card is not None and card_matches_model_identity(card, receipt_repo, receipt_revision):
+        raise LaunchRefusal(
+            2,
+            f"{RECEIPT_MISMATCH_REASON}: the pack at {model_path} no longer matches its "
+            f"pull receipt {receipt_path}: {result.detail}; its quality card describes the "
+            "bytes that were pulled, not these -- re-run `fastmlx pull` for this "
+            "directory, or remove the stale receipt so the pack is judged as unidentified",
+        )
+    print(
+        f"fastmlx serve: pull receipt {receipt_path} does not match the pack's bytes "
+        f"({result.detail}); the receipt is not evidence for any quality card here",
+        file=sys.stderr,
+    )
+
+
 def _resolve_model_repo(args, model_path: Path) -> Optional[str]:
     if args.model_repo:
         return args.model_repo
@@ -3789,6 +3962,11 @@ def _run_serve(args, passthrough_args: list) -> int:
             for chosen_notice in chosen_notices:
                 if chosen_notice not in resolve_notices:
                     resolve_notices.append(chosen_notice)
+
+    # --- receipt binding: the pack's bytes must still be what the pull
+    # receipt describes before the receipt's identity is trusted as the card's
+    # evidence (both card-selection branches above land here) -------------
+    _enforce_receipt_binding(model_path, card)
 
     # --- engine-build status (never gates admission; see decide_admission
     # below) ------------------------------------------------------------
