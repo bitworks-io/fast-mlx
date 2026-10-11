@@ -395,25 +395,23 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-13",
-                "title": "Publish v0.1.13: quality cards follow the pack; fastmlx-serve and fastmlx serve identify a pack by its pull receipt or Hugging Face cache path, and serve.sh applies the bundled card store",
-                "publishedAt": "2026-10-09T15:46:07Z",
+                "id": "tagged-distribution-v0-1-14",
+                "title": "Publish v0.1.14: gated-delta q/k normalization adds its epsilon like the official l2norm, fastmlx pull resolves main to a pinned sha, and fastmlx recommend uses the same pack identity as serve",
+                "publishedAt": "2026-10-11T10:33:03Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.13 arm64 macOS distribution: fastmlx-serve "
-                    "judges a pack by the identity its directory carries (its pull "
-                    "receipt, else its Hugging Face cache path), so a pack carded "
-                    "NO_GO is refused under an uncarded alias unless opted in with "
-                    "--accept-quality, an auto-picked quant is judged after the pick, "
-                    "and a name or receipt that resolves a different card than the "
-                    "directory refuses with quality_card_identity_conflict; fastmlx "
-                    "serve uses the same identity; scripts/serve.sh applies the "
-                    "bundled card store and judges an auto-picked quant by its own "
-                    "card before downloading it; fastmlx pull --adopt refuses "
-                    "--max-attempts and --min-free-bytes; and the bundled card store "
-                    "adds mistral-nemo-12b-4bit@m3ultra (NO_GO, opt-in), for 15 "
-                    "cards. The engine still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.14 arm64 macOS distribution: the gated-delta "
+                    "q/k normalization for Qwen3.5 and Qwen3-Next now adds its 1e-6 "
+                    "epsilon to the sum of squares, matching the official l2norm; "
+                    "measured on mlx-community/Qwen3.5-9B-MLX-4bit over 16 prompts of "
+                    "256 greedy tokens, 5 outputs are unchanged and 11 diverge only at "
+                    "near-ties, where the new build picks the old build's second "
+                    "choice, at most 0.375 nats behind; fastmlx pull <org>/<name> "
+                    "resolves main to a pinned sha; fastmlx recommend uses the same "
+                    "pack identity as serve and the engine; a malformed receipt no "
+                    "longer crashes recommend or serve; and --quant-candidates prints "
+                    "each admission line once. The engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -421,7 +419,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "2bbc3c1035d32a63247ebc005161d26560c32b7d",
+                "publicCommit": "821a1270ca48bf1904426a1e4099a66ef7f3b2af",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -438,6 +436,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "821a1270ca48bf1904426a1e4099a66ef7f3b2af",
                 "2bbc3c1035d32a63247ebc005161d26560c32b7d",
                 "449ff559582f82265049ee01e8d7505b807bdb9e",
                 "fa44eb086d4a4ef0543aa9d64459685b1fc850cf",

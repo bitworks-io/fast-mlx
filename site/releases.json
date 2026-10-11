@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-10-09",
+  "updatedAt": "2026-10-11",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-14",
+      "title": "Publish v0.1.14: gated-delta q/k normalization adds its epsilon like the official l2norm, fastmlx pull resolves main to a pinned sha, and fastmlx recommend uses the same pack identity as serve",
+      "publishedAt": "2026-10-11T10:33:03Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.14 arm64 macOS distribution: the gated-delta q/k normalization for Qwen3.5 and Qwen3-Next now adds its 1e-6 epsilon to the sum of squares, matching the official l2norm; measured on mlx-community/Qwen3.5-9B-MLX-4bit over 16 prompts of 256 greedy tokens, 5 outputs are unchanged and 11 diverge only at near-ties, where the new build picks the old build's second choice, at most 0.375 nats behind; fastmlx pull <org>/<name> resolves main to a pinned sha; fastmlx recommend uses the same pack identity as serve and the engine; a malformed receipt no longer crashes recommend or serve; and --quant-candidates prints each admission line once. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "821a1270ca48bf1904426a1e4099a66ef7f3b2af",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-13",
       "title": "Publish v0.1.13: quality cards follow the pack; fastmlx-serve and fastmlx serve identify a pack by its pull receipt or Hugging Face cache path, and serve.sh applies the bundled card store",
