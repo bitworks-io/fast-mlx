@@ -123,6 +123,26 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
         return (token, Self.decodedTokenLogprob(rawLogits: raw, sampledToken: token, topN: topN))
     }
 
+    /// The arrays a prefill loop must evaluate after one chunk's forward — the SHARED seam for
+    /// `MLXDecoder.prefillRawLogits` and `CompiledMLXDecoder.prefillCore`'s split-attention loop.
+    ///
+    /// - NON-final chunk: every cache's `innerState()` (the arrays the next chunk reads: keys/
+    ///   values or packed payload buffers plus the in-graph offset) and NOT the chunk logits.
+    ///   Only the final chunk's last row is ever consumed, so the lazy `[1, chunk, vocab]` lm_head
+    ///   projection of an earlier chunk is never computed (the vendored `LLMModel.prepare` idiom:
+    ///   `eval(cache)` on non-final chunks). The logits are not part of the cache graph, so
+    ///   dropping them changes no cache value — it only removes work and the transient allocation.
+    /// - FINAL chunk: exactly the pre-existing behavior, `[chunkLogits]`. Evaluating the logits
+    ///   also materializes this chunk's cache writes (the logits depend on the same graph).
+    ///
+    /// A prompt that fits in one chunk has only a final chunk, so its control flow is unchanged.
+    static func prefillChunkEvaluationTargets(
+        chunkLogits: MLXArray, caches: [any KVCache], isFinal: Bool
+    ) -> [MLXArray] {
+        if isFinal { return [chunkLogits] }
+        return caches.flatMap { $0.innerState() }
+    }
+
     /// Runs the chunked prefill forward and returns the FINAL chunk's last-position RAW logits
     /// (`[1, vocab]`, before any processor/penalty runs) — the shared first half of both `prefill`
     /// and `prefillWithLogprob`.
@@ -153,8 +173,10 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
             // Force this chunk's cache mutation to materialize before the next chunk reads the
             // in-graph offset and packed buffers, and drop the reference to any prior chunk's
             // logits so intermediate activations are not retained across the loop (mirrors
-            // CompiledMLXDecoder.prefillCore).
-            eval(chunkLogits)
+            // CompiledMLXDecoder.prefillCore). See `prefillChunkEvaluationTargets` for what is
+            // evaluated per chunk.
+            eval(Self.prefillChunkEvaluationTargets(
+                chunkLogits: chunkLogits, caches: cache, isFinal: end == promptTokens.count))
             lastChunkLogits = chunkLogits
             start = end
         }

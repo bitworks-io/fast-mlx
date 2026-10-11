@@ -479,8 +479,13 @@ public struct CompiledMLXDecoder: Decoder, KVCacheReleasingDecoder {
                 ])
                 let chunkLogits = model(ids, cache: caches)
                 // Bound the lazy graph and make each cache mutation visible before the next
-                // chunk reads the in-graph offset and packed buffers.
-                eval(chunkLogits)
+                // chunk reads the in-graph offset and packed buffers. Non-final chunks evaluate
+                // the caches' state instead of their logits (see
+                // `MLXDecoder.prefillChunkEvaluationTargets`), so the lm_head projection of a
+                // chunk whose logits are never read is not computed.
+                eval(MLXDecoder.prefillChunkEvaluationTargets(
+                    chunkLogits: chunkLogits, caches: caches,
+                    isFinal: end == promptLength))
                 lastChunkLogits = chunkLogits
                 start = end
             }

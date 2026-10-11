@@ -289,9 +289,14 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Python checker scripts/tests/test_card_resolution_conformance.py. Conscious decision to publish: all
 # three were read; they hold only synthetic repo ids (org/pack-*), synthetic card ids and hex revisions,
 # and the tests themselves refuse an absolute path or a private-path prefix in the fixture.
+# 2026-10-11, 1016 -> 1017: adds spike/Tests/SpikeCoreTests/PrefillNonFinalChunkEvaluationTests.swift
+# (projected with spike/Tests), the seam/exactness tests for prefill skipping the lm_head on non-final
+# chunks. Conscious decision to publish: read in full; it holds only synthetic random-weight fixtures
+# and token ids, names no model family, host, credential or machine-local path, and the projection
+# validator's marker sweep passed on it.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1016,
-    "pathModeSha256": "9d3052ee1974a54ea60971797c778108a9520261982b80aa1ba6af60e136d53d",
+    "pathCount": 1017,
+    "pathModeSha256": "be63ec2cd654c1bbb78f35787d432d47b5eb35cf1c6792de2041b1d045ddddbc",
 }
 
 
