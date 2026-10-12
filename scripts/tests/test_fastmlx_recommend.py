@@ -16,6 +16,7 @@ from unittest.mock import patch
 from scripts.tests.test_fastmlx_gguf_fit import build_gguf_bytes
 from scripts.tests.test_fastmlx_launch import (
     CAPTURING_FIT_CHECK_BODY,
+    FAKE_ENGINE_BODY,
     GREEN_ATTESTATION_WITH_RESIDENCY_BODY,
     P3_SHARED_REPO_AND_PIN_REPO,
     P3_SHARED_REPO_AND_PIN_REVISION,
@@ -24,7 +25,9 @@ from scripts.tests.test_fastmlx_launch import (
     SYNTHETIC_CARD_REVISION,
     _load_real_quality_guides_manifest,
     _synthetic_card,
+    fixture_manifest as launch_fixture_manifest,
     write_expert_stream_card_manifest,
+    write_pull_receipt as launch_write_pull_receipt,
     write_release_engine_binary,
     write_release_provenance,
 )
@@ -3734,6 +3737,247 @@ class WeightsFromManifestTestCase(unittest.TestCase):
         result = self.SIZER.compute_fit(args, weights=(123, [{"name": "x", "bytes": 123}], []))
         self.assertEqual(result["weights_bytes"], 123)
         self.assertEqual(result["fit"], "green")
+
+
+# ---------------------------------------------------------------------
+# `fastmlx recommend` refuses a pack that drifted from its pull receipt, by
+# the SAME decision `fastmlx serve` makes (`judge_receipt_binding`).
+# Predeclaration:
+# docs/task-inbox/2026-10-12-PREDECLARATION-recommend-refuses-a-pack-that-drifted-from-its-receipt.md
+# ---------------------------------------------------------------------
+RECEIPT_MISMATCH_REASON = "quality_card_receipt_mismatch"
+
+
+class RecommendReceiptBindingTestCase(unittest.TestCase):
+    CONFIG_BYTES = b'{"model_type": "fixture", "n": 1}\n'
+    WEIGHT_BYTES = b"weights-v1-" * 8
+    TOKENIZER_BYTES = b'{"tokens": []}\n'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.manifest_path = self.root / "quality-guides.json"
+        self.manifest_path.write_text(json.dumps(fixture_manifest()), encoding="utf-8")
+        # `serve` additionally requires every card to be engine-decodable, which
+        # recommend's own fixture manifest is not; parity runs serve on this one.
+        self.serve_manifest_path = self.root / "serve-quality-guides.json"
+        self.serve_manifest_path.write_text(json.dumps(launch_fixture_manifest()), encoding="utf-8")
+        self.fit_ran_marker = self.root / "fit-ran.marker"
+        self.green_fit_bin = write_script(
+            self.root / "fit-green.py",
+            GREEN_FIT_CHECK_BODY.replace(
+                "sys.exit(0)",
+                f"open({str(self.fit_ran_marker)!r}, 'a').close()\nsys.exit(0)",
+            ),
+        )
+        self.fake_engine_bin = write_script(self.root / "fake-engine.py", FAKE_ENGINE_BODY)
+
+    # --- fixtures ----------------------------------------------------------
+    @staticmethod
+    def entry(data: bytes) -> dict:
+        return {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+    def make_pack(self, name: str = "model") -> Path:
+        pack = self.root / name
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "config.json").write_bytes(self.CONFIG_BYTES)
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES)
+        (pack / "tokenizer" / "tokenizer.json").write_bytes(self.TOKENIZER_BYTES)
+        return pack
+
+    def receipt_files(self) -> dict:
+        return {
+            "config.json": self.entry(self.CONFIG_BYTES),
+            "model.safetensors": self.entry(self.WEIGHT_BYTES),
+            "tokenizer/tokenizer.json": self.entry(self.TOKENIZER_BYTES),
+        }
+
+    def pulled_pack(self, repo_id: str = PASS_REPO, files=None, name: str = "model") -> Path:
+        pack = self.make_pack(name)
+        launch_write_pull_receipt(
+            pack,
+            repo_id=repo_id,
+            revision="e" * 40,
+            files=self.receipt_files() if files is None else files,
+        )
+        return pack
+
+    def build_row(self, pack: Path) -> tuple:
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            row = FASTMLX_RECOMMEND.build_row(
+                model_path=pack,
+                cards=fixture_manifest()["cards"],
+                fit_check_bin=str(self.green_fit_bin),
+                host_use="shared",
+                context=None,
+                fit_check_args=[],
+                host_hardware_class=lambda: "apple-m5",
+            )
+        return row, stderr.getvalue()
+
+    def run_recommend(self, packs: list, *extra: str) -> tuple:
+        argv = ["recommend", "--quality-cards", str(self.manifest_path)]
+        for pack in packs:
+            argv += ["--model-path", str(pack)]
+        argv += ["--fit-check-bin", str(self.green_fit_bin), *extra]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def run_serve(self, pack: Path) -> tuple:
+        argv = [
+            "serve",
+            "--model-path", str(pack),
+            "--quality-cards", str(self.serve_manifest_path),
+            "--fit-check-bin", str(self.green_fit_bin),
+            "--engine-bin", str(self.fake_engine_bin),
+            "--context", "2048",
+            "--dry-run",
+        ]
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as ctx:
+                FASTMLX_RECOMMEND.launch.main(argv)
+        return ctx.exception.code, stdout.getvalue(), stderr.getvalue()
+
+    def assert_drift_error(self, pack: Path, offending: str, difference: str):
+        row, _ = self.build_row(pack)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_ERROR, row)
+        message = row["message"]
+        self.assertIn(RECEIPT_MISMATCH_REASON, message)
+        self.assertIn(offending, message)
+        self.assertIn(difference, message)
+        self.assertIn(str(FASTMLX_RECOMMEND.launch.pull.receipt_path_for(pack)), message)
+        self.assertEqual(row["card"]["id"], PASS_CARD_ID)
+        self.assertIsNone(row["fit"])
+        self.assertFalse(self.fit_ran_marker.exists(), "the fit check must not run")
+        self.assertIsNone(row["receiptNotice"])
+        return row
+
+    # --- R1-R4: the carded receipt no longer describes the bytes ------------
+    def test_r1_a_listed_file_with_a_different_size_is_an_error_row(self):
+        pack = self.pulled_pack()
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        self.assert_drift_error(pack, "model.safetensors", "size")
+
+    def test_r2_one_flipped_byte_at_the_same_size_is_an_error_row(self):
+        pack = self.pulled_pack()
+        flipped = bytearray(self.CONFIG_BYTES)
+        flipped[3] ^= 0x01
+        self.assertEqual(len(flipped), len(self.CONFIG_BYTES))
+        (pack / "config.json").write_bytes(bytes(flipped))
+        self.assert_drift_error(pack, "config.json", "sha256")
+
+    def test_r3_a_missing_listed_file_is_an_error_row(self):
+        pack = self.pulled_pack()
+        (pack / "tokenizer" / "tokenizer.json").unlink()
+        self.assert_drift_error(pack, "tokenizer/tokenizer.json", "missing")
+
+    def test_r4_an_unlisted_safetensors_file_is_an_error_row(self):
+        pack = self.pulled_pack()
+        (pack / "extra-00002.safetensors").write_bytes(b"unmeasured")
+        self.assert_drift_error(pack, "extra-00002.safetensors", "not listed")
+
+    def test_r1_through_main_exits_2_for_a_single_drifted_candidate(self):
+        pack = self.pulled_pack()
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        code, stdout, _ = self.run_recommend([pack], "--json")
+        self.assertEqual(code, 2)
+        row = json.loads(stdout)["rows"][0]
+        self.assertEqual(row["status"], "error")
+        self.assertIn(RECEIPT_MISMATCH_REASON, row["message"])
+
+    # --- R5: only the drifted candidate is an error --------------------------
+    def test_r5_only_the_drifted_candidate_is_an_error_and_exit_is_0(self):
+        drifted = self.pulled_pack(name="drifted")
+        healthy = self.pulled_pack(name="healthy")
+        (drifted / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        code, stdout, _ = self.run_recommend([drifted, healthy], "--json")
+        rows = {row["path"]: row for row in json.loads(stdout)["rows"]}
+        self.assertEqual(rows[str(drifted)]["status"], "error")
+        self.assertIn(RECEIPT_MISMATCH_REASON, rows[str(drifted)]["message"])
+        self.assertEqual(rows[str(healthy)]["status"], "recommended")
+        self.assertIsNone(rows[str(healthy)]["receiptNotice"])
+        self.assertEqual(code, 0)
+
+    # --- R6 / AC2: notice only, status unchanged ------------------------------
+    def test_r6_an_uncheckable_receipt_is_a_notice_and_keeps_its_status(self):
+        pack = self.pulled_pack(files={})
+        (pack / "model.safetensors").write_bytes(b"changed bytes of another size")
+        row, stderr = self.build_row(pack)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_RECOMMENDED)
+        self.assertEqual(row["card"]["id"], PASS_CARD_ID)
+        self.assertIn("cannot be checked", row["receiptNotice"])
+        self.assertIn(str(FASTMLX_RECOMMEND.launch.pull.receipt_path_for(pack)), row["receiptNotice"])
+        self.assertNotIn("fastmlx serve", row["receiptNotice"])
+        self.assertNotIn("fastmlx serve", stderr)
+        self.assertTrue(self.fit_ran_marker.exists())
+        code, stdout, _ = self.run_recommend([pack])
+        self.assertEqual(code, 0)
+        self.assertIn(row["receiptNotice"], stdout)
+
+    def test_r6_a_card_that_does_not_match_the_receipt_identity_is_a_notice(self):
+        pack = self.pulled_pack(repo_id="example/Uncarded")
+        (pack / "model.safetensors").write_bytes(self.WEIGHT_BYTES + b"x")
+        row, _ = self.build_row(pack)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_UNCARDED)
+        self.assertIn("model.safetensors", row["receiptNotice"])
+        self.assertIn("not evidence for any quality card", row["receiptNotice"])
+        self.assertNotIn(RECEIPT_MISMATCH_REASON, json.dumps(row))
+        code, stdout, _ = self.run_recommend([pack])
+        self.assertEqual(code, 1)
+        self.assertIn(row["receiptNotice"], stdout)
+        code, stdout, _ = self.run_recommend([pack], "--json")
+        self.assertEqual(json.loads(stdout)["rows"][0]["receiptNotice"], row["receiptNotice"])
+
+    # --- AC3: unchanged behaviour ---------------------------------------------
+    def test_a3_a_matching_pack_has_no_notice(self):
+        pack = self.pulled_pack()
+        row, stderr = self.build_row(pack)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_RECOMMENDED)
+        self.assertIsNone(row["receiptNotice"])
+        self.assertNotIn("receipt", stderr)
+
+    def test_a3_dotfiles_change_nothing(self):
+        pack = self.pulled_pack()
+        (pack / ".DS_Store").write_bytes(b"\x00junk")
+        row, _ = self.build_row(pack)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_RECOMMENDED)
+        self.assertIsNone(row["receiptNotice"])
+
+    def test_a3_a_pack_with_no_receipt_has_no_notice(self):
+        pack = self.make_pack()
+        row, _ = self.build_row(pack)
+        self.assertIsNone(row["receiptNotice"])
+        self.assertNotEqual(row["status"], FASTMLX_RECOMMEND.STATUS_ERROR)
+
+    # --- AC4: serve and recommend say the same thing ---------------------------
+    def test_parity_serve_refusal_and_recommend_row_share_reason_and_detail(self):
+        pack = self.pulled_pack()
+        (pack / "config.json").write_bytes(b"x" * len(self.CONFIG_BYTES))
+        row, _ = self.build_row(pack)
+        self.assertEqual(row["status"], FASTMLX_RECOMMEND.STATUS_ERROR)
+        code, _, stderr = self.run_serve(pack)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(RECEIPT_MISMATCH_REASON, stderr)
+        self.assertIn(RECEIPT_MISMATCH_REASON, row["message"])
+        # the very same sentence, byte for byte (reason, detail, receipt path, remedy)
+        self.assertIn(row["message"], stderr)
+        self.assertIn("sha256 differs", row["message"])
+
+    def test_parity_the_shared_helper_is_the_single_source_of_the_wording(self):
+        pack = self.pulled_pack()
+        (pack / "config.json").write_bytes(b"x" * len(self.CONFIG_BYTES))
+        launch = FASTMLX_RECOMMEND.launch
+        card = next(c for c in fixture_manifest()["cards"] if c["id"] == PASS_CARD_ID)
+        judgement = launch.judge_receipt_binding(pack, card)
+        self.assertEqual(judgement.kind, launch.RECEIPT_JUDGEMENT_REFUSE)
+        row, _ = self.build_row(pack)
+        self.assertEqual(row["message"], judgement.message)
 
 
 if __name__ == "__main__":

@@ -485,6 +485,7 @@ def build_row(
         "mtp": None,
         "tiebreakNotice": None,
         "verdictNotice": None,
+        "receiptNotice": None,
     }
 
     if not model_path.is_dir():
@@ -535,6 +536,20 @@ def build_row(
     )
     if not resolved_ok:
         return row
+
+    # The SAME receipt judgement `fastmlx serve` makes after card selection
+    # (`launch.judge_receipt_binding`): a pack whose bytes drifted from the
+    # receipt its selected card was matched through is an error row (serve
+    # would refuse it), and the fit check never runs for it. Any other
+    # mismatch, or an uncheckable receipt, is a row notice only.
+    judgement = launch.judge_receipt_binding(model_path, card)
+    if judgement.kind == launch.RECEIPT_JUDGEMENT_REFUSE:
+        row["status"] = STATUS_ERROR
+        row["card"] = _card_summary(card)
+        row["message"] = judgement.message
+        return row
+    if judgement.kind == launch.RECEIPT_JUDGEMENT_NOTICE:
+        row["receiptNotice"] = judgement.notice
 
     resolved_model_id = model_path.resolve().name
 
@@ -778,6 +793,7 @@ def _classify_pinned_row(
         "mtp": None,
         "tiebreakNotice": None,
         "verdictNotice": None,
+        "receiptNotice": None,
         "source": SOURCE_REVISION_MANIFEST,
         "downloaded": False,
         "ref": ref,
@@ -1022,6 +1038,9 @@ def _format_row_text(rank: int, row: dict) -> str:
     verdict_notice = row.get("verdictNotice")
     if verdict_notice and verdict_notice not in (row.get("message") or ""):
         tail += f" {verdict_notice}"
+    receipt_notice = row.get("receiptNotice")
+    if receipt_notice and receipt_notice not in (row.get("message") or ""):
+        tail += f" {receipt_notice}"
     lines.append(tail)
     if row.get("next_step"):
         lines.append(f"    next: {row['next_step']}")

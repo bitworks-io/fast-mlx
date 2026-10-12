@@ -3312,43 +3312,73 @@ def verify_receipt_binding(model_path: Path, receipt: dict) -> ReceiptBindingRes
     return ReceiptBindingResult(RECEIPT_BINDING_OK, None)
 
 
-def _enforce_receipt_binding(model_path: Path, card: Optional[dict]) -> None:
+RECEIPT_JUDGEMENT_NONE = "none"
+RECEIPT_JUDGEMENT_NOTICE = "notice"
+RECEIPT_JUDGEMENT_REFUSE = "refuse"
+
+
+class ReceiptJudgement(NamedTuple):
+    """The decision on a pack's pull receipt. ``kind`` is one of the
+    ``RECEIPT_JUDGEMENT_*`` constants. ``message`` is the refusal text
+    (``refuse`` only) and ``notice`` the one-line notice text WITHOUT any
+    command prefix (``notice`` only); the other field is ``None``."""
+
+    kind: str
+    message: Optional[str]
+    notice: Optional[str]
+
+
+def judge_receipt_binding(model_path: Path, card: Optional[dict]) -> ReceiptJudgement:
     """Judge the pack by its receipt only while the receipt still describes the
-    pack's bytes. A mismatch refuses (exit 2, ``quality_card_receipt_mismatch``)
-    when the selected card matches the receipt's own identity -- the receipt is
-    then that card's evidence -- and is otherwise a one-line stderr notice. A
-    receipt that cannot be checked (no usable ``files`` map) is a notice only,
-    and a pack with no receipt is untouched."""
+    pack's bytes (shared by ``fastmlx serve`` and ``fastmlx recommend`` so
+    their wording cannot drift). A mismatch is a ``refuse``
+    (``quality_card_receipt_mismatch``) when the selected card matches the
+    receipt's own identity -- the receipt is then that card's evidence -- and
+    otherwise a ``notice``. A receipt that cannot be checked (no usable
+    ``files`` map) is a ``notice`` only, and a pack with no receipt, or one
+    that matches, is ``none``. Pure: prints and raises nothing."""
     receipt = _load_pull_receipt(model_path)
     if receipt is None:
-        return
+        return ReceiptJudgement(RECEIPT_JUDGEMENT_NONE, None, None)
     result = verify_receipt_binding(model_path, receipt)
     if result.status == RECEIPT_BINDING_OK:
-        return
+        return ReceiptJudgement(RECEIPT_JUDGEMENT_NONE, None, None)
     receipt_path = pull.receipt_path_for(model_path.expanduser().absolute())
     if result.status == RECEIPT_BINDING_UNCHECKABLE:
-        print(
-            f"fastmlx serve: pull receipt {receipt_path} cannot be checked against the "
+        return ReceiptJudgement(
+            RECEIPT_JUDGEMENT_NOTICE,
+            None,
+            f"pull receipt {receipt_path} cannot be checked against the "
             f"pack's bytes ({result.detail})",
-            file=sys.stderr,
         )
-        return
     repo_id, revision = receipt.get("repo_id"), receipt.get("revision")
     receipt_repo = repo_id if isinstance(repo_id, str) and repo_id else None
     receipt_revision = revision if isinstance(revision, str) and revision else None
     if card is not None and card_matches_model_identity(card, receipt_repo, receipt_revision):
-        raise LaunchRefusal(
-            2,
+        return ReceiptJudgement(
+            RECEIPT_JUDGEMENT_REFUSE,
             f"{RECEIPT_MISMATCH_REASON}: the pack at {model_path} no longer matches its "
             f"pull receipt {receipt_path}: {result.detail}; its quality card describes the "
             "bytes that were pulled, not these -- re-run `fastmlx pull` for this "
             "directory, or remove the stale receipt so the pack is judged as unidentified",
+            None,
         )
-    print(
-        f"fastmlx serve: pull receipt {receipt_path} does not match the pack's bytes "
+    return ReceiptJudgement(
+        RECEIPT_JUDGEMENT_NOTICE,
+        None,
+        f"pull receipt {receipt_path} does not match the pack's bytes "
         f"({result.detail}); the receipt is not evidence for any quality card here",
-        file=sys.stderr,
     )
+
+
+def _enforce_receipt_binding(model_path: Path, card: Optional[dict]) -> None:
+    """Apply ``judge_receipt_binding`` for ``fastmlx serve``: a refusal exits 2
+    (``quality_card_receipt_mismatch``); a notice is one stderr line."""
+    judgement = judge_receipt_binding(model_path, card)
+    if judgement.kind == RECEIPT_JUDGEMENT_REFUSE:
+        raise LaunchRefusal(2, judgement.message)
+    if judgement.kind == RECEIPT_JUDGEMENT_NOTICE:
+        print(f"fastmlx serve: {judgement.notice}", file=sys.stderr)
 
 
 def _resolve_model_repo(args, model_path: Path) -> Optional[str]:
