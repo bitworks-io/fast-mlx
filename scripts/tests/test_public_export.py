@@ -295,8 +295,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # and token ids, names no model family, host, credential or machine-local path, and the projection
 # validator's marker sweep passed on it.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1017,
-    "pathModeSha256": "be63ec2cd654c1bbb78f35787d432d47b5eb35cf1c6792de2041b1d045ddddbc",
+    "pathCount": 1022,
+    "pathModeSha256": "d21cb5922d0b2c5298310d562a69afe950b26d9617f6e1f1ff502c1ea235b4a0",
 }
 
 

@@ -1,0 +1,1006 @@
+{
+  "schema": "receipt-binding-conformance-v1",
+  "about": "Shared by the Swift engine (PackReceiptBinding.verify, ReceiptBindingConformanceTests) and the Python launcher (verify_receipt_binding, scripts/tests/test_receipt_binding_conformance.py). Each case builds a small tree, builds the receipt files map from it, and expects status plus, for a mismatch, the first difference's kind and path. files: relative path -> {text} or {size} (size bytes of 'x'); dirs: empty directories; symlinks: link -> relative target (the target need not exist). receiptFiles: 'fromTree' computes {size, sha256} for every entry of files, otherwise the value is the receipt's files value verbatim; omitted means the receipt has no files key. receiptExclude drops listed names; receiptOverrides replaces entry keys (null removes one; upperSha256 upper-cases the computed sha256); receiptExtra adds entries ({copyFrom} takes size and sha256 from a created file). hashMaxBytes overrides the hash threshold. reasonContains is a substring of the uncheckable reason.",
+  "cases": [
+    {
+      "id": "ok-matching-tree",
+      "why": "Every listed file matches in size and sha256 and nothing else is present.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "size-differs",
+      "why": "A listed file's recorded size differs from the bytes found.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "a.txt": {
+          "size": 6
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "size",
+        "path": "a.txt"
+      }
+    },
+    {
+      "id": "sha256-differs",
+      "why": "Same size, different recorded sha256, within the hash threshold.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "b.txt": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "sha256",
+        "path": "b.txt"
+      }
+    },
+    {
+      "id": "missing-listed-file",
+      "why": "A listed file that is not in the pack.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExtra": {
+        "gone.bin": {
+          "copyFrom": "a.txt"
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "missing",
+        "path": "gone.bin"
+      }
+    },
+    {
+      "id": "unlisted-top-level-file",
+      "why": "A file in the pack that the receipt does not list.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "extra.txt": {
+          "text": "x"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        "extra.txt"
+      ],
+      "expect": {
+        "status": "mismatch",
+        "kind": "unlisted",
+        "path": "extra.txt"
+      }
+    },
+    {
+      "id": "unlisted-nested-file",
+      "why": "An unlisted file beside a listed one inside a listed directory prefix.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "sub/x.txt": {
+          "text": "x"
+        },
+        "sub/y.txt": {
+          "text": "y"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        "sub/y.txt"
+      ],
+      "expect": {
+        "status": "mismatch",
+        "kind": "unlisted",
+        "path": "sub/y.txt"
+      }
+    },
+    {
+      "id": "unlisted-inside-unlisted-directory",
+      "why": "A real directory the receipt does not mention is walked; its first file is named.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "extra/inner.txt": {
+          "text": "x"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        "extra/inner.txt"
+      ],
+      "expect": {
+        "status": "mismatch",
+        "kind": "unlisted",
+        "path": "extra/inner.txt"
+      }
+    },
+    {
+      "id": "dot-components-are-ignored",
+      "why": "Names starting with a dot, and everything under them, are not unlisted content.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        ".DS_Store": {
+          "text": "junk"
+        },
+        ".cache/blob": {
+          "text": "junk"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        ".DS_Store",
+        ".cache/blob"
+      ],
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "nested-listed-file-ok",
+      "why": "A listed file two directories deep.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "sub/deep/w.txt": {
+          "text": "w"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "listed-prefix-is-a-file",
+      "why": "The receipt lists dir/x.txt but dir is a regular file in the pack.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "dir": {
+          "text": "not a directory"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        "dir"
+      ],
+      "receiptExtra": {
+        "dir/x.txt": {
+          "copyFrom": "a.txt"
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "missing",
+        "path": "dir/x.txt"
+      }
+    },
+    {
+      "id": "listed-name-is-a-directory",
+      "why": "A listed name that is a directory is not a regular file.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "dirs": [
+        "d"
+      ],
+      "receiptFiles": "fromTree",
+      "receiptExtra": {
+        "d": {
+          "copyFrom": "a.txt"
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "missing",
+        "path": "d"
+      }
+    },
+    {
+      "id": "size-only-above-hash-threshold",
+      "why": "A file larger than the hash threshold is checked by size only; a wrong sha256 is not opened.",
+      "files": {
+        "big.bin": {
+          "size": 8
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "big.bin": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "hashMaxBytes": 4,
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "hash-threshold-is-inclusive",
+      "why": "A file exactly at the hash threshold is hashed.",
+      "files": {
+        "edge.bin": {
+          "size": 4
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "edge.bin": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "hashMaxBytes": 4,
+      "expect": {
+        "status": "mismatch",
+        "kind": "sha256",
+        "path": "edge.bin"
+      }
+    },
+    {
+      "id": "uppercase-recorded-sha256-is-compared-lowercased",
+      "why": "A recorded sha256 in upper case still matches.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "a.txt": {
+          "upperSha256": true
+        }
+      },
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "listed-symlink-to-file-is-followed",
+      "why": "A listed symlink resolves to a regular file with the recorded size and sha256.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "symlinks": [
+        {
+          "link": "link.txt",
+          "target": "a.txt"
+        }
+      ],
+      "receiptFiles": "fromTree",
+      "receiptExtra": {
+        "link.txt": {
+          "copyFrom": "a.txt"
+        }
+      },
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "unlisted-symlink-to-directory",
+      "why": "A symlink to a directory is neither a real directory nor a listed prefix: it is unlisted.",
+      "files": {
+        "sub/x.txt": {
+          "text": "x"
+        }
+      },
+      "symlinks": [
+        {
+          "link": "alias",
+          "target": "sub"
+        }
+      ],
+      "receiptFiles": "fromTree",
+      "expect": {
+        "status": "mismatch",
+        "kind": "unlisted",
+        "path": "alias"
+      }
+    },
+    {
+      "id": "unlisted-dangling-symlink",
+      "why": "A dangling symlink is unlisted content.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "symlinks": [
+        {
+          "link": "dangle",
+          "target": "nowhere"
+        }
+      ],
+      "receiptFiles": "fromTree",
+      "expect": {
+        "status": "mismatch",
+        "kind": "unlisted",
+        "path": "dangle"
+      }
+    },
+    {
+      "id": "listed-files-are-checked-in-sorted-order",
+      "why": "With two listed differences the one sorting first wins.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "a.txt": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "b.txt": {
+          "size": 99
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "sha256",
+        "path": "a.txt"
+      }
+    },
+    {
+      "id": "listed-difference-beats-unlisted-path",
+      "why": "Listed files are all checked before the unlisted walk.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "a-extra.txt": {
+          "text": "x"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        "a-extra.txt"
+      ],
+      "receiptOverrides": {
+        "b.txt": {
+          "size": 99
+        }
+      },
+      "expect": {
+        "status": "mismatch",
+        "kind": "size",
+        "path": "b.txt"
+      }
+    },
+    {
+      "id": "unlisted-walk-is-in-sorted-order",
+      "why": "With two unlisted files the one sorting first is named.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        },
+        "b.txt": {
+          "text": "bravo!"
+        },
+        "m.txt": {
+          "text": "x"
+        },
+        "c.txt": {
+          "text": "x"
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptExclude": [
+        "m.txt",
+        "c.txt"
+      ],
+      "expect": {
+        "status": "mismatch",
+        "kind": "unlisted",
+        "path": "c.txt"
+      }
+    },
+    {
+      "id": "uncheckable-no-files-key",
+      "why": "A receipt with no files map cannot be checked.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no files map"
+      }
+    },
+    {
+      "id": "uncheckable-empty-files-map",
+      "why": "An empty files map cannot be checked.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {},
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no files map"
+      }
+    },
+    {
+      "id": "uncheckable-files-is-a-list",
+      "why": "A files list is not a files map.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": [],
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no files map"
+      }
+    },
+    {
+      "id": "uncheckable-files-is-a-string",
+      "why": "A files string is not a files map.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": "a.txt",
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no files map"
+      }
+    },
+    {
+      "id": "uncheckable-files-is-null",
+      "why": "A null files value is not a files map.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": null,
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no files map"
+      }
+    },
+    {
+      "id": "uncheckable-name-absolute",
+      "why": "The listed name '/a.txt' is not a relative normal posix name.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "/a.txt": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "unusable name"
+      }
+    },
+    {
+      "id": "uncheckable-name-parent-component",
+      "why": "The listed name '../a.txt' is not a relative normal posix name.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "../a.txt": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "unusable name"
+      }
+    },
+    {
+      "id": "uncheckable-name-empty-component",
+      "why": "The listed name 'sub//a.txt' is not a relative normal posix name.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "sub//a.txt": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "unusable name"
+      }
+    },
+    {
+      "id": "uncheckable-name-dot-component",
+      "why": "The listed name './a.txt' is not a relative normal posix name.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "./a.txt": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "unusable name"
+      }
+    },
+    {
+      "id": "uncheckable-name-trailing-slash",
+      "why": "The listed name 'sub/' is not a relative normal posix name.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "sub/": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "unusable name"
+      }
+    },
+    {
+      "id": "uncheckable-name-empty-name",
+      "why": "The listed name '' is not a relative normal posix name.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "unusable name"
+      }
+    },
+    {
+      "id": "uncheckable-entry-is-a-string",
+      "why": "A files entry that is not an object.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": "x"
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "is malformed"
+      }
+    },
+    {
+      "id": "uncheckable-entry-is-a-list",
+      "why": "A files entry that is a list.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": [
+          5,
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "is malformed"
+      }
+    },
+    {
+      "id": "uncheckable-size-bool",
+      "why": "A size of True is not a non-negative integer.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": true,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-size-negative",
+      "why": "A size of -1 is not a non-negative integer.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": -1,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-size-float-integral",
+      "why": "A size of 5.0 is not a non-negative integer.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5.0,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-size-float",
+      "why": "A size of 1.5 is not a non-negative integer.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 1.5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-size-string",
+      "why": "A size of '5' is not a non-negative integer.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": "5",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-size-null",
+      "why": "A size of None is not a non-negative integer.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": null,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-size-missing",
+      "why": "An entry with no size.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no integer size"
+      }
+    },
+    {
+      "id": "uncheckable-sha256-short",
+      "why": "A sha256 of 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' is not 64 hex characters.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no sha256"
+      }
+    },
+    {
+      "id": "uncheckable-sha256-long",
+      "why": "A sha256 of 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' is not 64 hex characters.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5,
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no sha256"
+      }
+    },
+    {
+      "id": "uncheckable-sha256-non-hex",
+      "why": "A sha256 of 'gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg' is not 64 hex characters.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5,
+          "sha256": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg"
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no sha256"
+      }
+    },
+    {
+      "id": "uncheckable-sha256-number",
+      "why": "A sha256 of 5 is not 64 hex characters.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5,
+          "sha256": 5
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no sha256"
+      }
+    },
+    {
+      "id": "uncheckable-sha256-null",
+      "why": "A sha256 of None is not 64 hex characters.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5,
+          "sha256": null
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no sha256"
+      }
+    },
+    {
+      "id": "uncheckable-sha256-missing",
+      "why": "An entry with no sha256.",
+      "files": {
+        "a.txt": {
+          "text": "alpha"
+        }
+      },
+      "receiptFiles": {
+        "a.txt": {
+          "size": 5
+        }
+      },
+      "expect": {
+        "status": "uncheckable",
+        "kind": null,
+        "path": null,
+        "reasonContains": "no sha256"
+      }
+    }
+  ]
+}

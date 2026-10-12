@@ -601,7 +601,7 @@ public enum QualityCardStore {
     /// be a full 40-hex sha, `hfPin` must be a usable (>= 8 hex) pin, and `revision` must
     /// case-insensitively PREFIX-match `hfPin` (not equal it — a card's `hfPin` may itself be a short
     /// prefix of the pinned commit).
-    private static func hfPinMatchesRevision(hfPin: String?, revision: String?) -> Bool {
+    static func hfPinMatchesRevision(hfPin: String?, revision: String?) -> Bool {
         guard isFullHexRevision(revision), isUsableHfPin(hfPin), let hfPin, let revision else {
             return false
         }
@@ -990,7 +990,13 @@ public struct PackIdentity: Sendable, Equatable {
     /// resolving symlinks, the revision kept only when it is exactly 40 lowercase hex characters;
     /// (3) `nil`. A receipt and a hub path that name DIFFERENT repos throw `PackIdentityConflict`.
     public static func derive(directory: URL) throws -> PackIdentity? {
-        let receipt = receiptIdentity(of: directory)
+        try derive(directory: directory, receipt: PackReceipt.load(for: directory))
+    }
+
+    /// `derive(directory:)` over an already-loaded receipt, so a caller that also checks the receipt's
+    /// bytes (`PackAdmission.judge`) reads it once.
+    static func derive(directory: URL, receipt loaded: PackReceipt?) throws -> PackIdentity? {
+        let receipt = loaded.flatMap { receiptIdentity(of: $0) }
         let path = hubPathIdentity(of: directory)
         if let receiptRepo = receipt?.repo, let pathRepo = path?.repo, receiptRepo != pathRepo {
             throw PackIdentityConflict(receiptRepo: receiptRepo, pathRepo: pathRepo)
@@ -1001,19 +1007,9 @@ public struct PackIdentity: Sendable, Equatable {
         return PackIdentity(repo: repo, revision: revision)
     }
 
-    private static func receiptIdentity(of directory: URL) -> PackIdentity? {
-        let absolute = URL(fileURLWithPath: directory.path)
-        let receiptURL = URL(fileURLWithPath: absolute.path + ".pull-receipt.json")
-        guard let data = try? Data(contentsOf: receiptURL),
-            let object = try? JSONSerialization.jsonObject(with: data),
-            let receipt = object as? [String: Any]
-        else { return nil }
-        if let recordedDest = receipt["dest"] as? String {
-            let recorded = URL(fileURLWithPath: recordedDest).resolvingSymlinksInPath().path
-            guard recorded == absolute.resolvingSymlinksInPath().path else { return nil }
-        }
-        let repo = (receipt["repo_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-        let revision = (receipt["revision"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    private static func receiptIdentity(of receipt: PackReceipt) -> PackIdentity? {
+        let repo = receipt.repo
+        let revision = receipt.revision
         if repo == nil, revision == nil { return nil }
         return PackIdentity(repo: repo, revision: revision)
     }
@@ -1067,6 +1063,12 @@ public struct PackIdentityConflict: Error, Sendable, Equatable, CustomStringConv
 public enum PackAdmission {
     public static let identityConflictReason = "quality_card_identity_conflict"
     public static let ambiguousReason = "quality_card_ambiguous"
+    /// The pack's bytes no longer match its pull receipt, and the selected card is that receipt's
+    /// evidence. Mirrors Python `RECEIPT_MISMATCH_REASON`.
+    public static let receiptMismatchReason = "quality_card_receipt_mismatch"
+    /// A pack file at or under this size is sha256-compared against its receipt; a larger one is
+    /// checked by size only and never opened (the Python `RECEIPT_HASH_MAX_BYTES`, 64 MiB).
+    public static let defaultReceiptHashMaxBytes: Int64 = 64 * 1024 * 1024
 
     public enum Judgement: Sendable, Equatable {
         /// Serve. `flagMessage` is the opt-in one-line quality flag (`nil` otherwise). `notices` are
@@ -1084,15 +1086,19 @@ public enum PackAdmission {
             message: "fastmlx-serve configuration=refused reason=\(reason) detail=\(detail)")
     }
 
-    /// `directory == nil` judges the alias alone (today's behavior).
+    /// `directory == nil` judges the alias alone (today's behavior). With a directory, the pack's bytes
+    /// are also checked against its pull receipt (see `PackReceiptBinding`) once the card is chosen
+    /// and before the quality decision; `receiptHashMaxBytes` is the sha256 threshold (tests lower it).
     public static func judge(
         alias: String, aliasRevision: String?, directory: URL?, hostHardwareClass: String?,
-        cards: [QualityCard], optIn: QualityOptIn
+        cards: [QualityCard], optIn: QualityOptIn,
+        receiptHashMaxBytes: Int64 = PackAdmission.defaultReceiptHashMaxBytes
     ) -> Judgement {
         let identity: PackIdentity?
+        let receipt = directory.flatMap { PackReceipt.load(for: $0) }
         if let directory {
             do {
-                identity = try PackIdentity.derive(directory: directory)
+                identity = try PackIdentity.derive(directory: directory, receipt: receipt)
             } catch {
                 return refusal(reason: identityConflictReason, detail: "\(error)")
             }
@@ -1146,6 +1152,15 @@ public enum PackAdmission {
         }
 
         var notices: [String] = []
+        if let directory, let receipt {
+            switch PackReceiptBinding.judge(
+                directory: directory, receipt: receipt, card: card, hashMaxBytes: receiptHashMaxBytes)
+            {
+            case .none: break
+            case .notice(let notice): notices.append("fastmlx-serve: \(notice)")
+            case .refuse(let detail): return refusal(reason: receiptMismatchReason, detail: detail)
+            }
+        }
         if let notice = QualityAdmission.hostMismatchNotice(
             card: card, hostHardwareClass: hostHardwareClass)
         {
