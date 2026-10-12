@@ -2460,3 +2460,297 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertEqual(replacementResources?.reservedKVBytes, 0)
     }
 }
+
+// MARK: - Non-final prefill slices do not compute the lm_head
+
+/// Two-layer random-weight decoder with a REAL lm_head matmul, RoPE through the cache's
+/// `ropeOffset`, and causal attention over the cache. Unlike the integer toy models above, its
+/// forward is fully lazy and value-rich, so a prefill that evaluated the wrong arrays (or fewer
+/// than the next slice reads) would change values. Equal seeds give equal weights.
+private final class RandomWeightDenseProbeModel:
+    Module, LanguageModel, KVCacheDimensionProvider
+{
+    static let vocab = 2_048
+    static let dim = 16
+    static let heads = 2
+    static let headDim = 8
+    static let layers = 2
+
+    let kvHeads = Array(repeating: RandomWeightDenseProbeModel.heads, count: layers)
+    private let rope = RoPE(dimensions: headDim, traditional: false, base: 10_000)
+    private let embedding: MLXArray
+    private let wq: [MLXArray]
+    private let wk: [MLXArray]
+    private let wv: [MLXArray]
+    private let wo: [MLXArray]
+    private let head: MLXArray
+
+    init(seed: UInt64) {
+        MLXRandom.seed(seed)
+        func weight(_ shape: [Int]) -> MLXArray {
+            let array = MLXRandom.normal(shape) * 0.4
+            eval(array)
+            return array
+        }
+        let d = Self.dim
+        embedding = weight([Self.vocab, d])
+        wq = (0 ..< Self.layers).map { _ in weight([d, d]) }
+        wk = (0 ..< Self.layers).map { _ in weight([d, d]) }
+        wv = (0 ..< Self.layers).map { _ in weight([d, d]) }
+        wo = (0 ..< Self.layers).map { _ in weight([d, d]) }
+        head = weight([d, Self.vocab])
+        super.init()
+    }
+
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        guard let cache, cache.count == Self.layers else {
+            preconditionFailure("probe model requires one cache per layer")
+        }
+        let t = inputs.dim(1)
+        var h = embedding[inputs]  // [1, T, D]
+        for layer in 0 ..< Self.layers {
+            func split(_ x: MLXArray) -> MLXArray {
+                x.reshaped([1, t, Self.heads, Self.headDim]).transposed(0, 2, 1, 3)
+            }
+            let layerCache = cache[layer]
+            let q = applyRotaryPosition(
+                rope, to: split(matmul(h, wq[layer])), cache: layerCache)
+            let k = applyRotaryPosition(
+                rope, to: split(matmul(h, wk[layer])), cache: layerCache)
+            let v = split(matmul(h, wv[layer]))
+            let mask = layerCache.makeMask(n: t, windowSize: nil, returnArray: true)
+            let attended = attentionWithCacheUpdate(
+                queries: q, keys: k, values: v, cache: layerCache,
+                scale: 1 / Float(Self.headDim).squareRoot(), mask: mask)
+            let merged = attended.transposed(0, 2, 1, 3).reshaped([1, t, Self.dim])
+            h = h + matmul(merged, wo[layer])
+        }
+        return matmul(h, head)  // [1, T, V]
+    }
+}
+
+/// Compact exact-equality report for two arrays (never `XCTAssertEqual` on large collections).
+private func mismatch(_ label: String, _ actual: MLXArray, _ expected: MLXArray) -> String? {
+    guard actual.shape == expected.shape else {
+        return "\(label): shape \(actual.shape) != \(expected.shape)"
+    }
+    guard !arrayEqual(actual, expected).item(Bool.self) else { return nil }
+    let wrong = (actual .!= expected).asType(.int32).sum().item(Int.self)
+    return "\(label): \(wrong)/\(actual.size) elements differ"
+}
+
+final class DenseContinuousBatchRuntimePrefillSliceTests: XCTestCase {
+    private static let continuation = 6
+    private static let prompt = [3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8, 9]  // 13 = 5 + 5 + 3
+
+    private func slice(
+        _ runtime: DenseContinuousBatchRuntime, id: UInt64, tokens: [Int], from start: Int,
+        count: Int, maxOutputTokens: Int = 8
+    ) throws {
+        try runtime.prefill(
+            ContinuousBatchRuntimePrefill(
+                id: BatchRequestID(id),
+                startToken: start,
+                tokens: Array(tokens[start ..< start + count]),
+                isFinal: start + count == tokens.count,
+                totalPromptTokens: tokens.count,
+                maxOutputTokens: maxOutputTokens))
+    }
+
+    private func makeProbeRuntime(seed: UInt64) throws -> DenseContinuousBatchRuntime {
+        try DenseContinuousBatchRuntime(
+            testing: RandomWeightDenseProbeModel(seed: seed),
+            allocationChunk: 4,
+            maxContextTokens: 64,
+            initialDecodeReserve: 384,
+            layerCount: RandomWeightDenseProbeModel.layers,
+            keyValueHeadCount: RandomWeightDenseProbeModel.heads,
+            headDimension: RandomWeightDenseProbeModel.headDim,
+            elementBytes: 4)
+    }
+
+    private func decodeSolo(
+        _ runtime: DenseContinuousBatchRuntime, id: UInt64, count: Int
+    ) throws -> [Int] {
+        try (0 ..< count).map { _ in
+            try runtime.decode(.solo(BatchRequestID(id), speculationAllowed: false))[0].tokens[0]
+        }
+    }
+
+    // MARK: T1 — non-final slice logits are never consumed
+
+    /// `TinyDelayedNonFiniteLanguageModel` emits NaN logits at every position whose INPUT token is
+    /// 11 while its KV writes stay finite. Token 11 closes the first (non-final) slice, so before
+    /// the change the staged-token read of that slice's last row hit the non-finite guard and the
+    /// prefill threw. A non-final slice's logits feed nothing, so the prefill must succeed and the
+    /// FINAL slice must stage the token from its own (finite) last row.
+    func testNonFiniteLogitsOnANonFinalSliceAreNeverRead() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDelayedNonFiniteLanguageModel(invalidInput: 11),
+            allocationChunk: 4, maxContextTokens: 32, initialDecodeReserve: 4)
+        let tokens = [10, 11, 12, 13]
+
+        try slice(runtime, id: 1, tokens: tokens, from: 0, count: 2)  // ends on 11: NaN row
+        try slice(runtime, id: 1, tokens: tokens, from: 2, count: 1)
+        try slice(runtime, id: 1, tokens: tokens, from: 3, count: 1)
+
+        XCTAssertEqual(try decodeSolo(runtime, id: 1, count: 2), [14, 15])
+    }
+
+    /// The accepted trade is only on NON-final slices: the guard still runs on the final slice.
+    func testNonFiniteLogitsOnTheFinalSliceStillFailClosed() throws {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: TinyDelayedNonFiniteLanguageModel(invalidInput: 13),
+            allocationChunk: 4, maxContextTokens: 32, initialDecodeReserve: 4)
+        let tokens = [10, 11, 12, 13]
+        try slice(runtime, id: 1, tokens: tokens, from: 0, count: 2)
+        try slice(runtime, id: 1, tokens: tokens, from: 2, count: 1)
+
+        XCTAssertThrowsError(try slice(runtime, id: 1, tokens: tokens, from: 3, count: 1)) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError,
+                .invalidTokenID(BatchRequestID(1), -1))
+        }
+        XCTAssertEqual(runtime.diagnosticPrefillProgress(for: BatchRequestID(1))?.processedTokens, 3)
+        XCTAssertEqual(
+            runtime.diagnosticPrefillProgress(for: BatchRequestID(1))?.prefillComplete, false)
+    }
+
+    // MARK: T2 — exactness against the evaluate-every-slice oracle and the scalar control
+
+    func testRaggedSlicedPrefillIsExactAgainstEvaluateEverySliceOracleAndScalarControl() throws {
+        let seed: UInt64 = 20_261_011
+        let prompt = Self.prompt
+        let slices = [5, 5, 3]
+        XCTAssertEqual(slices.reduce(0, +), prompt.count)
+
+        // Production path: sliced prefill, then solo decode.
+        let runtime = try makeProbeRuntime(seed: seed)
+        var start = 0
+        for count in slices {
+            try slice(runtime, id: 1, tokens: prompt, from: start, count: count)
+            start += count
+        }
+        let prefillState = try XCTUnwrap(runtime.diagnosticScalarCacheState(for: BatchRequestID(1)))
+        eval(prefillState.flatMap { $0 })
+        let runtimeTokens = try decodeSolo(runtime, id: 1, count: Self.continuation)
+
+        // Oracle (a): the PRE-CHANGE behaviour — same model weights, same cache class and capacity,
+        // same slicing, but EVERY slice's logits are evaluated (the removed work).
+        let oracleModel = RandomWeightDenseProbeModel(seed: seed)
+        let capacity = prefillState[0][0].dim(2)
+        let oracleCaches = (0 ..< RandomWeightDenseProbeModel.layers).map { _ in
+            CompiledKVCache(capacity: capacity)
+        }
+        var oracleStaged: MLXArray!
+        start = 0
+        for count in slices {
+            let ids = MLXArray(prompt[start ..< start + count].map(Int32.init))
+                .reshaped([1, count])
+            let logits = oracleModel(ids, cache: oracleCaches)
+            eval(logits)
+            oracleStaged = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(logits[0..., -1, 0...])
+            eval(oracleStaged)
+            start += count
+        }
+        var problems: [String] = []
+        XCTAssertEqual(prefillState.count, oracleCaches.count)
+        for (layer, cache) in oracleCaches.enumerated() {
+            let expected = cache.innerState()
+            XCTAssertEqual(prefillState[layer].count, expected.count)
+            for (index, array) in expected.enumerated() where index < prefillState[layer].count {
+                if let message = mismatch(
+                    "layer \(layer) innerState[\(index)] vs evaluate-every-slice oracle",
+                    prefillState[layer][index], array)
+                {
+                    problems.append(message)
+                }
+            }
+        }
+        var oracleTokens = [oracleStaged.item(Int.self)]
+        while oracleTokens.count < Self.continuation {
+            let y = MLXArray([Int32(oracleTokens.last!)]).reshaped([1, 1])
+            let logits = oracleModel(y, cache: oracleCaches)
+            oracleTokens.append(argMax(logits[0..., -1, 0...], axis: -1).item(Int.self))
+        }
+
+        // Control (b): scalar route — one unsliced forward over a plain `KVCacheSimple` stack.
+        let controlModel = RandomWeightDenseProbeModel(seed: seed)
+        let controlCaches: [KVCache] = (0 ..< RandomWeightDenseProbeModel.layers).map { _ in
+            KVCacheSimple()
+        }
+        let controlIDs = MLXArray(prompt.map(Int32.init)).reshaped([1, prompt.count])
+        let controlLogits = controlModel(controlIDs, cache: controlCaches)
+        var controlTokens = [argMax(controlLogits[0..., -1, 0...], axis: -1).item(Int.self)]
+        while controlTokens.count < Self.continuation {
+            let y = MLXArray([Int32(controlTokens.last!)]).reshaped([1, 1])
+            let logits = controlModel(y, cache: controlCaches)
+            controlTokens.append(argMax(logits[0..., -1, 0...], axis: -1).item(Int.self))
+        }
+
+        if runtimeTokens != oracleTokens {
+            problems.append("tokens \(runtimeTokens) != evaluate-every-slice oracle \(oracleTokens)")
+        }
+        if runtimeTokens != controlTokens {
+            problems.append("tokens \(runtimeTokens) != scalar control \(controlTokens)")
+        }
+        XCTAssertEqual(Set(runtimeTokens).count > 1, true, "degenerate fixture: constant tokens")
+        XCTAssertTrue(problems.isEmpty, problems.joined(separator: "; "))
+    }
+
+    // MARK: T3 — bookkeeping and error paths are unchanged
+
+    func testNonFinalSlicesAdvanceBookkeepingAndLeaveNoStagedToken() throws {
+        let runtime = try makeRuntime()
+        let id = BatchRequestID(1)
+        let tokens = [10, 11, 12, 13, 14]
+
+        try slice(runtime, id: 1, tokens: tokens, from: 0, count: 2)
+        XCTAssertEqual(
+            runtime.diagnosticPrefillProgress(for: id),
+            .init(processedTokens: 2, cachedTokens: 2, prefillComplete: false, hasStagedToken: false))
+        XCTAssertEqual(runtime.diagnosticScalarLogicalOffset(for: id), 2)
+        XCTAssertThrowsError(try runtime.decode(.solo(id, speculationAllowed: false))) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError, .decodeBeforeFinalPrefill(id))
+        }
+
+        // Out-of-order slice: rejected, bookkeeping untouched.
+        XCTAssertThrowsError(try slice(runtime, id: 1, tokens: tokens, from: 3, count: 2)) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError,
+                .outOfOrderPrefill(id, expected: 2, actual: 3))
+        }
+        XCTAssertEqual(runtime.diagnosticPrefillProgress(for: id)?.processedTokens, 2)
+
+        try slice(runtime, id: 1, tokens: tokens, from: 2, count: 2)
+        XCTAssertEqual(
+            runtime.diagnosticPrefillProgress(for: id),
+            .init(processedTokens: 4, cachedTokens: 4, prefillComplete: false, hasStagedToken: false))
+        XCTAssertEqual(runtime.diagnosticScalarLogicalOffset(for: id), 4)
+
+        try slice(runtime, id: 1, tokens: tokens, from: 4, count: 1)
+        XCTAssertEqual(
+            runtime.diagnosticPrefillProgress(for: id),
+            .init(processedTokens: 5, cachedTokens: 5, prefillComplete: true, hasStagedToken: true))
+        XCTAssertEqual(runtime.diagnosticScalarLogicalOffset(for: id), 5)
+
+        XCTAssertThrowsError(try slice(runtime, id: 1, tokens: tokens, from: 4, count: 1)) {
+            XCTAssertEqual(
+                $0 as? DenseContinuousBatchRuntimeError, .prefillAfterFinalization(id))
+        }
+        // The staged first token is the final slice's own: 10+11+12+13+14 + 1.
+        XCTAssertEqual(
+            try runtime.decode(.solo(id, speculationAllowed: false)).map(\.tokens), [[61]])
+    }
+
+    private func makeRuntime() throws -> DenseContinuousBatchRuntime {
+        try DenseContinuousBatchRuntime(
+            testing: TinyDenseLanguageModel(),
+            allocationChunk: 4, maxContextTokens: 32_768, initialDecodeReserve: 384)
+    }
+}

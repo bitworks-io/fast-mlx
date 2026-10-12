@@ -838,10 +838,21 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         let ids = MLXArray(work.tokens.map(Int32.init)).reshaped([1, work.tokens.count])
         let modelCaches: [any KVCache] = caches.map { $0 }
         let logits = model(ids, cache: modelCaches)
-        let staged = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(
-            logits[0..., -1, 0...])
-        eval([staged] + caches.flatMap { $0.innerState() })
-        _ = try validatedToken(staged, id: work.id)
+        // Only a final slice stages a token. A non-final slice evaluates the caches alone, so the
+        // lazy lm_head projection feeding its discarded logits is never computed. The non-finite
+        // guard therefore runs on the final slice only; earlier slices' hidden states reach it
+        // through the caches it attends over (the same trade the scalar route made in 41f7dbb0).
+        let staged: MLXArray?
+        if work.isFinal {
+            let token = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(
+                logits[0..., -1, 0...])
+            eval([token] + caches.flatMap { $0.innerState() })
+            _ = try validatedToken(token, id: work.id)
+            staged = token
+        } else {
+            eval(caches.flatMap { $0.innerState() })
+            staged = nil
+        }
 
         // Recurrent-row offsets are DRIVER-maintained: the vendored `ArraysCache.advance` adjusts
         // only transient lengths/leftPadding and never `BaseKVCache.offset` (S3 finding 3). Prefill
@@ -862,7 +873,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.processedTokens = endToken
         slot.cachedTokens = endToken
         slot.prefillComplete = work.isFinal
-        slot.stagedToken = work.isFinal ? staged : nil
+        slot.stagedToken = staged
         if work.isFinal,
             let promptTokens = speculativePromptTokens[work.id],
             let configuration = soloPLDConfiguration
@@ -975,6 +986,34 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         for id: BatchRequestID
     ) -> Int? {
         slots[id]?.scalarCaches?.first?.continuousLogicalOffset
+    }
+
+    /// Prefill bookkeeping of one slot, for tests that pin what a non-final slice leaves behind.
+    struct DiagnosticPrefillProgress: Equatable {
+        let processedTokens: Int
+        let cachedTokens: Int
+        let prefillComplete: Bool
+        let hasStagedToken: Bool
+    }
+
+    func diagnosticPrefillProgress(
+        for id: BatchRequestID
+    ) -> DiagnosticPrefillProgress? {
+        slots[id].map {
+            DiagnosticPrefillProgress(
+                processedTokens: $0.processedTokens,
+                cachedTokens: $0.cachedTokens,
+                prefillComplete: $0.prefillComplete,
+                hasStagedToken: $0.stagedToken != nil)
+        }
+    }
+
+    /// Every scalar row cache's `innerState()` arrays (one inner list per layer), for exactness
+    /// tests that compare cache contents across prefill slicings.
+    func diagnosticScalarCacheState(
+        for id: BatchRequestID
+    ) -> [[MLXArray]]? {
+        slots[id]?.scalarCaches?.map { $0.innerState() }
     }
 
     public func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
