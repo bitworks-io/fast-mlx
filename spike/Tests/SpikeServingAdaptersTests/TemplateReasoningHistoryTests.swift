@@ -98,6 +98,36 @@ final class TemplateReasoningHistoryTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(box.rendered).contains("<think>\n\n</think>"))
     }
 
+    // Cycle 240: the SDK-dump echo and the `reasoning`-alias echo reach the template exactly like the minimal echo.
+    private static let minimalEcho = #"{"role":"assistant","content":"a","reasoning_content":"because"}"#
+    private static let sdkDumpEcho =
+        #"{"role":"assistant","content":"a","reasoning_content":"because","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":null}"#
+    private static let aliasEcho = #"{"role":"assistant","content":"a","reasoning":"because"}"#
+
+    private func decodedHistory(echo: String) throws -> [OpenAIChatMessage] {
+        let body = #"{"model":"m","messages":[{"role":"user","content":"q"},\#(echo)]}"#
+        return try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8)).messages
+    }
+
+    func testSDKDumpAndAliasEchoesGiveTheSameTemplateMessagesAsMinimalEcho() throws {
+        let minimal = try renderHistory(decodedHistory(echo: Self.minimalEcho))
+        for echo in [Self.sdkDumpEcho, Self.aliasEcho] {
+            let box = try renderHistory(decodedHistory(echo: echo))
+            XCTAssertEqual(box.messages.count, minimal.messages.count)
+            for (lhs, rhs) in zip(box.messages, minimal.messages) {
+                XCTAssertEqual(Set(lhs.keys), Set(rhs.keys), "key set differs for \(echo)")
+                XCTAssertEqual(lhs["role"] as? String, rhs["role"] as? String)
+                XCTAssertEqual(lhs["content"] as? String, rhs["content"] as? String)
+                XCTAssertEqual(lhs["reasoning_content"] as? String, rhs["reasoning_content"] as? String)
+            }
+            XCTAssertEqual(box.messages[1]["reasoning_content"] as? String, "because")
+            XCTAssertNil(box.messages[1]["reasoning"], "the alias must not leak to the template")
+            XCTAssertEqual(box.rendered, minimal.rendered)
+        }
+        XCTAssertTrue(
+            try XCTUnwrap(minimal.rendered).contains("<think>\nbecause\n</think>\n\na<|im_end|>"))
+    }
+
     // MARK: end to end (env-gated tokenizer)
 
     private func loadQwen3Tokenizer() async throws -> any MLXLMCommon.Tokenizer {
@@ -145,5 +175,22 @@ final class TemplateReasoningHistoryTests: XCTestCase {
             reasoningEffort: nil, addGenerationPrompt: nil)
         XCTAssertFalse(
             tokenizer.decode(tokenIds: plainIds, skipSpecialTokens: false).contains("need the tool"))
+    }
+
+    // Cycle 240: the minimal, SDK-dump and `reasoning`-alias echoes render byte-identical prompts.
+    func testRealTemplateRendersSDKDumpAndAliasEchoesIdentically() async throws {
+        let tokenizer = try await loadQwen3Tokenizer()
+        let codec = MLXScalarTextCodec(tokenizer: tokenizer)
+        func prompt(_ echo: String) throws -> [Int] {
+            // The assistant turn follows the last user query, so the real template renders its reasoning.
+            try codec.render(
+                messages: decodedHistory(echo: echo), tools: [], enableThinking: nil, reasoningEffort: nil,
+                addGenerationPrompt: nil)
+        }
+        let minimal = try prompt(Self.minimalEcho)
+        XCTAssertTrue(
+            tokenizer.decode(tokenIds: minimal, skipSpecialTokens: false).contains("<think>\nbecause\n</think>"))
+        XCTAssertEqual(try prompt(Self.sdkDumpEcho), minimal)
+        XCTAssertEqual(try prompt(Self.aliasEcho), minimal)
     }
 }

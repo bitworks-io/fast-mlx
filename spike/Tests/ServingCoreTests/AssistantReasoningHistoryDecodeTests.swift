@@ -113,4 +113,128 @@ final class AssistantReasoningHistoryDecodeTests: XCTestCase {
             message: "messages.reasoning_content must be a string",
             param: "messages.reasoning_content")
     }
+
+    // MARK: cycle 240: the SDK's serialized assistant message and the `reasoning` alias
+
+    private func decodeOne(_ message: String) throws -> OpenAIChatMessage {
+        try OpenAIChatCompletionRequest.decodeStrict(from: body(messages: "[\(message)]")).messages[0]
+    }
+
+    // The OpenAI Python SDK's `ChatCompletionMessage.model_dump()` shape, None -> null.
+    func testSDKDumpEchoDecodes() throws {
+        let message = try decodeOne(
+            #"{"role":"assistant","content":"a","reasoning_content":"because","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":null}"#
+        )
+        XCTAssertEqual(message.role, .assistant)
+        XCTAssertEqual(message.text, "a")
+        XCTAssertEqual(message.reasoningContent, "because")
+        XCTAssertTrue(message.toolCalls.isEmpty)
+    }
+
+    func testEmptyAnnotationsArrayIsAccepted() throws {
+        let message = try decodeOne(#"{"role":"assistant","content":"a","annotations":[]}"#)
+        XCTAssertEqual(message.text, "a")
+        XCTAssertNil(message.reasoningContent)
+    }
+
+    func testNullToolCallsIsTreatedAsAbsent() throws {
+        let assistant = try decodeOne(#"{"role":"assistant","content":"a","tool_calls":null}"#)
+        XCTAssertEqual(assistant.text, "a")
+        XCTAssertTrue(assistant.toolCalls.isEmpty)
+        let user = try decodeOne(#"{"role":"user","content":"q","tool_calls":null}"#)
+        XCTAssertEqual(user.text, "q")
+        XCTAssertTrue(user.toolCalls.isEmpty)
+    }
+
+    func testNullSDKFieldsOnUserMessageAreAccepted() throws {
+        let message = try decodeOne(
+            #"{"role":"user","content":"q","refusal":null,"annotations":null,"audio":null,"function_call":null}"#
+        )
+        XCTAssertEqual(message.role, .user)
+        XCTAssertEqual(message.text, "q")
+    }
+
+    func testReasoningAliasStringOnAssistantFeedsReasoningContent() throws {
+        let message = try decodeOne(#"{"role":"assistant","content":"a","reasoning":"because"}"#)
+        XCTAssertEqual(message.reasoningContent, "because")
+    }
+
+    func testEqualReasoningAndReasoningContentAreAccepted() throws {
+        let message = try decodeOne(
+            #"{"role":"assistant","content":"a","reasoning":"because","reasoning_content":"because"}"#)
+        XCTAssertEqual(message.reasoningContent, "because")
+    }
+
+    func testDifferingReasoningAndReasoningContentAreRefused() {
+        expectInvalidRequest(
+            body(
+                messages:
+                    #"[{"role":"assistant","content":"a","reasoning":"one","reasoning_content":"two"}]"#),
+            message: "messages.reasoning and messages.reasoning_content disagree",
+            param: "messages.reasoning")
+    }
+
+    func testReasoningAliasOnNonAssistantRoleIsRefused() {
+        for role in ["user", "system", "developer"] {
+            expectInvalidRequest(
+                body(messages: #"[{"role":"\#(role)","content":"q","reasoning":"r"}]"#),
+                message: "Only assistant messages may carry reasoning",
+                param: "messages.reasoning")
+        }
+        expectInvalidRequest(
+            body(messages: #"[{"role":"tool","tool_call_id":"c1","content":"q","reasoning":"r"}]"#),
+            message: "Only assistant messages may carry reasoning",
+            param: "messages.reasoning")
+    }
+
+    func testReasoningAliasOfWrongTypeIsRefused() {
+        for value in ["5", "{}", "[]", "true", "1.5"] {
+            expectInvalidRequest(
+                body(messages: #"[{"role":"assistant","content":"a","reasoning":\#(value)}]"#),
+                message: "messages.reasoning must be a string",
+                param: "messages.reasoning")
+        }
+    }
+
+    func testNullReasoningAliasFallsBackToReasoningContent() throws {
+        let message = try decodeOne(
+            #"{"role":"assistant","content":"a","reasoning":null,"reasoning_content":"because"}"#)
+        XCTAssertEqual(message.reasoningContent, "because")
+        let user = try decodeOne(#"{"role":"user","content":"q","reasoning":null}"#)
+        XCTAssertNil(user.reasoningContent)
+    }
+
+    func testNonNullRefusalIsRefused() {
+        for role in ["assistant", "user"] {
+            expectInvalidRequest(
+                body(messages: #"[{"role":"\#(role)","content":"a","refusal":"no"}]"#),
+                message: "messages.refusal is not supported; send null or omit it",
+                param: "messages.refusal")
+        }
+    }
+
+    func testNonEmptyOrNonArrayAnnotationsAreRefused() {
+        for value in [#"[{"type":"url_citation"}]"#, #""x""#, "{}", "5"] {
+            expectInvalidRequest(
+                body(messages: #"[{"role":"assistant","content":"a","annotations":\#(value)}]"#),
+                message: "messages.annotations is not supported; send null, [] or omit it",
+                param: "messages.annotations")
+        }
+    }
+
+    func testAudioObjectIsRefused() {
+        expectInvalidRequest(
+            body(messages: #"[{"role":"assistant","content":"a","audio":{"id":"a"}}]"#),
+            message: "messages.audio is not supported; send null or omit it",
+            param: "messages.audio")
+    }
+
+    func testFunctionCallObjectIsRefused() {
+        expectInvalidRequest(
+            body(
+                messages:
+                    #"[{"role":"assistant","content":"a","function_call":{"name":"f","arguments":"{}"}}]"#),
+            message: "messages.function_call is not supported; send null or omit it",
+            param: "messages.function_call")
+    }
 }

@@ -348,8 +348,9 @@ enum OpenAIToolDecoding {
     }
 
     /// Decode assistant-history `tool_calls`.
+    /// Absent and JSON `null` (the OpenAI SDK's serialized form of "no tool calls") both mean none.
     static func decodeToolCalls(_ raw: Any?, param: String) throws -> [OpenAIToolCall] {
-        guard let raw else { return [] }
+        guard let raw, !(raw is NSNull) else { return [] }
         guard let array = raw as? [Any] else {
             throw OpenAIServingError.invalidRequest("\(param) must be an array", param: param)
         }

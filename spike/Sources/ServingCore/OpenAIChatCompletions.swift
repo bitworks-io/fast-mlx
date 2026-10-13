@@ -1656,7 +1656,10 @@ private func decodeMessage(_ raw: Any) throws -> OpenAIChatMessage {
     }
     try rejectUnknownKeys(
         in: object,
-        allowed: ["role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"],
+        allowed: [
+            "role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content", "reasoning",
+            "refusal", "annotations", "audio", "function_call",
+        ],
         paramPrefix: "messages")
     let roleValue = try requiredString(object["role"], param: "messages.role")
     guard let role = OpenAIMessageRole(rawValue: roleValue) else {
@@ -1666,11 +1669,25 @@ private func decodeMessage(_ raw: Any) throws -> OpenAIChatMessage {
     let toolCalls = try OpenAIToolDecoding.decodeToolCalls(object["tool_calls"], param: "messages.tool_calls")
     let name = try optionalName(object["name"])
     let toolCallId = try optionalToolCallId(object["tool_call_id"])
-    let reasoningContent = try optionalReasoningContent(object["reasoning_content"])
-    if reasoningContent != nil, role != .assistant {
+    try requireNullOrAbsent(object, field: "refusal")
+    try requireNullOrAbsent(object, field: "audio")
+    try requireNullOrAbsent(object, field: "function_call")
+    try requireNullEmptyOrAbsentAnnotations(object["annotations"])
+    let reasoningContentField = try optionalReasoningContent(object["reasoning_content"])
+    let reasoningAlias = try optionalReasoningAlias(object["reasoning"])
+    if reasoningContentField != nil, role != .assistant {
         throw OpenAIServingError.invalidRequest(
             "Only assistant messages may carry reasoning_content", param: "messages.reasoning_content")
     }
+    if reasoningAlias != nil, role != .assistant {
+        throw OpenAIServingError.invalidRequest(
+            "Only assistant messages may carry reasoning", param: "messages.reasoning")
+    }
+    if let reasoningContentField, let reasoningAlias, reasoningContentField != reasoningAlias {
+        throw OpenAIServingError.invalidRequest(
+            "messages.reasoning and messages.reasoning_content disagree", param: "messages.reasoning")
+    }
+    let reasoningContent = reasoningContentField ?? reasoningAlias
 
     switch role {
     case .tool:
@@ -1715,6 +1732,35 @@ private func optionalName(_ raw: Any?) throws -> String? {
         throw OpenAIServingError.invalidRequest("messages.name must be a string", param: "messages.name")
     }
     return name
+}
+
+/// A field the OpenAI SDK serializes as `null` on every message (`message.model_dump()`) but that we cannot
+/// render (`refusal`, `audio`, `function_call`). Absent/`null` is ignored; any value is a 400 rather than a
+/// silent drop.
+private func requireNullOrAbsent(_ object: [String: Any], field: String) throws {
+    guard let raw = object[field], !(raw is NSNull) else { return }
+    throw OpenAIServingError.invalidRequest(
+        "messages.\(field) is not supported; send null or omit it", param: "messages.\(field)")
+}
+
+/// `annotations` is `null` (or `[]`) on the SDK's serialized message; only a non-empty list carries content
+/// we would drop, so absent/`null`/`[]` are ignored and anything else is a 400.
+private func requireNullEmptyOrAbsentAnnotations(_ raw: Any?) throws {
+    guard let raw, !(raw is NSNull) else { return }
+    if let array = raw as? [Any], array.isEmpty { return }
+    throw OpenAIServingError.invalidRequest(
+        "messages.annotations is not supported; send null, [] or omit it", param: "messages.annotations")
+}
+
+/// `reasoning` is the name some servers give the field `reasoning_content` carries; it follows the same
+/// rules (assistant only, string or null). When both are present they must agree.
+private func optionalReasoningAlias(_ raw: Any?) throws -> String? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard let reasoning = raw as? String else {
+        throw OpenAIServingError.invalidRequest(
+            "messages.reasoning must be a string", param: "messages.reasoning")
+    }
+    return reasoning
 }
 
 /// `reasoning_content` is the field our own responses emit on an assistant message; a client echoing
