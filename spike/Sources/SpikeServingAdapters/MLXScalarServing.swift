@@ -51,7 +51,7 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
                     let argumentsObject: any Sendable
                     if let data = call.function.arguments.data(using: .utf8),
                         let parsed = try? JSONSerialization.jsonObject(with: data) {
-                        argumentsObject = ServingJSONValue(foundation: parsed).asSendable
+                        argumentsObject = ServingJSONValue(foundation: parsed).templateSendable
                     } else {
                         argumentsObject = [String: any Sendable]()
                     }
@@ -68,7 +68,7 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
             if let name = message.name { dict["name"] = name }
             return dict
         }
-        let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { $0.raw.asObjectSendable }
+        let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { $0.raw.templateObjectSendable }
         var context: [String: any Sendable] = [:]
         if let enableThinking { context["enable_thinking"] = enableThinking }
         if let reasoningEffort { context["reasoning_effort"] = reasoningEffort }
