@@ -32,6 +32,11 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     /// (QwenLM/Qwen3 #1817). The agentic qwen3_5 family is served on the scalar route, which leaves
     /// this off and respects the template default.
     public var disableThinkingWhenToolsActive: Bool
+    /// Whether the loaded family begins generation inside the reasoning block (see
+    /// `servingThinksByDefault`). The loader computes it from the model's `model_type` and its own chat
+    /// template; `start` folds it with the request's resolved `enable_thinking` into
+    /// `ServingGenerationHandle.separatesReasoning`. Defaults to `false`: byte-identical passthrough.
+    public var thinksByDefault: Bool
     /// Immutable model/host-fit capability. Production serving always supplies this; nil retains
     /// the legacy embedding contract for existing library callers and fixtures.
     public let modelCapabilities: ServingModelCapabilities?
@@ -44,6 +49,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         admission: ContinuousServingAdmissionMode = .immediateBatchNoSpec,
         toolCallFormat: ToolCallFormat = .json,
         disableThinkingWhenToolsActive: Bool = false,
+        thinksByDefault: Bool = false,
         modelCapabilities: ServingModelCapabilities? = nil
     ) {
         precondition(
@@ -63,6 +69,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.admission = admission
         self.toolCallFormat = toolCallFormat
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
+        self.thinksByDefault = thinksByDefault
         self.modelCapabilities = modelCapabilities
     }
 }
@@ -88,6 +95,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let ignoreEOS: Bool
         let activeTools: [OpenAIToolSpec]
         let completionBudgetResolution: ServingCompletionBudgetResolution?
+        /// Streaming reasoning separation for this request (family `thinksByDefault` folded with the
+        /// SAME resolved `enable_thinking` the prompt was rendered from).
+        let separatesReasoning: Bool
         let outputTokenTraceLimit: Int?
         let completedTraceCapacity: Int
     }
@@ -286,11 +296,18 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         try Self.rejectUnsupportedDecodeControls(request)
 
         let activeTools = request.activeTools
+        // Resolve thinking ONCE and use the SAME value for the prompt render and the reasoning gate —
+        // a closed `<think></think>` in the prompt with a splitter still engaged would mislabel the
+        // answer. This route only accepts `.chat` prompts (raw-text is rejected above).
+        let resolvedEnableThinking = request.resolvedEnableThinking(
+            disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive)
+        let separatesReasoning = servingSeparatesReasoning(
+            thinksByDefault: configuration.thinksByDefault,
+            resolvedEnableThinking: resolvedEnableThinking)
         let promptTokens = try codec.render(
             messages: request.messages,
             tools: activeTools,
-            enableThinking: request.resolvedEnableThinking(
-                disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive),
+            enableThinking: resolvedEnableThinking,
             reasoningEffort: request.reasoningEffort,
             addGenerationPrompt: request.addGenerationPrompt)
         guard !promptTokens.isEmpty else {
@@ -314,6 +331,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             ignoreEOS: request.ignoreEOS,
             activeTools: activeTools,
             completionBudgetResolution: completionBudgetResolution,
+            separatesReasoning: separatesReasoning,
             outputTokenTraceLimit: outputTokenTraceLimit,
             completedTraceCapacity: completedTraceCapacity)
         switch configuration.admission {
@@ -818,7 +836,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             route: route,
             mailbox: mailbox,
             lease: lease,
-            completionBudgetResolution: prepared.completionBudgetResolution)
+            completionBudgetResolution: prepared.completionBudgetResolution,
+            separatesReasoning: prepared.separatesReasoning)
     }
 
     private func execute(

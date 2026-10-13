@@ -391,6 +391,24 @@ public func validateContinuousServingModelLoadConfiguration(
     return configuration
 }
 
+/// Whether the continuous route's loaded checkpoint begins generation inside the reasoning block, so
+/// `ContinuousServingBackend.start` may separate `<think>` reasoning for it. Keyed on the SAME
+/// artifact-derived inputs as the scalar route (`model_type` from `config.json` and whether the
+/// checkpoint's own chat template attests the `<think>`/`</think>` markers), with the decoder route taken
+/// from the proof: `.nativeHeterogeneous` when hybrid geometry was certified, `.compiled` (dense) otherwise.
+/// Fail-closed: an unknown family, a template without the markers, or an unreadable artifact yields
+/// `false` (byte-identical passthrough). This route has no `--chat-template` override.
+func continuousServingThinksByDefault(
+    modelDirectory: URL,
+    hybridAdmitted: Bool
+) -> Bool {
+    servingThinksByDefault(
+        route: hybridAdmitted ? .nativeHeterogeneous : .compiled,
+        modelType: scalarServingModelType(modelDirectory: modelDirectory),
+        templateAttestsThinkMarkers: scalarServingChatTemplateAttestsThinkMarkers(
+            modelDirectory: modelDirectory))
+}
+
 /// Load one source-locked dense model into a single actor-confined continuous route.
 public func loadContinuousServingModel(
     configuration rawConfiguration: ContinuousServingModelLoadConfiguration
@@ -492,6 +510,12 @@ public func loadContinuousServingModel(
     var backendConfiguration = configuration.backendConfiguration
     backendConfiguration.toolCallFormat = servingToolCallFormat(
         inferred: context.configuration.toolCallFormat)
+    // Streaming reasoning separation is keyed on the loaded family AND its own chat template (the
+    // route is `.nativeHeterogeneous` only when the proof certified hybrid geometry). The tool-time
+    // `disableThinkingWhenToolsActive` workaround stays whatever the caller configured.
+    backendConfiguration.thinksByDefault = continuousServingThinksByDefault(
+        modelDirectory: configuration.modelDirectory,
+        hybridAdmitted: proof.verifiedHybridGeometry != nil)
     backendConfiguration.scorecardTraceCapacity = configuration.traceLimit
     let backend = ContinuousServingBackend(
         launchedModel: configuration.launchedModel,

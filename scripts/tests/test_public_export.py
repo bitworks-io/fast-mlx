@@ -300,9 +300,14 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # full; they hold only synthetic message strings and a hand-written template excerpt, name no model family,
 # host, credential or machine-local path (the tokenizer directory comes from an env var), and the projection
 # validator's marker sweep passed on them.
+# 2026-10-13, 1031 -> 1032: adds spike/Tests/SpikeServingAdaptersTests/ContinuousServingReasoningSeparationTests.swift
+# (projected with spike/Tests), the tests for the continuous route separating `<think>` reasoning like the scalar route.
+# Conscious decision to publish: read in full; it holds only fixture runtimes/codecs, synthetic prompts and hand-written
+# template strings in temp directories, names no host, credential or machine-local path, and the projection
+# validator's marker sweep passed on it.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1031,
-    "pathModeSha256": "7ea4d9cbb68caca5bdcad92637cfbc6614c9175556b3ccf3d7ee5f393b644426",
+    "pathCount": 1032,
+    "pathModeSha256": "b7b3022c3214afbe4e3a0afbf23cc05459b63b4b6f75603d2daa4555a9f25d37",
 }
 
 
