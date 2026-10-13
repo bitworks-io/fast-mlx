@@ -116,12 +116,25 @@ public struct OpenAIToolSpec: Sendable, Equatable {
     /// The full, unmodified `{"type":"function","function":{…}}` object, forwarded verbatim to the
     /// chat template's `tools` argument.
     public var raw: ServingJSONValue
+    /// The same `{"type":"function","function":{…}}` object re-parsed with the client's JSON key
+    /// order (and number literal text) intact, so the chat template can render it like Python
+    /// transformers does. `nil` when the order-preserving re-parse was unavailable (it refuses
+    /// duplicate keys and depth > 256, which `JSONSerialization` accepts); consumers then fall back
+    /// to `raw`.
+    public var orderedRaw: JSONSchemaSubsetCompiler.RawValue?
 
-    public init(name: String, description: String?, parameters: ServingJSONValue, raw: ServingJSONValue) {
+    public init(
+        name: String,
+        description: String?,
+        parameters: ServingJSONValue,
+        raw: ServingJSONValue,
+        orderedRaw: JSONSchemaSubsetCompiler.RawValue? = nil
+    ) {
         self.name = name
         self.description = description
         self.parameters = parameters
         self.raw = raw
+        self.orderedRaw = orderedRaw
     }
 }
 
@@ -279,6 +292,30 @@ enum OpenAIToolDecoding {
                 parameters: parametersValue,
                 raw: ServingJSONValue(foundation: object))
         }
+    }
+
+    /// Attaches the client-ordered `{"type":…,"function":…}` object to each decoded spec.
+    ///
+    /// `decodeTools` maps the request array 1:1 (it throws on any bad entry, never skips one), so
+    /// element `i` of the re-parsed `tools` array is spec `i`. Best effort: a body only the stricter
+    /// order-preserving parser refuses (duplicate key, depth > 256), a missing/mismatched `tools`
+    /// array, or a non-object element leaves every `orderedRaw` nil — callers then fall back to
+    /// `raw`. This never throws, so it cannot introduce a new 400.
+    static func attachOrderedRaw(to specs: [OpenAIToolSpec], rawBody: Data) -> [OpenAIToolSpec] {
+        guard !specs.isEmpty,
+            let root = try? JSONSchemaSubsetCompiler.parseOrdered(rawBody),
+            case .object(let rootPairs) = root,
+            case .array(let elements)? = rootPairs.last(where: { $0.key == "tools" })?.value,
+            elements.count == specs.count
+        else { return specs }
+        var ordered: [JSONSchemaSubsetCompiler.RawValue] = []
+        for element in elements {
+            guard case .object = element else { return specs }
+            ordered.append(element)
+        }
+        var result = specs
+        for index in result.indices { result[index].orderedRaw = ordered[index] }
+        return result
     }
 
     /// Decode `tool_choice`. Default is `.auto` when tools are present, otherwise `.none`.

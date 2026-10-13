@@ -49,7 +49,15 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
             if !message.toolCalls.isEmpty {
                 dict["tool_calls"] = message.toolCalls.map { call -> [String: any Sendable] in
                     let argumentsObject: any Sendable
-                    if let data = call.function.arguments.data(using: .utf8),
+                    let argumentsData = call.function.arguments.data(using: .utf8)
+                    if let argumentsData,
+                        let ordered = try? JSONSchemaSubsetCompiler.parseOrdered(argumentsData),
+                        case .object = ordered {
+                        // Client key order + `json.loads` number semantics (see
+                        // `RawValue.templateJinjaValue`). A refusal of the stricter parser
+                        // (duplicate key, depth), or a non-object, takes the unchanged path below.
+                        argumentsObject = ordered.templateJinjaValue
+                    } else if let data = argumentsData,
                         let parsed = try? JSONSerialization.jsonObject(with: data) {
                         argumentsObject = ServingJSONValue(foundation: parsed).templateSendable
                     } else {
@@ -92,6 +100,16 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
         // doc comment), and pinning it here means a future change to the bridge's own default can
         // never silently change this codec's behavior out from under it.
         context["add_generation_prompt"] = addGenerationPrompt ?? true
+        // `toolSpecs` above is built from `[String: Any]` dictionaries, which `Value(any:)` renders
+        // with SORTED keys. Python transformers renders the client's JSON key order, and the
+        // template's `tool | tojson` is trained on that. When every tool carries its ordered parse,
+        // pass the ordered `Jinja.Value`s through `additionalContext["tools"]`: the swift-transformers
+        // merge loop overwrites the sorted `tools` value it set from `toolSpecs` (same idiom as
+        // `add_generation_prompt` above). `toolSpecs` stays non-nil so the tokenizer still selects
+        // the named `tool_use` template. If any tool lacks `orderedRaw`, behavior is unchanged.
+        if !tools.isEmpty, tools.allSatisfy({ $0.orderedRaw != nil }) {
+            context["tools"] = Jinja.Value.array(tools.compactMap { $0.orderedRaw?.templateJinjaValue })
+        }
         do {
             return try tokenizer.applyChatTemplate(
                 messages: templateMessages,

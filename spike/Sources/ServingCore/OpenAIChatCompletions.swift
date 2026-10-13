@@ -364,7 +364,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         let stream = try optionalBool(root["stream"], param: "stream") ?? false
         let stop = try decodeStop(root["stop"])
 
-        let tools = try OpenAIToolDecoding.decodeTools(root["tools"])
+        let tools = OpenAIToolDecoding.attachOrderedRaw(
+            to: try OpenAIToolDecoding.decodeTools(root["tools"]), rawBody: data)
         let toolChoice = try OpenAIToolDecoding.decodeToolChoice(root["tool_choice"], hasTools: !tools.isEmpty)
         let parallelToolCalls = try optionalBool(root["parallel_tool_calls"], param: "parallel_tool_calls")
         let enableThinking = try optionalBool(root["enable_thinking"], param: "enable_thinking")

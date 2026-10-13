@@ -11,7 +11,8 @@ import Tokenizers
 
 /// JSON `null` in chat-template inputs (history tool-call arguments, tool schemas) must reach the
 /// template as Jinja `none`, not Foundation's `NSNull` (which swift-jinja's `Value(any:)` rejects,
-/// surfacing as a `chat_template_rejected` 400). Cycle 236c.
+/// surfacing as an HTTP 500 `generation_failed` on the default route: the `JinjaError` is not a
+/// `TemplateException`, so it is not translated to `chat_template_rejected`). Cycle 236c.
 final class TemplateNullValueTests: XCTestCase {
     private static let nullyJSON = #"{"a":null,"b":[1,null,{"c":null}]}"#
 
