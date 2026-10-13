@@ -74,6 +74,8 @@ public struct MLXScalarTextCodec: ScalarServingTextCodec {
             }
             if let toolCallId = message.toolCallId { dict["tool_call_id"] = toolCallId }
             if let name = message.name { dict["name"] = name }
+            // Present ONLY when the client sent it, so a template's `is defined` test matches transformers.
+            if let reasoningContent = message.reasoningContent { dict["reasoning_content"] = reasoningContent }
             return dict
         }
         let toolSpecs: [ToolSpec]? = tools.isEmpty ? nil : tools.compactMap { $0.raw.templateObjectSendable }

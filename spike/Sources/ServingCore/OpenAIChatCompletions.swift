@@ -89,19 +89,24 @@ public struct OpenAIChatMessage: Sendable, Equatable {
     public var toolCallId: String?
     /// Optional author name (e.g. the tool name on a `tool` message).
     public var name: String?
+    /// Reasoning an assistant history turn carried (the `reasoning_content` our own responses emit);
+    /// nil when the client sent none. Assistant messages only.
+    public var reasoningContent: String?
 
     public init(
         role: OpenAIMessageRole,
         text: String,
         toolCalls: [OpenAIToolCall] = [],
         toolCallId: String? = nil,
-        name: String? = nil
+        name: String? = nil,
+        reasoningContent: String? = nil
     ) {
         self.role = role
         self.text = text
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.name = name
+        self.reasoningContent = reasoningContent
     }
 }
 
@@ -1651,7 +1656,7 @@ private func decodeMessage(_ raw: Any) throws -> OpenAIChatMessage {
     }
     try rejectUnknownKeys(
         in: object,
-        allowed: ["role", "content", "tool_calls", "tool_call_id", "name"],
+        allowed: ["role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"],
         paramPrefix: "messages")
     let roleValue = try requiredString(object["role"], param: "messages.role")
     guard let role = OpenAIMessageRole(rawValue: roleValue) else {
@@ -1661,6 +1666,11 @@ private func decodeMessage(_ raw: Any) throws -> OpenAIChatMessage {
     let toolCalls = try OpenAIToolDecoding.decodeToolCalls(object["tool_calls"], param: "messages.tool_calls")
     let name = try optionalName(object["name"])
     let toolCallId = try optionalToolCallId(object["tool_call_id"])
+    let reasoningContent = try optionalReasoningContent(object["reasoning_content"])
+    if reasoningContent != nil, role != .assistant {
+        throw OpenAIServingError.invalidRequest(
+            "Only assistant messages may carry reasoning_content", param: "messages.reasoning_content")
+    }
 
     switch role {
     case .tool:
@@ -1676,7 +1686,8 @@ private func decodeMessage(_ raw: Any) throws -> OpenAIChatMessage {
         return OpenAIChatMessage(role: role, text: text, toolCallId: toolCallId, name: name)
     case .assistant:
         let text = try decodeAssistantContent(object["content"], hasToolCalls: !toolCalls.isEmpty)
-        return OpenAIChatMessage(role: role, text: text, toolCalls: toolCalls, name: name)
+        return OpenAIChatMessage(
+            role: role, text: text, toolCalls: toolCalls, name: name, reasoningContent: reasoningContent)
     default:
         guard toolCalls.isEmpty else {
             throw OpenAIServingError.invalidRequest(
@@ -1704,6 +1715,17 @@ private func optionalName(_ raw: Any?) throws -> String? {
         throw OpenAIServingError.invalidRequest("messages.name must be a string", param: "messages.name")
     }
     return name
+}
+
+/// `reasoning_content` is the field our own responses emit on an assistant message; a client echoing
+/// that message back as history sends it here. Absent/`null` is nil; any other non-string is a 400.
+private func optionalReasoningContent(_ raw: Any?) throws -> String? {
+    guard let raw, !(raw is NSNull) else { return nil }
+    guard let reasoning = raw as? String else {
+        throw OpenAIServingError.invalidRequest(
+            "messages.reasoning_content must be a string", param: "messages.reasoning_content")
+    }
+    return reasoning
 }
 
 private func optionalToolCallId(_ raw: Any?) throws -> String? {

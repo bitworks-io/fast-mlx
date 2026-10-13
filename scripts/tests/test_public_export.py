@@ -294,9 +294,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # chunks. Conscious decision to publish: read in full; it holds only synthetic random-weight fixtures
 # and token ids, names no model family, host, credential or machine-local path, and the projection
 # validator's marker sweep passed on it.
+# 2026-10-13, 1029 -> 1031: adds spike/Tests/ServingCoreTests/AssistantReasoningHistoryDecodeTests.swift and
+# spike/Tests/SpikeServingAdaptersTests/TemplateReasoningHistoryTests.swift (projected with spike/Tests), the
+# tests for assistant history turns accepting `reasoning_content`. Conscious decision to publish: both read in
+# full; they hold only synthetic message strings and a hand-written template excerpt, name no model family,
+# host, credential or machine-local path (the tokenizer directory comes from an env var), and the projection
+# validator's marker sweep passed on them.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1029,
-    "pathModeSha256": "37ef2e790f54d387779f6a27a25c225af5fecc551fab3ba39e1c6f27bd26f704",
+    "pathCount": 1031,
+    "pathModeSha256": "7ea4d9cbb68caca5bdcad92637cfbc6614c9175556b3ccf3d7ee5f393b644426",
 }
 
 
