@@ -71,4 +71,80 @@ final class ScalarHybridFallbackPolicyTests: XCTestCase {
             "fastmlx-serve continuous_admitted=hybrid model_type=qwen3_5 "
                 + "reason=allow_hybrid_qwen35")
     }
+
+    // MARK: - Config-scoped fallback eligibility (Llama 3.x, cycle 236)
+
+    private static let llama3FullConfig = Data(
+        #"{"model_type":"llama","vocab_size":128256,"rope_scaling":{"rope_type":"llama3","factor":32.0}}"#.utf8)
+    private static let llama3VocabOnlyConfig = Data(#"{"model_type":"llama","vocab_size":128256}"#.utf8)
+    private static let llama3RopeOnlyConfig = Data(
+        #"{"model_type":"llama","vocab_size":32000,"rope_scaling":{"rope_type":"llama3"}}"#.utf8)
+
+    func testLlama3ConfigShapeIsEligibleForScalarFallback() {
+        XCTAssertTrue(
+            isScalarServingFallbackEligible(modelType: "llama", configJSON: Self.llama3FullConfig))
+    }
+
+    func testLlamaWithLlama3VocabAloneIsEligible() {
+        XCTAssertTrue(
+            isScalarServingFallbackEligible(modelType: "llama", configJSON: Self.llama3VocabOnlyConfig))
+    }
+
+    func testLlamaWithLlama3RopeTypeAloneIsEligible() {
+        XCTAssertTrue(
+            isScalarServingFallbackEligible(modelType: "llama", configJSON: Self.llama3RopeOnlyConfig))
+    }
+
+    func testLlama2ShapedConfigFailsClosed() {
+        let plain = Data(#"{"model_type":"llama","vocab_size":32000}"#.utf8)
+        let linear = Data(
+            #"{"model_type":"llama","vocab_size":32000,"rope_scaling":{"rope_type":"linear","factor":2.0}}"#.utf8)
+        let missingVocab = Data(#"{"model_type":"llama"}"#.utf8)
+        let justBelow = Data(#"{"model_type":"llama","vocab_size":127999}"#.utf8)
+        let stringVocab = Data(#"{"model_type":"llama","vocab_size":"128256"}"#.utf8)
+        let ropeNotObject = Data(#"{"model_type":"llama","vocab_size":32000,"rope_scaling":"llama3"}"#.utf8)
+        for config in [plain, linear, missingVocab, justBelow, stringVocab, ropeNotObject] {
+            XCTAssertFalse(
+                isScalarServingFallbackEligible(modelType: "llama", configJSON: config),
+                "\(String(decoding: config, as: UTF8.self)) is not a Llama 3.x signal and must fail closed")
+        }
+    }
+
+    func testLlamaWithoutUsableConfigFailsClosed() {
+        XCTAssertFalse(isScalarServingFallbackEligible(modelType: "llama", configJSON: nil))
+        XCTAssertFalse(
+            isScalarServingFallbackEligible(modelType: "llama", configJSON: Data("not json {".utf8)))
+        XCTAssertFalse(isScalarServingFallbackEligible(modelType: "llama", configJSON: Data()))
+        XCTAssertFalse(
+            isScalarServingFallbackEligible(modelType: "llama", configJSON: Data("[128256]".utf8)))
+    }
+
+    func testQwen3_5StaysEligibleWithAnyConfig() {
+        XCTAssertTrue(isScalarServingFallbackEligible(modelType: "qwen3_5", configJSON: nil))
+        XCTAssertTrue(
+            isScalarServingFallbackEligible(modelType: "qwen3_5", configJSON: Data("garbage".utf8)))
+        XCTAssertTrue(
+            isScalarServingFallbackEligible(modelType: "qwen3_5", configJSON: Self.llama3FullConfig))
+    }
+
+    func testOtherFamiliesFailClosedEvenWithLlama3Config() {
+        for family in ["qwen3", "qwen3_next", "qwen3_5_moe", "qwen4_exp", "gemma3", "mistral", ""] {
+            XCTAssertFalse(
+                isScalarServingFallbackEligible(modelType: family, configJSON: Self.llama3FullConfig),
+                "\(family) must not ride a llama3-shaped config into the scalar fallback")
+        }
+    }
+
+    func testLlamaTagIsExactMatch() {
+        for family in ["Llama", "LLAMA", " llama", "llama ", "llama\n"] {
+            XCTAssertFalse(
+                isScalarServingFallbackEligible(modelType: family, configJSON: Self.llama3FullConfig),
+                "'\(family)' is not the exact llama tag and must fail closed")
+        }
+    }
+
+    func testFamilyOnlyPredicateStillExcludesLlama() {
+        // Llama admission is config-scoped; the family-only predicate must not grow a llama entry.
+        XCTAssertFalse(isScalarHybridServingFamily("llama"))
+    }
 }

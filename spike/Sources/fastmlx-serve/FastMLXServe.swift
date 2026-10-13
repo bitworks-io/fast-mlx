@@ -1528,15 +1528,19 @@ private func prepareBackend(
                 // throws unsupportedModelFamily and the catch below falls back to scalar serving.
                 allowHybridQwen35: arguments.allowHybridQwen35))
         } catch DenseContinuousBatchRuntimeError.unsupportedModelFamily(let family)
-            where isScalarHybridServingFamily(family)
+            where isScalarServingFallbackEligible(
+                modelType: family,
+                configJSON: try? Data(
+                    contentsOf: served.directory.appendingPathComponent("config.json")))
         {
             // The continuous route only supports qwen3; the proof fails closed before any
             // weight load or global Memory mutation (MLXContinuousServing.verifying runs first).
-            // For families the scalar route is live-proven to serve (currently qwen3_5's hybrid
-            // GatedDeltaNet-linear/full-attention layout), keep the operator's one-command
-            // `serve.sh --model <repo>` working by falling back to scalar serving. The resolved
-            // fit-check limits are route-agnostic (arch-derived) and reused as-is; scalar ignores
-            // the reservedKV/context fields. Every non-allowlisted family rethrows, so
+            // For packs the scalar route is live-proven to serve (qwen3_5's hybrid
+            // GatedDeltaNet-linear/full-attention layout, and Llama 3.x — `model_type: llama`
+            // admitted only when config.json shows llama3 rope or a 128k vocab), keep the operator's
+            // one-command `serve.sh --model <repo>` working by falling back to scalar serving. The
+            // resolved fit-check limits are route-agnostic (arch-derived) and reused as-is; scalar
+            // ignores the reservedKV/context fields. Every ineligible pack rethrows, so
             // `verifying` stays the sole authority on continuous support.
             FileHandle.standardError.write(
                 Data((scalarHybridFallbackAnnounceLine(modelType: family) + "\n").utf8))

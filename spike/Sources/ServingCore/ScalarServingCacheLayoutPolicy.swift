@@ -1,3 +1,5 @@
+import Foundation
+
 public enum ScalarServingNativeCacheKind: String, Codable, Equatable, Sendable {
     case denseAttention = "dense-attention"
     case rotatingAttention = "rotating-attention"
@@ -93,9 +95,12 @@ public enum ScalarServingDecoderRoute: String, Equatable, Sendable {
 /// Fail-closed by construction: this is a *serving-proof* allowlist, deliberately
 /// narrower than the sizer's hybrid-linear classification (`ModelConfigDecoder`,
 /// which also tags `qwen3_next` and the human-gated MoE `qwen3_5_moe`). Only
-/// `qwen3_5` has a recorded live scalar-serving proof (generation + `.xmlFunction`
-/// tool calls); every other family — proven or not by the sizer — rethrows and
-/// leaves `DenseContinuousBatchModelProof.verifying` the sole authority on support.
+/// `qwen3_5` has a recorded live scalar-serving proof that a bare family tag can
+/// express (generation + `.xmlFunction` tool calls); every other family — proven or
+/// not by the sizer — rethrows and leaves `DenseContinuousBatchModelProof.verifying`
+/// the sole authority on support. Llama 3.x also has a live proof, but a
+/// config-scoped one a family-only predicate cannot express, so it is deliberately
+/// absent from this set and admitted only by `isScalarServingFallbackEligible`.
 private let scalarHybridServingFamilies: Set<String> = ["qwen3_5"]
 
 /// Whether `family` (a raw `config.json` `model_type`) is eligible for the
@@ -105,8 +110,44 @@ public func isScalarHybridServingFamily(_ family: String) -> Bool {
     scalarHybridServingFamilies.contains(family)
 }
 
+/// Whether a pack is eligible for the continuous→scalar serving fallback, given its raw
+/// `config.json` `model_type` and (optionally) the raw `config.json` bytes.
+///
+/// `qwen3_5` is eligible exactly as `isScalarHybridServingFamily` says, with no config needed.
+/// `llama` is eligible ONLY when the config shows Llama 3.x: it parses as a JSON object AND either
+/// the top-level `vocab_size` is an integer >= 128000 OR `rope_scaling` is an object whose
+/// `rope_type` is `"llama3"`. These are the same two signals the vendored `ToolCallFormat.infer`
+/// uses to pick `.llama3`. A missing, unparseable, or non-object config, or a Llama-1/2-shaped one
+/// (vocab 32000, no llama3 rope), fails closed. Every other family tag is ineligible regardless of
+/// config. Exact-match on the tag: no case folding or trimming.
+///
+/// Why `llama` is config-scoped rather than a member of `scalarHybridServingFamilies`: the live
+/// scalar proof covers Llama 3.x only, and `model_type: llama` is shared by Llama 1/2 and many
+/// derivatives that were never served on this route. A predicate that takes only a family tag
+/// cannot express that scoping — the same lesson as qwen4_exp, whose proof is route-scoped and
+/// which therefore stays out of the allowlist
+/// (docs/task-inbox/2026-09-08-qwen4exp-scalar-fallback-allowlist-NO-GO.md). The live proof is
+/// cycle 236: `mlx-community/Llama-3.2-3B-Instruct-4bit` on the scalar route (greedy stop on
+/// end-of-turn, streaming usage, parsed llama3 tool calls)
+/// (docs/task-inbox/2026-10-12-PREDECLARATION-serve-sh-starts-llama-3-on-the-scalar-route.md).
+public func isScalarServingFallbackEligible(modelType: String, configJSON: Data?) -> Bool {
+    if isScalarHybridServingFamily(modelType) { return true }
+    guard modelType == "llama",
+        let configJSON,
+        let object = try? JSONSerialization.jsonObject(with: configJSON) as? [String: Any]
+    else { return false }
+    if let vocabSize = object["vocab_size"] as? Int, vocabSize >= 128000 { return true }
+    if let ropeScaling = object["rope_scaling"] as? [String: Any],
+        let ropeType = ropeScaling["rope_type"] as? String,
+        ropeType == "llama3"
+    {
+        return true
+    }
+    return false
+}
+
 /// Operator-facing announce line written to stderr when the continuous route
-/// rejects a family that `isScalarHybridServingFamily` admits and the executable
+/// rejects a family that `isScalarServingFallbackEligible` admits and the executable
 /// falls back to scalar serving. Machine-readable with a fixed key order so the
 /// live gate (and evidence tooling) can assert the fallback happened, mirroring
 /// the fit-check announce style. This is the ONLY place the fallback is announced;
