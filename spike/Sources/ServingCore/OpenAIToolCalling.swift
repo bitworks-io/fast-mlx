@@ -246,6 +246,16 @@ public extension OpenAIChatCompletionRequest {
         }
         return (disableThinkingWhenToolsActive && !activeTools.isEmpty) ? false : nil
     }
+
+    /// Applies `parallel_tool_calls` to the calls a backend just emitted. `false` caps the whole
+    /// reply at ONE call: `alreadyEmitted` is how many calls this choice has already sent, so the
+    /// cap is cumulative across `.toolCalls` events and only the FIRST call overall survives
+    /// (unchanged id, name and arguments). Absent, `null` and `true` return `calls` untouched.
+    /// Generation itself is not stopped early — dropped calls were still decoded.
+    func limitingToolCalls(_ calls: [OpenAIToolCall], alreadyEmitted: Int) -> [OpenAIToolCall] {
+        guard parallelToolCalls == false else { return calls }
+        return Array(calls.prefix(max(0, 1 - alreadyEmitted)))
+    }
 }
 
 // MARK: - Decode helpers (strict, matching OpenAIChatCompletions.swift style)

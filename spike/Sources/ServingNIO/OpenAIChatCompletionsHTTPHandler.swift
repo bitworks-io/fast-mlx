@@ -1407,7 +1407,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     channel: channel,
                     writabilityGate: writabilityGate,
                     responseKind: responseKind,
-                    logprobsRequest: request.logprobsRequest)
+                    logprobsRequest: request.logprobsRequest,
+                    request: request)
                 requestLogCompletion = streamResult.completion
                 try await writeSSETerminal(
                     streamResult.completion,
@@ -1446,7 +1447,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         content: split.content,
                         finishReason: result.completion.finishReason,
                         usage: result.completion.usage,
-                        toolCalls: result.toolCalls,
+                        // `parallel_tool_calls: false` keeps only the first call; every other
+                        // request forwards them all.
+                        toolCalls: request.limitingToolCalls(result.toolCalls, alreadyEmitted: 0),
                         reasoningContent: split.reasoning,
                         // Covers every generated token in generation order (see
                         // `ServingResponseDelta.tokenLogprobs`'s doc comment) — including tokens
@@ -1816,7 +1819,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
         channel: any Channel,
         writabilityGate: ServingChannelWritabilityGate,
         responseKind: ServingResponseKind,
-        logprobsRequest: ServingLogprobsRequest?
+        logprobsRequest: ServingLogprobsRequest?,
+        request: OpenAIChatCompletionRequest
     ) async throws -> StreamResult {
         var pending: ServingResponseDelta? = first
         var completion: ServingGenerationCompletion?
@@ -1833,6 +1837,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         // contract: a token generated between two emitted chunks always ends up on the LATER one.
         var pendingLogprobs: [ServingTokenLogprob] = []
         var completionsTextOffset = 0
+        // Tool calls already sent on this stream, so `parallel_tool_calls: false` caps the whole
+        // reply at one call even when the backend splits its calls across several `.toolCalls` events.
+        var emittedToolCalls = 0
 
         func drainLogprobs() -> [ServingTokenLogprob] {
             defer { pendingLogprobs.removeAll() }
@@ -1935,10 +1942,12 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         channel: channel,
                         timeout: configuration.backpressureStallTimeout)
                 }
-            case .toolCalls(let calls):
+            case .toolCalls(let emitted):
                 guard completion == nil else {
                     throw RunError.missingCompletion
                 }
+                let calls = request.limitingToolCalls(emitted, alreadyEmitted: emittedToolCalls)
+                emittedToolCalls += calls.count
                 // The legacy text_completion shape has no field to carry a tool call — a backend
                 // emitting one on this route is violating the contract, not producing chat-shaped
                 // chunks this route can honestly downgrade into plain text.

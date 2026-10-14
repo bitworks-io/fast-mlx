@@ -310,9 +310,14 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Conscious decision to publish: read in full; it holds only synthetic request bodies (model "m", prompt "hi"),
 # names no model family, host, credential or machine-local path, and the projection validator's marker sweep
 # passed on it.
+# 2026-10-13, 1033 -> 1035: adds spike/Tests/ServingCoreTests/OpenAIParallelToolCallsLimitTests.swift and
+# spike/Tests/ServingNIOTests/ParallelToolCallsLimitHTTPTests.swift (projected with spike/Tests), the tests for
+# `parallel_tool_calls: false` returning at most one tool call. Conscious decision to publish: read in full; they hold
+# only synthetic request bodies and an in-memory fake backend, name no model family, host, credential or
+# machine-local path, and the projection validator's marker sweep passed on them.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1033,
-    "pathModeSha256": "44307925500224adefa8c25d61e4e59fa9b28214d0244ad74b5526ac78d2dcca",
+    "pathCount": 1035,
+    "pathModeSha256": "35687d0e0c27d962489cffbfeed3eee52b7d4babbb60fba7a853841565f98742",
 }
 
 
