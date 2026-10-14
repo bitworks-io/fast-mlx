@@ -395,23 +395,40 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-14",
-                "title": "Publish v0.1.14: gated-delta q/k normalization adds its epsilon like the official l2norm, fastmlx pull resolves main to a pinned sha, and fastmlx recommend uses the same pack identity as serve",
-                "publishedAt": "2026-10-11T10:33:03Z",
+                "id": "tagged-distribution-v0-1-15",
+                "title": "Publish v0.1.15: serve, recommend and the engine refuse a pack that drifted from its pull receipt, Llama 3 packs start on the default serve.sh route, chat templates render like transformers, and OpenAI-compatible requests accept null optionals and parallel_tool_calls false",
+                "publishedAt": "2026-10-14T15:33:21Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.14 arm64 macOS distribution: the gated-delta "
-                    "q/k normalization for Qwen3.5 and Qwen3-Next now adds its 1e-6 "
-                    "epsilon to the sum of squares, matching the official l2norm; "
-                    "measured on mlx-community/Qwen3.5-9B-MLX-4bit over 16 prompts of "
-                    "256 greedy tokens, 5 outputs are unchanged and 11 diverge only at "
-                    "near-ties, where the new build picks the old build's second "
-                    "choice, at most 0.375 nats behind; fastmlx pull <org>/<name> "
-                    "resolves main to a pinned sha; fastmlx recommend uses the same "
-                    "pack identity as serve and the engine; a malformed receipt no "
-                    "longer crashes recommend or serve; and --quant-candidates prints "
-                    "each admission line once. The engine still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.15 arm64 macOS distribution: fastmlx serve, "
+                    "fastmlx recommend and the engine (fastmlx-serve) check a pack "
+                    "against its pull receipt before trusting the receipt's quality "
+                    "card, requiring every listed file to exist with its recorded size, "
+                    "files of 64 MiB or less to match their recorded sha256, and no "
+                    "unlisted file to be present, so a drifted pack whose card matches "
+                    "the receipt makes serve and the engine exit 2 with "
+                    "quality_card_receipt_mismatch and recommend report that row as an "
+                    "error, while files over 64 MiB are size-checked only; "
+                    "scripts/serve.sh --model now starts a Llama 3.x pack on the scalar "
+                    "route, and other Llama versions are still refused; the template "
+                    "engine moved from swift-jinja 2.3.6 to 2.5.1, so chat templates "
+                    "honor comment whitespace control, tojson emits Python's "
+                    "separators, tool definitions and tool-call arguments keep the "
+                    "client's key order, and a tool argument holding JSON null renders "
+                    "instead of failing with HTTP 500; this changes the prompt of every "
+                    "tool-bearing request on every model family by design, so greedy "
+                    "output on tool requests can differ from v0.1.14; non-final prefill "
+                    "chunks no longer compute a discarded logits projection, with "
+                    "identical greedy output and a lower peak MLX memory measured; and "
+                    "OpenAI-compatible requests accept echoed assistant history "
+                    "carrying reasoning_content, its reasoning alias, or the OpenAI "
+                    "Python SDK's null fields, treat optional request fields sent as "
+                    "JSON null as absent on /v1/chat/completions and /v1/completions, "
+                    "return at most one tool call when parallel_tool_calls is false, "
+                    "and separate reasoning_content from content on the "
+                    "continuous-batch route like the scalar route. The engine still "
+                    "links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -419,7 +436,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "821a1270ca48bf1904426a1e4099a66ef7f3b2af",
+                "publicCommit": "97700a31c54500b01e59f6d771f264763ac0cd8d",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -436,6 +453,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "97700a31c54500b01e59f6d771f264763ac0cd8d",
                 "821a1270ca48bf1904426a1e4099a66ef7f3b2af",
                 "2bbc3c1035d32a63247ebc005161d26560c32b7d",
                 "449ff559582f82265049ee01e8d7505b807bdb9e",
