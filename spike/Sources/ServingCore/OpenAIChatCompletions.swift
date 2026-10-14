@@ -1809,7 +1809,7 @@ private func decodeContent(_ raw: Any?) throws -> String {
 }
 
 private func decodeStop(_ raw: Any?) throws -> [String] {
-    guard let raw else { return [] }
+    guard let raw, !(raw is NSNull) else { return [] }
     if let stop = raw as? String {
         guard !stop.isEmpty else {
             throw OpenAIServingError.invalidRequest("stop entries must be non-empty", param: "stop")
@@ -1843,7 +1843,7 @@ private func requiredArray(_ raw: Any?, param: String) throws -> [Any] {
 }
 
 private func optionalBool(_ raw: Any?, param: String) throws -> Bool? {
-    guard let raw else { return nil }
+    guard let raw, !(raw is NSNull) else { return nil }
     guard let bool = raw as? Bool else {
         throw OpenAIServingError.invalidRequest("\(param) must be a boolean", param: param)
     }
@@ -1852,9 +1852,10 @@ private func optionalBool(_ raw: Any?, param: String) throws -> Bool? {
 
 /// Strict boolean: accepts ONLY a JSON `true`/`false`. Unlike `optionalBool` (whose `as? Bool` cast
 /// also accepts the JSON numbers 0 and 1 because `JSONSerialization` bridges them through
-/// `NSNumber`), this refuses every number, string, and `null`. Used for `ignore_eos`, a new field
-/// whose contract is "a non-boolean is a 400"; existing fields keep `optionalBool` unchanged so
-/// their accepted inputs do not move.
+/// `NSNumber`), this refuses every number and string, and it still refuses `null` (the other
+/// optional helpers treat `null` as absent; this one deliberately does not). Used for `ignore_eos`,
+/// a new field whose contract is "a non-boolean is a 400"; existing fields keep `optionalBool` so
+/// the JSON numbers 0 and 1 they accept do not move.
 private func optionalStrictBool(_ raw: Any?, param: String) throws -> Bool? {
     guard let raw else { return nil }
     guard let number = raw as? NSNumber, CFGetTypeID(number) == CFBooleanGetTypeID() else {
@@ -1864,7 +1865,7 @@ private func optionalStrictBool(_ raw: Any?, param: String) throws -> Bool? {
 }
 
 private func optionalDouble(_ raw: Any?, param: String) throws -> Double? {
-    guard let raw else { return nil }
+    guard let raw, !(raw is NSNull) else { return nil }
     guard let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
         throw OpenAIServingError.invalidRequest("\(param) must be numeric", param: param)
     }
@@ -1876,12 +1877,12 @@ private func optionalDouble(_ raw: Any?, param: String) throws -> Double? {
 }
 
 private func optionalInt(_ raw: Any?, param: String) throws -> Int? {
-    guard let raw else { return nil }
+    guard let raw, !(raw is NSNull) else { return nil }
     return try exactInteger(raw, param: param, lowerBound: Decimal(Int.min), upperBound: Decimal(Int.max), convert: Int.init)
 }
 
 private func optionalInt64(_ raw: Any?, param: String) throws -> Int64? {
-    guard let raw else { return nil }
+    guard let raw, !(raw is NSNull) else { return nil }
     return try exactInteger(
         raw,
         param: param,
@@ -2109,8 +2110,8 @@ private func decodeChatLogprobs(logprobs rawLogprobs: Any?, topLogprobs rawTopLo
 
     let topLogprobs: Int?
     if let rawTopLogprobs, !(rawTopLogprobs is NSNull) {
-        // `optionalInt` only returns `nil` when its input is Swift `nil`, which cannot happen here
-        // (this branch already filtered out absence and JSON `null`) — `?? 0` never actually fires,
+        // `optionalInt` only returns `nil` for absence or JSON `null`, which cannot happen here
+        // (this branch already filtered both out) — `?? 0` never actually fires,
         // it just avoids force-unwrapping that invariant.
         let decoded = try optionalInt(rawTopLogprobs, param: "top_logprobs") ?? 0
         guard (0...20).contains(decoded) else {

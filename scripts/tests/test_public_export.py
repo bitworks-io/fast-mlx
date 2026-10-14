@@ -305,9 +305,14 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # Conscious decision to publish: read in full; it holds only fixture runtimes/codecs, synthetic prompts and hand-written
 # template strings in temp directories, names no host, credential or machine-local path, and the projection
 # validator's marker sweep passed on it.
+# 2026-10-13, 1032 -> 1033: adds spike/Tests/ServingCoreTests/OpenAINullOptionalFieldsDecodeTests.swift
+# (projected with spike/Tests), the tests for JSON `null` on an optional request field decoding like an absent key.
+# Conscious decision to publish: read in full; it holds only synthetic request bodies (model "m", prompt "hi"),
+# names no model family, host, credential or machine-local path, and the projection validator's marker sweep
+# passed on it.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1032,
-    "pathModeSha256": "b7b3022c3214afbe4e3a0afbf23cc05459b63b4b6f75603d2daa4555a9f25d37",
+    "pathCount": 1033,
+    "pathModeSha256": "44307925500224adefa8c25d61e4e59fa9b28214d0244ad74b5526ac78d2dcca",
 }
 
 

@@ -251,9 +251,9 @@ public extension OpenAIChatCompletionRequest {
 // MARK: - Decode helpers (strict, matching OpenAIChatCompletions.swift style)
 
 enum OpenAIToolDecoding {
-    /// Decode the request `tools` array. Empty array is allowed (behaves as no tools).
+    /// Decode the request `tools` array. Empty array is allowed (behaves as no tools); JSON `null` means absent.
     static func decodeTools(_ raw: Any?) throws -> [OpenAIToolSpec] {
-        guard let raw else { return [] }
+        guard let raw, !(raw is NSNull) else { return [] }
         guard let array = raw as? [Any] else {
             throw OpenAIServingError.invalidRequest("tools must be an array", param: "tools")
         }
@@ -318,9 +318,9 @@ enum OpenAIToolDecoding {
         return result
     }
 
-    /// Decode `tool_choice`. Default is `.auto` when tools are present, otherwise `.none`.
+    /// Decode `tool_choice`. Default (absent or JSON `null`) is `.auto` when tools are present, otherwise `.none`.
     static func decodeToolChoice(_ raw: Any?, hasTools: Bool) throws -> OpenAIToolChoice {
-        guard let raw else { return hasTools ? .auto : .none }
+        guard let raw, !(raw is NSNull) else { return hasTools ? .auto : .none }
         if let string = raw as? String {
             switch string {
             case "none": return .none
