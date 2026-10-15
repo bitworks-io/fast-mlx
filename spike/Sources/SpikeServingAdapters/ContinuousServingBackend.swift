@@ -94,6 +94,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         /// `ignore_eos`: the coordinator submission must not end this request on a model stop id.
         let ignoreEOS: Bool
         let activeTools: [OpenAIToolSpec]
+        /// The request's `parallel_tool_calls` (`nil` = absent/null). Only an explicit `false`
+        /// stops decoding at the first completed tool call.
+        let parallelToolCalls: Bool?
         let completionBudgetResolution: ServingCompletionBudgetResolution?
         /// Streaming reasoning separation for this request (family `thinksByDefault` folded with the
         /// SAME resolved `enable_thinking` the prompt was rendered from).
@@ -120,6 +123,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         var detokenizer: any ScalarServingDetokenizer
         var stopFilter: ServingStopStringFilter
         let toolCallProcessor: ToolCallProcessor?
+        let parallelToolCalls: Bool?
         let responseID: String
         let outputTokenTraceLimit: Int?
         let completedTraceCapacity: Int
@@ -330,6 +334,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             stopStrings: modelStopStrings.union(request.stop),
             ignoreEOS: request.ignoreEOS,
             activeTools: activeTools,
+            parallelToolCalls: request.parallelToolCalls,
             completionBudgetResolution: completionBudgetResolution,
             separatesReasoning: separatesReasoning,
             outputTokenTraceLimit: outputTokenTraceLimit,
@@ -817,6 +822,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             stopFilter: ServingStopStringFilter(
                 stopStrings: prepared.stopStrings),
             toolCallProcessor: toolCallProcessor,
+            parallelToolCalls: prepared.parallelToolCalls,
             responseID: responseID,
             outputTokenTraceLimit: prepared.outputTokenTraceLimit,
             completedTraceCapacity: prepared.completedTraceCapacity)
@@ -935,7 +941,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let output = chunk.map { request.stopFilter.process($0) }
         requests[id] = request
 
-        let stopped = output?.stopped == true
+        var stopped = output?.stopped == true
         if stopped {
             _ = await coordinator.cancel(request.coordinatorID)
             try Task.checkCancellation()
@@ -948,6 +954,17 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             } else {
                 try await request.mailbox.send(.text(text))
             }
+        }
+        // `parallel_tool_calls: false` caps the reply at the first call, so release the slot on
+        // the token that closes it. Must run AFTER `processChunk` above: the call only becomes
+        // "completed" once this token's text has been fed to the processor.
+        if !stopped, let processor = request.toolCallProcessor,
+            OpenAIChatCompletionRequest.shouldStopAfterToolCalls(
+                parallelToolCalls: request.parallelToolCalls,
+                completedCount: processor.toolCalls.count)
+        {
+            _ = await coordinator.cancel(request.coordinatorID)
+            stopped = true
         }
         try Task.checkCancellation()
         return stopped

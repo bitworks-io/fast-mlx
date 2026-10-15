@@ -63,6 +63,83 @@ final class ScalarServingBackendTests: XCTestCase {
         }
         XCTAssertFalse(hasToolCalls, "JSON parser must not decode xmlFunction syntax: \(events)")
     }
+
+    // parallel_tool_calls == false stops generation at the first completed call (cycle 244). The
+    // script finishes call A at token 2 and would finish call B at token 4 before EOS.
+    private static let twoCallPieces: [Int: String] = [
+        1: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}"#,
+        2: "</tool_call>",
+        3: "\n" + #"<tool_call>{"name":"get_weather","arguments":{"city":"Rome"}}"#,
+        4: "</tool_call>",
+    ]
+
+    private func toolCallsAndCompletion(
+        _ events: [ServingResponseDelta]
+    ) -> (calls: [[OpenAIToolCall]], completion: ServingGenerationCompletion?) {
+        var calls: [[OpenAIToolCall]] = []
+        var completion: ServingGenerationCompletion?
+        for event in events {
+            switch event {
+            case .toolCalls(let batch): calls.append(batch)
+            case .completion(let value): completion = value
+            default: break
+            }
+        }
+        return (calls, completion)
+    }
+
+    func testScalarParallelFalseStopsAtTheFirstCompletedCall() async throws {
+        let backend = makeBackend(
+            script: [1, 2, 3, 4, 99], pieces: Self.twoCallPieces, promptTokens: [10])
+        let handle = try await backend.start(
+            request(maxTokens: 8, tools: [weatherTool], parallelToolCalls: false))
+
+        let (calls, completion) = toolCallsAndCompletion(try await collect(handle.mailbox))
+
+        XCTAssertEqual(calls.count, 1, "exactly one .toolCalls event")
+        XCTAssertEqual(calls.first?.count, 1)
+        XCTAssertEqual(calls.first?.first?.function.name, "get_weather")
+        XCTAssertTrue(calls.first?.first?.function.arguments.contains("Paris") == true)
+        XCTAssertEqual(completion?.finishReason, .toolCalls)
+        XCTAssertEqual(completion?.usage.completionTokens, 2)
+    }
+
+    func testScalarParallelAbsentOrTrueKeepsEveryCallAndRunsToEOS() async throws {
+        for parallel in [nil, true] as [Bool?] {
+            let backend = makeBackend(
+                script: [1, 2, 3, 4, 99], pieces: Self.twoCallPieces, promptTokens: [10])
+            let handle = try await backend.start(
+                request(maxTokens: 8, tools: [weatherTool], parallelToolCalls: parallel))
+
+            let (calls, completion) = toolCallsAndCompletion(try await collect(handle.mailbox))
+
+            let flat = calls.flatMap { $0 }
+            XCTAssertEqual(flat.count, 2, "parallel=\(String(describing: parallel))")
+            XCTAssertTrue(flat.first?.function.arguments.contains("Paris") == true)
+            XCTAssertTrue(flat.last?.function.arguments.contains("Rome") == true)
+            XCTAssertEqual(completion?.finishReason, .toolCalls)
+            XCTAssertEqual(completion?.usage.completionTokens, 4)
+        }
+    }
+
+    func testScalarParallelFalseWithNoCallIsUnchangedAndRunsToEOS() async throws {
+        let backend = makeBackend(
+            script: [1, 2, 99], pieces: [1: "hello ", 2: "world"], promptTokens: [10])
+        let handle = try await backend.start(
+            request(maxTokens: 8, tools: [weatherTool], parallelToolCalls: false))
+
+        let events = try await collect(handle.mailbox)
+
+        let (calls, completion) = toolCallsAndCompletion(events)
+        XCTAssertTrue(calls.isEmpty)
+        XCTAssertEqual(completion?.finishReason, .stop)
+        XCTAssertEqual(completion?.usage.completionTokens, 2)
+        let text = events.compactMap { event -> String? in
+            if case .text(let value) = event { return value }
+            return nil
+        }.joined()
+        XCTAssertEqual(text, "hello world")
+    }
     // Handle plumbing for streaming reasoning separation. The backend must derive
     // `handle.separatesReasoning` from the family (`thinksByDefault`) folded with the SAME resolved
     // thinking value it renders the prompt from — so the SSE handler can route a thinks-by-default
@@ -963,7 +1040,8 @@ private func request(
     maxTokens: Int,
     stop: [String] = [],
     tools: [OpenAIToolSpec] = [],
-    enableThinking: Bool? = nil
+    enableThinking: Bool? = nil,
+    parallelToolCalls: Bool? = nil
 ) -> OpenAIChatCompletionRequest {
     OpenAIChatCompletionRequest(
         model: "fixture-model",
@@ -977,6 +1055,7 @@ private func request(
         stop: stop,
         tools: tools,
         toolChoice: tools.isEmpty ? .none : .auto,
+        parallelToolCalls: parallelToolCalls,
         enableThinking: enableThinking)
 }
 

@@ -256,6 +256,19 @@ public extension OpenAIChatCompletionRequest {
         guard parallelToolCalls == false else { return calls }
         return Array(calls.prefix(max(0, 1 - alreadyEmitted)))
     }
+
+    /// Whether generation should stop right now because `parallel_tool_calls` is `false` and the
+    /// request's tool-call processor already holds a completed call. Only an explicit `false`
+    /// stops; absent, `null` and `true` never do, and zero completed calls never do.
+    static func shouldStopAfterToolCalls(parallelToolCalls: Bool?, completedCount: Int) -> Bool {
+        parallelToolCalls == false && completedCount >= 1
+    }
+
+    /// Instance form of ``shouldStopAfterToolCalls(parallelToolCalls:completedCount:)``.
+    func shouldStopAfterToolCalls(completedCount: Int) -> Bool {
+        Self.shouldStopAfterToolCalls(
+            parallelToolCalls: parallelToolCalls, completedCount: completedCount)
+    }
 }
 
 // MARK: - Decode helpers (strict, matching OpenAIChatCompletions.swift style)

@@ -50,6 +50,36 @@ final class OpenAIParallelToolCallsLimitTests: XCTestCase {
         XCTAssertEqual(falseRequest.limitingToolCalls([calls[1]], alreadyEmitted: 0), [calls[1]])
     }
 
+    // Early stop (cycle 244): only an explicit `false` with at least one COMPLETED call stops generation.
+    func testFalseStopsGenerationOnlyOnceACallIsCompleted() throws {
+        let falseRequest = try request(parallel: "false")
+        XCTAssertFalse(falseRequest.shouldStopAfterToolCalls(completedCount: 0))
+        XCTAssertTrue(falseRequest.shouldStopAfterToolCalls(completedCount: 1))
+        XCTAssertTrue(falseRequest.shouldStopAfterToolCalls(completedCount: 2))
+    }
+
+    func testAbsentNullAndTrueNeverStopGeneration() throws {
+        for parallel in [nil, "null", "true"] {
+            let parsed = try request(parallel: parallel)
+            for count in [0, 1, 2, 5] {
+                XCTAssertFalse(
+                    parsed.shouldStopAfterToolCalls(completedCount: count),
+                    "parallel=\(parallel ?? "absent") count=\(count)")
+            }
+        }
+    }
+
+    func testStaticPredicateMatchesTheInstanceForm() {
+        XCTAssertFalse(
+            OpenAIChatCompletionRequest.shouldStopAfterToolCalls(parallelToolCalls: false, completedCount: 0))
+        XCTAssertTrue(
+            OpenAIChatCompletionRequest.shouldStopAfterToolCalls(parallelToolCalls: false, completedCount: 1))
+        XCTAssertFalse(
+            OpenAIChatCompletionRequest.shouldStopAfterToolCalls(parallelToolCalls: true, completedCount: 1))
+        XCTAssertFalse(
+            OpenAIChatCompletionRequest.shouldStopAfterToolCalls(parallelToolCalls: nil, completedCount: 1))
+    }
+
     func testNullDecodesAsNilAndFalseAsFalse() throws {
         XCTAssertNil(try request(parallel: "null").parallelToolCalls)
         XCTAssertNil(try request(parallel: nil).parallelToolCalls)

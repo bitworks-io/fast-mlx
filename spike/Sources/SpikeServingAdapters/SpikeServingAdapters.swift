@@ -930,7 +930,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             }
         }
         try Task.checkCancellation()
-        return output?.stopped == true ? .stopGeneration : .continueGeneration
+        if output?.stopped == true {
+            return .stopGeneration
+        }
+        // `parallel_tool_calls: false` caps the reply at the first call, so stop decoding on the
+        // token that closes it. Must run AFTER `processChunk` above: the call only becomes
+        // "completed" once this token's text has been fed to the processor.
+        if let processor = current.toolCallProcessor,
+            current.request.request.shouldStopAfterToolCalls(
+                completedCount: processor.toolCalls.count)
+        {
+            return .stopGeneration
+        }
+        return .continueGeneration
     }
 
     /// Map one `SpikeCore.DecodedTokenLogprob` (a raw token ID + candidates, no notion of text) to

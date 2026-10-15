@@ -1518,6 +1518,88 @@ final class ContinuousServingBackendTests: XCTestCase {
             reason: .clientDisconnected)
     }
 
+    // parallel_tool_calls == false stops generation at the first completed call (cycle 244). The
+    // script finishes call A at token 2 and would finish call B at token 4 before EOS.
+    private static let twoCallPieces: [Int: String] = [
+        1: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}"#,
+        2: "</tool_call>",
+        3: "\n" + #"<tool_call>{"name":"get_weather","arguments":{"city":"Rome"}}"#,
+        4: "</tool_call>",
+    ]
+
+    private func runToolScript(
+        script: [Int],
+        pieces: [Int: String],
+        parallelToolCalls: Bool?
+    ) async throws -> (
+        calls: [[OpenAIToolCall]], completion: ServingGenerationCompletion?,
+        slotsAfter: Int
+    ) {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: script],
+                recorder: ContinuousRuntimeRecorder()),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["tools": [10]],
+            pieces: pieces,
+            stopTokenIDs: [99])
+        let handle = try await backend.start(
+            request(
+                text: "tools", maxTokens: 8, tools: [continuousWeatherTool],
+                parallelToolCalls: parallelToolCalls))
+        let events = try await collect(handle.mailbox)
+        let slotsAfter = await coordinator.snapshots().count
+        var calls: [[OpenAIToolCall]] = []
+        var completion: ServingGenerationCompletion?
+        for event in events {
+            switch event {
+            case .toolCalls(let batch): calls.append(batch)
+            case .completion(let value): completion = value
+            default: break
+            }
+        }
+        return (calls, completion, slotsAfter)
+    }
+
+    func testParallelFalseStopsAtTheFirstCompletedCallAndReleasesTheSlot() async throws {
+        let result = try await runToolScript(
+            script: [1, 2, 3, 4, 99], pieces: Self.twoCallPieces, parallelToolCalls: false)
+
+        XCTAssertEqual(result.calls.count, 1, "exactly one .toolCalls event")
+        XCTAssertEqual(result.calls.first?.count, 1)
+        XCTAssertTrue(result.calls.first?.first?.function.arguments.contains("Paris") == true)
+        XCTAssertEqual(result.completion?.finishReason, .toolCalls)
+        XCTAssertEqual(result.completion?.usage.completionTokens, 2)
+        XCTAssertEqual(result.slotsAfter, 0, "coordinator slot must be released by the stop")
+    }
+
+    func testParallelAbsentOrTrueKeepsEveryCallAndRunsToEOS() async throws {
+        for parallel in [nil, true] as [Bool?] {
+            let result = try await runToolScript(
+                script: [1, 2, 3, 4, 99], pieces: Self.twoCallPieces, parallelToolCalls: parallel)
+
+            let flat = result.calls.flatMap { $0 }
+            XCTAssertEqual(flat.count, 2, "parallel=\(String(describing: parallel))")
+            XCTAssertTrue(flat.first?.function.arguments.contains("Paris") == true)
+            XCTAssertTrue(flat.last?.function.arguments.contains("Rome") == true)
+            XCTAssertEqual(result.completion?.finishReason, .toolCalls)
+            XCTAssertEqual(result.completion?.usage.completionTokens, 4)
+        }
+    }
+
+    func testParallelFalseWithNoCallIsUnchangedAndRunsToEOS() async throws {
+        let result = try await runToolScript(
+            script: [1, 2, 99], pieces: [1: "hello ", 2: "world"], parallelToolCalls: false)
+
+        XCTAssertTrue(result.calls.isEmpty)
+        XCTAssertEqual(result.completion?.finishReason, .stop)
+        XCTAssertEqual(result.completion?.usage.completionTokens, 2)
+    }
+
     func testQueueExhaustionDisconnectAndReplacementRecoverOneSharedCoordinator() async throws {
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 1, queued: 1),
@@ -2357,10 +2439,35 @@ private func makeDynamicBackend(
             modelCapabilities: modelCapabilities))
 }
 
+private let continuousWeatherTool = OpenAIToolSpec(
+    name: "get_weather",
+    description: "Look up the weather for a city",
+    parameters: .object([
+        "type": .string("object"),
+        "properties": .object([
+            "city": .object(["type": .string("string")])
+        ]),
+    ]),
+    raw: .object([
+        "type": .string("function"),
+        "function": .object([
+            "name": .string("get_weather"),
+            "description": .string("Look up the weather for a city"),
+            "parameters": .object([
+                "type": .string("object"),
+                "properties": .object([
+                    "city": .object(["type": .string("string")])
+                ]),
+            ]),
+        ]),
+    ]))
+
 private func request(
     text: String,
     maxTokens: Int,
-    stop: [String] = []
+    stop: [String] = [],
+    tools: [OpenAIToolSpec] = [],
+    parallelToolCalls: Bool? = nil
 ) -> OpenAIChatCompletionRequest {
     OpenAIChatCompletionRequest(
         model: "fixture",
@@ -2371,7 +2478,10 @@ private func request(
         temperature: 0,
         choiceCount: 1,
         stream: true,
-        stop: stop)
+        stop: stop,
+        tools: tools,
+        toolChoice: tools.isEmpty ? .none : .auto,
+        parallelToolCalls: parallelToolCalls)
 }
 
 private func collect(
