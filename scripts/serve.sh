@@ -34,6 +34,9 @@
 # Pass --plan-concurrency N to size the fit-check for N concurrent decode streams (a stricter,
 # concurrency-aware verdict); the default sizes for a single stream.
 # Set FASTMLX_API_KEY to require Bearer auth (mandatory when binding a non-loopback --host).
+# Pass --single-stream (wrapper-only; never forwarded) to serve on the single-stream scalar route
+# instead of the default continuous-batch route: sampling (temperature>0), penalties, logprobs,
+# /v1/completions, response_format and --chat-template are served only there.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -138,6 +141,41 @@ validate_host_use() {
 }
 
 validate_host_use
+
+# --single-stream is a wrapper-only opt-out of the default continuous-batch route. That route is
+# greedy-only: it returns 400 for temperature>0, non-neutral penalties, logprobs, /v1/completions and
+# response_format, and the binary refuses --chat-template and --default-sampling alongside it. The
+# scalar (single-stream) route serves all of those, but the wrapper otherwise always selects the
+# continuous route (and its --max-reserved-kv-bytes default, which the binary rejects without
+# continuous mode), so this flag is how a user reaches the scalar route. Parsed, checked and stripped
+# here, before any build, binary resolution, download or quant work, so a conflicting launch exits 2
+# having touched nothing; the binary never sees the flag.
+validate_and_strip_single_stream() {
+  local count=0 a conflict
+  for a in ${ARGS[@]+"${ARGS[@]}"}; do
+    [ "$a" = "--single-stream" ] && count=$((count + 1))
+  done
+  [ "$count" -eq 0 ] && return 0
+  if [ "$count" -gt 1 ]; then
+    echo "[fast-mlx] error: --single-stream may be provided only once." >&2
+    exit 2
+  fi
+  for conflict in --continuous-batch-no-spec --continuous-dynamic-pld --max-reserved-kv-bytes; do
+    if have "$conflict"; then
+      echo "[fast-mlx] error: --single-stream cannot be combined with $conflict: --single-stream selects the single-stream scalar route, which has no continuous-batch mode or reserved-KV budget." >&2
+      exit 2
+    fi
+  done
+  NEWARGS=()
+  for a in ${ARGS[@]+"${ARGS[@]}"}; do
+    [ "$a" = "--single-stream" ] && continue
+    NEWARGS+=("$a")
+  done
+  ARGS=(${NEWARGS[@]+"${NEWARGS[@]}"})
+  SINGLE_STREAM=1
+}
+SINGLE_STREAM=0
+validate_and_strip_single_stream
 
 # Apply the bundled quality-card store. The engine looks for its default store at
 # site/quality-guides.json relative to ITS working directory, and we cd into spike/ below, where
@@ -409,7 +447,8 @@ if ! have --scripted; then
   # (FastMLXServeArguments.swift, FastMLXServeArgumentError.ngramOffloadPlanWithContinuousBatch), so
   # injecting --continuous-batch-no-spec here would make the documented Flash Next launch impossible
   # to start.
-  have --continuous-batch-no-spec || have --continuous-dynamic-pld || have --ngram-offload-plan || have --exact-qwen35-mtp || ARGS+=(--continuous-batch-no-spec)
+  # --single-stream (stripped above) likewise opts out of both defaults and selects the scalar route.
+  [ "$SINGLE_STREAM" -eq 1 ] || have --continuous-batch-no-spec || have --continuous-dynamic-pld || have --ngram-offload-plan || have --exact-qwen35-mtp || ARGS+=(--continuous-batch-no-spec)
   # --memory-limit-bytes and --cache-limit-bytes are deliberately left uninjected: an omitted flag
   # must reach the binary as absence, not as a wrapper guess, because the binary's pre-load fit-check
   # derives both from the host probe (Metal working set, host classification) that this wrapper
@@ -431,12 +470,17 @@ if ! have --scripted; then
   # the scalar offload route above deliberately never selects continuous mode. Injecting the default
   # here would turn the earlier continuous-batch-no-spec suppression into a different launch failure
   # for the same Flash Next command.
-  if ! have --max-reserved-kv-bytes && ! have --exact-qwen35-mtp && ! have --ngram-offload-plan; then
-    KV_DEFAULT="$(( RAM * 30 / 100 ))"
-    if OPERATOR_MEMORY_LIMIT="$(value_of --memory-limit-bytes)" && [ "$OPERATOR_MEMORY_LIMIT" -lt "$KV_DEFAULT" ] 2>/dev/null; then
-      KV_DEFAULT="$OPERATOR_MEMORY_LIMIT"
+  #
+  # --single-stream (stripped above) skips this default for the same reason: the scalar route it
+  # selects never has continuous mode, so the binary would reject the injected flag.
+  if [ "$SINGLE_STREAM" -ne 1 ]; then
+    if ! have --max-reserved-kv-bytes && ! have --exact-qwen35-mtp && ! have --ngram-offload-plan; then
+      KV_DEFAULT="$(( RAM * 30 / 100 ))"
+      if OPERATOR_MEMORY_LIMIT="$(value_of --memory-limit-bytes)" && [ "$OPERATOR_MEMORY_LIMIT" -lt "$KV_DEFAULT" ] 2>/dev/null; then
+        KV_DEFAULT="$OPERATOR_MEMORY_LIMIT"
+      fi
+      ARGS+=(--max-reserved-kv-bytes "$KV_DEFAULT")
     fi
-    ARGS+=(--max-reserved-kv-bytes "$KV_DEFAULT")
   fi
 fi
 

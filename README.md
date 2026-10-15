@@ -92,6 +92,11 @@ actually bound, including when your budget turned out to be the loose one. Use `
 to change where it listens, and set `FASTMLX_API_KEY` to require Bearer auth (mandatory for a
 non-loopback `--host`).
 
+The default launch serves on the continuous-batch route, which is greedy only. Pass `--single-stream`
+to serve on the single-stream scalar route instead, for sampling (`temperature` > 0), penalties,
+logprobs, `/v1/completions`, `response_format` and `--chat-template`; it cannot be combined with
+`--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
+
 Call it with the standard OpenAI shape, including tools:
 
 ```sh
@@ -112,14 +117,14 @@ on `choices[0].logprobs.content` (streaming: the same shape as a sibling of `del
 that carries new tokens). Each value is `log_softmax` of the model's own RAW output logits for that
 generation step — computed BEFORE temperature, top-p/top-k, min-p, and any penalty/logit processor,
 matching vLLM's default logprobs semantics rather than the post-sampling distribution actually drawn
-from. Real logprobs are served only by the single-stream scalar route, and only when that route is
-serving a plain (native-cache, non-speculative) decoder: a scalar serve running the compiled-fp16
-path or in-checkpoint MTP speculative decoding, the continuous-batch route, the separate draft-model
-speculative route, and evidence-recording mode all fail closed with 400 `logprobs_unsupported`
-rather than silently omitting the values a caller asked for, or reporting logprobs for tokens a
-speculative decoder didn't itself score. In practice, hybrid-attention checkpoints served without
-MTP compute logprobs. Dense-attention checkpoints, which take the compiled fp16 fast path by
-default, refuse them. `top_logprobs` without `logprobs:true` is rejected
+from. Real logprobs are served only by the single-stream scalar route (`serve.sh --single-stream`),
+and only when that route is serving a plain (native-cache, non-speculative) decoder: a scalar serve
+running the compiled-fp16 path or in-checkpoint MTP speculative decoding, the continuous-batch route,
+the separate draft-model speculative route, and evidence-recording mode all fail closed with 400
+`logprobs_unsupported` rather than silently omitting the values a caller asked for, or reporting
+logprobs for tokens a speculative decoder didn't itself score. In practice, hybrid-attention
+checkpoints served without MTP compute logprobs. Dense-attention checkpoints, which take the
+compiled fp16 fast path by default, refuse them. `top_logprobs` without `logprobs:true` is rejected
 (`top_logprobs` param), matching OpenAI's own validation. `logprobs:false`/absent is unchanged — no
 `logprobs` key at all, byte-identical to before this feature existed.
 
@@ -141,7 +146,8 @@ against the schema). This covers the OpenAI SDK's `client.chat.completions.parse
 - Properties are generated in declared order, and optional ones may be omitted.
 - With thinking on, reasoning is generated first and the constraint applies to the reply.
 
-Both formats are served only by the single-stream scalar route and its non-speculative decoders.
+Both formats are served only by the single-stream scalar route (`serve.sh --single-stream`) and its
+non-speculative decoders.
 Speculative and continuous-batch routes return a 400, and so does combining either format with
 `tools`, `logprobs` or `stop`.
 
