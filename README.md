@@ -118,15 +118,18 @@ that carries new tokens). Each value is `log_softmax` of the model's own RAW out
 generation step — computed BEFORE temperature, top-p/top-k, min-p, and any penalty/logit processor,
 matching vLLM's default logprobs semantics rather than the post-sampling distribution actually drawn
 from. Real logprobs are served only by the single-stream scalar route (`serve.sh --single-stream`),
-and only when that route is serving a plain (native-cache, non-speculative) decoder: a scalar serve
-running the compiled-fp16 path or in-checkpoint MTP speculative decoding, the continuous-batch route,
-the separate draft-model speculative route, and evidence-recording mode all fail closed with 400
-`logprobs_unsupported` rather than silently omitting the values a caller asked for, or reporting
-logprobs for tokens a speculative decoder didn't itself score. In practice, hybrid-attention
-checkpoints served without MTP compute logprobs. Dense-attention checkpoints, which take the
-compiled fp16 fast path by default, refuse them. `top_logprobs` without `logprobs:true` is rejected
-(`top_logprobs` param), matching OpenAI's own validation. `logprobs:false`/absent is unchanged — no
-`logprobs` key at all, byte-identical to before this feature existed.
+and only when that route is not speculative: a plain (native-cache) decoder and the compiled-fp16
+path both serve them (on the compiled-fp16 path
+a logprobs request runs on the general (uncompiled) decoder, so it decodes at that decoder's speed
+rather than the compiled fast path's). In-checkpoint MTP speculative decoding, the continuous-batch
+route, the separate draft-model speculative route, and evidence-recording mode all fail closed with
+400 `logprobs_unsupported` rather than silently omitting the values a caller asked for, or
+reporting logprobs for tokens a speculative decoder didn't itself score. In practice, any
+checkpoint served by the scalar route without MTP computes logprobs, hybrid-attention and
+dense-attention (compiled fp16 fast path by default) alike.
+`top_logprobs` without `logprobs:true` is rejected (`top_logprobs` param), matching OpenAI's own
+validation. `logprobs:false`/absent is unchanged — no `logprobs` key at all, byte-identical to
+before this feature existed.
 
 Structured output: `"response_format":{"type":"json_object"}` and
 `"response_format":{"type":"json_schema","json_schema":{"name":…,"schema":…,"strict":…}}` are enforced
@@ -168,10 +171,11 @@ route, and evidence-recording mode all fail closed with `completions_unsupported
 `logprobs_unsupported` for a logprobs request) rather than silently mistreating raw text as an
 already-templated chat prompt or omitting values a caller asked for. As with the chat route, a
 `logprobs` request against the scalar route ITSELF still refuses with `logprobs_unsupported` when
-that scalar serve is running the compiled-fp16 path or in-checkpoint MTP speculative decoding — only
-a plain (native-cache, non-speculative) scalar decoder computes real values. An omitted `max_tokens` does
-not fall back to the legacy API's 16-token default — it uses the server's own completion-budget
-policy, the same one `/v1/chat/completions` applies when `max_completion_tokens` is omitted.
+that scalar serve is running in-checkpoint MTP speculative decoding — a plain (native-cache) scalar
+decoder and the compiled-fp16 path (on its general (uncompiled) decoder, at that decoder's speed)
+compute real values. An omitted `max_tokens` does not fall back to the legacy API's 16-token
+default — it uses the server's own completion-budget policy, the same one `/v1/chat/completions`
+applies when `max_completion_tokens` is omitted.
 
 Completion length is model- and host-fit-aware. The default request budget is 4,096 tokens, but it
 is not a global maximum: when `--max-completion-tokens` is omitted, the loaded model's authenticated

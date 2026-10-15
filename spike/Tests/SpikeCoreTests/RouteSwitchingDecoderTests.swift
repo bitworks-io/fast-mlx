@@ -280,6 +280,24 @@ final class RouteSwitchingDecoderTests: XCTestCase {
         decoder.setResponseFormatConstraint(nil)
         XCTAssertTrue(log.lastConstraintWasNonNil == false, "setResponseFormatConstraint(nil) must forward nil to general")
     }
+
+    // MARK: - 11. Admission: the composed decoder admits logprobs requests
+
+    /// The serving adapters gate a logprobs request on `InferenceActor.supportsLogprobs()`, which is
+    /// `decoder is LogprobDecoding`. The compiled-fp16 strategy binds a `RouteSwitchingDecoder`
+    /// (`MLXScalarServing.swift`), so the composed decoder itself must conform — otherwise every
+    /// dense-attention checkpoint on the default fast path would answer a logprobs request with 400
+    /// `logprobs_unsupported`. README.md's logprobs section states they are served.
+    func testInferenceActorAdmitsLogprobsForRouteSwitchingDecoder() async {
+        let log = CallLog()
+        let actor = InferenceActor(
+            decoder: RouteSwitchingDecoder(fast: FakeFast(log: log), general: FakeGeneral(log: log)))
+
+        let admitted = await actor.supportsLogprobs()
+        XCTAssertTrue(
+            admitted,
+            "the compiled-fp16 strategy's composed RouteSwitchingDecoder must admit logprobs requests (README.md depends on it)")
+    }
 }
 
 // MARK: - Test doubles
