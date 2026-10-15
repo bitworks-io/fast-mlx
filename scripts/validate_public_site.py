@@ -254,9 +254,9 @@ RESEARCH_EXPLORER_SCRIPT_PATH = "assets/research-explorer.js"
 RESEARCH_EXPLORER_SCRIPT_SHA256 = (
     "cb75f437a56eafc49ce3d0d692183d6f001d4cb8d6cc16df6c66635ce6beb9c2"
 )
-REVIEWED_HOME_PAGE_BYTES = 12_309
+REVIEWED_HOME_PAGE_BYTES = 11_522
 REVIEWED_HOME_PAGE_SHA256 = (
-    "f22b294307a2df86bc62feab567958524b1de9ffaa7444087831f96757b0f7ba"
+    "fa470cef960cc1db21a9ce0bd72c1ffc6f876b912566eebd9f6490f909469db7"
 )
 SOCIAL_CARD_BYTES = 1_011_297
 SOCIAL_CARD_WIDTH = 1_200
@@ -280,9 +280,9 @@ REVIEWED_LICENSE_PAGE_BYTES = 7_323
 REVIEWED_LICENSE_PAGE_SHA256 = (
     "5413029327e71b5472ae598279b119da2e32ece334f791c7295aa0afc638372b"
 )
-REVIEWED_STATUS_PAGE_BYTES = 24_636
+REVIEWED_STATUS_PAGE_BYTES = 23_849
 REVIEWED_STATUS_PAGE_SHA256 = (
-    "66665950c61fa6ac4e4a16b68f9dd34aff8e3087eeb06df4f4c18bc6c2175fb6"
+    "ecdd403d9d034ae8a06dca989a7417364cf71b2585fd3d1284c99d632c12f907"
 )
 REVIEWED_CAPABILITIES_PAGE_BYTES = 18_032
 REVIEWED_CAPABILITIES_PAGE_SHA256 = (
@@ -458,8 +458,8 @@ REVIEWED_STATUS_LINKS = (
     "../research/the-fastest-request-wasnt-the-fastest-service/",
     "../benchmarks/http-sse-operational-soak/",
     "../research/the-proof-did-not-end-when-the-timer-did/",
-    "../releases/tagged-distribution-v0-1-15/",
-    "https://github.com/bitworks-io/fast-mlx/commit/97700a31c54500b01e59f6d771f264763ac0cd8d",
+    "../releases/tagged-distribution-v0-1-16/",
+    "https://github.com/bitworks-io/fast-mlx/commit/0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
     "../methodology/",
     "../capabilities/index.json",
     "../releases/index.json",
@@ -471,7 +471,7 @@ REVIEWED_STATUS_TEXT = (
     "9 reviewed capabilities",
     "3 measured proof points",
     "32 published research notes",
-    "38 reviewed release records",
+    "39 reviewed release records",
     "Released source and comparison evidence do not grant unreviewed model, acquisition, launchability, containment, or runtime authority.",
     "This page performs no live lookup, ranking, aggregation, benchmark execution, or authority transition.",
 )
@@ -632,11 +632,15 @@ REVIEWED_ARTICLE_DATES: Dict[str, Tuple[str, str]] = {
     "research/the-wall-that-wasnt/": ("2026-07-09", "2026-08-06"),
     "research/one-formula-wrong-for-a-third-of-the-catalog/": ("2026-07-09", "2026-08-22"),
 }
-REVIEWED_RELEASE_INDEX_BYTES = 48_605
+REVIEWED_RELEASE_INDEX_BYTES = 50_703
 REVIEWED_RELEASE_INDEX_SHA256 = (
-    "9a1d4b51d65ff32a344093f091b669bfbe4dfe857814dd5f3c9e73d7a4ebf4a8"
+    "8d01a5ad11cf9599e5918680f40e25e19d92aee528891fd5cd96d6d4cb221b33"
 )
 REVIEWED_RELEASE_IDENTITIES: Tuple[Tuple[str, str], ...] = (
+    (
+        "tagged-distribution-v0-1-16",
+        "Publish v0.1.16: parallel_tool_calls false stops generating at the first completed tool call, the tool-call parser skips the reasoning block, and the README states that compiled-fp16 dense serves return logprobs",
+    ),
     (
         "tagged-distribution-v0-1-15",
         "Publish v0.1.15: serve, recommend and the engine refuse a pack that drifted from its pull receipt, Llama 3 packs start on the default serve.sh route, chat templates render like transformers, and OpenAI-compatible requests accept null optionals and parallel_tool_calls false",
@@ -752,6 +756,10 @@ REVIEWED_RELEASE_PATHS = tuple(
     f"releases/{identifier}/" for identifier, _title in REVIEWED_RELEASE_IDENTITIES
 )
 REVIEWED_RELEASE_DETAIL_SEALS: Dict[str, Tuple[int, str]] = {
+    "tagged-distribution-v0-1-16": (
+        6_073,
+        "cfe24b374d95efb15bf658ca6f8532534561cd0e0c076619511b65bc3ac59748",
+    ),
     "tagged-distribution-v0-1-15": (
         6_984,
         "817bbdca07b968585607dd8ee10b5cd630cf6a0f9867a6209abaa1680ada5cae",
@@ -3753,7 +3761,7 @@ def validate_status_page(site: Path) -> List[str]:
     root = collector.roots[0]
     expected_root_attributes = {
         "data-status-page": None,
-        "data-latest-release-id": "tagged-distribution-v0-1-15",
+        "data-latest-release-id": "tagged-distribution-v0-1-16",
         "data-boundary-id": "runtime-model-promotion",
         "data-boundary-state": "gated",
     }

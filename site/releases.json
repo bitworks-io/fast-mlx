@@ -3,7 +3,7 @@
   "project": "fast-mlx",
   "policy": "reviewed-public-releases-only",
   "claimBoundary": "fast-mlx-owned-results-only",
-  "updatedAt": "2026-10-14",
+  "updatedAt": "2026-10-15",
   "currentBoundary": {
     "id": "runtime-model-promotion",
     "label": "Runtime and model promotion",
@@ -15,6 +15,26 @@
     }
   },
   "releases": [
+    {
+      "id": "tagged-distribution-v0-1-16",
+      "title": "Publish v0.1.16: parallel_tool_calls false stops generating at the first completed tool call, the tool-call parser skips the reasoning block, and the README states that compiled-fp16 dense serves return logprobs",
+      "publishedAt": "2026-10-15T18:14:28Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.16 arm64 macOS distribution: with parallel_tool_calls false, both serving routes stop generation on the token that closes the first tool call and the continuous-batch route releases its slot, so the reply is unchanged and only completion_tokens drops (40 to 19 and 41 to 20 on two-call Qwen3-0.6B-4bit replies), while absent, null and true behave as before; with thinking on and tools attached, only text after the first </think> reaches the tool-call parser, so a <tool_call> drafted inside the reasoning block is no longer parsed as a real call, on both routes; and the README now states that dense checkpoints on the compiled-fp16 path serve logprobs on the general (uncompiled) decoder at that decoder's speed, while in-checkpoint MTP, the continuous-batch route, the draft-model route and evidence mode still refuse with logprobs_unsupported. Greedy output is identical to the development build on the release check prompts. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
     {
       "id": "tagged-distribution-v0-1-15",
       "title": "Publish v0.1.15: serve, recommend and the engine refuse a pack that drifted from its pull receipt, Llama 3 packs start on the default serve.sh route, chat templates render like transformers, and OpenAI-compatible requests accept null optionals and parallel_tool_calls false",

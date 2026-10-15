@@ -395,39 +395,28 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-15",
-                "title": "Publish v0.1.15: serve, recommend and the engine refuse a pack that drifted from its pull receipt, Llama 3 packs start on the default serve.sh route, chat templates render like transformers, and OpenAI-compatible requests accept null optionals and parallel_tool_calls false",
-                "publishedAt": "2026-10-14T15:33:21Z",
+                "id": "tagged-distribution-v0-1-16",
+                "title": "Publish v0.1.16: parallel_tool_calls false stops generating at the first completed tool call, the tool-call parser skips the reasoning block, and the README states that compiled-fp16 dense serves return logprobs",
+                "publishedAt": "2026-10-15T18:14:28Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.15 arm64 macOS distribution: fastmlx serve, "
-                    "fastmlx recommend and the engine (fastmlx-serve) check a pack "
-                    "against its pull receipt before trusting the receipt's quality "
-                    "card, requiring every listed file to exist with its recorded size, "
-                    "files of 64 MiB or less to match their recorded sha256, and no "
-                    "unlisted file to be present, so a drifted pack whose card matches "
-                    "the receipt makes serve and the engine exit 2 with "
-                    "quality_card_receipt_mismatch and recommend report that row as an "
-                    "error, while files over 64 MiB are size-checked only; "
-                    "scripts/serve.sh --model now starts a Llama 3.x pack on the scalar "
-                    "route, and other Llama versions are still refused; the template "
-                    "engine moved from swift-jinja 2.3.6 to 2.5.1, so chat templates "
-                    "honor comment whitespace control, tojson emits Python's "
-                    "separators, tool definitions and tool-call arguments keep the "
-                    "client's key order, and a tool argument holding JSON null renders "
-                    "instead of failing with HTTP 500; this changes the prompt of every "
-                    "tool-bearing request on every model family by design, so greedy "
-                    "output on tool requests can differ from v0.1.14; non-final prefill "
-                    "chunks no longer compute a discarded logits projection, with "
-                    "identical greedy output and a lower peak MLX memory measured; and "
-                    "OpenAI-compatible requests accept echoed assistant history "
-                    "carrying reasoning_content, its reasoning alias, or the OpenAI "
-                    "Python SDK's null fields, treat optional request fields sent as "
-                    "JSON null as absent on /v1/chat/completions and /v1/completions, "
-                    "return at most one tool call when parallel_tool_calls is false, "
-                    "and separate reasoning_content from content on the "
-                    "continuous-batch route like the scalar route. The engine still "
+                    "Publishes the v0.1.16 arm64 macOS distribution: with "
+                    "parallel_tool_calls false, both serving routes stop generation on "
+                    "the token that closes the first tool call and the "
+                    "continuous-batch route releases its slot, so the reply is "
+                    "unchanged and only completion_tokens drops (40 to 19 and 41 to 20 "
+                    "on two-call Qwen3-0.6B-4bit replies), while absent, null and true "
+                    "behave as before; with thinking on and tools attached, only text "
+                    "after the first </think> reaches the tool-call parser, so a "
+                    "<tool_call> drafted inside the reasoning block is no longer "
+                    "parsed as a real call, on both routes; and the README now states "
+                    "that dense checkpoints on the compiled-fp16 path serve logprobs "
+                    "on the general (uncompiled) decoder at that decoder's speed, "
+                    "while in-checkpoint MTP, the continuous-batch route, the "
+                    "draft-model route and evidence mode still refuse with "
+                    "logprobs_unsupported. Greedy output is identical to the "
+                    "development build on the release check prompts. The engine still "
                     "links mlx-swift 0.31.6."
                 ),
                 "scope": (
@@ -436,7 +425,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "97700a31c54500b01e59f6d771f264763ac0cd8d",
+                "publicCommit": "0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -453,6 +442,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
                 "97700a31c54500b01e59f6d771f264763ac0cd8d",
                 "821a1270ca48bf1904426a1e4099a66ef7f3b2af",
                 "2bbc3c1035d32a63247ebc005161d26560c32b7d",
