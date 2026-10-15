@@ -866,11 +866,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             }
 
             try Task.checkCancellation()
-            // Reasoning held back for a possible `</think>` precedes the stop-filter tail in stream order.
-            try await flushReasoningGate(for: id)
-            if !stoppedByString {
-                try await flushStopFilter(for: id)
-            }
+            // Held reasoning bytes and the stop-filter tail, in stream order, through gate and parser.
+            try await flushEndOfStream(for: id, includeStopFilterTail: !stoppedByString)
             guard let request = requests[id] else {
                 throw CancellationError()
             }
@@ -1010,29 +1007,40 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 truncated: request.outputTokenTraceTruncated))
     }
 
-    private func flushReasoningGate(for id: ServingRequestID) async throws {
+    /// End of stream: the stop filter's held tail is the LAST text in stream order, so it is routed
+    /// exactly like a chunk -- through the reasoning gate (which also releases a held `</think>`
+    /// prefix) and then the tool-call processor -- rather than sent to the client directly. The
+    /// processor's own residual (earlier text) is then released by `processEOS`, so the client sees
+    /// the stream in order and the parser sees exactly what the client is shown as content.
+    ///
+    /// A request stopped by a stop string or by `parallel_tool_calls: false` (`stoppedByString`) never
+    /// emitted its held tail, so the tail is not read there; only a held `</think>` prefix is released.
+    private func flushEndOfStream(for id: ServingRequestID, includeStopFilterTail: Bool) async throws {
         guard var request = requests[id] else {
             throw CancellationError()
         }
-        guard var gate = request.reasoningGate else {
-            return
+        let tail = includeStopFilterTail ? request.stopFilter.finish() : nil
+        var passthrough = ""
+        var parserText = tail ?? ""
+        if var gate = request.reasoningGate {
+            let routed = gate.finish(tail: tail)
+            request.reasoningGate = gate
+            passthrough = routed.passthrough
+            parserText = routed.toParser
         }
-        let held = gate.flush()
-        request.reasoningGate = gate
         requests[id] = request
-        if !held.isEmpty {
-            try await request.mailbox.send(.text(held))
-        }
-    }
-
-    private func flushStopFilter(for id: ServingRequestID) async throws {
-        guard var request = requests[id] else {
-            throw CancellationError()
-        }
-        let tail = request.stopFilter.finish()
-        requests[id] = request
-        if let tail {
-            try await request.mailbox.send(.text(tail))
+        if let processor = request.toolCallProcessor {
+            if !passthrough.isEmpty {
+                try await request.mailbox.send(.text(passthrough))
+            }
+            if !parserText.isEmpty, let display = processor.processChunk(parserText), !display.isEmpty {
+                try await request.mailbox.send(.text(display))
+            }
+        } else {
+            let text = passthrough + parserText
+            if !text.isEmpty {
+                try await request.mailbox.send(.text(text))
+            }
         }
     }
 

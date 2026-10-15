@@ -7327,6 +7327,9 @@ class PublicSiteTests(unittest.TestCase):
         # Added 2026-10-08 (cycle 216): the Mistral-Nemo-12B 4-bit vs BF16 card (NO_GO),
         # measured on the M3 Ultra with engine build 449ff559.
         "mistral-nemo-12b-4bit@m3ultra": "449ff559582f82265049ee01e8d7505b807bdb9e",
+        # Added 2026-10-15 (cycle 250): the Llama-3.2-3B 4-bit vs BF16 card (NO_GO),
+        # measured on the M3 Ultra with engine build 0c9b2f33 (v0.1.16).
+        "llama-3p2-3b-4bit@m3ultra": "0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
     }
 
     def test_real_manifest_engine_build_shas_are_exactly_as_expected(self) -> None:

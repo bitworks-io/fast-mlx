@@ -101,4 +101,56 @@ final class ReasoningPhaseToolCallGateTests: XCTestCase {
         XCTAssertEqual(second.toParser, "")
         XCTAssertEqual(gate.flush(), "")
     }
+
+    // F1: the end-of-stream tail is routed like a chunk, with the held bytes prepended, so a `</think>`
+    // that the stop filter's tail completes is still recognised and the bytes after it go to the parser.
+    func testFinishWithTailCompletesAHeldClosingTagInReasoningPhase() {
+        var gate = ReasoningPhaseToolCallGate()
+        let held = gate.route("</th")
+        XCTAssertEqual(held.passthrough, "")
+        XCTAssertEqual(held.toParser, "")
+        let finished = gate.finish(tail: "ink>X")
+        XCTAssertEqual(finished.passthrough, "</think>")
+        XCTAssertEqual(finished.toParser, "X")
+        XCTAssertEqual(gate.flush(), "")
+    }
+
+    // F2: in the parser phase the tail is parser input, never passthrough.
+    func testFinishWithTailInParserPhaseSendsTheTailToTheParser() {
+        var gate = ReasoningPhaseToolCallGate()
+        _ = gate.route("think</think>")
+        let finished = gate.finish(tail: "</tool_call>")
+        XCTAssertEqual(finished.passthrough, "")
+        XCTAssertEqual(finished.toParser, "</tool_call>")
+    }
+
+    // F3: with no tail, `finish` releases the held bytes as reasoning, exactly like `flush()`.
+    func testFinishWithNilTailReleasesHeldBytesAsPassthroughLikeFlush() {
+        var gate = ReasoningPhaseToolCallGate()
+        _ = gate.route("draft </th")
+        var reference = gate
+        let finished = gate.finish(tail: nil)
+        XCTAssertEqual(finished.passthrough, "</th")
+        XCTAssertEqual(finished.toParser, "")
+        XCTAssertEqual(finished.passthrough, reference.flush())
+    }
+
+    // F4: idempotent -- a second call (or a later flush) returns nothing, and a tail that leaves a
+    // held tag prefix is released as passthrough rather than retained.
+    func testFinishIsIdempotentAndReleasesATailThatEndsInAHeldTagPrefix() {
+        var gate = ReasoningPhaseToolCallGate()
+        _ = gate.route("</th")
+        let first = gate.finish(tail: nil)
+        XCTAssertEqual(first.passthrough, "</th")
+        let second = gate.finish(tail: nil)
+        XCTAssertEqual(second.passthrough, "")
+        XCTAssertEqual(second.toParser, "")
+        XCTAssertEqual(gate.flush(), "")
+
+        var tailed = ReasoningPhaseToolCallGate()
+        let ending = tailed.finish(tail: "reasoning </thi")
+        XCTAssertEqual(ending.passthrough, "reasoning </thi")
+        XCTAssertEqual(ending.toParser, "")
+        XCTAssertEqual(tailed.flush(), "")
+    }
 }

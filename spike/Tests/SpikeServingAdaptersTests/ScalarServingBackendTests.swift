@@ -215,6 +215,69 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertTrue(all.calls.last?.function.arguments.contains("Rome") == true)
     }
 
+    // End of stream with a tool call buffered AND the stop filter holding a proper prefix of a stop
+    // string (cycle 250). The held tail is LATER in stream order than everything the processor has
+    // buffered, so it must reach the processor (and the gate) rather than the client directly: the
+    // client text, concatenated, is the visible stream in order, and the parser sees what the client sees.
+    private func runEOSTail(
+        pieces: [Int: String], script: [Int], stop: [String], thinksByDefault: Bool
+    ) async throws -> (
+        calls: [OpenAIToolCall], completion: ServingGenerationCompletion?, texts: [String]
+    ) {
+        let backend = makeBackend(
+            script: script, pieces: pieces, promptTokens: [10], thinksByDefault: thinksByDefault)
+        let handle = try await backend.start(
+            request(maxTokens: 8, stop: stop, tools: [weatherTool]))
+        let events = try await collect(handle.mailbox)
+        let (batches, completion) = toolCallsAndCompletion(events)
+        let texts = events.compactMap { event -> String? in
+            if case .text(let value) = event { return value }
+            return nil
+        }
+        return (batches.flatMap { $0 }, completion, texts)
+    }
+
+    // S1
+    func testScalarEOSStopFilterTailFollowsTheProcessorResidualInStreamOrder() async throws {
+        for thinks in [false, true] {
+            let result = try await runEOSTail(
+                pieces: [
+                    1: "</think>hello ",
+                    2: #"<tool_call>{"name":"get_weather","arguments":{"city":"Pa"#,
+                    3: "ST",
+                ],
+                script: [1, 2, 3, 99], stop: ["STOP"], thinksByDefault: thinks)
+
+            XCTAssertEqual(
+                result.texts.joined(),
+                #"</think>hello <tool_call>{"name":"get_weather","arguments":{"city":"PaST"#,
+                "thinks=\(thinks): residual precedes the tail, concatenation is the visible stream")
+            XCTAssertTrue(result.calls.isEmpty, "thinks=\(thinks)")
+            XCTAssertEqual(result.completion?.finishReason, .stop, "thinks=\(thinks)")
+        }
+    }
+
+    // S2: the held tail is the call's closing tag; the parser must see it and complete the call
+    // instead of the tag leaking to the client as text.
+    func testScalarEOSStopFilterTailThatClosesAToolCallIsParsedNotLeaked() async throws {
+        for thinks in [false, true] {
+            let result = try await runEOSTail(
+                pieces: [
+                    1: "</think>hello ",
+                    2: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}"#,
+                    3: "</tool_call>",
+                ],
+                script: [1, 2, 3, 99], stop: ["</tool_call>X"], thinksByDefault: thinks)
+
+            XCTAssertEqual(result.calls.count, 1, "thinks=\(thinks)")
+            XCTAssertTrue(result.calls.first?.function.arguments.contains("Paris") == true)
+            XCTAssertEqual(result.completion?.finishReason, .toolCalls, "thinks=\(thinks)")
+            XCTAssertEqual(
+                result.texts.joined(), "</think>hello ",
+                "thinks=\(thinks): the closing tag is parser input, not client text")
+        }
+    }
+
     // Handle plumbing for streaming reasoning separation. The backend must derive
     // `handle.separatesReasoning` from the family (`thinksByDefault`) folded with the SAME resolved
     // thinking value it renders the prompt from — so the SSE handler can route a thinks-by-default

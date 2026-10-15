@@ -53,6 +53,15 @@ public struct ReasoningPhaseToolCallGate: Sendable {
         return String(decoding: held, as: UTF8.self)
     }
 
+    /// End of stream: route the stop filter's held `tail` like a chunk (the held bytes are prepended, so
+    /// stream order holds), then release whatever is still held as reasoning. A tail that completes a
+    /// split `</think>` is therefore recognised, and in the parser phase the tail is parser input.
+    /// `finish(tail: nil)` is `flush()` returned as passthrough. Idempotent: a second call is empty.
+    public mutating func finish(tail: String?) -> (passthrough: String, toParser: String) {
+        let routed = tail.map { route($0) } ?? (passthrough: "", toParser: "")
+        return (routed.passthrough + flush(), routed.toParser)
+    }
+
     private static func firstIndex(of needle: [UInt8], in haystack: [UInt8]) -> Int? {
         guard haystack.count >= needle.count else {
             return nil
