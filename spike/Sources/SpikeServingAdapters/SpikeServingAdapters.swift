@@ -299,6 +299,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         /// inside this `Sendable` struct.
         let responseFormatConstraint: (any LogitProcessor & ConstraintProcessorFailureReporting & Sendable)?
         let activeTools: [OpenAIToolSpec]
+        /// This request's `ServingGenerationHandle.separatesReasoning`; `launch` engages the
+        /// reasoning-phase tool-call gate only when it is true AND tools are present.
+        let separatesReasoning: Bool
         let mailbox: BoundedDeltaMailbox
         let lease: ServingRequestLease
     }
@@ -310,6 +313,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         var detokenizer: any ScalarServingDetokenizer
         var stopFilter: ServingStopStringFilter
         let toolCallProcessor: ToolCallProcessor?
+        /// Non-nil only when a tool processor exists AND the response separates reasoning: keeps the
+        /// parser from seeing text the client is shown as `reasoning_content`.
+        var reasoningGate: ReasoningPhaseToolCallGate?
     }
 
     private let launchedModel: String
@@ -596,6 +602,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             logprobsRequest: request.logprobsRequest,
             responseFormatConstraint: responseFormatConstraint,
             activeTools: activeTools,
+            separatesReasoning: separatesReasoning,
             mailbox: mailbox,
             lease: lease)
 
@@ -777,7 +784,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             cancellationReason: nil,
             detokenizer: codec.makeDetokenizer(),
             stopFilter: ServingStopStringFilter(stopStrings: stops),
-            toolCallProcessor: toolCallProcessor)
+            toolCallProcessor: toolCallProcessor,
+            reasoningGate: toolCallProcessor != nil && request.separatesReasoning
+                ? ReasoningPhaseToolCallGate() : nil)
         let task = Task { [weak self] in
             guard let self else {
                 return
@@ -863,6 +872,8 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                         delta: delta))
             }
             try Task.checkCancellation()
+            // Reasoning held back for a possible `</think>` precedes the stop-filter tail in stream order.
+            try await flushReasoningGate(for: id)
             try await flushStopFilter(for: id)
             var finishReason: OpenAIChatFinishReason =
                 summary.finishReason == .length ? .length : .stop
@@ -922,7 +933,22 @@ public actor ScalarServingBackend: ServingGenerationBackend {
 
         if let text = output?.text {
             if let processor = current.toolCallProcessor {
-                if let display = processor.processChunk(text), !display.isEmpty {
+                var parserText = text
+                var gated = false
+                if var gate = current.reasoningGate {
+                    // Reasoning (through the first `</think>`) is shown as content, never parsed.
+                    let routed = gate.route(text)
+                    active?.reasoningGate = gate
+                    if !routed.passthrough.isEmpty {
+                        try await current.request.mailbox.send(.text(routed.passthrough))
+                    }
+                    parserText = routed.toParser
+                    gated = true
+                }
+                if gated && parserText.isEmpty {
+                    // Nothing reached the parser (all reasoning, or a held tag prefix).
+                } else if let display = processor.processChunk(parserText), !display.isEmpty
+                {
                     try await current.request.mailbox.send(.text(display))
                 }
             } else {
@@ -982,6 +1008,21 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             logprob: Double(logprob.logprob),
             topCandidates: candidates)
         try await current.request.mailbox.send(.tokenLogprobs([served]))
+    }
+
+    private func flushReasoningGate(for id: ServingRequestID) async throws {
+        guard var current = active, current.request.id == id else {
+            throw CancellationError()
+        }
+        guard var gate = current.reasoningGate else {
+            return
+        }
+        let held = gate.flush()
+        current.reasoningGate = gate
+        active = current
+        if !held.isEmpty {
+            try await current.request.mailbox.send(.text(held))
+        }
     }
 
     private func flushStopFilter(for id: ServingRequestID) async throws {

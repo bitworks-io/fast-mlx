@@ -1344,7 +1344,7 @@ final class ContinuousServingBackendTests: XCTestCase {
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 1, queued: 1),
             runtime: FixtureContinuousRuntime(
-                scriptsByPromptHead: [10: [1, 2, 3, 99]],
+                scriptsByPromptHead: [10: [1, 2, 3, 4, 5, 6, 99]],
                 recorder: recorder),
             publicationCapacity: 1,
             traceLimit: 32)
@@ -1438,7 +1438,7 @@ final class ContinuousServingBackendTests: XCTestCase {
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 1, queued: 2),
             runtime: FixtureContinuousRuntime(
-                scriptsByPromptHead: [10: [1, 2, 3, 99]],
+                scriptsByPromptHead: [10: [1, 2, 3, 4, 5, 6, 99]],
                 recorder: ContinuousRuntimeRecorder()),
             publicationCapacity: 1,
             traceLimit: 32)
@@ -1480,7 +1480,7 @@ final class ContinuousServingBackendTests: XCTestCase {
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 1, queued: 1),
             runtime: FixtureContinuousRuntime(
-                scriptsByPromptHead: [10: [1, 2, 3, 99]],
+                scriptsByPromptHead: [10: [1, 2, 3, 4, 5, 6, 99]],
                 recorder: ContinuousRuntimeRecorder()),
             publicationCapacity: 1,
             traceLimit: 32)
@@ -1589,6 +1589,97 @@ final class ContinuousServingBackendTests: XCTestCase {
             XCTAssertEqual(result.completion?.finishReason, .toolCalls)
             XCTAssertEqual(result.completion?.usage.completionTokens, 4)
         }
+    }
+
+    // The tool parser sees only the bytes the client is shown as content (cycle 247): a call drafted
+    // inside the reasoning block (before the first `</think>`) is reasoning text, not a call.
+    private static let draftInsideThinkingPieces: [Int: String] = [
+        1: "<think>draft ",
+        2: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}"#,
+        3: "</tool_call>",
+        4: "</think>",
+        5: #"<tool_call>{"name":"get_weather","arguments":{"city":"Rome"}}"#,
+        6: "</tool_call>",
+    ]
+
+    private func runDraftInsideThinking(
+        thinksByDefault: Bool, parallelToolCalls: Bool?
+    ) async throws -> (
+        calls: [OpenAIToolCall], completion: ServingGenerationCompletion?, text: String,
+        separates: Bool
+    ) {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 2, 3, 4, 5, 6, 99]],
+                recorder: ContinuousRuntimeRecorder()),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["tools": [10]],
+            pieces: Self.draftInsideThinkingPieces,
+            stopTokenIDs: [99],
+            thinksByDefault: thinksByDefault)
+        let handle = try await backend.start(
+            request(
+                text: "tools", maxTokens: 8, tools: [continuousWeatherTool],
+                parallelToolCalls: parallelToolCalls, enableThinking: true))
+        let events = try await collect(handle.mailbox)
+        var calls: [OpenAIToolCall] = []
+        var completion: ServingGenerationCompletion?
+        var text = ""
+        for event in events {
+            switch event {
+            case .toolCalls(let batch): calls.append(contentsOf: batch)
+            case .completion(let value): completion = value
+            case .text(let value): text += value
+            default: break
+            }
+        }
+        return (calls, completion, text, handle.separatesReasoning)
+    }
+
+    func testToolCallDraftedInsideReasoningIsNotParsedUnderParallelFalse() async throws {
+        let result = try await runDraftInsideThinking(thinksByDefault: true, parallelToolCalls: false)
+
+        XCTAssertTrue(result.separates)
+        XCTAssertEqual(result.calls.count, 1)
+        XCTAssertTrue(result.calls.first?.function.arguments.contains("Rome") == true)
+        XCTAssertFalse(result.calls.contains { $0.function.arguments.contains("Paris") })
+        XCTAssertEqual(result.completion?.finishReason, .toolCalls)
+        XCTAssertEqual(
+            result.completion?.usage.completionTokens, 6,
+            "the draft must not stop generation: the whole script is generated")
+        XCTAssertTrue(result.text.contains("Paris"), "the draft reaches the client as reasoning text")
+        XCTAssertTrue(result.text.hasPrefix("<think>draft <tool_call>{"))
+        XCTAssertTrue(result.text.contains("</think>"))
+    }
+
+    func testToolCallDraftedInsideReasoningIsNotParsedUnderParallelAbsentOrTrue() async throws {
+        for parallel in [nil, true] as [Bool?] {
+            let result = try await runDraftInsideThinking(
+                thinksByDefault: true, parallelToolCalls: parallel)
+
+            XCTAssertEqual(result.calls.count, 1, "parallel=\(String(describing: parallel))")
+            XCTAssertTrue(result.calls.first?.function.arguments.contains("Rome") == true)
+            XCTAssertEqual(result.completion?.usage.completionTokens, 6)
+            XCTAssertTrue(result.text.contains("Paris"))
+        }
+    }
+
+    // Control: a handle that does not separate reasoning has no gate, so today's behavior holds.
+    func testWithoutReasoningSeparationStillParsesTheDraftedCall() async throws {
+        let stopped = try await runDraftInsideThinking(thinksByDefault: false, parallelToolCalls: false)
+        XCTAssertFalse(stopped.separates)
+        XCTAssertEqual(stopped.calls.count, 1)
+        XCTAssertTrue(stopped.calls.first?.function.arguments.contains("Paris") == true)
+        XCTAssertEqual(stopped.completion?.usage.completionTokens, 3)
+
+        let all = try await runDraftInsideThinking(thinksByDefault: false, parallelToolCalls: nil)
+        XCTAssertEqual(all.calls.count, 2)
+        XCTAssertTrue(all.calls.first?.function.arguments.contains("Paris") == true)
+        XCTAssertTrue(all.calls.last?.function.arguments.contains("Rome") == true)
     }
 
     func testParallelFalseWithNoCallIsUnchangedAndRunsToEOS() async throws {
@@ -1920,7 +2011,7 @@ final class ContinuousServingBackendTests: XCTestCase {
             configuration: try configuration(active: 1, queued: 1),
             runtime: FixtureContinuousRuntime(
                 scriptsByPromptHead: [
-                    10: [1, 2, 3, 99],
+                    10: [1, 2, 3, 4, 5, 6, 99],
                     20: [4, 5, 99],
                 ],
                 recorder: ContinuousRuntimeRecorder()),
@@ -2385,7 +2476,8 @@ private func makeBackend(
     mailboxCapacity: BoundedDeltaMailbox.Capacity = .init(
         maxDeltas: 2,
         maxBytes: 4_096),
-    modelCapabilities: ServingModelCapabilities? = nil
+    modelCapabilities: ServingModelCapabilities? = nil,
+    thinksByDefault: Bool = false
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -2400,6 +2492,7 @@ private func makeBackend(
             defaultMaximumCompletionTokens: 8,
             queueRetryAfterSeconds: 2,
             mailboxCapacity: mailboxCapacity,
+            thinksByDefault: thinksByDefault,
             modelCapabilities: modelCapabilities))
 }
 
@@ -2467,7 +2560,8 @@ private func request(
     maxTokens: Int,
     stop: [String] = [],
     tools: [OpenAIToolSpec] = [],
-    parallelToolCalls: Bool? = nil
+    parallelToolCalls: Bool? = nil,
+    enableThinking: Bool? = nil
 ) -> OpenAIChatCompletionRequest {
     OpenAIChatCompletionRequest(
         model: "fixture",
@@ -2481,7 +2575,8 @@ private func request(
         stop: stop,
         tools: tools,
         toolChoice: tools.isEmpty ? .none : .auto,
-        parallelToolCalls: parallelToolCalls)
+        parallelToolCalls: parallelToolCalls,
+        enableThinking: enableThinking)
 }
 
 private func collect(

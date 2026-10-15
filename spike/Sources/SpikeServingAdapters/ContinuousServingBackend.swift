@@ -123,6 +123,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         var detokenizer: any ScalarServingDetokenizer
         var stopFilter: ServingStopStringFilter
         let toolCallProcessor: ToolCallProcessor?
+        /// Non-nil only when a tool processor exists AND the response separates reasoning: keeps the
+        /// parser from seeing text the client is shown as `reasoning_content`.
+        var reasoningGate: ReasoningPhaseToolCallGate?
         let parallelToolCalls: Bool?
         let responseID: String
         let outputTokenTraceLimit: Int?
@@ -822,6 +825,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             stopFilter: ServingStopStringFilter(
                 stopStrings: prepared.stopStrings),
             toolCallProcessor: toolCallProcessor,
+            reasoningGate: toolCallProcessor != nil && prepared.separatesReasoning
+                ? ReasoningPhaseToolCallGate() : nil,
             parallelToolCalls: prepared.parallelToolCalls,
             responseID: responseID,
             outputTokenTraceLimit: prepared.outputTokenTraceLimit,
@@ -861,6 +866,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             }
 
             try Task.checkCancellation()
+            // Reasoning held back for a possible `</think>` precedes the stop-filter tail in stream order.
+            try await flushReasoningGate(for: id)
             if !stoppedByString {
                 try await flushStopFilter(for: id)
             }
@@ -948,7 +955,22 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
         if let text = output?.text {
             if let processor = request.toolCallProcessor {
-                if let display = processor.processChunk(text), !display.isEmpty {
+                var parserText = text
+                var gated = false
+                if var gate = request.reasoningGate {
+                    // Reasoning (through the first `</think>`) is shown as content, never parsed.
+                    let routed = gate.route(text)
+                    requests[id]?.reasoningGate = gate
+                    if !routed.passthrough.isEmpty {
+                        try await request.mailbox.send(.text(routed.passthrough))
+                    }
+                    parserText = routed.toParser
+                    gated = true
+                }
+                if gated && parserText.isEmpty {
+                    // Nothing reached the parser (all reasoning, or a held tag prefix).
+                } else if let display = processor.processChunk(parserText), !display.isEmpty
+                {
                     try await request.mailbox.send(.text(display))
                 }
             } else {
@@ -986,6 +1008,21 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 outputTokenIDs: request.outputTokenTrace,
                 completionTokenCount: request.generatedTokenCount,
                 truncated: request.outputTokenTraceTruncated))
+    }
+
+    private func flushReasoningGate(for id: ServingRequestID) async throws {
+        guard var request = requests[id] else {
+            throw CancellationError()
+        }
+        guard var gate = request.reasoningGate else {
+            return
+        }
+        let held = gate.flush()
+        request.reasoningGate = gate
+        requests[id] = request
+        if !held.isEmpty {
+            try await request.mailbox.send(.text(held))
+        }
     }
 
     private func flushStopFilter(for id: ServingRequestID) async throws {

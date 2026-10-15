@@ -315,9 +315,14 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # `parallel_tool_calls: false` returning at most one tool call. Conscious decision to publish: read in full; they hold
 # only synthetic request bodies and an in-memory fake backend, name no model family, host, credential or
 # machine-local path, and the projection validator's marker sweep passed on them.
+# 2026-10-15, 1035 -> 1037: adds spike/Sources/ServingCore/ReasoningPhaseToolCallGate.swift and
+# spike/Tests/ServingCoreTests/ReasoningPhaseToolCallGateTests.swift (projected with spike/Sources and spike/Tests), the
+# gate that keeps the tool-call parser out of the reasoning block. Conscious decision to publish: read in full; they hold
+# only the gate and synthetic chunk strings, name no model family, host, credential or machine-local path, and the
+# projection validator's marker sweep passed on them.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1035,
-    "pathModeSha256": "35687d0e0c27d962489cffbfeed3eee52b7d4babbb60fba7a853841565f98742",
+    "pathCount": 1037,
+    "pathModeSha256": "8217216df3b9e49d65d0252898bb35fa7914bcb68a15cc922d43ba6b65f5071e",
 }
 
 

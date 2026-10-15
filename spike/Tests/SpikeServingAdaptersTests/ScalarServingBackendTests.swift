@@ -14,7 +14,7 @@ final class ScalarServingBackendTests: XCTestCase {
     // JSON parser cannot decode. With `toolCallFormat: .xmlFunction` the call must parse.
     func testScalarRouteHonorsXMLFunctionToolCallFormat() async throws {
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [
                 1: "<tool_call><function=get_weather>",
                 2: "<parameter=city>Paris</parameter>",
@@ -45,7 +45,7 @@ final class ScalarServingBackendTests: XCTestCase {
     // parse as a tool call — proving the format field is actually consumed, not incidental.
     func testScalarRouteJSONFormatDoesNotParseXMLFunctionStream() async throws {
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [
                 1: "<tool_call><function=get_weather>",
                 2: "<parameter=city>Paris</parameter>",
@@ -140,6 +140,81 @@ final class ScalarServingBackendTests: XCTestCase {
         }.joined()
         XCTAssertEqual(text, "hello world")
     }
+
+    // The tool parser sees only the bytes the client is shown as content (cycle 247): a call drafted
+    // inside the reasoning block (before the first `</think>`) is reasoning text, not a call. Script:
+    // a Paris draft inside the thinking block, the closing tag, then the real Rome call, then EOS.
+    private static let draftInsideThinkingPieces: [Int: String] = [
+        1: "<think>draft ",
+        2: #"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}"#,
+        3: "</tool_call>",
+        4: "</think>",
+        5: #"<tool_call>{"name":"get_weather","arguments":{"city":"Rome"}}"#,
+        6: "</tool_call>",
+    ]
+
+    private func runDraftInsideThinking(
+        thinksByDefault: Bool, parallelToolCalls: Bool?
+    ) async throws -> (
+        calls: [OpenAIToolCall], completion: ServingGenerationCompletion?, text: String
+    ) {
+        let backend = makeBackend(
+            script: [1, 2, 3, 4, 5, 6, 99], pieces: Self.draftInsideThinkingPieces, promptTokens: [10],
+            thinksByDefault: thinksByDefault)
+        let handle = try await backend.start(
+            request(maxTokens: 8, tools: [weatherTool], parallelToolCalls: parallelToolCalls))
+        XCTAssertEqual(handle.separatesReasoning, thinksByDefault)
+        let events = try await collect(handle.mailbox)
+        let (batches, completion) = toolCallsAndCompletion(events)
+        let text = events.compactMap { event -> String? in
+            if case .text(let value) = event { return value }
+            return nil
+        }.joined()
+        return (batches.flatMap { $0 }, completion, text)
+    }
+
+    func testScalarToolCallDraftedInsideReasoningIsNotParsedUnderParallelFalse() async throws {
+        let result = try await runDraftInsideThinking(thinksByDefault: true, parallelToolCalls: false)
+
+        XCTAssertEqual(result.calls.count, 1)
+        XCTAssertTrue(result.calls.first?.function.arguments.contains("Rome") == true)
+        XCTAssertFalse(result.calls.contains { $0.function.arguments.contains("Paris") })
+        XCTAssertEqual(result.completion?.finishReason, .toolCalls)
+        XCTAssertEqual(
+            result.completion?.usage.completionTokens, 6,
+            "the draft must not stop generation: the whole script is generated")
+        XCTAssertTrue(result.text.contains("Paris"), "the draft reaches the client as reasoning text")
+        XCTAssertTrue(result.text.hasPrefix("<think>draft <tool_call>{"))
+        XCTAssertTrue(result.text.contains("</think>"))
+        XCTAssertFalse(result.text.contains("Rome"), "the real call is not echoed as text")
+    }
+
+    func testScalarToolCallDraftedInsideReasoningIsNotParsedUnderParallelAbsentOrTrue() async throws {
+        for parallel in [nil, true] as [Bool?] {
+            let result = try await runDraftInsideThinking(
+                thinksByDefault: true, parallelToolCalls: parallel)
+
+            XCTAssertEqual(result.calls.count, 1, "parallel=\(String(describing: parallel))")
+            XCTAssertTrue(result.calls.first?.function.arguments.contains("Rome") == true)
+            XCTAssertEqual(result.completion?.finishReason, .toolCalls)
+            XCTAssertEqual(result.completion?.usage.completionTokens, 6)
+            XCTAssertTrue(result.text.contains("Paris"))
+        }
+    }
+
+    // Control: a handle that does not separate reasoning has no gate, so today's behavior holds.
+    func testScalarWithoutReasoningSeparationStillParsesTheDraftedCall() async throws {
+        let stopped = try await runDraftInsideThinking(thinksByDefault: false, parallelToolCalls: false)
+        XCTAssertEqual(stopped.calls.count, 1)
+        XCTAssertTrue(stopped.calls.first?.function.arguments.contains("Paris") == true)
+        XCTAssertEqual(stopped.completion?.usage.completionTokens, 3)
+
+        let all = try await runDraftInsideThinking(thinksByDefault: false, parallelToolCalls: nil)
+        XCTAssertEqual(all.calls.count, 2)
+        XCTAssertTrue(all.calls.first?.function.arguments.contains("Paris") == true)
+        XCTAssertTrue(all.calls.last?.function.arguments.contains("Rome") == true)
+    }
+
     // Handle plumbing for streaming reasoning separation. The backend must derive
     // `handle.separatesReasoning` from the family (`thinksByDefault`) folded with the SAME resolved
     // thinking value it renders the prompt from — so the SSE handler can route a thinks-by-default
@@ -483,7 +558,7 @@ final class ScalarServingBackendTests: XCTestCase {
 
     func testQueueExhaustionQueuedCancellationAndActiveCancellationRecover() async throws {
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [1: "a", 2: "b", 3: "c"],
             promptTokens: [10],
             mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
@@ -539,7 +614,7 @@ final class ScalarServingBackendTests: XCTestCase {
 
     func testShutdownCancelsActiveAndQueuedRequestsAndRejectsNewWork() async throws {
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [1: "a", 2: "b", 3: "c"],
             promptTokens: [10],
             mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
@@ -633,7 +708,7 @@ final class ScalarServingBackendTests: XCTestCase {
 
     func testActiveShutdownCancellationStopsAdmissionAndNeverLaunchesQueuedWork() async throws {
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [1: "a", 2: "b", 3: "c"],
             promptTokens: [10],
             mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
@@ -670,7 +745,7 @@ final class ScalarServingBackendTests: XCTestCase {
     func testFullQueueRejectsBeforeRenderingPrompt() async throws {
         let renderCounter = RenderCounter()
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [1: "a", 2: "b", 3: "c"],
             promptTokens: [10],
             mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
@@ -737,7 +812,7 @@ final class ScalarServingBackendTests: XCTestCase {
             maximumNonStreamingCompletionTokens: 3,
             completionLimitPolicy: .reject)
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [1: "a", 2: "b", 3: "c"],
             promptTokens: [10],
             mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
@@ -863,7 +938,7 @@ final class ScalarServingBackendTests: XCTestCase {
         // property of THAT request, not a permanent property of the backend, and that it wins over
         // the queue-full check for that one request without disturbing the two already admitted.
         let backend = makeBackend(
-            script: [1, 2, 3, 99],
+            script: [1, 2, 3, 4, 5, 6, 99],
             pieces: [1: "a", 2: "b", 3: "c"],
             promptTokens: [10],
             mailboxCapacity: .init(maxDeltas: 1, maxBytes: 8),
