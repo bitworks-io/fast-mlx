@@ -60,7 +60,7 @@ public enum ExactQwen35MTPServingAdmissionDecision: Equatable, Sendable {
 ///
 /// The caller must pass a binding returned by the existing artifact preflight. Even then, eligibility
 /// is intentionally narrower than engine capability: only the measured processor-free greedy shape is
-/// admitted, while sampling, penalties, tools, and overlapping speculative work stay on scalar serving.
+/// admitted, while sampling, penalties, `logit_bias`, tools, and overlapping speculative work stay on scalar serving.
 /// This policy never loads a drafter and must not be treated as proof of streaming, cancellation, cache
 /// finalization, or API parity; those remain separate live-executor gates.
 public enum ExactQwen35MTPServingAdmissionPolicy {
@@ -71,7 +71,8 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
         sampling: ServingSamplingPolicy,
         penalties: DecoderPenalties,
         hasActiveTools: Bool,
-        speculativeRequestCount: Int
+        speculativeRequestCount: Int,
+        hasLogitBias: Bool = false
     ) -> ExactQwen35MTPServingAdmissionDecision {
         guard speculativeRequestCount >= 0 else {
             return .scalarFallback(.invalidSpeculativeRequestCount)
@@ -88,7 +89,7 @@ public enum ExactQwen35MTPServingAdmissionPolicy {
         guard case .greedy = sampling else {
             return .scalarFallback(.sampledGeneration)
         }
-        guard penalties.isEmpty else {
+        guard penalties.isEmpty, !hasLogitBias else {
             return .scalarFallback(.logitProcessor)
         }
         guard !hasActiveTools else {

@@ -21,6 +21,13 @@ public protocol ServingGenerationBackend: Sendable {
     /// no backend sets this `true` yet (stage 2a compiles/validates the schema but wires no
     /// automaton).
     var supportsJSONSchemaResponseFormat: Bool { get }
+    /// Whether this backend's decoding route can apply a non-empty OpenAI `logit_bias` map to the
+    /// logits before sampling. Defaults to `false` (fail closed): only the plain scalar route, whose
+    /// decoder owns a logit-processor seam, declares `true`. Every other route (continuous batching,
+    /// compiled/speculative decoders, test doubles) must be refused with a 400 by
+    /// `validateLogitBiasCapability` at the single dispatch point rather than serve an unbiased
+    /// response to a caller who asked for a bias.
+    var supportsLogitBias: Bool { get }
 }
 
 extension ServingGenerationBackend {
@@ -37,6 +44,25 @@ extension ServingGenerationBackend {
 
     public var supportsJSONObjectResponseFormat: Bool { false }
     public var supportsJSONSchemaResponseFormat: Bool { false }
+    public var supportsLogitBias: Bool { false }
+}
+
+/// The single ServingCore-level admission check for `logit_bias` against a backend's declared
+/// capability. Called at the one dispatch point before `backend.start(_:)` (alongside
+/// `validateResponseFormatCapability`), so a backend that cannot apply a bias never receives a
+/// request carrying one and no generation is started for it. The neutral empty map needs no
+/// capability and passes on every backend. Throws `OpenAIServingError.invalidRequest` with
+/// `param: "logit_bias"`.
+public func validateLogitBiasCapability(
+    request: OpenAIChatCompletionRequest,
+    backendSupportsLogitBias: Bool
+) throws {
+    guard !request.logitBias.isEmpty else { return }
+    guard backendSupportsLogitBias else {
+        throw OpenAIServingError.invalidRequest(
+            "logit_bias is not supported by the loaded model's decoding route",
+            param: "logit_bias")
+    }
 }
 
 /// The single ServingCore-level admission check for `response_format` against a specific backend's

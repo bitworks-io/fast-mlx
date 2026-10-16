@@ -349,6 +349,39 @@ final class ExactQwen35MTPServingBackendTests: XCTestCase {
         XCTAssertEqual(runner.snapshot().startCount, 1)
     }
 
+    // `logit_bias` on the exact-MTP wrapper: a non-empty bias is a logit processor, so the request
+    // is INELIGIBLE for speculation and falls back to the scalar route exactly like a penalty does
+    // (it must never reach the MTP runner); the wrapper only advertises the capability when its
+    // scalar fallback does, so with a fallback that cannot apply it the HTTP gate refuses first.
+    func testLogitBiasRequestFallsBackToScalarAndNeverReachesTheMTPRunner() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback(supportsLogitBias: true)
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+        XCTAssertTrue(backend.supportsLogitBias)
+
+        var biased = request(maxTokens: 2)
+        biased.logitBias = [5: -100]
+        let handle = try await backend.start(biased)
+        _ = try await collect(handle.mailbox)
+
+        XCTAssertEqual(handle.route, .scalarGreedy)
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        XCTAssertEqual(scalar.snapshot().startCount, 1)
+        XCTAssertEqual(scalar.snapshot().lastRequest?.logitBias, [5: -100])
+
+        // Control: the same wrapper still speculates for a request without a bias.
+        let plain = try await backend.start(request(maxTokens: 2))
+        _ = try await collect(plain.mailbox)
+        XCTAssertEqual(plain.route, .exactQwen35MTP)
+        XCTAssertEqual(runner.snapshot().startCount, 1)
+    }
+
+    func testWrapperDoesNotClaimLogitBiasWhenItsScalarFallbackCannotApplyIt() throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: [], promptTokens: 1, completionTokens: 0, stopReason: .stop))
+        let backend = try makeBackend(runner: runner, scalarFallback: ScriptedScalarFallback())
+        XCTAssertFalse(backend.supportsLogitBias)
+    }
+
     func testConstructionRejectsScalarFallbackThatMayShareRawTarget() {
         XCTAssertThrowsError(
             try makeBackend(
@@ -601,15 +634,22 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
         let startCount: Int
         let shutdownCount: Int
         let lastCompletionBudgetResolution: ServingCompletionBudgetResolution?
+        let lastRequest: OpenAIChatCompletionRequest?
     }
 
     private struct State: Sendable {
         var startCount = 0
         var shutdownCount = 0
         var lastCompletionBudgetResolution: ServingCompletionBudgetResolution?
+        var lastRequest: OpenAIChatCompletionRequest?
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
+    let supportsLogitBias: Bool
+
+    init(supportsLogitBias: Bool = false) {
+        self.supportsLogitBias = supportsLogitBias
+    }
 
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
         try await start(request, completionBudgetResolution: nil)
@@ -631,6 +671,7 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
         let sequence = state.withLock { state in
             state.startCount += 1
             state.lastCompletionBudgetResolution = completionBudgetResolution
+            state.lastRequest = request
             return state.startCount
         }
         let mailbox = BoundedDeltaMailbox(capacity: .init(maxDeltas: 4, maxBytes: 1_024))
@@ -665,7 +706,8 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
             Snapshot(
                 startCount: $0.startCount,
                 shutdownCount: $0.shutdownCount,
-                lastCompletionBudgetResolution: $0.lastCompletionBudgetResolution)
+                lastCompletionBudgetResolution: $0.lastCompletionBudgetResolution,
+                lastRequest: $0.lastRequest)
         }
     }
 }

@@ -94,8 +94,8 @@ non-loopback `--host`).
 
 The default launch serves on the continuous-batch route, which is greedy only. Pass `--single-stream`
 to serve on the single-stream scalar route instead, for sampling (`temperature` > 0), penalties,
-logprobs, `/v1/completions`, `response_format` and `--chat-template`; it cannot be combined with
-`--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
+logprobs, `logit_bias`, `/v1/completions`, `response_format` and `--chat-template`; it cannot be
+combined with `--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
 
 Call it with the standard OpenAI shape, including tools:
 
@@ -130,6 +130,14 @@ dense-attention (compiled fp16 fast path by default) alike.
 `top_logprobs` without `logprobs:true` is rejected (`top_logprobs` param), matching OpenAI's own
 validation. `logprobs:false`/absent is unchanged — no `logprobs` key at all, byte-identical to
 before this feature existed.
+
+`"logit_bias":{"<token id>":<bias>}` adds each bias to that token's logit before sampling (greedy
+and sampled) on the single-stream scalar route. Keys are base-10 token ids below the model's
+`vocab_size`, values are in [-100, 100], and at most 300 entries are allowed; anything else is a 400
+on `logit_bias`. A `response_format` mask still has the last word, so a +100 bias cannot force a
+token the grammar forbids. Logprobs stay those of the raw logits, before the bias. A route that
+cannot apply a bias (the continuous-batch route, speculative decoding) answers a non-empty map with
+a 400 rather than ignoring it; `{}` is accepted everywhere.
 
 Structured output: `"response_format":{"type":"json_object"}` and
 `"response_format":{"type":"json_schema","json_schema":{"name":…,"schema":…,"strict":…}}` are enforced

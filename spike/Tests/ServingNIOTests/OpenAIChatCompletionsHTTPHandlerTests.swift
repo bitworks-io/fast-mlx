@@ -3462,6 +3462,106 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    // MARK: - `logit_bias` capability gate
+    //
+    // A non-empty `logit_bias` is applied ONLY by a backend that declares
+    // `ServingGenerationBackend.supportsLogitBias` (the plain scalar route). Every other backend
+    // must be refused with a 400 (`param: "logit_bias"`) BEFORE `backend.start(_:)` is called -- a
+    // silently ignored bias would be a wrong answer the caller cannot detect. `{}` stays neutral.
+
+    private func logitBiasChatBody(_ biasJSON: String) -> String {
+        """
+        {"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"max_completion_tokens":8,"temperature":0,"stream":false,"logit_bias":\(biasJSON)}
+        """
+    }
+
+    private func logitBiasCompletionsBody(_ biasJSON: String) -> String {
+        """
+        {"model":"qwen3-32b","prompt":"Hello","max_tokens":8,"temperature":0,"stream":false,"logit_bias":\(biasJSON)}
+        """
+    }
+
+    func testNonEmptyLogitBiasIsRefusedByACapabilityFalseBackendWithZeroStarts() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["served"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: logitBiasChatBody(#"{"50":-100}"#))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["param"] as? String, "logit_bias")
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testNonEmptyLogitBiasOnCompletionsIsRefusedByACapabilityFalseBackendWithZeroStarts() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["served"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: logitBiasCompletionsBody(#"{"50":100}"#))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+        let error = try XCTUnwrap(object["error"] as? [String: Any])
+        XCTAssertEqual(error["param"] as? String, "logit_bias")
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    func testEmptyLogitBiasStillReachesACapabilityFalseBackend() async throws {
+        for body in [logitBiasChatBody("{}"), logitBiasChatBody("null")] {
+            let backend = ScriptedBackend(scripts: [
+                .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+            ])
+            let channel = try await makeChannel(backend: backend)
+
+            try await writeRequest(channel, body: body)
+            let response = try await collectResponse(from: channel)
+
+            XCTAssertEqual(response.head.status, .ok, body)
+            XCTAssertEqual(backend.snapshot().startCount, 1, body)
+            XCTAssertEqual(backend.snapshot().lastRequest?.logitBias, [:], body)
+            _ = try await channel.finish()
+        }
+    }
+
+    func testLogitBiasReachesABackendThatDeclaresTheCapability() async throws {
+        let backend = ScriptedBackend(
+            scripts: [.completed(text: ["hi"], promptTokens: 1, completionTokens: 1)],
+            supportsLogitBias: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(channel, body: logitBiasChatBody(#"{"50":-100,"51":25.5}"#))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertEqual(backend.snapshot().lastRequest?.logitBias, [50: -100, 51: 25.5])
+        _ = try await channel.finish()
+    }
+
+    func testLogitBiasOnCompletionsReachesABackendThatDeclaresTheCapability() async throws {
+        let backend = ScriptedBackend(
+            scripts: [.completed(text: ["hi"], promptTokens: 1, completionTokens: 1)],
+            supportsLogitBias: true)
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(channel, body: logitBiasCompletionsBody(#"{"7":100}"#))
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        XCTAssertEqual(backend.snapshot().lastRequest?.logitBias, [7: 100])
+        _ = try await channel.finish()
+    }
+
     // MARK: - Request log (`--request-log json` / `ServingHTTPConfiguration.requestLog`)
 
     func testRequestLogChatNonStreamingSuccessEmitsExactlyOneLineWithNoContent() async throws {
@@ -4082,13 +4182,18 @@ private final class ScriptedBackend: ServingGenerationBackend, Sendable {
     /// `false`, matching the protocol-extension default every real backend still has in slice 1c —
     /// see `OpenAIChatCompletionsHTTPHandlerTests`'s response-format capability-gate tests).
     let supportsJSONObjectResponseFormat: Bool
+    /// Test-only override of `ServingGenerationBackend.supportsLogitBias` (default `false`, the
+    /// fail-closed protocol default every non-scalar route keeps).
+    let supportsLogitBias: Bool
 
     init(
         scripts: [Script],
         separatesReasoning: Bool = false,
         mailboxMaximumBytes: Int = 1_024,
-        supportsJSONObjectResponseFormat: Bool = false
+        supportsJSONObjectResponseFormat: Bool = false,
+        supportsLogitBias: Bool = false
     ) {
+        self.supportsLogitBias = supportsLogitBias
         state = OSAllocatedUnfairLock(initialState: State(scripts: scripts))
         self.separatesReasoning = separatesReasoning
         self.mailboxMaximumBytes = mailboxMaximumBytes

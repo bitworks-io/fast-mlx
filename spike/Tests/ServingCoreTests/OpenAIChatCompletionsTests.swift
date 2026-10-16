@@ -286,7 +286,8 @@ final class OpenAIChatCompletionsTests: XCTestCase {
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_object","extra":1}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"x"}}}"#, "response_format"),
             (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"response_format":{"type":"bogus"}}"#, "response_format"),
-            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":1}}"#, "logit_bias"),
+            // `logit_bias` is HONORED now (see `OpenAILogitBiasTests`); only a malformed map is a 400.
+            (#"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hi"}],"logit_bias":{"123":101}}"#, "logit_bias"),
         ]
         for (body, param) in cases {
             XCTAssertOpenAIError(

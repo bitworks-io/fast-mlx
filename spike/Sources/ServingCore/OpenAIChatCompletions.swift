@@ -222,6 +222,13 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
     /// only state that leaves every existing response byte-for-byte unchanged) — see
     /// `ServingResponseFormat`'s doc comment. Never listed in `ignoredFields` when non-nil.
     public var responseFormat: ServingResponseFormat?
+    /// Validated, HONORED OpenAI `logit_bias` (token id -> additive bias in [-100, 100]), or `[:]`
+    /// when absent/null/`{}` (the only state that leaves every existing response byte-for-byte
+    /// unchanged). Decoded by `decodeLogitBias`; a non-empty map is applied ONLY by a backend that
+    /// declares `ServingGenerationBackend.supportsLogitBias` (the plain scalar route) and is refused
+    /// with a 400 (`param: "logit_bias"`) everywhere else -- never silently ignored. Never listed in
+    /// `ignoredFields` when non-empty.
+    public var logitBias: [Int: Float]
     /// `.chat` for every request decoded from `/v1/chat/completions` (the only value
     /// `decodeStrict` can ever produce). `.rawText(prompt)` is set exclusively by
     /// `OpenAICompletionRequest.asChatCompletionRequest()` for the legacy `/v1/completions` route —
@@ -254,6 +261,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         ignoredFields: [String] = [],
         logprobsRequest: ServingLogprobsRequest? = nil,
         responseFormat: ServingResponseFormat? = nil,
+        logitBias: [Int: Float] = [:],
         promptInput: ServingPromptInput = .chat
     ) {
         self.model = model
@@ -281,6 +289,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         self.ignoredFields = ignoredFields
         self.logprobsRequest = logprobsRequest
         self.responseFormat = responseFormat
+        self.logitBias = logitBias
         self.promptInput = promptInput
     }
 
@@ -443,7 +452,7 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
                     param: "stop")
             }
         }
-        let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
+        let (logitBiasPresent, logitBias) = try decodeLogitBias(root["logit_bias"])
 
         let includeUsage = try decodeStreamOptions(root["stream_options"], stream: stream)
 
@@ -453,7 +462,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
         if store != nil { ignoredFields.append("store") }
         if serviceTier != nil { ignoredFields.append("service_tier") }
         if responseFormatIgnoredPresent { ignoredFields.append("response_format") }
-        if logitBiasPresent { ignoredFields.append("logit_bias") }
+        // Only the neutral `{}` is "ignored"; a non-empty map is honored (see `logitBias`).
+        if logitBiasPresent && logitBias.isEmpty { ignoredFields.append("logit_bias") }
         ignoredFields.append(contentsOf: unknownTopLevelKeys)
         ignoredFields.append(contentsOf: chatTemplateKwargsIgnoredFields)
         ignoredFields.sort()
@@ -483,7 +493,8 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
             logprobsRequest: logprobsRequest,
-            responseFormat: responseFormat)
+            responseFormat: responseFormat,
+            logitBias: logitBias)
     }
 
     public func requireLaunchedModel(_ launchedModel: String) throws {
@@ -525,6 +536,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
     /// Validated integer `logprobs` request (0...5), or `nil` when not requested. See
     /// `ServingLogprobsRequest`'s doc comment.
     public var logprobsRequest: ServingLogprobsRequest?
+    /// Same contract as `OpenAIChatCompletionRequest.logitBias` (`[:]` = neutral).
+    public var logitBias: [Int: Float]
 
     public init(
         model: String,
@@ -543,7 +556,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         ignoreEOS: Bool = false,
         includeUsage: Bool = false,
         ignoredFields: [String] = [],
-        logprobsRequest: ServingLogprobsRequest? = nil
+        logprobsRequest: ServingLogprobsRequest? = nil,
+        logitBias: [Int: Float] = [:]
     ) {
         self.model = model
         self.prompt = prompt
@@ -562,6 +576,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         self.includeUsage = includeUsage
         self.ignoredFields = ignoredFields
         self.logprobsRequest = logprobsRequest
+        self.logitBias = logitBias
     }
 
     public static func decodeStrict(
@@ -639,7 +654,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         let user = try optionalUser(root["user"])
         let metadata = try optionalMetadata(root["metadata"])
         let logprobsRequest = try decodeCompletionLogprobs(root["logprobs"])
-        let logitBiasPresent = try validateNeutralLogitBias(root["logit_bias"])
+        let (logitBiasPresent, logitBias) = try decodeLogitBias(root["logit_bias"])
         let echoPresent = try validateNeutralEcho(root["echo"])
         try rejectIfPresentSuffix(root["suffix"])
         let bestOf = try optionalInt(root["best_of"], param: "best_of")
@@ -652,7 +667,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
         var ignoredFields: [String] = []
         if user != nil { ignoredFields.append("user") }
         if metadata != nil { ignoredFields.append("metadata") }
-        if logitBiasPresent { ignoredFields.append("logit_bias") }
+        if logitBiasPresent && logitBias.isEmpty { ignoredFields.append("logit_bias") }
         if echoPresent { ignoredFields.append("echo") }
         ignoredFields.append(contentsOf: unknownTopLevelKeys)
         ignoredFields.sort()
@@ -674,7 +689,8 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             ignoreEOS: ignoreEOS,
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
-            logprobsRequest: logprobsRequest)
+            logprobsRequest: logprobsRequest,
+            logitBias: logitBias)
     }
 
     /// Converts to the shared `OpenAIChatCompletionRequest` shape every serving backend consumes.
@@ -706,6 +722,7 @@ public struct OpenAICompletionRequest: Sendable, Equatable {
             includeUsage: includeUsage,
             ignoredFields: ignoredFields,
             logprobsRequest: logprobsRequest,
+            logitBias: logitBias,
             promptInput: .rawText(prompt))
     }
 
@@ -2296,20 +2313,58 @@ private func extractOrderedJSONSchemaSchema(
     return schema
 }
 
-/// `logit_bias` is only accepted empty/absent — a non-empty bias map would change sampling in a
-/// way this server does not implement, and returning ordinary output while claiming to have
-/// applied a bias would be a silent behavior mismatch. Returns whether the field was present
-/// (non-null).
-private func validateNeutralLogitBias(_ raw: Any?) throws -> Bool {
-    guard let raw, !(raw is NSNull) else { return false }
+/// OpenAI `logit_bias`: an object mapping token-id STRINGS to an additive bias. Decoded strictly --
+/// every violation is a 400 with `param: "logit_bias"`:
+///   - the value must be an object (absent / `null` are neutral and return an empty map);
+///   - at most `maximumLogitBiasEntries` (300) entries;
+///   - every key is a canonical base-10 non-negative integer: ASCII digits only, no sign, no
+///     whitespace, no exponent/hex/fraction, no leading zeros (so `"50"` and `"050"` cannot both
+///     name token 50), and it must fit an `Int`;
+///   - every value is a finite JSON number (not a boolean, string, null, array or object) in
+///     [-100, 100].
+/// Returns whether the field was present (non-null) and the parsed map. The map is HONORED when
+/// non-empty; `{}` is accepted, empty, and recorded by the caller as an ignored neutral field
+/// exactly as before this feature existed. Whether a token id is below the loaded model's
+/// vocabulary can only be known by the backend, so that bound is enforced there (also a 400).
+private func decodeLogitBias(_ raw: Any?) throws -> (present: Bool, bias: [Int: Float]) {
+    guard let raw, !(raw is NSNull) else { return (false, [:]) }
     guard let object = raw as? [String: Any] else {
         throw OpenAIServingError.invalidRequest("logit_bias must be an object", param: "logit_bias")
     }
-    guard object.isEmpty else {
+    guard object.count <= maximumLogitBiasEntries else {
         throw OpenAIServingError.invalidRequest(
-            "Unsupported value for logit_bias: only an empty object is supported", param: "logit_bias")
+            "logit_bias must contain at most \(maximumLogitBiasEntries) entries", param: "logit_bias")
     }
-    return true
+    var bias: [Int: Float] = [:]
+    bias.reserveCapacity(object.count)
+    for (key, value) in object {
+        guard let tokenID = canonicalTokenID(key) else {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias keys must be non-negative base-10 integer token ids", param: "logit_bias")
+        }
+        guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias values must be numbers", param: "logit_bias")
+        }
+        let double = number.doubleValue
+        guard double.isFinite, (-100.0...100.0).contains(double) else {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias values must be finite numbers between -100 and 100", param: "logit_bias")
+        }
+        bias[tokenID] = Float(double)
+    }
+    return (true, bias)
+}
+
+/// Upper bound on `logit_bias` entries (OpenAI's documented limit).
+private let maximumLogitBiasEntries = 300
+
+/// A canonical base-10 non-negative integer string (`"0"`, `"50"`), or `nil`.
+private func canonicalTokenID(_ key: String) -> Int? {
+    let bytes = Array(key.utf8)
+    guard !bytes.isEmpty, bytes.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
+    guard bytes.count == 1 || bytes[0] != 0x30 else { return nil }
+    return Int(key)
 }
 
 /// Decodes `stream_options` and resolves whether a terminal usage-only SSE chunk should be

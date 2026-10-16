@@ -391,6 +391,37 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        // `logit_bias` is a real, honored feature, but only a backend that can apply it to the
+        // logits (the plain scalar route) declares `supportsLogitBias`. Every other route is refused
+        // here with a 400 BEFORE `backend.start(_:)` -- same single dispatch point as the
+        // `response_format` gate above -- so a non-empty bias is never silently ignored and no
+        // generation is started for it. The neutral empty map always passes.
+        do {
+            try validateLogitBiasCapability(
+                request: request, backendSupportsLogitBias: backend.supportsLogitBias)
+        } catch let error as OpenAIServingError {
+            writeError(
+                error,
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
+            return
+        } catch {
+            // `validateLogitBiasCapability` only ever throws `OpenAIServingError`; this catch-all
+            // exists solely so the `do` block's error type does not widen to `any Error`.
+            writeError(
+                .invalidRequest(
+                    "logit_bias is not supported by the loaded model's decoding route",
+                    param: "logit_bias"),
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
         // Serving evidence recording has no way to serialize per-token logprobs into
         // `ServingEvidence.Request`/`Response` today — fail closed with a normal OpenAI-style 400
         // BEFORE any evidence request construction, exactly like the `isLegacyCompletions` guard

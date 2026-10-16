@@ -187,6 +187,12 @@ public struct ScalarServingBackendConfiguration: Sendable {
     /// `json_object` just because the route flag alone said "non-speculative". Defaults `false`
     /// (fail closed), matching `isNonSpeculativeScalarRoute`'s own default reasoning.
     public var decoderSupportsResponseFormatConstraint: Bool
+    /// The model's logits width (`vocab_size` from `config.json`), used to bound `logit_bias` token
+    /// ids at admission: an id at or beyond it is a 400 BEFORE generation, never an out-of-bounds
+    /// MLX index. `nil` (the default, FAIL CLOSED) means the width is unknown, which makes
+    /// `ScalarServingBackend.supportsLogitBias` `false` so a non-empty bias is refused rather than
+    /// applied unchecked. Set by `loadScalarServingModel` on the non-speculative route only.
+    public var logitBiasVocabularySize: Int?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -385,6 +391,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             && configuration.decoderSupportsResponseFormatConstraint
     }
 
+    /// `true` only when ALL THREE hold: this backend is the plain, non-speculative scalar route
+    /// (`isNonSpeculativeScalarRoute`), the CONCRETE bound decoder reports it can run an injected
+    /// logit processor (`decoderSupportsResponseFormatConstraint` -- the bias rides the same
+    /// per-request processor slot as the response-format mask), AND the model's vocabulary size is
+    /// known (`logitBiasVocabularySize`), so every bias id can be bounded before generation.
+    /// Compiled-only, MTP/speculative and continuous routes never satisfy this, so a non-empty
+    /// `logit_bias` is refused with a 400 there (see `ServingGenerationBackend.supportsLogitBias`).
+    public nonisolated var supportsLogitBias: Bool {
+        configuration.isNonSpeculativeScalarRoute
+            && configuration.decoderSupportsResponseFormatConstraint
+            && configuration.logitBiasVocabularySize != nil
+    }
+
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
@@ -424,6 +443,26 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 "This server does not support ignore_eos on the loaded decoding route",
                 param: "ignore_eos",
                 code: "ignore_eos_unsupported")
+        }
+        // `logit_bias`: applied here, on the plain scalar route only, by composing a
+        // `LogitBiasLogitProcessor` into the per-request processor slot below. Refused with a 400
+        // (`param: "logit_bias"`) BEFORE any prompt render, queueing or decoder work when this
+        // backend cannot apply it honestly (speculative/compiled-only route, decoder without the
+        // processor seam, unknown vocabulary) or when a token id lies outside the model's
+        // vocabulary (which would otherwise be an out-of-bounds MLX index). The HTTP layer gates on
+        // `supportsLogitBias` first; this is the same rule enforced at the backend itself.
+        if !request.logitBias.isEmpty {
+            guard supportsLogitBias, let vocabularySize = configuration.logitBiasVocabularySize else {
+                throw OpenAIServingError.invalidRequest(
+                    "logit_bias is not supported by the loaded model's decoding route",
+                    param: "logit_bias")
+            }
+            if let maximumID = request.logitBias.keys.max(), maximumID >= vocabularySize {
+                throw OpenAIServingError.invalidRequest(
+                    "logit_bias token ids must be smaller than the model's vocabulary size "
+                        + "(\(vocabularySize))",
+                    param: "logit_bias")
+            }
         }
         // Real per-token logprobs require the bound decoder to conform to `SpikeCore.
         // LogprobDecoding` (today: a plain `MLXDecoder` — see `MLXScalarServing.swift`'s
@@ -513,6 +552,14 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 constraint: schemaConstraint,
                 activeFromStart: !separatesReasoning,
                 thinkEndTokenID: support.thinkEndTokenID)
+        }
+        // Bias FIRST, response-format mask LAST: the composite occupies the decoder's single
+        // constraint slot, which runs after the penalty processor, so the order is penalties ->
+        // bias -> mask and a +100 bias can never resurrect a masked token. A request without a
+        // bias keeps the mask (or nothing) in the slot, byte-for-byte as before.
+        if !request.logitBias.isEmpty {
+            responseFormatConstraint = LogitBiasLogitProcessor(
+                bias: request.logitBias, then: responseFormatConstraint)
         }
         var promptTokens: [Int]?
         var completionBudgetResolution: ServingCompletionBudgetResolution?

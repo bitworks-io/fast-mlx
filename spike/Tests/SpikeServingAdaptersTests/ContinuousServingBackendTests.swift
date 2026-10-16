@@ -98,6 +98,55 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    /// `logit_bias`: the compiled continuous path has no logit processor, so a non-empty map must be
+    /// REFUSED with a 400 (`param: "logit_bias"`) before any admission or decode -- a silent no-op
+    /// would return an unbiased answer to a caller who asked for a bias. The neutral `[:]` map (what
+    /// `logit_bias: {}` decodes to) is unaffected, and the backend never claims the capability.
+    func testContinuousBatchRouteRefusesNonEmptyLogitBiasWithoutAdmittingAnything()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+        XCTAssertFalse(backend.supportsLogitBias, "the continuous route must not claim logit_bias")
+
+        var biased = request(text: "solo", maxTokens: 2)
+        biased.logitBias = [1: -100]
+        do {
+            _ = try await backend.start(biased)
+            XCTFail("continuous route must refuse a logit_bias request instead of ignoring it")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequest(_, let param) = error else {
+                XCTFail("expected invalidRequest, got \(error)")
+                await backend.shutdown()
+                return
+            }
+            XCTAssertEqual(param, "logit_bias")
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [], "a refused request must never be admitted")
+        XCTAssertEqual(recorder.decodeActions, [], "a refused request must never reach a decode step")
+
+        // Control: the neutral empty map is still a normal, admissible request.
+        var neutral = request(text: "solo", maxTokens: 2)
+        neutral.logitBias = [:]
+        let handle = try await backend.start(neutral)
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
     /// The continuous-batch route only knows how to render a CHAT-templated prompt — a legacy
     /// `/v1/completions` request (`.rawText`) must be rejected with `completions_unsupported`
     /// BEFORE anything is rendered or decoded, never silently mistreated as an already-templated

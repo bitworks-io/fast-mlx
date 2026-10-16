@@ -1444,6 +1444,13 @@ public func loadScalarServingModel(
         // independent tokenizer.json check of its own (identical prerequisites, shared trie build).
         backendConfiguration.jsonSchemaConstraintSupport = loadScalarServingJSONSchemaConstraintSupport(
             sharing: backendConfiguration.jsonObjectConstraintSupport)
+        // `logit_bias` (OpenAI): applied on this plain scalar route via the same per-request
+        // processor slot. The model's own `vocab_size` bounds every bias token id at admission; an
+        // unreadable config leaves it `nil`, which keeps `ScalarServingBackend.supportsLogitBias`
+        // `false` (a non-empty bias is then refused, never applied unchecked). The speculative arm
+        // below leaves it `nil` for the same fail-closed reason.
+        backendConfiguration.logitBiasVocabularySize = scalarServingModelVocabSize(
+            modelDirectory: configuration.modelDirectory)
     } else {
         print("fastmlx-serve response_format=json_object support=disabled reason=speculative_route")
         print("fastmlx-serve response_format=json_schema support=disabled reason=speculative_route")

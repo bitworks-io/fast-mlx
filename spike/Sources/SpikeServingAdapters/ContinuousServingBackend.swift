@@ -205,6 +205,16 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         // `RepetitionContext` is a MULTIPLICATIVE penalty (`x < 0 ? x * penalty : x / penalty`),
         // so its neutral element is `1`, not `0`. Both HF-recommended presets for the deployed
         // model send `repetition_penalty: 1.0`, which must stay admissible here.
+        // `logit_bias` is a logit processor too, and the compiled continuous path has none: refuse a
+        // non-empty map (400, `param: "logit_bias"`) rather than answer unbiased. The backend leaves
+        // `supportsLogitBias` at its `false` protocol default, so the HTTP gate refuses first; this is
+        // the defense in depth for a caller that reaches `start` directly.
+        guard request.logitBias.isEmpty else {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias is not supported on the continuous-batch route "
+                    + "(no logit processor on the compiled path)",
+                param: "logit_bias")
+        }
         if (request.presencePenalty ?? 0) != 0 || (request.frequencyPenalty ?? 0) != 0
             || !DecoderPenalties.repetitionPenaltyIsNeutral(request.repetitionPenalty)
         {

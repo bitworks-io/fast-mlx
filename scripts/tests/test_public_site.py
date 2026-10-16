@@ -395,28 +395,28 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-17",
-                "title": "Publish v0.1.17: a pack file rewritten in place after its pull receipt is hashed and refused, the end-of-stream tool-call tail reaches the tool-call parser, and Llama-3.2-3B 4-bit carries a NO_GO quality card",
-                "publishedAt": "2026-10-16T04:51:33Z",
+                "id": "tagged-distribution-v0-1-18",
+                "title": "Publish v0.1.18: an out-of-range number in a tool argument no longer crashes the server, and an unsatisfiable tool_choice is a 400",
+                "publishedAt": "2026-10-16T23:29:38Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.17 arm64 macOS distribution: serve, recommend "
-                    "and fastmlx-serve now sha256-compare a listed pack file over 64 "
-                    "MiB against the fastmlx pull receipt whenever its ctime is at or "
-                    "after the receipt's, so a same-size rewrite of a weight shard "
-                    "after the pull is refused with quality_card_receipt_mismatch "
-                    "instead of admitted under the old receipt's quality card, while a "
-                    "content-preserving ctime change costs one hash at start and never "
-                    "changes the verdict; the stop filter's held tail flushed at end of "
-                    "stream now passes through the reasoning gate and the tool-call "
-                    "parser in stream order on both serving routes, so a closing "
-                    "tool-call tag no longer leaks into content; and the bundled "
-                    "quality-card store adds llama-3p2-3b-4bit@m3ultra (NO_GO, opt-in), "
-                    "so a Llama-3.2-3B-Instruct 4-bit pack that used to start as "
-                    "unmeasured now needs --accept-quality. Greedy output is identical "
-                    "to the development build on the release check prompts. The engine "
-                    "still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.18 arm64 macOS distribution: a schema-number "
+                    "tool argument outside the 64-bit integer range (for example 1e20) "
+                    "on the XML-style, pythonic and MiniMax-M2 tool-call formats no "
+                    "longer traps fastmlx-serve; it arrives as the JSON number 1e+20, "
+                    "inf and nan arrive as strings with the call's other arguments "
+                    "kept, and a hex lexeme such as 0x10 now arrives as the string "
+                    "\"0x10\" instead of the number 16; and tool_choice \"required\" or "
+                    "a named function with no tools (absent, null or []), or a named "
+                    "function not declared in tools, is now an OpenAI-style 400 on "
+                    "tool_choice before generation starts, streaming or not, instead "
+                    "of a plain-text answer, while \"auto\" and \"none\" without tools "
+                    "are still accepted and \"required\" with valid tools is still not "
+                    "enforced during generation. The bundled quality-card store is "
+                    "unchanged from v0.1.17. Greedy output is identical to the "
+                    "development build on the release check prompts. The engine still "
+                    "links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -424,7 +424,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "61a151b41ec081562c41e4eb9e59fb88dd9a0cfa",
+                "publicCommit": "72eb89473c2d266ba95f6b3e0831801b8b64b7a8",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -441,6 +441,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "72eb89473c2d266ba95f6b3e0831801b8b64b7a8",
                 "61a151b41ec081562c41e4eb9e59fb88dd9a0cfa",
                 "0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
                 "97700a31c54500b01e59f6d771f264763ac0cd8d",

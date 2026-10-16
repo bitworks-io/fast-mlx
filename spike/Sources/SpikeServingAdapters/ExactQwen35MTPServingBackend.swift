@@ -259,11 +259,25 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             "modelCapabilities must describe the launched model")
     }
 
+    /// `logit_bias` is a logit processor, so a request carrying a non-empty map is INELIGIBLE for
+    /// speculation (`ExactQwen35MTPServingAdmissionPolicy` -> `.logitProcessor`, exactly like a
+    /// penalty) and is served by the scalar fallback. This wrapper therefore supports it if and only
+    /// if that fallback does; with a fallback that cannot apply it the HTTP gate refuses first and no
+    /// route is started. The MTP runner never sees a bias.
+    public nonisolated var supportsLogitBias: Bool { scalarFallback.supportsLogitBias }
+
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
         guard acceptingRequests else {
             throw ExactQwen35MTPServingBackendError.shuttingDown
+        }
+        // Defense in depth behind the HTTP capability gate: never forward a bias to a fallback that
+        // cannot apply it (and never start the MTP route for one).
+        guard request.logitBias.isEmpty || scalarFallback.supportsLogitBias else {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias is not supported by the loaded model's decoding route",
+                param: "logit_bias")
         }
         // This backend only knows how to speculate over a CHAT-templated prompt; fail closed rather
         // than falling back to the scalar route, which would silently serve a raw-text completion off
@@ -314,7 +328,8 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
             sampling: sampling,
             penalties: penalties,
             hasActiveTools: !request.activeTools.isEmpty,
-            speculativeRequestCount: activeReservationCount)
+            speculativeRequestCount: activeReservationCount,
+            hasLogitBias: !request.logitBias.isEmpty)
 
         guard case .eligible(let descriptor) = decision else {
             return try await scalarFallback.start(request)

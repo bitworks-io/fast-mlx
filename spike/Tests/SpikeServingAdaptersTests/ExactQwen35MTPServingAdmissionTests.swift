@@ -142,6 +142,15 @@ final class ExactQwen35MTPServingAdmissionTests: XCTestCase {
         }
     }
 
+    /// A non-empty `logit_bias` is a logit processor: it must make the request INELIGIBLE for
+    /// speculation (same stable reason as a penalty), and the absence of one changes nothing.
+    func testLogitBiasFallsBackFromLogitProcessorPath() {
+        XCTAssertEqual(decide(hasLogitBias: true), .scalarFallback(.logitProcessor))
+        guard case .eligible = decide(hasLogitBias: false) else {
+            return XCTFail("a request without logit_bias must stay eligible")
+        }
+    }
+
     /// `repetitionPenalty == 1` is the HF-style MULTIPLICATIVE no-op (both HF-recommended presets
     /// for the deployed model send exactly this value on every request). Fixing
     /// `DecoderPenalties.isEmpty`'s neutral element moves such a request from `.scalarFallback`
@@ -191,7 +200,8 @@ private func decide(
     sampling: ServingSamplingPolicy = .greedy,
     penalties: DecoderPenalties = .none,
     hasActiveTools: Bool = false,
-    speculativeRequestCount: Int = 0
+    speculativeRequestCount: Int = 0,
+    hasLogitBias: Bool = false
 ) -> ExactQwen35MTPServingAdmissionDecision {
     ExactQwen35MTPServingAdmissionPolicy.decide(
         selection: selection,
@@ -200,7 +210,8 @@ private func decide(
         sampling: sampling,
         penalties: penalties,
         hasActiveTools: hasActiveTools,
-        speculativeRequestCount: speculativeRequestCount)
+        speculativeRequestCount: speculativeRequestCount,
+        hasLogitBias: hasLogitBias)
 }
 
 private func binding(
