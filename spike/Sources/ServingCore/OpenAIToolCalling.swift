@@ -219,6 +219,11 @@ public extension OpenAIChatCompletionRequest {
     /// - `.none` → no tools (the model cannot call anything);
     /// - `.function(name)` → only that named function (reliably restricting the callable set);
     /// - `.auto` / `.required` → all declared tools.
+    ///
+    /// Known limitation: `"required"` and a named function are validated at decode time (they need a
+    /// non-empty `tools`, and a named function must be declared) but are NOT enforced during
+    /// generation — there is no constrained decoding, so a model that answers in plain text still
+    /// returns 200 with `finish_reason` `"stop"`.
     var activeTools: [OpenAIToolSpec] {
         switch toolChoice {
         case .none:
@@ -341,14 +346,25 @@ enum OpenAIToolDecoding {
         return result
     }
 
-    /// Decode `tool_choice`. Default (absent or JSON `null`) is `.auto` when tools are present, otherwise `.none`.
-    static func decodeToolChoice(_ raw: Any?, hasTools: Bool) throws -> OpenAIToolChoice {
+    /// Decode `tool_choice` against the declared `tools`. Default (absent or JSON `null`) is `.auto`
+    /// when tools are present, otherwise `.none`. Fails closed on a choice the request cannot satisfy:
+    /// `"required"` or a named function with no tools, and a named function not declared in `tools`
+    /// (exact, case-sensitive match; the client's name is not echoed). `"none"` and `"auto"` stay
+    /// accepted without tools.
+    static func decodeToolChoice(_ raw: Any?, tools: [OpenAIToolSpec]) throws -> OpenAIToolChoice {
+        let hasTools = !tools.isEmpty
         guard let raw, !(raw is NSNull) else { return hasTools ? .auto : .none }
         if let string = raw as? String {
             switch string {
             case "none": return .none
             case "auto": return .auto
-            case "required": return .required
+            case "required":
+                guard hasTools else {
+                    throw OpenAIServingError.invalidRequest(
+                        "tool_choice \"required\" requires a non-empty tools array",
+                        param: "tool_choice")
+                }
+                return .required
             default:
                 throw OpenAIServingError.invalidRequest(
                     "tool_choice must be none, auto, required, or a function object",
@@ -363,6 +379,14 @@ enum OpenAIToolDecoding {
                 throw OpenAIServingError.invalidRequest(
                     "tool_choice function must be {\"type\":\"function\",\"function\":{\"name\":…}}",
                     param: "tool_choice")
+            }
+            guard hasTools else {
+                throw OpenAIServingError.invalidRequest(
+                    "tool_choice function requires a non-empty tools array", param: "tool_choice")
+            }
+            guard tools.contains(where: { $0.name == name }) else {
+                throw OpenAIServingError.invalidRequest(
+                    "tool_choice function name is not declared in tools", param: "tool_choice")
             }
             return .function(name)
         }
