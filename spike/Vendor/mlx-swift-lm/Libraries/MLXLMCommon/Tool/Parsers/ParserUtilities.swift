@@ -134,6 +134,14 @@ func extractTypesFromSchema(_ schema: [String: any Sendable]?) -> [String] {
 
 // MARK: - Type Conversion
 
+/// True when the trimmed lexeme, after an optional leading sign, starts with `0x`/`0X`.
+/// Swift's `Double(String)` accepts hex floats; Python's `float()` does not.
+private func isHexNumberLexeme(_ value: String) -> Bool {
+    var text = Substring(value.trimmingCharacters(in: .whitespacesAndNewlines))
+    if let first = text.first, first == "+" || first == "-" { text = text.dropFirst() }
+    return text.hasPrefix("0x") || text.hasPrefix("0X")
+}
+
 /// Convert parameter value based on multiple possible types.
 /// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/minimax_m2.py
 func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
@@ -165,9 +173,11 @@ func convertValueWithTypes(_ value: String, types: [String]) -> any Sendable {
             }
 
         case "number", "float":
-            if let floatVal = Double(value) {
-                let intVal = Int(floatVal)
-                return floatVal != Double(intVal) ? floatVal : intVal
+            // `Int(Double)` traps on inf/nan/out-of-range, and Swift `Double("0x10")` is 16 while
+            // Python `float()` refuses hex: treat both as "not a number" (try the next type).
+            if !isHexNumberLexeme(value), let floatVal = Double(value), floatVal.isFinite {
+                if let intVal = Int(exactly: floatVal) { return intVal }
+                return floatVal
             }
 
         case "boolean", "bool":
@@ -219,9 +229,11 @@ func convertParameterValue(
 
     // Float types
     if type.hasPrefix("num") || type.hasPrefix("float") {
-        if let floatVal = Double(value) {
-            let intVal = Int(floatVal)
-            return floatVal != Double(intVal) ? floatVal : intVal
+        // `Int(Double)` traps on inf/nan/out-of-range, and Swift `Double("0x10")` is 16 while
+        // Python `float()` refuses hex: both stay the raw string.
+        if !isHexNumberLexeme(value), let floatVal = Double(value), floatVal.isFinite {
+            if let intVal = Int(exactly: floatVal) { return intVal }
+            return floatVal
         }
         return value
     }

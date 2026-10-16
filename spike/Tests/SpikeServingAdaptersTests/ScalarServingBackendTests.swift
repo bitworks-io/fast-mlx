@@ -41,6 +41,49 @@ final class ScalarServingBackendTests: XCTestCase {
         XCTAssertEqual(finish, .toolCalls)
     }
 
+    // Cycle 254 (B1): a schema-`number` argument the model emits outside `Int`'s range must not trap
+    // the server process (`Int(Double)` traps), and the call still reaches the client with the
+    // value as a JSON double alongside its sibling argument.
+    func testScalarRouteOutOfIntRangeNumberArgumentDoesNotTrapAndIsReturned() async throws {
+        let properties: ServingJSONValue = .object([
+            "amount": .object(["type": .string("number")]),
+            "note": .object(["type": .string("string")]),
+        ])
+        let parameters: ServingJSONValue = .object([
+            "type": .string("object"), "properties": properties,
+        ])
+        let payTool = OpenAIToolSpec(
+            name: "pay", description: "Pay an amount", parameters: parameters,
+            raw: .object([
+                "type": .string("function"),
+                "function": .object([
+                    "name": .string("pay"),
+                    "description": .string("Pay an amount"),
+                    "parameters": parameters,
+                ]),
+            ]))
+        let backend = makeBackend(
+            script: [1, 2, 3, 4, 99],
+            pieces: [
+                1: "<tool_call><function=pay>",
+                2: "<parameter=amount>1e20</parameter><parameter=note>x</parameter>",
+                3: "</function></tool_call>",
+            ],
+            promptTokens: [10],
+            toolCallFormat: .xmlFunction)
+        let handle = try await backend.start(request(maxTokens: 4, tools: [payTool]))
+
+        let events = try await collect(handle.mailbox)
+
+        let toolCalls = events.compactMap { event -> [OpenAIToolCall]? in
+            if case .toolCalls(let calls) = event { return calls }
+            return nil
+        }.first
+        let call = try XCTUnwrap(toolCalls?.first, "xmlFunction tool call must be parsed: \(events)")
+        XCTAssertEqual(call.function.name, "pay")
+        XCTAssertEqual(call.function.arguments, #"{"amount":1e+20,"note":"x"}"#)
+    }
+
     // Negative control: the SAME xmlFunction stream under the default `.json` format must NOT
     // parse as a tool call — proving the format field is actually consumed, not incidental.
     func testScalarRouteJSONFormatDoesNotParseXMLFunctionStream() async throws {
