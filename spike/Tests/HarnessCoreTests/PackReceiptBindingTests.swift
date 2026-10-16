@@ -124,6 +124,93 @@ final class PackReceiptBindingTests: XCTestCase {
         try handle.write(contentsOf: Data([byte]))
     }
 
+    // MARK: ctime ordering helpers (the ctime gate)
+
+    private func changeTime(_ url: URL) -> PackReceiptBinding.ChangeTime? {
+        PackReceiptBinding.statChangeTime(url.path)
+    }
+
+    /// Bumps ctime without changing bytes or mode (`chmod` to the current mode).
+    private func bumpChangeTime(_ url: URL) throws {
+        var info = stat()
+        XCTAssertEqual(stat(url.path, &info), 0)
+        XCTAssertEqual(chmod(url.path, info.st_mode & 0o7777), 0)
+    }
+
+    private func regularFiles(under directory: URL) -> [URL] {
+        let enumerator = FileManager.default.enumerator(
+            at: directory, includingPropertiesForKeys: [.isRegularFileKey])
+        return (enumerator?.allObjects as? [URL] ?? []).filter {
+            (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }
+    }
+
+    /// Makes the receipt's ctime STRICTLY greater than every file in the pack (bounded retries).
+    private func orderReceiptAfterPack(_ pack: Pack) throws {
+        let files = regularFiles(under: pack.directory)
+        for _ in 0..<500 {
+            if let receiptTime = changeTime(pack.receiptURL),
+                files.allSatisfy({ (changeTime($0).map { $0 < receiptTime }) ?? false })
+            {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+            try bumpChangeTime(pack.receiptURL)
+        }
+        XCTFail("could not order the receipt ctime after the pack files")
+    }
+
+    /// Brings `url`'s ctime to at or after the receipt's (bounded retries).
+    private func orderNotBeforeReceipt(_ url: URL, _ pack: Pack) throws {
+        for _ in 0..<500 {
+            if let receiptTime = changeTime(pack.receiptURL), let time = changeTime(url),
+                time >= receiptTime
+            {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+            try bumpChangeTime(url)
+        }
+        XCTFail("could not order the file ctime at or after the receipt")
+    }
+
+    /// Rewrites the receipt with `data` and orders it strictly after every pack file.
+    private func rewriteReceipt(_ pack: Pack, with data: Data) throws {
+        try data.write(to: pack.receiptURL)
+        try orderReceiptAfterPack(pack)
+    }
+
+    /// Rewrites `model.safetensors` in place at the same size (first byte flipped) AFTER the receipt.
+    private func flipWeightsAfterReceipt(_ pack: Pack) throws -> URL {
+        try orderReceiptAfterPack(pack)
+        let url = pack.directory.appendingPathComponent("model.safetensors")
+        var bytes = try Data(contentsOf: url)
+        bytes[0] ^= 0x01
+        let handle = try FileHandle(forWritingTo: url)  // in place, no truncate
+        try handle.write(contentsOf: bytes)
+        try handle.close()
+        try orderNotBeforeReceipt(url, pack)
+        return url
+    }
+
+    /// Wrong recorded sha256 for `model.safetensors`, receipt written after the pack.
+    private func recordWrongWeightsSha(_ pack: Pack) throws -> [String: Any] {
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: pack.receiptURL)) as? [String: Any])
+        var files = try XCTUnwrap(object["files"] as? [String: [String: Any]])
+        files["model.safetensors"]?["sha256"] = String(repeating: "a", count: 64)
+        object["files"] = files
+        try rewriteReceipt(pack, with: JSONSerialization.data(withJSONObject: object))
+        return object
+    }
+
+    private func gatedJudge(_ pack: Pack, threshold: Int64) -> PackAdmission.Judgement {
+        PackAdmission.judge(
+            alias: "my-model", aliasRevision: nil, directory: pack.directory,
+            hostHardwareClass: nil, cards: cards, optIn: QualityOptIn(),
+            receiptHashMaxBytes: threshold)
+    }
+
     private func assertReceiptRefusal(
         _ judgement: PackAdmission.Judgement, pack: Pack, contains fragments: [String],
         file: StaticString = #filePath, line: UInt = #line
@@ -284,9 +371,13 @@ final class PackReceiptBindingTests: XCTestCase {
     func testT10SameSizeFlipInAFileLargerThanTheThresholdIsNotDetectedButAnAppendIs() throws {
         let pack = try makePack()
         let url = pack.directory.appendingPathComponent("model.safetensors")  // 31 bytes
+        // The receipt is (re)written AFTER the flip, so the file is older than it: the accepted
+        // limit for a large file untouched since the receipt (an edit made before it).
+        let receiptData = try Data(contentsOf: pack.receiptURL)
         var bytes = try Data(contentsOf: url)
         bytes[0] ^= 0x01
         try bytes.write(to: url)
+        try rewriteReceipt(pack, with: receiptData)
         func judged(threshold: Int64) -> PackAdmission.Judgement {
             PackAdmission.judge(
                 alias: "my-model", aliasRevision: nil, directory: pack.directory,
@@ -303,6 +394,117 @@ final class PackReceiptBindingTests: XCTestCase {
         try append(0x21, to: url)
         assertReceiptRefusal(
             judged(threshold: 30), pack: pack, contains: ["'model.safetensors' size differs"])
+    }
+
+    // MARK: the ctime gate -- a large file changed since the receipt is hashed
+
+    func testCtimeT1LargeFileEditedSameSizeAfterTheReceiptIsAShaMismatch() throws {
+        let pack = try makePack()
+        _ = try flipWeightsAfterReceipt(pack)
+        let receipt = try XCTUnwrap(PackReceipt.load(for: pack.directory))
+        guard case .mismatch(let difference) = PackReceiptBinding.verify(
+            directory: pack.directory, receipt: receipt.object, hashMaxBytes: 30)
+        else { return XCTFail("expected a mismatch") }
+        XCTAssertEqual(difference.kind, .sha256)
+        XCTAssertEqual(difference.path, "model.safetensors")
+    }
+
+    func testCtimeT2JudgeRefusesTheEditedLargeFileForAMatchingCard() throws {
+        let pack = try makePack()
+        _ = try flipWeightsAfterReceipt(pack)
+        assertReceiptRefusal(
+            gatedJudge(pack, threshold: 30), pack: pack,
+            contains: ["'model.safetensors' sha256 differs"])
+    }
+
+    func testCtimeT4UntouchedLargeFileOlderThanTheReceiptIsNeverOpened() throws {
+        let pack = try makePack()
+        let object = try recordWrongWeightsSha(pack)
+        // A wrong recorded sha256 is only visible if the file is hashed: ok means it was not.
+        XCTAssertEqual(
+            PackReceiptBinding.verify(directory: pack.directory, receipt: object, hashMaxBytes: 30),
+            .ok)
+        // Control: at the file's own size it is hashed, and the wrong sha shows.
+        guard case .mismatch(let difference) = PackReceiptBinding.verify(
+            directory: pack.directory, receipt: object, hashMaxBytes: 31)
+        else { return XCTFail("expected a mismatch at threshold 31") }
+        XCTAssertEqual(difference.kind, .sha256)
+    }
+
+    func testCtimeT5EqualChangeTimeIsHashedAndOnlyAnOlderFileIsNot() throws {
+        let pack = try makePack()
+        let object = try recordWrongWeightsSha(pack)
+        let receiptPath = PackReceipt.receiptPath(for: pack.directory)
+        func verify(file: PackReceiptBinding.ChangeTime) -> PackReceiptBinding.Outcome {
+            PackReceiptBinding.verify(
+                directory: pack.directory, receipt: object, hashMaxBytes: 30,
+                changeTime: { path in
+                    path == receiptPath ? .init(seconds: 1000, nanoseconds: 500) : file
+                })
+        }
+        for (label, file, hashed) in [
+            ("equal", PackReceiptBinding.ChangeTime(seconds: 1000, nanoseconds: 500), true),
+            ("one ns newer", .init(seconds: 1000, nanoseconds: 501), true),
+            ("one ns older", .init(seconds: 1000, nanoseconds: 499), false),
+            ("newer second, older ns", .init(seconds: 1001, nanoseconds: 0), true),
+            ("older second, newer ns", .init(seconds: 999, nanoseconds: 999_999_999), false),
+        ] {
+            let outcome = verify(file: file)
+            if hashed {
+                guard case .mismatch(let difference) = outcome else {
+                    XCTFail("\(label): expected a sha256 mismatch, got \(outcome)")
+                    continue
+                }
+                XCTAssertEqual(difference.kind, .sha256, label)
+            } else {
+                XCTAssertEqual(outcome, .ok, label)
+            }
+        }
+    }
+
+    func testCtimeT6ReceiptThatCannotBeStattedHashesLargeFiles() throws {
+        let pack = try makePack()
+        let object = try recordWrongWeightsSha(pack)
+        try FileManager.default.removeItem(at: pack.receiptURL)
+        guard case .mismatch(let difference) = PackReceiptBinding.verify(
+            directory: pack.directory, receipt: object, hashMaxBytes: 30)
+        else { return XCTFail("expected a mismatch") }
+        XCTAssertEqual(difference.kind, .sha256)
+        XCTAssertEqual(difference.path, "model.safetensors")
+        // The injected seam agrees: a nil receipt change time hashes.
+        XCTAssertNotEqual(
+            PackReceiptBinding.verify(
+                directory: pack.directory, receipt: object, hashMaxBytes: 30,
+                changeTime: { _ in nil }),
+            .ok)
+    }
+
+    func testCtimeT7RestoredBytesAndTouchOnlyAreOkBecauseTheHashDecides() throws {
+        let pack = try makePack()
+        let url = try flipWeightsAfterReceipt(pack)
+        var bytes = try Data(contentsOf: url)
+        bytes[0] ^= 0x01  // restore the original byte
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.write(contentsOf: bytes)
+        try handle.close()
+        try orderNotBeforeReceipt(url, pack)
+        let receipt = try XCTUnwrap(PackReceipt.load(for: pack.directory))
+        XCTAssertEqual(
+            PackReceiptBinding.verify(
+                directory: pack.directory, receipt: receipt.object, hashMaxBytes: 30),
+            .ok)
+        // Touch only (chmod): ctime moves, bytes do not.
+        try bumpChangeTime(url)
+        try orderNotBeforeReceipt(url, pack)
+        XCTAssertEqual(
+            PackReceiptBinding.verify(
+                directory: pack.directory, receipt: receipt.object, hashMaxBytes: 30),
+            .ok)
+    }
+
+    func testReceiptPathIsTheSiblingFileLoadReads() throws {
+        let pack = try makePack()
+        XCTAssertEqual(PackReceipt.receiptPath(for: pack.directory), pack.receiptURL.path)
     }
 
     func testDefaultHashThresholdIs64MiB() {

@@ -1,6 +1,6 @@
 {
   "schema": "receipt-binding-conformance-v1",
-  "about": "Shared by the Swift engine (PackReceiptBinding.verify, ReceiptBindingConformanceTests) and the Python launcher (verify_receipt_binding, scripts/tests/test_receipt_binding_conformance.py). Each case builds a small tree, builds the receipt files map from it, and expects status plus, for a mismatch, the first difference's kind and path. files: relative path -> {text} or {size} (size bytes of 'x'); dirs: empty directories; symlinks: link -> relative target (the target need not exist). receiptFiles: 'fromTree' computes {size, sha256} for every entry of files, otherwise the value is the receipt's files value verbatim; omitted means the receipt has no files key. receiptExclude drops listed names; receiptOverrides replaces entry keys (null removes one; upperSha256 upper-cases the computed sha256); receiptExtra adds entries ({copyFrom} takes size and sha256 from a created file). hashMaxBytes overrides the hash threshold. reasonContains is a substring of the uncheckable reason.",
+  "about": "Shared by the Swift engine (PackReceiptBinding.verify, ReceiptBindingConformanceTests) and the Python launcher (verify_receipt_binding, scripts/tests/test_receipt_binding_conformance.py). Each case builds a small tree, builds the receipt files map from it, and expects status plus, for a mismatch, the first difference's kind and path. files: relative path -> {text} or {size} (size bytes of 'x'); dirs: empty directories; symlinks: link -> relative target (the target need not exist). receiptFiles: 'fromTree' computes {size, sha256} for every entry of files, otherwise the value is the receipt's files value verbatim; omitted means the receipt has no files key. receiptExclude drops listed names; receiptOverrides replaces entry keys (null removes one; upperSha256 upper-cases the computed sha256); receiptExtra adds entries ({copyFrom} takes size and sha256 from a created file). hashMaxBytes overrides the hash threshold. Both runners write the receipt (the receipt object as JSON) at the sibling path <packdir>.pull-receipt.json and make its ctime strictly greater than every created file's before verifying, so a file above the threshold is older than the receipt and is checked by size only. editedAfterReceipt: names of files rewritten in place, same size, one byte changed ('x' becomes 'y' for {size} files), AFTER the receipt exists and with the file ctime brought to at or after the receipt ctime (the receipt entry was computed before the edit). touchedAfterReceipt: names of files whose ctime is bumped to at or after the receipt ctime (chmod) without changing bytes. receiptMissing: true means the receipt file is NOT written to disk (verify still receives the receipt object), so every listed file is hashed. reasonContains is a substring of the uncheckable reason.",
   "cases": [
     {
       "id": "ok-matching-tree",
@@ -287,6 +287,66 @@
         "status": "ok",
         "kind": null,
         "path": null
+      }
+    },
+    {
+      "id": "large-file-edited-after-receipt-is-hashed",
+      "why": "A file larger than the hash threshold rewritten in place at the same size after the receipt was written has a ctime at or after the receipt's, so it is hashed and the recorded sha256 no longer matches.",
+      "files": {
+        "big.bin": {
+          "size": 8
+        }
+      },
+      "receiptFiles": "fromTree",
+      "hashMaxBytes": 4,
+      "editedAfterReceipt": [
+        "big.bin"
+      ],
+      "expect": {
+        "status": "mismatch",
+        "kind": "sha256",
+        "path": "big.bin"
+      }
+    },
+    {
+      "id": "large-file-restored-after-receipt-is-ok",
+      "why": "A file larger than the hash threshold whose ctime moved after the receipt without its bytes changing is hashed and matches: the hash decides, not the ctime.",
+      "files": {
+        "big.bin": {
+          "size": 8
+        }
+      },
+      "receiptFiles": "fromTree",
+      "hashMaxBytes": 4,
+      "touchedAfterReceipt": [
+        "big.bin"
+      ],
+      "expect": {
+        "status": "ok",
+        "kind": null,
+        "path": null
+      }
+    },
+    {
+      "id": "receipt-unstatable-hashes-large-files",
+      "why": "When the sibling receipt file cannot be stat'd every listed file is hashed regardless of size, so a wrong recorded sha256 on a file above the threshold is a mismatch.",
+      "files": {
+        "big.bin": {
+          "size": 8
+        }
+      },
+      "receiptFiles": "fromTree",
+      "receiptOverrides": {
+        "big.bin": {
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "hashMaxBytes": 4,
+      "receiptMissing": true,
+      "expect": {
+        "status": "mismatch",
+        "kind": "sha256",
+        "path": "big.bin"
       }
     },
     {

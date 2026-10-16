@@ -85,6 +85,86 @@ final class ReceiptBindingConformanceTests: XCTestCase {
         return receipt
     }
 
+    private func changeTime(_ url: URL) -> PackReceiptBinding.ChangeTime? {
+        PackReceiptBinding.statChangeTime(url.path)
+    }
+
+    private func bumpChangeTime(_ url: URL) throws {
+        var info = stat()
+        XCTAssertEqual(stat(url.path, &info), 0)
+        XCTAssertEqual(chmod(url.path, info.st_mode & 0o7777), 0)
+    }
+
+    /// Every regular file (symlinks resolved) under `directory`; a dangling symlink is skipped.
+    private func resolvedFiles(under directory: URL) -> [URL] {
+        var found: [URL] = []
+        let fm = FileManager.default
+        guard let names = fm.enumerator(atPath: directory.path)?.allObjects as? [String] else {
+            return []
+        }
+        for name in names {
+            let url = directory.appendingPathComponent(name)
+            var info = stat()
+            if stat(url.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG { found.append(url) }
+        }
+        return found
+    }
+
+    /// Writes the sibling receipt and makes its ctime STRICTLY greater than every created file's.
+    private func writeReceiptAndOrder(_ receipt: [String: Any], pack: URL) throws -> URL {
+        let receiptURL = URL(fileURLWithPath: PackReceipt.receiptPath(for: pack))
+        XCTAssertNotEqual(receiptURL.path, pack.path)
+        try JSONSerialization.data(withJSONObject: receipt).write(to: receiptURL)
+        let files = resolvedFiles(under: pack)
+        for _ in 0..<500 {
+            if let receiptTime = changeTime(receiptURL),
+                files.allSatisfy({ (changeTime($0).map { $0 < receiptTime }) ?? false })
+            {
+                return receiptURL
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+            try bumpChangeTime(receiptURL)
+        }
+        XCTFail("could not order the receipt ctime after the pack files")
+        return receiptURL
+    }
+
+    private func orderNotBefore(_ url: URL, receipt receiptURL: URL) throws {
+        for _ in 0..<500 {
+            if let receiptTime = changeTime(receiptURL), let time = changeTime(url),
+                time >= receiptTime
+            {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.002)
+            try bumpChangeTime(url)
+        }
+        XCTFail("could not order the file ctime at or after the receipt")
+    }
+
+    /// `editedAfterReceipt` (one byte changed in place, same size) and `touchedAfterReceipt`
+    /// (ctime bump only), both applied after the receipt exists.
+    private func applyPostReceiptEdits(_ spec: [String: Any], pack: URL, receipt receiptURL: URL) throws {
+        let files = (spec["files"] as? [String: [String: Any]]) ?? [:]
+        for name in (spec["editedAfterReceipt"] as? [String]) ?? [] {
+            let url = pack.appendingPathComponent(name)
+            var data = try Data(contentsOf: url)
+            if files[name]?["size"] != nil {
+                XCTAssertEqual(data.first, 0x78)
+                data[0] = 0x79
+            } else {
+                data[0] ^= 0x01
+            }
+            let handle = try FileHandle(forWritingTo: url)  // in place, no truncate
+            try handle.write(contentsOf: data)
+            try handle.close()
+            try orderNotBefore(url, receipt: receiptURL)
+        }
+        for name in (spec["touchedAfterReceipt"] as? [String]) ?? [] {
+            try orderNotBefore(pack.appendingPathComponent(name), receipt: receiptURL)
+        }
+    }
+
     func testFixtureIsWellFormed() throws {
         XCTAssertEqual(try table()["schema"] as? String, "receipt-binding-conformance-v1")
         let all = try cases()
@@ -97,6 +177,8 @@ final class ReceiptBindingConformanceTests: XCTestCase {
             "ok-matching-tree", "size-differs", "sha256-differs", "missing-listed-file",
             "unlisted-top-level-file", "unlisted-nested-file", "dot-components-are-ignored",
             "nested-listed-file-ok", "listed-prefix-is-a-file", "size-only-above-hash-threshold",
+            "large-file-edited-after-receipt-is-hashed", "large-file-restored-after-receipt-is-ok",
+            "receipt-unstatable-hashes-large-files",
             "hash-threshold-is-inclusive", "uncheckable-no-files-key", "uncheckable-name-absolute",
             "uncheckable-entry-is-a-string", "uncheckable-size-bool", "uncheckable-sha256-short",
         ] {
@@ -118,6 +200,10 @@ final class ReceiptBindingConformanceTests: XCTestCase {
             try FileManager.default.createDirectory(at: pack, withIntermediateDirectories: true)
             try buildTree(spec, at: pack)
             let receipt = try buildReceipt(spec, at: pack)
+            if (spec["receiptMissing"] as? Bool) != true {
+                let receiptURL = try writeReceiptAndOrder(receipt, pack: pack)
+                try applyPostReceiptEdits(spec, pack: pack, receipt: receiptURL)
+            }
             let threshold = (spec["hashMaxBytes"] as? Int).map(Int64.init) ?? PackAdmission.defaultReceiptHashMaxBytes
             let outcome = PackReceiptBinding.verify(
                 directory: pack, receipt: receipt, hashMaxBytes: threshold)

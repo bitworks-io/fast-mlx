@@ -3179,9 +3179,13 @@ def derive_pack_identity(model_path: Path) -> Optional[tuple]:
 
 
 RECEIPT_MISMATCH_REASON = "quality_card_receipt_mismatch"
-# Files at or under this size are sha256-compared against the receipt; a larger
-# file is checked by size only and is NEVER opened (an accident guard, not an
-# adversary guard: a same-size in-place edit of a large shard goes undetected).
+# Files at or under this size are always sha256-compared against the receipt. A
+# larger file is checked by size and is opened only when its ctime (symlinks
+# followed) is at or after the receipt file's ctime, i.e. it may have changed
+# since `fastmlx pull` wrote the receipt, or when the receipt cannot be
+# stat'd. Honest limit: a later ctime bump of the receipt itself (chmod,
+# rewrite) re-hides an edit made before it -- an accident guard, not an
+# adversary guard.
 RECEIPT_HASH_MAX_BYTES = 64 * 1024 * 1024
 RECEIPT_BINDING_OK = "ok"
 RECEIPT_BINDING_MISMATCH = "mismatch"
@@ -3204,6 +3208,12 @@ def _receipt_file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stat_ctime_ns(path: Path) -> int:
+    """``path``'s ctime in integer nanoseconds (symlinks followed). A seam so
+    tests can pin the equal-ctime edge, which a real filesystem cannot."""
+    return os.stat(path).st_ctime_ns
 
 
 def _receipt_listed_files(receipt: dict):
@@ -3232,19 +3242,47 @@ def _receipt_listed_files(receipt: dict):
     return listed, None
 
 
+def _receipt_needs_hash(path: Path, size: int, receipt_ctime_ns: Optional[int]) -> bool:
+    """Whether a listed file of the (already size-checked) ``size`` is sha256
+    compared: always at or under ``RECEIPT_HASH_MAX_BYTES`` (read at call
+    time); above it only without a receipt ctime or when the file's ctime is
+    at or after it. A file whose ctime cannot be read is hashed, so the read
+    reports the real error."""
+    if size <= RECEIPT_HASH_MAX_BYTES or receipt_ctime_ns is None:
+        return True
+    try:
+        return _stat_ctime_ns(path) >= receipt_ctime_ns
+    except OSError:
+        return True
+
+
 def verify_receipt_binding(model_path: Path, receipt: dict) -> ReceiptBindingResult:
     """Check ``model_path`` against the receipt's per-file ``files`` map, in two
     directions: every listed file must exist (symlinks followed) with the
     recorded size -- and, when that size is at most ``RECEIPT_HASH_MAX_BYTES``,
     the recorded sha256 -- and the directory must hold no unlisted path outside
     dot-components (the notion of unverified content ``fastmlx pull --adopt``
-    refuses on). Listed files are checked first, in sorted order, then the
-    unlisted-path walk in sorted order; the first difference is returned.
-    A receipt with no usable ``files`` map is ``uncheckable``, not a mismatch.
+    refuses on). A larger file is sha256-compared too when its ctime is at or
+    after the sibling receipt file's ctime (nanosecond resolution, symlinks
+    followed: it may have changed since the receipt was written), and EVERY
+    listed file is hashed when the receipt cannot be stat'd; an untouched
+    larger file is never opened. The limit is honest: a later ctime bump of
+    the receipt itself (chmod, rewrite) re-hides an edit made before it --
+    an accident guard, not an adversary guard. Listed files are checked
+    first, in sorted order, then the unlisted-path walk in sorted order; the
+    first difference is returned. A receipt with no usable ``files`` map is
+    ``uncheckable``, not a mismatch.
     """
     listed, why = _receipt_listed_files(receipt)
     if listed is None:
         return ReceiptBindingResult(RECEIPT_BINDING_UNCHECKABLE, why)
+    receipt_ctime_ns: Optional[int]
+    try:
+        receipt_ctime_ns = _stat_ctime_ns(
+            pull.receipt_path_for(model_path.expanduser().absolute())
+        )
+    except OSError:
+        receipt_ctime_ns = None
     for name in sorted(listed):
         sha256, size = listed[name]
         path = model_path / name
@@ -3265,7 +3303,7 @@ def verify_receipt_binding(model_path: Path, receipt: dict) -> ReceiptBindingRes
                 RECEIPT_BINDING_MISMATCH,
                 f"{label} size differs (receipt {size}, found {observed_size})",
             )
-        if size <= RECEIPT_HASH_MAX_BYTES:
+        if _receipt_needs_hash(path, size, receipt_ctime_ns):
             try:
                 observed_sha256 = _receipt_file_sha256(path)
             except OSError as error:

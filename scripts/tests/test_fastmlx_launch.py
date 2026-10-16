@@ -8883,8 +8883,21 @@ class ReceiptBindingLauncherTestCase(unittest.TestCase):
         self.assertNotIn(RECEIPT_MISMATCH_REASON, stderr)
 
     # --- A6: the hash threshold ----------------------------------------------
-    def test_a6_a_file_above_the_threshold_is_never_hashed(self):
+    def a6_receipt_after_pack_files(self, pack: Path) -> None:
+        """Bump the receipt's ctime (chmod to its own mode) until it is strictly
+        after every pack file's, so "untouched since the receipt" is real."""
+        receipt = Path(str(pack.absolute()) + ".pull-receipt.json")
+        newest = max(path.stat().st_ctime_ns for path in pack.iterdir())
+        for _ in range(500):
+            if receipt.stat().st_ctime_ns > newest:
+                return
+            time.sleep(0.002)
+            os.chmod(receipt, receipt.stat().st_mode & 0o7777)
+        self.fail("could not order the receipt's ctime after the pack files")
+
+    def test_a6_an_untouched_file_above_the_threshold_is_never_hashed(self):
         pack = self.pulled_pack()
+        self.a6_receipt_after_pack_files(pack)
         hashed: list = []
         real_hash = FASTMLX_LAUNCH._receipt_file_sha256
 
@@ -8897,12 +8910,32 @@ class ReceiptBindingLauncherTestCase(unittest.TestCase):
         with patch.object(FASTMLX_LAUNCH, "RECEIPT_HASH_MAX_BYTES", 40), patch.object(
             FASTMLX_LAUNCH, "_receipt_file_sha256", counting_hash
         ):
-            # Same size, different content on the large shard: undetected by
-            # design (size, not content, guards shards).
-            (pack / "model.safetensors").write_bytes(b"X" * len(self.WEIGHT_BYTES))
             code, stdout, stderr = self.run_main(self.argv(pack))
         self.assertEqual(code, 0, stderr)
         self.assertEqual(sorted(hashed), ["config.json", "tokenizer.json"])
+
+    def test_a6_a_same_size_edit_above_the_threshold_after_the_receipt_refuses(self):
+        pack = self.pulled_pack()
+        self.a6_receipt_after_pack_files(pack)
+        hashed: list = []
+        real_hash = FASTMLX_LAUNCH._receipt_file_sha256
+
+        def counting_hash(path):
+            hashed.append(Path(path).name)
+            return real_hash(path)
+
+        with patch.object(FASTMLX_LAUNCH, "RECEIPT_HASH_MAX_BYTES", 40), patch.object(
+            FASTMLX_LAUNCH, "_receipt_file_sha256", counting_hash
+        ):
+            # Same size, different content on the large shard, written after
+            # the receipt: its ctime is now at or after the receipt's, so it is
+            # hashed and the drift is caught.
+            (pack / "model.safetensors").write_bytes(b"X" * len(self.WEIGHT_BYTES))
+            code, stdout, stderr = self.run_main(self.argv(pack))
+        self.assertEqual(code, 2, stderr)
+        self.assertIn(RECEIPT_MISMATCH_REASON, stderr)
+        self.assertIn("model.safetensors", stderr)
+        self.assertIn("model.safetensors", hashed)
 
     def test_a6_the_threshold_constant_is_64_mib(self):
         self.assertEqual(FASTMLX_LAUNCH.RECEIPT_HASH_MAX_BYTES, 64 * 1024 * 1024)

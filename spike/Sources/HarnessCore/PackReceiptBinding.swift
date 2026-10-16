@@ -11,9 +11,15 @@ struct PackReceipt {
     let url: URL
     let object: [String: Any]
 
+    /// The sibling receipt path `<absolute dir>.pull-receipt.json` (Python `pull.receipt_path_for`).
+    /// Shared by `load` and `PackReceiptBinding.verify` so the two cannot name different files.
+    static func receiptPath(for directory: URL) -> String {
+        URL(fileURLWithPath: directory.path).path + ".pull-receipt.json"
+    }
+
     static func load(for directory: URL) -> PackReceipt? {
         let absolute = URL(fileURLWithPath: directory.path)
-        let receiptURL = URL(fileURLWithPath: absolute.path + ".pull-receipt.json")
+        let receiptURL = URL(fileURLWithPath: receiptPath(for: directory))
         guard let data = try? Data(contentsOf: receiptURL),
             let json = try? JSONSerialization.jsonObject(with: data),
             let object = json as? [String: Any]
@@ -38,8 +44,13 @@ struct PackReceipt {
 /// Every listed file must exist (symlinks followed) with the recorded size -- and, when that size is
 /// at most `hashMaxBytes`, the recorded sha256 -- and the directory must hold no unlisted path
 /// outside dot-components. Listed files are checked first, in sorted order, then the unlisted-path
-/// walk in sorted order; the first difference is returned. A larger file is checked by size only and
-/// is never opened: an accident guard, not an adversary guard.
+/// walk in sorted order; the first difference is returned.
+///
+/// A larger file is checked by size and is opened only when its change time (`st_ctimespec`, symlinks
+/// followed, compared as (seconds, nanoseconds)) is at or after the sibling receipt file's -- it may
+/// have changed since the receipt was written -- or when the receipt cannot be stat'd, in which case
+/// every listed file is hashed. The honest limit: a later ctime bump of the receipt itself (chmod,
+/// rewrite) re-hides an edit made before it. An accident guard, not an adversary guard.
 enum PackReceiptBinding {
     /// Files at or under this size are sha256-compared; the Python `RECEIPT_HASH_MAX_BYTES`.
     static let defaultHashMaxBytes: Int64 = PackAdmission.defaultReceiptHashMaxBytes
@@ -105,8 +116,30 @@ enum PackReceiptBinding {
         let sizeText: String
     }
 
+    /// A file's change time as (seconds, nanoseconds); compares lexicographically.
+    struct ChangeTime: Comparable, Equatable {
+        let seconds: Int64
+        let nanoseconds: Int64
+
+        static func < (lhs: ChangeTime, rhs: ChangeTime) -> Bool {
+            (lhs.seconds, lhs.nanoseconds) < (rhs.seconds, rhs.nanoseconds)
+        }
+    }
+
+    /// `stat(2)` (symlinks followed) change time of `path`, or `nil` when it cannot be stat'd.
+    /// The default source for `verify`'s `changeTime`; tests inject their own to pin the equal edge.
+    static func statChangeTime(_ path: String) -> ChangeTime? {
+        var info = stat()
+        guard fileStatus(Array(path.utf8), followingSymlinks: true, into: &info) == 0 else {
+            return nil
+        }
+        return ChangeTime(
+            seconds: Int64(info.st_ctimespec.tv_sec), nanoseconds: Int64(info.st_ctimespec.tv_nsec))
+    }
+
     static func verify(
-        directory: URL, receipt: [String: Any], hashMaxBytes: Int64 = defaultHashMaxBytes
+        directory: URL, receipt: [String: Any], hashMaxBytes: Int64 = defaultHashMaxBytes,
+        changeTime: (String) -> ChangeTime? = PackReceiptBinding.statChangeTime
     ) -> Outcome {
         let listed: [Name: Listed]
         switch listedFiles(receipt) {
@@ -114,6 +147,8 @@ enum PackReceiptBinding {
         case .success(let value): listed = value
         }
         let root = directory.path
+        // Stat the receipt once; an unstat-able receipt hashes every listed file.
+        let receiptChangeTime = changeTime(PackReceipt.receiptPath(for: directory))
         for key in listed.keys.sorted(by: Name.precedes) {
             guard let expected = listed[key] else { continue }
             let name = key.text
@@ -144,7 +179,18 @@ enum PackReceiptBinding {
                         detail: "\(label) size differs (receipt \(expected.sizeText), found \(observed))"
                     ))
             }
-            if expected.size <= hashMaxBytes {
+            // At or under the threshold: always hashed. Above it: hashed only when the file may have
+            // changed since the receipt (ctime at or after it), or the receipt could not be stat'd.
+            // A file whose ctime cannot be read is hashed too, so the read reports the real error.
+            var needsHash = expected.size <= hashMaxBytes
+            if !needsHash {
+                if let receiptChangeTime, let fileChangeTime = changeTime(path) {
+                    needsHash = fileChangeTime >= receiptChangeTime
+                } else {
+                    needsHash = true
+                }
+            }
+            if needsHash {
                 switch sha256Hex(ofFileAt: path) {
                 case .failure(let code): return .mismatch(unreadable(name, label, code.code))
                 case .success(let digest):

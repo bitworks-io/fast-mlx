@@ -1067,7 +1067,8 @@ public enum PackAdmission {
     /// evidence. Mirrors Python `RECEIPT_MISMATCH_REASON`.
     public static let receiptMismatchReason = "quality_card_receipt_mismatch"
     /// A pack file at or under this size is sha256-compared against its receipt; a larger one is
-    /// checked by size only and never opened (the Python `RECEIPT_HASH_MAX_BYTES`, 64 MiB).
+    /// checked by size, and hashed only when changed since the receipt was written (see
+    /// `PackReceiptBinding`; the Python `RECEIPT_HASH_MAX_BYTES`, 64 MiB).
     public static let defaultReceiptHashMaxBytes: Int64 = 64 * 1024 * 1024
 
     public enum Judgement: Sendable, Equatable {

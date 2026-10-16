@@ -7,7 +7,12 @@ checked by BOTH this module (``fastmlx_launch.verify_receipt_binding``, used by
 one rule in two languages; if they drift, the launcher refuses a pack the
 engine admits (or the reverse). The table pins the status and, for a mismatch,
 the first difference's kind and path -- including the size-only case above a
-lowered hash threshold, which pins the accepted 64 MiB limit in both languages.
+lowered hash threshold, which pins the accepted 64 MiB limit in both languages --
+and the ctime gate: a file above the threshold is also hashed when its ctime is
+at or after the sibling receipt file's (or when the receipt cannot be stat'd).
+The runner writes the receipt next to the pack and orders its ctime strictly
+after every created file before applying a case's ``editedAfterReceipt`` /
+``touchedAfterReceipt`` / ``receiptMissing`` fields.
 """
 
 import hashlib
@@ -16,7 +21,9 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +75,66 @@ def build_tree(root: Path, case: dict) -> None:
         (root / relative).mkdir(parents=True, exist_ok=True)
     for link in case.get("symlinks", []):
         os.symlink(link["target"], root / link["link"])
+
+
+def _ctime_ns(path) -> int:
+    return os.stat(path).st_ctime_ns
+
+
+def _bump_ctime(path) -> None:
+    os.chmod(path, stat.S_IMODE(os.stat(path).st_mode))
+
+
+def _tree_paths(root: Path) -> list:
+    """Every created file and every symlink whose target resolves (stat follows)."""
+    paths = []
+    for current, _dirs, names in os.walk(root):
+        for name in names:
+            path = Path(current) / name
+            if path.exists():
+                paths.append(path)
+    return paths
+
+
+def write_receipt_and_order(pack: Path, receipt: dict) -> Path:
+    """Write the sibling receipt and make its ctime STRICTLY greater than every
+    file/symlink-target ctime in the pack (bounded chmod-bump retries)."""
+    receipt_path = FASTMLX_LAUNCH.pull.receipt_path_for(pack)
+    assert receipt_path.parent == pack.parent and receipt_path != pack
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    paths = _tree_paths(pack)
+    for _ in range(500):
+        if all(_ctime_ns(receipt_path) > _ctime_ns(path) for path in paths):
+            return receipt_path
+        time.sleep(0.002)
+        _bump_ctime(receipt_path)
+    raise AssertionError("could not order the receipt ctime after the pack files")
+
+
+def ensure_not_before(path: Path, receipt_path: Path) -> None:
+    for _ in range(500):
+        if _ctime_ns(path) >= _ctime_ns(receipt_path):
+            return
+        time.sleep(0.002)
+        _bump_ctime(path)
+    raise AssertionError("could not order the file ctime at or after the receipt")
+
+
+def apply_post_receipt_edits(pack: Path, case: dict, receipt_path: Path) -> None:
+    for name in case.get("editedAfterReceipt", []):
+        path = pack / name
+        data = bytearray(path.read_bytes())
+        spec = case["files"][name]
+        if "size" in spec:
+            assert data[0:1] == b"x"
+            data[0] = ord("y")
+        else:
+            data[0] ^= 0x01
+        with open(path, "r+b") as handle:  # in place, same size
+            handle.write(bytes(data))
+        ensure_not_before(path, receipt_path)
+    for name in case.get("touchedAfterReceipt", []):
+        ensure_not_before(pack / name, receipt_path)
 
 
 def tree_entry(root: Path, relative: str) -> dict:
@@ -135,6 +202,9 @@ class ReceiptBindingConformanceTests(unittest.TestCase):
             "nested-listed-file-ok",
             "listed-prefix-is-a-file",
             "size-only-above-hash-threshold",
+            "large-file-edited-after-receipt-is-hashed",
+            "large-file-restored-after-receipt-is-ok",
+            "receipt-unstatable-hashes-large-files",
             "hash-threshold-is-inclusive",
             "uncheckable-no-files-key",
             "uncheckable-name-absolute",
@@ -159,6 +229,9 @@ class ReceiptBindingConformanceTests(unittest.TestCase):
                     pack.mkdir()
                     build_tree(pack, case)
                     receipt = build_receipt(pack, case)
+                    if not case.get("receiptMissing", False):
+                        receipt_path = write_receipt_and_order(pack, receipt)
+                        apply_post_receipt_edits(pack, case, receipt_path)
                     threshold = case.get("hashMaxBytes", launch.RECEIPT_HASH_MAX_BYTES)
                     with mock.patch.object(launch, "RECEIPT_HASH_MAX_BYTES", threshold):
                         result = launch.verify_receipt_binding(pack, receipt)

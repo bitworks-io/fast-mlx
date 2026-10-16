@@ -247,8 +247,8 @@ Face cache by its path (`.../models--<org>--<name>/snapshots/<revision>`), the s
 does. A pack whose card says NO_GO is refused until you opt in with `--accept-quality <card-id>`, so a
 measured quality cost is never applied silently. A `--model-repo` or `--card-id` that names a different
 card than the pack's own receipt or path refuses with `quality_card_identity_conflict`. `serve` and `recommend` also
-check the pack's files against the receipt's recorded sizes and sha256 digests (files over 64 MiB by
-size only; unlisted dotfiles ignored); when the bytes no longer match and the receipt's own identity selected
+check the pack's files against the receipt's recorded sizes and sha256 digests (files over 64 MiB are
+size-checked unless changed since the receipt was written, in which case they are hashed too; unlisted dotfiles ignored); when the bytes no longer match and the receipt's own identity selected
 the card, `serve` refuses with `quality_card_receipt_mismatch` and `recommend` reports that pack as an
 `error` row with the same message (re-run `fastmlx pull`, or remove the stale receipt).
 
