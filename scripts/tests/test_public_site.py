@@ -395,28 +395,32 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-18",
-                "title": "Publish v0.1.18: an out-of-range number in a tool argument no longer crashes the server, and an unsatisfiable tool_choice is a 400",
-                "publishedAt": "2026-10-16T23:29:38Z",
+                "id": "tagged-distribution-v0-1-19",
+                "title": "Publish v0.1.19: tool_choice \"required\" and a named tool_choice are enforced during generation, and logit_bias is honored",
+                "publishedAt": "2026-10-17T14:18:36Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.18 arm64 macOS distribution: a schema-number "
-                    "tool argument outside the 64-bit integer range (for example 1e20) "
-                    "on the XML-style, pythonic and MiniMax-M2 tool-call formats no "
-                    "longer traps fastmlx-serve; it arrives as the JSON number 1e+20, "
-                    "inf and nan arrive as strings with the call's other arguments "
-                    "kept, and a hex lexeme such as 0x10 now arrives as the string "
-                    "\"0x10\" instead of the number 16; and tool_choice \"required\" or "
-                    "a named function with no tools (absent, null or []), or a named "
-                    "function not declared in tools, is now an OpenAI-style 400 on "
-                    "tool_choice before generation starts, streaming or not, instead "
-                    "of a plain-text answer, while \"auto\" and \"none\" without tools "
-                    "are still accepted and \"required\" with valid tools is still not "
-                    "enforced during generation. The bundled quality-card store is "
-                    "unchanged from v0.1.17. Greedy output is identical to the "
-                    "development build on the release check prompts. The engine still "
-                    "links mlx-swift 0.31.6."
+                    "Publishes the v0.1.19 arm64 macOS distribution: on the plain "
+                    "scalar route, tool_choice \"required\" with tools declared now "
+                    "constrains decoding to exactly one call to a declared function "
+                    "whose arguments validate against that function's parameters, "
+                    "with content null, and a named tool_choice produces one call to "
+                    "that function with its arguments masked to its parameters "
+                    "schema, where a schema feature outside the supported subset on "
+                    "any declared tool, a function name outside letters, digits, "
+                    "underscores and hyphens, duplicate names, or response_format "
+                    "together with a named or \"required\" choice is a 400 on "
+                    "tool_choice; and logit_bias, which used to be a 400 whenever "
+                    "non-empty, is now applied after the penalties and before the "
+                    "grammar mask, with a token id at or above the model's "
+                    "vocab_size a 400 on logit_bias and logprobs reported before the "
+                    "bias. The continuous-batch and speculative routes validate "
+                    "tool_choice without enforcing it and still refuse a non-empty "
+                    "logit_bias. The bundled quality-card store is unchanged from "
+                    "v0.1.18. Greedy output is identical to the development build "
+                    "on the release check prompts. The engine still links mlx-swift "
+                    "0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -424,7 +428,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "72eb89473c2d266ba95f6b3e0831801b8b64b7a8",
+                "publicCommit": "494f5b62cc78164f715c57ed6ea02089e0d73fb6",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -441,6 +445,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "494f5b62cc78164f715c57ed6ea02089e0d73fb6",
                 "72eb89473c2d266ba95f6b3e0831801b8b64b7a8",
                 "61a151b41ec081562c41e4eb9e59fb88dd9a0cfa",
                 "0c9b2f33db1d257cc5e9c060cd49c95c5423b718",
