@@ -19,9 +19,9 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
     }
 
     private func run(
-        payload: String
+        payload: String,
+        backend: CountingBackend = CountingBackend()
     ) async throws -> (head: HTTPResponseHead, body: String, starts: Int) {
-        let backend = CountingBackend()
         let configuration = ServingHTTPConfiguration(
             launchedModel: "qwen3-32b",
             requestLimits: .productionDefault,
@@ -94,11 +94,60 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
         XCTAssertEqual(result.head.status, .ok, result.body)
         XCTAssertEqual(result.starts, 1)
     }
+
+    /// A named choice enforced by a backend answers ONE call with `finish_reason` `stop` (or `length`
+    /// for a truncated call) and no `content`; the HTTP layer must pass both through untouched
+    /// (never rewriting them to `tool_calls`), streaming and not.
+    func testEnforcedNamedCallKeepsStopFinishReasonAndNullContent() async throws {
+        let backend = CountingBackend(
+            toolCall: OpenAIToolCall(
+                id: "call_abc", function: .init(name: "get_weather", arguments: #"{"city":"Paris"}"#)),
+            finishReason: .stop)
+        let plain = try await run(
+            payload: payload(stream: false, tools: declared, toolChoice: namedDeclared), backend: backend)
+        XCTAssertEqual(plain.head.status, .ok, plain.body)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(plain.body.utf8)) as? [String: Any])
+        let choice = try XCTUnwrap((json["choices"] as? [[String: Any]])?.first)
+        XCTAssertEqual(choice["finish_reason"] as? String, "stop")
+        let message = try XCTUnwrap(choice["message"] as? [String: Any])
+        XCTAssertTrue(message["content"] is NSNull, plain.body)
+        let calls = try XCTUnwrap(message["tool_calls"] as? [[String: Any]])
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual((calls[0]["function"] as? [String: Any])?["name"] as? String, "get_weather")
+        XCTAssertEqual(
+            (calls[0]["function"] as? [String: Any])?["arguments"] as? String, #"{"city":"Paris"}"#)
+
+        let streamed = try await run(
+            payload: payload(stream: true, tools: declared, toolChoice: namedDeclared), backend: backend)
+        XCTAssertEqual(streamed.head.status, .ok, streamed.body)
+        XCTAssertTrue(streamed.body.contains(#""finish_reason":"stop""#), streamed.body)
+        XCTAssertFalse(streamed.body.contains(#""finish_reason":"tool_calls""#), streamed.body)
+        XCTAssertTrue(streamed.body.contains(#""name":"get_weather""#), streamed.body)
+        XCTAssertFalse(streamed.body.contains(#""content":"#), streamed.body)
+
+        let truncated = try await run(
+            payload: payload(stream: false, tools: declared, toolChoice: namedDeclared),
+            backend: CountingBackend(
+                toolCall: OpenAIToolCall(
+                    id: "call_abc", function: .init(name: "get_weather", arguments: #"{"ci"#)),
+                finishReason: .length))
+        XCTAssertTrue(truncated.body.contains(#""finish_reason":"length""#), truncated.body)
+        XCTAssertTrue(truncated.body.contains(#"{\"ci"#), truncated.body)
+    }
 }
 
-/// Counts `start` calls and completes immediately with plain text.
+/// Counts `start` calls and completes immediately with plain text, or -- when given a `toolCall` --
+/// with exactly that one tool call and no text.
 private final class CountingBackend: ServingGenerationBackend, Sendable {
     private let starts = OSAllocatedUnfairLock(initialState: 0)
+    private let toolCall: OpenAIToolCall?
+    private let finishReason: OpenAIChatFinishReason
+
+    init(toolCall: OpenAIToolCall? = nil, finishReason: OpenAIChatFinishReason = .stop) {
+        self.toolCall = toolCall
+        self.finishReason = finishReason
+    }
 
     var startCount: Int { starts.withLock { $0 } }
 
@@ -114,12 +163,18 @@ private final class CountingBackend: ServingGenerationBackend, Sendable {
             route: .continuousBatchNoSpec,
             mailbox: mailbox,
             lease: lease)
+        let toolCall = toolCall
+        let finishReason = finishReason
         Task {
-            try? await mailbox.send(.text("ok"))
+            if let toolCall {
+                try? await mailbox.send(.toolCalls([toolCall]))
+            } else {
+                try? await mailbox.send(.text("ok"))
+            }
             try? await mailbox.send(
                 .completion(
                     ServingGenerationCompletion(
-                        finishReason: .stop,
+                        finishReason: finishReason,
                         usage: OpenAIChatUsage(promptTokens: 3, completionTokens: 1))))
             await mailbox.finish()
         }

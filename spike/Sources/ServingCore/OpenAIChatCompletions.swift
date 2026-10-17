@@ -435,6 +435,15 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
             case .jsonObject: kind = "json_object"
             case .jsonSchema: kind = "json_schema"
             }
+            // A named `tool_choice` claims the decoder's single constraint slot for the function's
+            // arguments on the scalar route, so it cannot also carry a response-format mask: say so
+            // with the `tool_choice` param (checked first; any other tools combination keeps the
+            // `tools` param below).
+            if case .function = toolChoice {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format \(kind) is not supported together with a named tool_choice",
+                    param: "tool_choice")
+            }
             guard tools.isEmpty else {
                 throw OpenAIServingError.invalidRequest(
                     "response_format \(kind) is not supported together with tools",

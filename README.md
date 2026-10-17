@@ -162,6 +162,19 @@ non-speculative decoders.
 Speculative and continuous-batch routes return a 400, and so does combining either format with
 `tools`, `logprobs` or `stop`.
 
+A named function, `"tool_choice":{"type":"function","function":{"name":X}}`, is enforced on the same
+scalar route. X's `parameters` are compiled with the `json_schema` subset above (an absent or empty
+`parameters` is an empty object) and masked during decoding, so the reply is exactly one `tool_calls`
+entry for X whose arguments parse and validate, with `content: null` and `finish_reason` `"stop"`.
+Instructor's default tools mode and other "structured output through a tool" helpers rely on this.
+If `max_tokens` runs out first, the finish reason is `"length"` and the call carries the partial
+arguments. With thinking on, reasoning stays unmasked in `reasoning_content` and the mask starts at
+`</think>`. A streaming reply sends the call as one tool-call delta when generation ends. These
+return a 400 on `tool_choice` before any generation: a schema outside the subset, `response_format`
+on the same request, or a thinking request whose tokenizer has no `</think>` token. `"required"`,
+and a named function on the continuous-batch and speculative routes, are still validated but not
+enforced: a model that answers in prose there returns plain `content`.
+
 `POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients
 such as `openai-python`'s `client.completions.create`, LangChain's `OpenAI` LLM, or lm-eval-style
 harnesses. It shares the same sampling, completion-budget, and admission behavior as

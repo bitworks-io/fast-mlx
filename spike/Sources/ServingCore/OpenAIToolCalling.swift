@@ -138,6 +138,52 @@ public struct OpenAIToolSpec: Sendable, Equatable {
     }
 }
 
+extension OpenAIToolSpec {
+    /// Compiles this tool's `parameters` (client key order, from `orderedRaw`) with the same
+    /// `JSONSchemaSubsetCompiler` that `response_format: json_schema` uses, for a forced
+    /// (named `tool_choice`) call whose arguments are generated under a token mask.
+    ///
+    /// A tool with no `parameters` (or an empty `{}`) is the empty object schema `{"type":"object"}`
+    /// per OpenAI semantics. Every refusal is an OpenAI-style 400 with `param: "tool_choice"`:
+    /// the client's key order is unavailable (`orderedRaw == nil`), the schema uses a construct
+    /// outside the compiler's subset, or the root is not an object. Compiled non-strict, so a
+    /// schema without `additionalProperties: false` is accepted (the mask then simply never emits
+    /// undeclared properties).
+    public func forcedArgumentsFormat() throws -> JSONSchemaResponseFormat {
+        guard case .object(let toolPairs)? = orderedRaw,
+            case .object(let functionPairs)? = toolPairs.last(where: { $0.key == "function" })?.value
+        else {
+            throw OpenAIServingError.invalidRequest(
+                "tool_choice cannot be enforced: the declared function's parameters could not be "
+                    + "read in the client's key order",
+                param: "tool_choice")
+        }
+        var schema: JSONSchemaSubsetCompiler.RawValue = .object([(key: "type", value: .string("object"))])
+        if let declared = functionPairs.last(where: { $0.key == "parameters" })?.value {
+            if case .object(let pairs) = declared, pairs.isEmpty {
+                // `{}` is the empty parameter list, same as absent.
+            } else {
+                schema = declared
+            }
+        }
+        let compiled: JSONSchemaResponseFormat
+        do {
+            compiled = try JSONSchemaSubsetCompiler.compile(name: "tool_arguments", schema: schema, strict: false)
+        } catch let error as JSONSchemaCompileError {
+            throw OpenAIServingError.invalidRequest(
+                "tool_choice cannot be enforced: the declared function's parameters are not "
+                    + "supported\(error.path): \(error.message)",
+                param: "tool_choice")
+        }
+        guard case .object = compiled.root else {
+            throw OpenAIServingError.invalidRequest(
+                "tool_choice cannot be enforced: the declared function's parameters must be an object schema",
+                param: "tool_choice")
+        }
+        return compiled
+    }
+}
+
 // MARK: - tool_choice
 
 public enum OpenAIToolChoice: Sendable, Equatable {
@@ -220,10 +266,14 @@ public extension OpenAIChatCompletionRequest {
     /// - `.function(name)` → only that named function (reliably restricting the callable set);
     /// - `.auto` / `.required` → all declared tools.
     ///
-    /// Known limitation: `"required"` and a named function are validated at decode time (they need a
-    /// non-empty `tools`, and a named function must be declared) but are NOT enforced during
-    /// generation — there is no constrained decoding, so a model that answers in plain text still
-    /// returns 200 with `finish_reason` `"stop"`.
+    /// Enforcement scope: a named function is ENFORCED during generation only on the plain scalar
+    /// route when the loaded backend declares `json_schema` constraint support (its `parameters`
+    /// are compiled and masked, and the reply is exactly one call to that function; see
+    /// `OpenAIToolSpec.forcedArgumentsFormat()`). Everywhere else -- `"required"` on every route, and a named
+    /// function on routes without that support (continuous batching, MTP/speculative, a checkpoint
+    /// whose tokenizer cannot host the mask) -- the choice is validated at decode time (it needs a
+    /// non-empty `tools`, and a named function must be declared) but NOT enforced: a model that
+    /// answers in plain text still returns 200 with `finish_reason` `"stop"`.
     var activeTools: [OpenAIToolSpec] {
         switch toolChoice {
         case .none:
@@ -233,6 +283,12 @@ public extension OpenAIChatCompletionRequest {
         case .auto, .required:
             return tools
         }
+    }
+
+    /// The declared function a `tool_choice` names, or `nil` for `none`/`auto`/`required`.
+    var namedToolChoice: OpenAIToolSpec? {
+        guard case .function(let name) = toolChoice else { return nil }
+        return tools.first { $0.name == name }
     }
 
     /// The thinking mode to render with, under the serving model's tool-thinking policy. Always

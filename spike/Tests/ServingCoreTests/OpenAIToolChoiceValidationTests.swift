@@ -97,4 +97,86 @@ final class OpenAIToolChoiceValidationTests: XCTestCase {
         }
         XCTAssertEqual(try chat("").toolChoice, OpenAIToolChoice.none)
     }
+
+    // MARK: - Named tool_choice + response_format (cycle 257)
+
+    func testResponseFormatWithNamedToolChoiceIsRefusedOnToolChoiceParam() {
+        for format in [
+            #"{"type":"json_object"}"#,
+            #"{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}"#,
+        ] {
+            assertRefused(
+                #","tools":[\#(tool("f"))],"tool_choice":\#(named("f")),"response_format":\#(format)"#,
+                message: "response_format \(format.contains("json_object") ? "json_object" : "json_schema") "
+                    + "is not supported together with a named tool_choice")
+        }
+    }
+
+    /// Control: any OTHER tool_choice keeps today's `tools`-param refusal.
+    func testResponseFormatWithAutoToolsKeepsTheToolsParamRefusal() {
+        let error = chatError(
+            #","tools":[\#(tool("f"))],"tool_choice":"auto","response_format":{"type":"json_object"}"#)
+        XCTAssertEqual(error?.param, "tools")
+    }
+
+    // MARK: - OpenAIToolSpec.forcedArgumentsFormat
+
+    private func spec(_ toolJSON: String, at index: Int = 0) throws -> OpenAIToolSpec {
+        let body = #"{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[\#(toolJSON)]}"#
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+        return request.tools[index]
+    }
+
+    private func objectPropertyNames(_ format: JSONSchemaResponseFormat) -> [String]? {
+        guard case .object(let properties) = format.root else { return nil }
+        return properties.map(\.name)
+    }
+
+    func testForcedArgumentsFormatKeepsTheClientsPropertyOrder() throws {
+        let tool = try spec(
+            #"{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}},"required":["zeta"]}}}"#)
+        let format = try tool.forcedArgumentsFormat()
+        XCTAssertEqual(objectPropertyNames(format), ["zeta", "alpha"])
+    }
+
+    func testForcedArgumentsFormatTreatsAbsentAndEmptyParametersAsAnEmptyObject() throws {
+        for json in [
+            #"{"type":"function","function":{"name":"f"}}"#,
+            #"{"type":"function","function":{"name":"f","parameters":{}}}"#,
+            #"{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}"#,
+        ] {
+            let format = try spec(json).forcedArgumentsFormat()
+            XCTAssertEqual(objectPropertyNames(format), [], json)
+        }
+    }
+
+    func testForcedArgumentsFormatRefusesUnsupportedSchemasOnToolChoice() throws {
+        for json in [
+            // keyword outside the subset
+            #"{"type":"function","function":{"name":"f","parameters":{"type":"object","properties":{"a":{"type":"string","pattern":"^x"}}}}}"#,
+            // not an object root
+            #"{"type":"function","function":{"name":"f","parameters":{"type":"string"}}}"#,
+            // additionalProperties other than false
+            #"{"type":"function","function":{"name":"f","parameters":{"type":"object","additionalProperties":true}}}"#,
+        ] {
+            let tool = try spec(json)
+            XCTAssertThrowsError(try tool.forcedArgumentsFormat(), json) { error in
+                guard case OpenAIServingError.invalidRequest(_, let param) = error else {
+                    return XCTFail("expected invalidRequest, got \(error)")
+                }
+                XCTAssertEqual(param, "tool_choice", json)
+            }
+        }
+    }
+
+    func testForcedArgumentsFormatRefusesWhenTheClientKeyOrderIsUnavailable() {
+        let tool = OpenAIToolSpec(
+            name: "f", description: nil, parameters: .object([:]), raw: .object([:]), orderedRaw: nil)
+        XCTAssertThrowsError(try tool.forcedArgumentsFormat()) { error in
+            guard case OpenAIServingError.invalidRequest(_, let param) = error else {
+                return XCTFail("expected invalidRequest, got \(error)")
+            }
+            XCTAssertEqual(param, "tool_choice")
+        }
+    }
 }

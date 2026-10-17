@@ -305,6 +305,10 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         /// inside this `Sendable` struct.
         let responseFormatConstraint: (any LogitProcessor & ConstraintProcessorFailureReporting & Sendable)?
         let activeTools: [OpenAIToolSpec]
+        /// Non-nil exactly when a named `tool_choice` is ENFORCED for this request (`start` installed
+        /// the compiled-parameters mask in `responseFormatConstraint`): the post-reasoning generated
+        /// text is that function's arguments, answered as one tool call instead of `content`.
+        let enforcedToolName: String?
         /// This request's `ServingGenerationHandle.separatesReasoning`; `launch` engages the
         /// reasoning-phase tool-call gate only when it is true AND tools are present.
         let separatesReasoning: Bool
@@ -322,6 +326,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         /// Non-nil only when a tool processor exists AND the response separates reasoning: keeps the
         /// parser from seeing text the client is shown as `reasoning_content`.
         var reasoningGate: ReasoningPhaseToolCallGate?
+        /// Post-reasoning generated text of an enforced named `tool_choice` (the call's arguments,
+        /// byte for byte). Unused (always empty) for every other request.
+        var enforcedToolArguments = ""
     }
 
     private let launchedModel: String
@@ -506,6 +513,38 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         // request must never fall through a missing case here and be silently served as free text —
         // see the response-format design doc's "fail-open guard" finding.
         var responseFormatConstraint: (any LogitProcessor & ConstraintProcessorFailureReporting & Sendable)?
+        // Named `tool_choice` enforcement. ENFORCED only when this backend can honestly run the
+        // json_schema mask (`supportsJSONSchemaResponseFormat`: the plain scalar route, a decoder with
+        // the constraint seam, schema support loaded); otherwise the choice stays validated-only,
+        // exactly as before. Every refusal below is a 400 on `tool_choice`, raised BEFORE any prompt
+        // render, queueing or decoder work. The mask occupies the decoder's single constraint slot,
+        // which is why a `response_format` cannot ride along.
+        var enforcedToolName: String?
+        var enforcedToolConstraint: (any LogitProcessor & ConstraintProcessorFailureReporting & Sendable)?
+        if request.promptInput == .chat, let tool = request.namedToolChoice,
+            supportsJSONSchemaResponseFormat, let support = configuration.jsonSchemaConstraintSupport
+        {
+            guard request.responseFormat == nil else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format is not supported together with a named tool_choice",
+                    param: "tool_choice")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "a named tool_choice cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "tool_choice")
+            }
+            let argumentsFormat = try tool.forcedArgumentsFormat()
+            // Same never-blocks-the-actor-executor contract as the `.jsonSchema` branch below.
+            let argumentsConstraint = JSONSchemaTokenConstraint(
+                table: await support.table, format: argumentsFormat)
+            enforcedToolConstraint = JSONSchemaMaskingLogitProcessor(
+                constraint: argumentsConstraint,
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+            enforcedToolName = tool.name
+        }
         switch request.responseFormat {
         case nil:
             break
@@ -552,6 +591,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 constraint: schemaConstraint,
                 activeFromStart: !separatesReasoning,
                 thinkEndTokenID: support.thinkEndTokenID)
+        }
+        if let enforcedToolConstraint {
+            responseFormatConstraint = enforcedToolConstraint
         }
         // Bias FIRST, response-format mask LAST: the composite occupies the decoder's single
         // constraint slot, which runs after the penalty processor, so the order is penalties ->
@@ -649,6 +691,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             logprobsRequest: request.logprobsRequest,
             responseFormatConstraint: responseFormatConstraint,
             activeTools: activeTools,
+            enforcedToolName: enforcedToolName,
             separatesReasoning: separatesReasoning,
             mailbox: mailbox,
             lease: lease)
@@ -817,10 +860,23 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         }
     }
 
+    /// Same id shape the vendored `ToolCallFormat.generateToolCallID()` (internal to that module)
+    /// gives parsed calls: `call_<32 hex>`, or 9 hex characters for the Mistral format.
+    private static func makeToolCallID(format: ToolCallFormat) -> String {
+        let uuid = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        switch format {
+        case .mistral: return String(uuid.prefix(9))
+        default: return "call_" + uuid.lowercased()
+        }
+    }
+
     private func launch(_ request: PendingRequest) {
         let stops = modelStopStrings.union(request.request.stop)
+        // An enforced named `tool_choice` never runs the family parser: the generated text IS the
+        // arguments (see `publish`), so the processor stays nil and only the reasoning gate remains.
+        let isEnforced = request.enforcedToolName != nil
         let toolCallProcessor: ToolCallProcessor? =
-            request.activeTools.isEmpty
+            request.activeTools.isEmpty || isEnforced
             ? nil
             : ToolCallProcessor(
                 format: configuration.toolCallFormat,
@@ -832,7 +888,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             detokenizer: codec.makeDetokenizer(),
             stopFilter: ServingStopStringFilter(stopStrings: stops),
             toolCallProcessor: toolCallProcessor,
-            reasoningGate: toolCallProcessor != nil && request.separatesReasoning
+            reasoningGate: (toolCallProcessor != nil || isEnforced) && request.separatesReasoning
                 ? ReasoningPhaseToolCallGate() : nil)
         let task = Task { [weak self] in
             guard let self else {
@@ -923,6 +979,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             try await flushEndOfStream(for: id)
             var finishReason: OpenAIChatFinishReason =
                 summary.finishReason == .length ? .length : .stop
+            if let toolName = request.enforcedToolName, let arguments = active?.enforcedToolArguments,
+                !arguments.isEmpty
+            {
+                // Exactly one call to the named function; `finish_reason` stays `stop`/`length`
+                // (OpenAI's behavior for a forced function), and a truncated call carries its
+                // partial arguments. Nothing was generated past reasoning -> no call.
+                try await request.mailbox.send(
+                    .toolCalls([
+                        OpenAIToolCall(
+                            id: Self.makeToolCallID(format: configuration.toolCallFormat),
+                            function: .init(name: toolName, arguments: arguments))
+                    ]))
+            }
             if let processor = active?.toolCallProcessor {
                 // Preserve any residual buffered text that turned out NOT to be a tool call
                 // (e.g. the model ended mid-`<tool_call` or emitted malformed JSON) so it is
@@ -978,7 +1047,20 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         active = current
 
         if let text = output?.text {
-            if let processor = current.toolCallProcessor {
+            if current.request.enforcedToolName != nil {
+                var argumentsText = text
+                if var gate = current.reasoningGate {
+                    // Reasoning (through the first `</think>`) is shown unmasked as before; only the
+                    // bytes after it are the call's arguments.
+                    let routed = gate.route(text)
+                    active?.reasoningGate = gate
+                    if !routed.passthrough.isEmpty {
+                        try await current.request.mailbox.send(.text(routed.passthrough))
+                    }
+                    argumentsText = routed.toParser
+                }
+                active?.enforcedToolArguments += argumentsText
+            } else if let processor = current.toolCallProcessor {
                 var parserText = text
                 var gated = false
                 if var gate = current.reasoningGate {
@@ -1075,7 +1157,12 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             parserText = routed.toParser
         }
         active = current
-        if let processor = current.toolCallProcessor {
+        if current.request.enforcedToolName != nil {
+            if !passthrough.isEmpty {
+                try await current.request.mailbox.send(.text(passthrough))
+            }
+            active?.enforcedToolArguments += parserText
+        } else if let processor = current.toolCallProcessor {
             if !passthrough.isEmpty {
                 try await current.request.mailbox.send(.text(passthrough))
             }

@@ -321,8 +321,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # only the gate and synthetic chunk strings, name no model family, host, credential or machine-local path, and the
 # projection validator's marker sweep passed on them.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1044,
-    "pathModeSha256": "79589721de6b5ccacf4a960674386098d114d947dc5524d55a09f55ab7bb00f0",
+    "pathCount": 1045,
+    "pathModeSha256": "e4042abea4a5ac05c8a0fe91f6ec7ca91f98f909a6d25f08637912d11a2180aa",
 }
 
 
