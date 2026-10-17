@@ -113,6 +113,10 @@ public final class JSONSchemaConstraintTable: @unchecked Sendable {
 
     private let cacheByteBudget: Int
 
+    /// Mask table for `tool_choice: "required"` (`ToolUnionAutomaton`): shares this table's per-vocab
+    /// resources, owns a separate cache. Does not touch the schema cache below.
+    let unionTable: ToolUnionConstraintTable
+
     private let lock = NSLock()
     // Keyed by `JSONSchemaAutomaton.MaskCacheKey` — see that type's doc comment for why it is safe
     // (and necessary) to key on the fingerprint-carrying, table-identity-EXCLUDING key rather than
@@ -153,6 +157,7 @@ public final class JSONSchemaConstraintTable: @unchecked Sendable {
     ) {
         self.resources = resources
         self.cacheByteBudget = cacheByteBudget
+        self.unionTable = ToolUnionConstraintTable(resources: resources, cacheByteBudget: cacheByteBudget)
     }
 
     func classification(for id: Int) -> TokenByteClassification {

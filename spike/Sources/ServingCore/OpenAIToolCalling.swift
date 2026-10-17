@@ -184,6 +184,40 @@ extension OpenAIToolSpec {
     }
 }
 
+extension Array where Element == OpenAIToolSpec {
+    /// The union format for an ENFORCED `tool_choice: "required"`: every declared tool's `parameters`
+    /// compiled with `forcedArgumentsFormat()` (so an unsupported schema on ANY tool is refused, not
+    /// just the first), under OpenAI's function-name grammar (`[A-Za-z0-9_-]+`, because the name is
+    /// emitted as a literal with no JSON escaping) with no duplicate names. Every refusal is an
+    /// OpenAI-style 400 with `param: "tool_choice"`; the client's names are not echoed.
+    public func requiredToolUnionFormat() throws -> ToolUnionFormat {
+        var seen = Set<String>()
+        for tool in self {
+            guard ToolUnionFormat.isValidName(tool.name) else {
+                throw OpenAIServingError.invalidRequest(
+                    "tool_choice \"required\" cannot be enforced: a declared function name must "
+                        + "contain only letters, digits, underscores and hyphens",
+                    param: "tool_choice")
+            }
+            guard seen.insert(tool.name).inserted else {
+                throw OpenAIServingError.invalidRequest(
+                    "tool_choice \"required\" cannot be enforced: declared function names must be unique",
+                    param: "tool_choice")
+            }
+        }
+        var entries: [(name: String, format: JSONSchemaResponseFormat)] = []
+        for tool in self {
+            entries.append((name: tool.name, format: try tool.forcedArgumentsFormat()))
+        }
+        guard let union = ToolUnionFormat(entries: entries) else {
+            throw OpenAIServingError.invalidRequest(
+                "tool_choice \"required\" cannot be enforced without declared functions",
+                param: "tool_choice")
+        }
+        return union
+    }
+}
+
 // MARK: - tool_choice
 
 public enum OpenAIToolChoice: Sendable, Equatable {
@@ -266,14 +300,16 @@ public extension OpenAIChatCompletionRequest {
     /// - `.function(name)` → only that named function (reliably restricting the callable set);
     /// - `.auto` / `.required` → all declared tools.
     ///
-    /// Enforcement scope: a named function is ENFORCED during generation only on the plain scalar
-    /// route when the loaded backend declares `json_schema` constraint support (its `parameters`
-    /// are compiled and masked, and the reply is exactly one call to that function; see
-    /// `OpenAIToolSpec.forcedArgumentsFormat()`). Everywhere else -- `"required"` on every route, and a named
-    /// function on routes without that support (continuous batching, MTP/speculative, a checkpoint
-    /// whose tokenizer cannot host the mask) -- the choice is validated at decode time (it needs a
-    /// non-empty `tools`, and a named function must be declared) but NOT enforced: a model that
-    /// answers in plain text still returns 200 with `finish_reason` `"stop"`.
+    /// Enforcement scope: on the plain scalar route, when the loaded backend declares `json_schema`
+    /// constraint support, both a named function and `"required"` are ENFORCED during generation. A
+    /// named function has its `parameters` compiled and masked (the reply is exactly one call to that
+    /// function; see `OpenAIToolSpec.forcedArgumentsFormat()`); `"required"` masks a union over every
+    /// declared tool (the reply is exactly one call, to a declared function, with that function's
+    /// arguments schema-constrained; see `[OpenAIToolSpec].requiredToolUnionFormat()`). Everywhere
+    /// else -- continuous batching, MTP/speculative, a checkpoint whose tokenizer cannot host the mask
+    /// -- the choice is validated at decode time (it needs a non-empty `tools`, and a named function
+    /// must be declared) but NOT enforced: a model that answers in plain text still returns 200 with
+    /// `finish_reason` `"stop"`.
     var activeTools: [OpenAIToolSpec] {
         switch toolChoice {
         case .none:

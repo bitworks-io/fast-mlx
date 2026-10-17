@@ -112,6 +112,18 @@ final class OpenAIToolChoiceValidationTests: XCTestCase {
         }
     }
 
+    func testResponseFormatWithRequiredToolChoiceIsRefusedOnToolChoiceParam() {
+        for format in [
+            #"{"type":"json_object"}"#,
+            #"{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}}"#,
+        ] {
+            assertRefused(
+                #","tools":[\#(tool("f"))],"tool_choice":"required","response_format":\#(format)"#,
+                message: "response_format \(format.contains("json_object") ? "json_object" : "json_schema") "
+                    + "is not supported together with tool_choice \"required\"")
+        }
+    }
+
     /// Control: any OTHER tool_choice keeps today's `tools`-param refusal.
     func testResponseFormatWithAutoToolsKeepsTheToolsParamRefusal() {
         let error = chatError(

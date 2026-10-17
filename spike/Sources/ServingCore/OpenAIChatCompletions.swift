@@ -444,6 +444,13 @@ public struct OpenAIChatCompletionRequest: Sendable, Equatable {
                     "response_format \(kind) is not supported together with a named tool_choice",
                     param: "tool_choice")
             }
+            // `tool_choice: "required"` likewise takes the constraint slot (a union over the declared
+            // tools) wherever it is enforced, so it names `tool_choice` too.
+            if case .required = toolChoice {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format \(kind) is not supported together with tool_choice \"required\"",
+                    param: "tool_choice")
+            }
             guard tools.isEmpty else {
                 throw OpenAIServingError.invalidRequest(
                     "response_format \(kind) is not supported together with tools",

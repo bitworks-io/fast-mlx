@@ -309,11 +309,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         /// the compiled-parameters mask in `responseFormatConstraint`): the post-reasoning generated
         /// text is that function's arguments, answered as one tool call instead of `content`.
         let enforcedToolName: String?
+        /// Non-nil exactly when `tool_choice: "required"` is ENFORCED for this request (`start`
+        /// installed the union mask over every declared tool): the post-reasoning generated text is
+        /// one `{"name": ..., "arguments": ...}` document, answered as one tool call.
+        let enforcedToolUnion: ToolUnionFormat?
         /// This request's `ServingGenerationHandle.separatesReasoning`; `launch` engages the
         /// reasoning-phase tool-call gate only when it is true AND tools are present.
         let separatesReasoning: Bool
         let mailbox: BoundedDeltaMailbox
         let lease: ServingRequestLease
+
+        /// True when a named or `"required"` `tool_choice` is enforced: the family tool parser is
+        /// bypassed and the post-reasoning text is accumulated for `publish`.
+        var isToolChoiceEnforced: Bool { enforcedToolName != nil || enforcedToolUnion != nil }
     }
 
     private struct ActiveRequest {
@@ -327,7 +335,8 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         /// parser from seeing text the client is shown as `reasoning_content`.
         var reasoningGate: ReasoningPhaseToolCallGate?
         /// Post-reasoning generated text of an enforced named `tool_choice` (the call's arguments,
-        /// byte for byte). Unused (always empty) for every other request.
+        /// byte for byte), or of an enforced `"required"` (the whole framed document). Unused (always
+        /// empty) for every other request.
         var enforcedToolArguments = ""
     }
 
@@ -545,6 +554,32 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 thinkEndTokenID: support.thinkEndTokenID)
             enforcedToolName = tool.name
         }
+        // `tool_choice: "required"` enforcement: same conditions, same single constraint slot, same
+        // thinking rules and 400-before-any-work contract as the named block above, with a union mask
+        // over EVERY declared tool instead of one function's arguments.
+        var enforcedToolUnion: ToolUnionFormat?
+        if request.promptInput == .chat, case .required = request.toolChoice,
+            supportsJSONSchemaResponseFormat, let support = configuration.jsonSchemaConstraintSupport
+        {
+            guard request.responseFormat == nil else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format is not supported together with tool_choice \"required\"",
+                    param: "tool_choice")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "tool_choice \"required\" cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "tool_choice")
+            }
+            let union = try request.tools.requiredToolUnionFormat()
+            let unionConstraint = ToolUnionTokenConstraint(table: await support.table, format: union)
+            enforcedToolConstraint = ConstraintMaskingLogitProcessor<ToolUnionTokenConstraint>(
+                constraint: unionConstraint,
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+            enforcedToolUnion = union
+        }
         switch request.responseFormat {
         case nil:
             break
@@ -692,6 +727,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             responseFormatConstraint: responseFormatConstraint,
             activeTools: activeTools,
             enforcedToolName: enforcedToolName,
+            enforcedToolUnion: enforcedToolUnion,
             separatesReasoning: separatesReasoning,
             mailbox: mailbox,
             lease: lease)
@@ -874,7 +910,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let stops = modelStopStrings.union(request.request.stop)
         // An enforced named `tool_choice` never runs the family parser: the generated text IS the
         // arguments (see `publish`), so the processor stays nil and only the reasoning gate remains.
-        let isEnforced = request.enforcedToolName != nil
+        let isEnforced = request.isToolChoiceEnforced
         let toolCallProcessor: ToolCallProcessor? =
             request.activeTools.isEmpty || isEnforced
             ? nil
@@ -992,6 +1028,19 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                             function: .init(name: toolName, arguments: arguments))
                     ]))
             }
+            if let union = request.enforcedToolUnion, let generated = active?.enforcedToolArguments,
+                let parsed = union.parse(generated: generated)
+            {
+                // Exactly one call, to the name the document completed, carrying the chosen tool's
+                // argument bytes (partial when the budget ran out). A document whose name was never
+                // completed names no tool, so it yields no call and no content.
+                try await request.mailbox.send(
+                    .toolCalls([
+                        OpenAIToolCall(
+                            id: Self.makeToolCallID(format: configuration.toolCallFormat),
+                            function: .init(name: parsed.name, arguments: parsed.arguments))
+                    ]))
+            }
             if let processor = active?.toolCallProcessor {
                 // Preserve any residual buffered text that turned out NOT to be a tool call
                 // (e.g. the model ended mid-`<tool_call` or emitted malformed JSON) so it is
@@ -1047,7 +1096,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         active = current
 
         if let text = output?.text {
-            if current.request.enforcedToolName != nil {
+            if current.request.isToolChoiceEnforced {
                 var argumentsText = text
                 if var gate = current.reasoningGate {
                     // Reasoning (through the first `</think>`) is shown unmasked as before; only the
@@ -1157,7 +1206,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             parserText = routed.toParser
         }
         active = current
-        if current.request.enforcedToolName != nil {
+        if current.request.isToolChoiceEnforced {
             if !passthrough.isEmpty {
                 try await current.request.mailbox.send(.text(passthrough))
             }

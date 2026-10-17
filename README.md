@@ -171,9 +171,17 @@ If `max_tokens` runs out first, the finish reason is `"length"` and the call car
 arguments. With thinking on, reasoning stays unmasked in `reasoning_content` and the mask starts at
 `</think>`. A streaming reply sends the call as one tool-call delta when generation ends. These
 return a 400 on `tool_choice` before any generation: a schema outside the subset, `response_format`
-on the same request, or a thinking request whose tokenizer has no `</think>` token. `"required"`,
-and a named function on the continuous-batch and speculative routes, are still validated but not
-enforced: a model that answers in prose there returns plain `content`.
+on the same request, or a thinking request whose tokenizer has no `</think>` token.
+
+`tool_choice: "required"` is enforced the same way on the single-stream scalar route: the reply is
+exactly one tool call, to one of the declared functions, with `content: null` and that function's
+`arguments` constrained to its `parameters` schema. The model picks which function; the server
+guarantees it is a declared one. Thinking, `finish_reason` and streaming behave as for a named
+function. The same 400 on `tool_choice` applies, and so does one for a declared name with a character
+outside `[A-Za-z0-9_-]` or a duplicated name. Limit: one call only, so there are no parallel calls
+under `"required"` on this route. On the continuous-batch and speculative routes `"required"` and a
+named function are still validated but not enforced: a model that answers in prose there returns
+plain `content`.
 
 `POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients
 such as `openai-python`'s `client.completions.create`, LangChain's `OpenAI` LLM, or lm-eval-style

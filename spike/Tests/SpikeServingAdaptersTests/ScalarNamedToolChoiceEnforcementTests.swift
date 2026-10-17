@@ -483,8 +483,10 @@ final class ScalarNamedToolChoiceEnforcementTests: XCTestCase {
 
     // MARK: Controls -- everything else is unchanged
 
-    func testAutoAndNoneAndAbsentAndRequiredStayUnconstrainedProse() async throws {
-        for choice: String? in [#""auto""#, #""none""#, nil, #""required""#] {
+    /// (`"required"` is no longer in this list: cycle 259 enforces it, see
+    /// `ScalarRequiredToolChoiceEnforcementTests`.)
+    func testAutoAndNoneAndAbsentStayUnconstrainedProse() async throws {
+        for choice: String? in [#""auto""#, #""none""#, nil] {
             let rig = makeRig()
             let result = try await send(rig.backend, payload: payload(toolChoice: choice))
             XCTAssertEqual(result.head.status, .ok, result.body)

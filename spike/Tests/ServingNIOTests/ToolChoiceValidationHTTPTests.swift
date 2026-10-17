@@ -95,6 +95,41 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
         XCTAssertEqual(result.starts, 1)
     }
 
+    /// `"required"` together with `response_format` is a 400 naming `tool_choice`, before the backend.
+    func testRequiredWithResponseFormatIs400OnToolChoiceBeforeBackend() async throws {
+        for stream in [false, true] {
+            let base = payload(stream: stream, tools: declared, toolChoice: #""required""#)
+            let result = try await run(
+                payload: String(base.dropLast()) + #","response_format":{"type":"json_object"}}"#)
+            assertRefusedBeforeBackend(result)
+        }
+    }
+
+    /// A `"required"` call from an enforcing backend is passed through like a named one: one call,
+    /// `finish_reason` `stop`, `content` null.
+    func testEnforcedRequiredCallKeepsStopFinishReasonAndNullContent() async throws {
+        let backend = CountingBackend(
+            toolCall: OpenAIToolCall(
+                id: "call_abc", function: .init(name: "get_weather", arguments: #"{"city":"Paris"}"#)),
+            finishReason: .stop)
+        let plain = try await run(
+            payload: payload(stream: false, tools: declared, toolChoice: #""required""#), backend: backend)
+        XCTAssertEqual(plain.head.status, .ok, plain.body)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(plain.body.utf8)) as? [String: Any])
+        let choice = try XCTUnwrap((json["choices"] as? [[String: Any]])?.first)
+        XCTAssertEqual(choice["finish_reason"] as? String, "stop")
+        let message = try XCTUnwrap(choice["message"] as? [String: Any])
+        XCTAssertTrue(message["content"] is NSNull, plain.body)
+        XCTAssertEqual((message["tool_calls"] as? [[String: Any]])?.count, 1)
+
+        let streamed = try await run(
+            payload: payload(stream: true, tools: declared, toolChoice: #""required""#), backend: backend)
+        XCTAssertTrue(streamed.body.contains(#""finish_reason":"stop""#), streamed.body)
+        XCTAssertFalse(streamed.body.contains(#""finish_reason":"tool_calls""#), streamed.body)
+        XCTAssertFalse(streamed.body.contains(#""content":"#), streamed.body)
+    }
+
     /// A named choice enforced by a backend answers ONE call with `finish_reason` `stop` (or `length`
     /// for a truncated call) and no `content`; the HTTP layer must pass both through untouched
     /// (never rewriting them to `tool_calls`), streaming and not.
