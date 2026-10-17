@@ -34,6 +34,16 @@ private final class PendingContinuationGate: Sendable {
 public enum ServingResponseDelta: Equatable, Sendable {
     case text(String)
     case toolCalls([OpenAIToolCall])
+    /// Head of ONE incrementally streamed tool call (enforced `tool_choice` on the plain scalar
+    /// route): carries the call's `id`, `type` and `function.name`; `function.arguments` is ignored
+    /// (the arguments arrive as the following `.toolCallArguments` fragments, in order). A stream
+    /// emits `id`/`type`/`name` only on this head; every later fragment belongs to the same call.
+    /// Non-streaming assembly (`collectNonStreaming`) folds a head plus its fragments into the same
+    /// single `OpenAIToolCall` a lone `.toolCalls` delta would have carried.
+    case toolCallStart(OpenAIToolCall)
+    /// The next fragment of the arguments of the call opened by the latest `.toolCallStart`. The
+    /// concatenation of every fragment is that call's full `function.arguments` string, byte for byte.
+    case toolCallArguments(String)
     /// One or more newly generated tokens' logprobs, in generation order. Sent as its own delta
     /// (never merged into `.text`) so a backend can report a token's logprob at the moment it is
     /// generated even when the incremental detokenizer has not yet flushed any display text for
@@ -65,6 +75,14 @@ public enum ServingResponseDelta: Equatable, Sendable {
                     jsonStringPayloadUpperBound(call.function.arguments))
             }
             return count
+        case .toolCallStart(let call):
+            var count = 96  // object keys, punctuation, and quotes
+            count = saturatingAdd(count, jsonStringPayloadUpperBound(call.id))
+            count = saturatingAdd(count, jsonStringPayloadUpperBound(call.type))
+            count = saturatingAdd(count, jsonStringPayloadUpperBound(call.function.name))
+            return count
+        case .toolCallArguments(let fragment):
+            return saturatingAdd(32, jsonStringPayloadUpperBound(fragment))
         case .tokenLogprobs(let tokens):
             // Conservative upper bound: per-token object overhead plus each candidate's own text —
             // real payloads are far smaller (at most a handful of tokens, each with ≤ 20 candidates).

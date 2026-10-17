@@ -169,7 +169,9 @@ entry for X whose arguments parse and validate, with `content: null` and `finish
 Instructor's default tools mode and other "structured output through a tool" helpers rely on this.
 If `max_tokens` runs out first, the finish reason is `"length"` and the call carries the partial
 arguments. With thinking on, reasoning stays unmasked in `reasoning_content` and the mask starts at
-`</think>`. A streaming reply sends the call as one tool-call delta when generation ends. These
+`</think>`. A streaming reply sends the tool-call head (`id`, `type`, `name`, empty `arguments`) once
+the first argument byte is decoded, then the `arguments` as incremental fragments while the model
+writes them (never before reasoning ends). These
 return a 400 on `tool_choice` before any generation: a schema outside the subset, `response_format`
 on the same request, or a thinking request whose tokenizer has no `</think>` token.
 
@@ -177,7 +179,9 @@ on the same request, or a thinking request whose tokenizer has no `</think>` tok
 exactly one tool call, to one of the declared functions, with `content: null` and that function's
 `arguments` constrained to its `parameters` schema. The model picks which function; the server
 guarantees it is a declared one. Thinking, `finish_reason` and streaming behave as for a named
-function. The same 400 on `tool_choice` applies, and so does one for a declared name with a character
+function; the head carries the chosen name once the model has written it, and only the `arguments`
+value is streamed (the `{"name": ..., "arguments": ...}` framing is not). The same 400 on
+`tool_choice` applies, and so does one for a declared name with a character
 outside `[A-Za-z0-9_-]` or a duplicated name. Limit: one call only, so there are no parallel calls
 under `"required"` on this route. On the continuous-batch and speculative routes `"required"` and a
 named function are still validated but not enforced: a model that answers in prose there returns

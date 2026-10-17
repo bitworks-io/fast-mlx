@@ -97,6 +97,67 @@ public struct ToolUnionFormat: Sendable, Equatable {
     }
 }
 
+// MARK: - Incremental argument stream
+
+/// Incremental counterpart of `ToolUnionFormat.parse(generated:)` for streaming (cycle 260): fed the
+/// generated document in pieces, it reports the chosen tool's name once the `"arguments": ` frame is
+/// complete and then only the bytes that belong to the arguments value. The wrapper's closing `}` is
+/// never reported, and trailing whitespace is held back until a later non-whitespace argument byte
+/// proves it is interior, so the concatenation of every `arguments` piece equals
+/// `parse(generated:)`'s `arguments` byte for byte at every cut point (a cut before the frame
+/// completes reports no name, exactly as `parse` returns `nil`).
+///
+/// It replays the same `ToolUnionAutomaton` the mask used. A byte the automaton rejects ends the
+/// stream (everything after it is ignored), mirroring `parse`'s `break`.
+public struct ToolUnionArgumentStream: Sendable {
+    public struct Output: Sendable, Equatable {
+        /// The chosen tool's name; non-nil exactly once, on the piece whose bytes complete the frame.
+        public var name: String?
+        /// Argument bytes released by this piece (possibly empty).
+        public var arguments: String
+    }
+
+    private var automaton: ToolUnionAutomaton
+    private let names: [String]
+    private var heldWhitespace: [UInt8] = []
+    private var ended = false
+
+    public init(format: ToolUnionFormat) {
+        self.automaton = ToolUnionAutomaton(format: format)
+        self.names = format.names
+    }
+
+    public mutating func consume(_ text: String) -> Output {
+        var name: String?
+        var released: [UInt8] = []
+        for byte in text.utf8 {
+            if ended { break }
+            let wasInArguments = automaton.isInArguments
+            guard automaton.advance(byte: byte) else {
+                ended = true
+                break
+            }
+            if !wasInArguments {
+                if automaton.isInArguments, let tool = automaton.chosenTool { name = names[tool] }
+                continue
+            }
+            if automaton.isComplete {
+                // The wrapper's closing `}`: not an argument byte; held whitespace is trailing.
+                heldWhitespace.removeAll()
+                continue
+            }
+            if [0x20, 0x09, 0x0A, 0x0D].contains(byte) {
+                heldWhitespace.append(byte)
+            } else {
+                released.append(contentsOf: heldWhitespace)
+                heldWhitespace.removeAll()
+                released.append(byte)
+            }
+        }
+        return Output(name: name, arguments: String(decoding: released, as: UTF8.self))
+    }
+}
+
 /// Immutable, shared (by reference) compiled state of one `ToolUnionFormat`; copies of an automaton
 /// share it instead of each carrying the name tables and every tool's compiled schema.
 final class ToolUnionSpec: Sendable {

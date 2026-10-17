@@ -1025,7 +1025,7 @@ private func collectContinuousControl(
         switch delta {
         case .text(let value):
             text += value
-        case .toolCalls:
+        case .toolCalls, .toolCallStart, .toolCallArguments:
             break
         case .tokenLogprobs:
             break

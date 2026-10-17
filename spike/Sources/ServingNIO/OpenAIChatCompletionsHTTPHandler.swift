@@ -1871,6 +1871,10 @@ private extension OpenAIChatCompletionsHTTPHandler {
         // Tool calls already sent on this stream, so `parallel_tool_calls: false` caps the whole
         // reply at one call even when the backend splits its calls across several `.toolCalls` events.
         var emittedToolCalls = 0
+        // The index of the call opened by the latest `.toolCallStart` whose `.toolCallArguments`
+        // fragments are streaming now; `nil` when `parallel_tool_calls: false` dropped that head.
+        var streamedToolCallIndex: Int?
+        var streamedToolCallOpened = false
 
         func drainLogprobs() -> [ServingTokenLogprob] {
             defer { pendingLogprobs.removeAll() }
@@ -2047,6 +2051,88 @@ private extension OpenAIChatCompletionsHTTPHandler {
                             timeout: configuration.backpressureStallTimeout)
                     }
                 }
+            case .toolCallStart(let call):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                guard responseKind != .completions else {
+                    throw RunError.invalidBackendHandle
+                }
+                // Head of one incrementally streamed call (enforced `tool_choice`): id + type + name
+                // with an empty `arguments`, then the fragments below. Only the head counts as a
+                // call, so `parallel_tool_calls: false` caps heads, never fragments. A head the cap
+                // drops also drops its fragments (`streamedToolCallIndex == nil`).
+                streamedToolCallOpened = true
+                guard
+                    request.limitingToolCalls([call], alreadyEmitted: emittedToolCalls).isEmpty
+                        == false
+                else {
+                    streamedToolCallIndex = nil
+                    break
+                }
+                let callIndex = emittedToolCalls
+                emittedToolCalls += 1
+                streamedToolCallIndex = callIndex
+                try await waitUntilWritable(
+                    writabilityGate,
+                    timeout: configuration.backpressureStallTimeout)
+                let head = OpenAIChatCompletionChunk(
+                    id: handle.responseID,
+                    created: handle.created,
+                    model: handle.model,
+                    index: 0,
+                    delta: .init(
+                        role: nil,
+                        content: nil,
+                        toolCalls: [
+                            OpenAIToolCallDelta(
+                                index: callIndex,
+                                id: call.id,
+                                type: "function",
+                                function: .init(name: call.function.name, arguments: ""))
+                        ]),
+                    finishReason: nil,
+                    logprobs: chatLogprobs())
+                try await writeBody(
+                    head.sseEvent(),
+                    channel: channel,
+                    timeout: configuration.backpressureStallTimeout)
+            case .toolCallArguments(let fragment):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                guard responseKind != .completions, streamedToolCallOpened else {
+                    throw RunError.invalidBackendHandle
+                }
+                // Fragment of the latest head's arguments: index + arguments only (no id/type/name).
+                // Logprobs buffered so far ride on this chunk (carry-once, as for `.text`).
+                guard let callIndex = streamedToolCallIndex, !fragment.isEmpty else {
+                    break
+                }
+                try await waitUntilWritable(
+                    writabilityGate,
+                    timeout: configuration.backpressureStallTimeout)
+                let chunk = OpenAIChatCompletionChunk(
+                    id: handle.responseID,
+                    created: handle.created,
+                    model: handle.model,
+                    index: 0,
+                    delta: .init(
+                        role: nil,
+                        content: nil,
+                        toolCalls: [
+                            OpenAIToolCallDelta(
+                                index: callIndex,
+                                id: nil,
+                                type: nil,
+                                function: .init(name: nil, arguments: fragment))
+                        ]),
+                    finishReason: nil,
+                    logprobs: chatLogprobs())
+                try await writeBody(
+                    chunk.sseEvent(),
+                    channel: channel,
+                    timeout: configuration.backpressureStallTimeout)
             case .tokenLogprobs(let tokens):
                 guard completion == nil else {
                     throw RunError.missingCompletion
@@ -2111,6 +2197,36 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 }
                 byteCount = newCount
                 toolCalls.append(contentsOf: calls)
+            case .toolCallStart(let call):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                let (newCount, overflow) = byteCount.addingReportingOverflow(
+                    event.utf8ByteCount)
+                guard !overflow, newCount <= maximumBytes else {
+                    throw RunError.responseLimitExceeded
+                }
+                byteCount = newCount
+                // The head opens one call whose arguments are the following fragments; assembled
+                // here into the same single `OpenAIToolCall` a lone `.toolCalls` delta would carry.
+                toolCalls.append(
+                    OpenAIToolCall(
+                        id: call.id, type: call.type,
+                        function: .init(name: call.function.name, arguments: "")))
+            case .toolCallArguments(let fragment):
+                guard completion == nil else {
+                    throw RunError.missingCompletion
+                }
+                let (newCount, overflow) = byteCount.addingReportingOverflow(
+                    event.utf8ByteCount)
+                guard !overflow, newCount <= maximumBytes else {
+                    throw RunError.responseLimitExceeded
+                }
+                byteCount = newCount
+                guard !toolCalls.isEmpty else {
+                    throw RunError.invalidBackendHandle
+                }
+                toolCalls[toolCalls.count - 1].function.arguments += fragment
             case .tokenLogprobs(let tokens):
                 guard completion == nil else {
                     throw RunError.missingCompletion

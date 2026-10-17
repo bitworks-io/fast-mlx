@@ -193,6 +193,65 @@ final class ToolUnionConstraintTests: XCTestCase {
         }
     }
 
+    // MARK: - Incremental argument stream (cycle 260)
+
+    /// The streamed pieces, concatenated, must equal `parse(generated:)`'s arguments at EVERY cut point
+    /// and for every chunking of the document, and the name must appear exactly when `parse` has one.
+    func testArgumentStreamMatchesParseAtEveryCutPointAndChunking() throws {
+        let format = try union([weather, timeTool])
+        let documents = [
+            #"{"name": "get_weather", "arguments": {"city": "Paris"}}"#,
+            #"{"name": "lookup_time", "arguments": {"zone": "UTC"}}"#,
+            #"{"name": "get_weather", "arguments": {"city": "Zürich 日本 "#,  // multi-byte, trailing space in a string
+            #"{"name": "get_weather", "arguments": {"city": "P"} }"#,  // whitespace before the wrapper's brace
+            #"{"name": "get_weather", "arguments": {"#+"\n  ",  // trailing whitespace at a cut
+            #"{"name": "get_weather", "arguments": { "city" : "P" }"#,  // interior whitespace
+        ]
+        for document in documents {
+            let scalars = Array(document.unicodeScalars)
+            for cut in 0...scalars.count {
+                var prefix = String.UnicodeScalarView()
+                prefix.append(contentsOf: scalars[0..<cut])
+                let expected = format.parse(generated: String(prefix))
+                for chunk in [1, 2, 3, 7, max(1, cut)] {
+                    var stream = ToolUnionArgumentStream(format: format)
+                    var names: [String] = []
+                    var arguments = ""
+                    var index = 0
+                    while index < cut {
+                        let end = min(cut, index + chunk)
+                        var piece = String.UnicodeScalarView()
+                        piece.append(contentsOf: scalars[index..<end])
+                        let output = stream.consume(String(piece))
+                        if let value = output.name { names.append(value) }
+                        arguments += output.arguments
+                        index = end
+                    }
+                    let label = "cut \(cut) chunk \(chunk) of \(document)"
+                    XCTAssertEqual(names, expected.map { [$0.name] } ?? [], label)
+                    XCTAssertEqual(arguments, expected?.arguments ?? "", label)
+                }
+            }
+        }
+    }
+
+    func testArgumentStreamNeverReportsTheWrappersClosingBraceAndHoldsTrailingWhitespace() throws {
+        let format = try union([weather, timeTool])
+        var stream = ToolUnionArgumentStream(format: format)
+        let framed = stream.consume(#"{"name": "get_weather", "arguments": "#)
+        XCTAssertEqual(framed, .init(name: "get_weather", arguments: ""))
+        // The arguments object's own `}` is reported; the wrapper's `}` that follows is not.
+        XCTAssertEqual(stream.consume(#"{"city": "P"}"#).arguments, #"{"city": "P"}"#)
+        XCTAssertEqual(stream.consume("}"), .init(name: nil, arguments: ""))
+        XCTAssertEqual(stream.consume("}").arguments, "", "bytes after the document are ignored")
+
+        // Whitespace is held until a later non-whitespace byte shows it is interior.
+        var held = ToolUnionArgumentStream(format: format)
+        _ = held.consume(#"{"name": "get_weather", "arguments": "#)
+        XCTAssertEqual(held.consume(#"{"city": "#).arguments, #"{"city":"#)
+        XCTAssertEqual(held.consume(#""P"#).arguments, #" "P"#)
+    }
+
     // MARK: - AC2: token mask over a toy vocab (shared trie)
 
     /// Every byte (so any text tokenizes), multi-byte tokens spanning every phase boundary, EOS, banned.

@@ -659,7 +659,7 @@ enum Qwen38ScorecardProductionRouteRunner {
                         switch delta {
                         case .text:
                             break
-                        case .toolCalls:
+                        case .toolCalls, .toolCallStart, .toolCallArguments:
                             throw Qwen38ScorecardContinuousRouteError
                                 .incompleteRequest(
                                     index: request.requestIndex)
@@ -1031,7 +1031,7 @@ public enum Qwen38ScorecardContinuousRouteRunner {
                     throw Qwen38ScorecardContinuousRouteError.malformedTokenText(text)
                 }
                 outputTokens.append(token)
-            case .toolCalls:
+            case .toolCalls, .toolCallStart, .toolCallArguments:
                 throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: index)
             case .tokenLogprobs:
                 // Unreachable: this harness route never requests logprobs (the continuous-batch

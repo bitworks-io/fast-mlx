@@ -72,6 +72,30 @@ final class ServingBoundedDeltaMailboxTests: XCTestCase {
         XCTAssertEqual(snapshot.bufferedDeltas, 0)
     }
 
+    func testStreamedToolCallDeltasCountAgainstMailboxByteCapacity() async throws {
+        let fragment = ServingResponseDelta.toolCallArguments(String(repeating: "\"", count: 20))
+        XCTAssertGreaterThanOrEqual(fragment.utf8ByteCount, 40, "JSON escapes are counted")
+        let head = ServingResponseDelta.toolCallStart(
+            OpenAIToolCall(id: "call_0", function: .init(name: "lookup", arguments: "")))
+        XCTAssertGreaterThan(head.utf8ByteCount, "call_0".utf8.count + "lookup".utf8.count)
+
+        let tiny = BoundedDeltaMailbox(capacity: .init(maxDeltas: 4, maxBytes: 32))
+        do {
+            try await tiny.send(fragment)
+            XCTFail("Expected an oversized fragment to exceed mailbox capacity")
+        } catch let error as ServingMailboxError {
+            XCTAssertEqual(error, .backend("delta exceeds mailbox byte capacity"))
+        }
+
+        let mailbox = BoundedDeltaMailbox(capacity: .init(maxDeltas: 4, maxBytes: 4_096))
+        try await mailbox.send(head)
+        try await mailbox.send(fragment)
+        let first = try await mailbox.next()
+        let second = try await mailbox.next()
+        XCTAssertEqual(first, head)
+        XCTAssertEqual(second, fragment)
+    }
+
     func testJSONStringEscapesCountAgainstMailboxByteCapacity() async throws {
         let delta = ServingResponseDelta.text(String(repeating: "\"", count: 20))
         XCTAssertEqual(delta.utf8ByteCount, 40)

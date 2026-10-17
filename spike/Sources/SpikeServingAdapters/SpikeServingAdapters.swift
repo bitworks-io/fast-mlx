@@ -320,7 +320,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         let lease: ServingRequestLease
 
         /// True when a named or `"required"` `tool_choice` is enforced: the family tool parser is
-        /// bypassed and the post-reasoning text is accumulated for `publish`.
+        /// bypassed and the post-reasoning text is streamed as a call head plus argument fragments.
         var isToolChoiceEnforced: Bool { enforcedToolName != nil || enforcedToolUnion != nil }
     }
 
@@ -334,10 +334,32 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         /// Non-nil only when a tool processor exists AND the response separates reasoning: keeps the
         /// parser from seeing text the client is shown as `reasoning_content`.
         var reasoningGate: ReasoningPhaseToolCallGate?
-        /// Post-reasoning generated text of an enforced named `tool_choice` (the call's arguments,
-        /// byte for byte), or of an enforced `"required"` (the whole framed document). Unused (always
-        /// empty) for every other request.
-        var enforcedToolArguments = ""
+        /// Incremental tool-call assembly for an enforced `tool_choice` (`nil` for every other
+        /// request): turns the post-reasoning generated text into a call head plus argument fragments.
+        var enforcedStream: EnforcedToolCallStream?
+    }
+
+    /// Incremental form of an enforced call: the post-reasoning generated text is fed in as it is
+    /// decoded and comes out as the call's name (once, when the call is known) plus the bytes that
+    /// belong to its `arguments`. Named: the generated text IS the arguments, so the head goes out
+    /// with the first non-empty text. Required: the union document's frame is stripped and the
+    /// wrapper's closing brace held back (`ToolUnionArgumentStream`).
+    private enum EnforcedToolCallStream {
+        case named(name: String, headSent: Bool)
+        case union(ToolUnionArgumentStream)
+
+        mutating func consume(_ text: String) -> (name: String?, arguments: String) {
+            switch self {
+            case .named(let name, let headSent):
+                guard !text.isEmpty else { return (nil, "") }
+                self = .named(name: name, headSent: true)
+                return (headSent ? nil : name, text)
+            case .union(var stream):
+                let output = stream.consume(text)
+                self = .union(stream)
+                return (output.name, output.arguments)
+            }
+        }
     }
 
     private let launchedModel: String
@@ -925,7 +947,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             stopFilter: ServingStopStringFilter(stopStrings: stops),
             toolCallProcessor: toolCallProcessor,
             reasoningGate: (toolCallProcessor != nil || isEnforced) && request.separatesReasoning
-                ? ReasoningPhaseToolCallGate() : nil)
+                ? ReasoningPhaseToolCallGate() : nil,
+            enforcedStream: request.enforcedToolName.map { .named(name: $0, headSent: false) }
+                ?? request.enforcedToolUnion.map { .union(ToolUnionArgumentStream(format: $0)) })
         let task = Task { [weak self] in
             guard let self else {
                 return
@@ -1015,32 +1039,10 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             try await flushEndOfStream(for: id)
             var finishReason: OpenAIChatFinishReason =
                 summary.finishReason == .length ? .length : .stop
-            if let toolName = request.enforcedToolName, let arguments = active?.enforcedToolArguments,
-                !arguments.isEmpty
-            {
-                // Exactly one call to the named function; `finish_reason` stays `stop`/`length`
-                // (OpenAI's behavior for a forced function), and a truncated call carries its
-                // partial arguments. Nothing was generated past reasoning -> no call.
-                try await request.mailbox.send(
-                    .toolCalls([
-                        OpenAIToolCall(
-                            id: Self.makeToolCallID(format: configuration.toolCallFormat),
-                            function: .init(name: toolName, arguments: arguments))
-                    ]))
-            }
-            if let union = request.enforcedToolUnion, let generated = active?.enforcedToolArguments,
-                let parsed = union.parse(generated: generated)
-            {
-                // Exactly one call, to the name the document completed, carrying the chosen tool's
-                // argument bytes (partial when the budget ran out). A document whose name was never
-                // completed names no tool, so it yields no call and no content.
-                try await request.mailbox.send(
-                    .toolCalls([
-                        OpenAIToolCall(
-                            id: Self.makeToolCallID(format: configuration.toolCallFormat),
-                            function: .init(name: parsed.name, arguments: parsed.arguments))
-                    ]))
-            }
+            // An enforced call (named, or "required") was already streamed as it decoded: one head
+            // (`.toolCallStart`) once the call was known, then `.toolCallArguments` fragments. A call
+            // that never became known (nothing generated past reasoning, or a "required" document cut
+            // before its name completed) sent nothing, so there is no call and no content.
             if let processor = active?.toolCallProcessor {
                 // Preserve any residual buffered text that turned out NOT to be a tool call
                 // (e.g. the model ended mid-`<tool_call` or emitted malformed JSON) so it is
@@ -1108,7 +1110,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                     }
                     argumentsText = routed.toParser
                 }
-                active?.enforcedToolArguments += argumentsText
+                try await publishEnforcedToolText(argumentsText, for: current.request)
             } else if let processor = current.toolCallProcessor {
                 var parserText = text
                 var gated = false
@@ -1146,6 +1148,28 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             return .stopGeneration
         }
         return .continueGeneration
+    }
+
+    /// Feeds post-reasoning text of an enforced `tool_choice` into the incremental call assembly and
+    /// sends what it releases: the head (`.toolCallStart`, with a fresh id) the moment the call is
+    /// known, then the arguments fragment for these bytes. The assembly state is stored before the
+    /// first suspension so a re-entrant call can never see stale state.
+    private func publishEnforcedToolText(
+        _ text: String, for request: PendingRequest
+    ) async throws {
+        guard !text.isEmpty, var stream = active?.enforcedStream else { return }
+        let released = stream.consume(text)
+        active?.enforcedStream = stream
+        if let name = released.name {
+            try await request.mailbox.send(
+                .toolCallStart(
+                    OpenAIToolCall(
+                        id: Self.makeToolCallID(format: configuration.toolCallFormat),
+                        function: .init(name: name, arguments: ""))))
+        }
+        if !released.arguments.isEmpty {
+            try await request.mailbox.send(.toolCallArguments(released.arguments))
+        }
     }
 
     /// Map one `SpikeCore.DecodedTokenLogprob` (a raw token ID + candidates, no notion of text) to
@@ -1210,7 +1234,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             if !passthrough.isEmpty {
                 try await current.request.mailbox.send(.text(passthrough))
             }
-            active?.enforcedToolArguments += parserText
+            try await publishEnforcedToolText(parserText, for: current.request)
         } else if let processor = current.toolCallProcessor {
             if !passthrough.isEmpty {
                 try await current.request.mailbox.send(.text(passthrough))
