@@ -183,9 +183,12 @@ function; the head carries the chosen name once the model has written it, and on
 value is streamed (the `{"name": ..., "arguments": ...}` framing is not). The same 400 on
 `tool_choice` applies, and so does one for a declared name with a character
 outside `[A-Za-z0-9_-]` or a duplicated name. Limit: one call only, so there are no parallel calls
-under `"required"` on this route. On the continuous-batch and speculative routes `"required"` and a
-named function are still validated but not enforced: a model that answers in prose there returns
-plain `content`.
+under `"required"` on this route. On the continuous-batch and speculative/MTP routes (including an in-checkpoint MTP drafter), and on a
+checkpoint whose tokenizer cannot host the mask, `"required"` and a named function cannot be enforced,
+so they are refused with a 400 (`invalid_request_error`, `param` `tool_choice`) before any generation
+or SSE header, never answered in prose. They are enforced only on the non-speculative single-stream
+scalar route.
+`"auto"`, `"none"` and an absent `tool_choice` are unaffected.
 
 `POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients
 such as `openai-python`'s `client.completions.create`, LangChain's `OpenAI` LLM, or lm-eval-style

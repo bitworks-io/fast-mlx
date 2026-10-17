@@ -303,6 +303,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 param: "logprobs",
                 code: "logprobs_unsupported")
         }
+        // This route has no per-row constraint seam, so a named or `"required"` `tool_choice` cannot
+        // be enforced: refuse it (400, `param: "tool_choice"`) before any admission or decode, never
+        // answer in prose. Defense in depth behind the HTTP capability gate.
+        try validateToolChoiceCapability(
+            request: request, backendEnforcesToolChoice: enforcesForcingToolChoice)
         try request.requireLaunchedModel(launchedModel)
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ContinuousServingBackendError.invalidStopTokenIDs

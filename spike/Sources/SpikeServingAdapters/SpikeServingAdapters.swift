@@ -429,6 +429,10 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             && configuration.decoderSupportsResponseFormatConstraint
     }
 
+    /// A named or `"required"` `tool_choice` is enforced exactly when the json_schema mask is
+    /// available: this is precisely the condition of the named/required enforcement blocks in `start`.
+    public nonisolated var enforcesForcingToolChoice: Bool { supportsJSONSchemaResponseFormat }
+
     /// `true` only when ALL THREE hold: this backend is the plain, non-speculative scalar route
     /// (`isNonSpeculativeScalarRoute`), the CONCRETE bound decoder reports it can run an injected
     /// logit processor (`decoderSupportsResponseFormatConstraint` -- the bias rides the same
@@ -482,6 +486,12 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 param: "ignore_eos",
                 code: "ignore_eos_unsupported")
         }
+        // A named or `"required"` `tool_choice` is refused (400, `param: "tool_choice"`) unless this
+        // backend can enforce it (`enforcesForcingToolChoice`, the exact condition of
+        // the enforcement blocks below). Defense in depth behind the HTTP gate, before any
+        // prompt render, queueing or decoder work.
+        try validateToolChoiceCapability(
+            request: request, backendEnforcesToolChoice: enforcesForcingToolChoice)
         // `logit_bias`: applied here, on the plain scalar route only, by composing a
         // `LogitBiasLogitProcessor` into the per-request processor slot below. Refused with a 400
         // (`param: "logit_bias"`) BEFORE any prompt render, queueing or decoder work when this

@@ -9,7 +9,9 @@ import XCTest
 @testable import ServingNIO
 
 /// An unsatisfiable `tool_choice` is a 400 naming `tool_choice`, answered BEFORE the backend starts,
-/// for both streaming and non-streaming requests. A declared named function still reaches the backend.
+/// for both streaming and non-streaming requests. A declared named function still reaches a backend
+/// that ENFORCES it (`supportsJSONSchemaResponseFormat == true`); a backend that cannot enforce a
+/// named or `"required"` choice is refused with the same 400 rather than answering in prose.
 final class ToolChoiceValidationHTTPTests: XCTestCase {
     private func payload(stream: Bool, tools: String?, toolChoice: String) -> String {
         let toolsField = tools.map { #","tools":\#($0)"# } ?? ""
@@ -88,11 +90,94 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
         }
     }
 
-    func testDeclaredNamedFunctionReachesBackend() async throws {
+    func testDeclaredNamedFunctionReachesEnforcingBackend() async throws {
         let result = try await run(
-            payload: payload(stream: false, tools: declared, toolChoice: namedDeclared))
+            payload: payload(stream: false, tools: declared, toolChoice: namedDeclared),
+            backend: CountingBackend(enforcesToolChoice: true))
         XCTAssertEqual(result.head.status, .ok, result.body)
         XCTAssertEqual(result.starts, 1)
+    }
+
+    // MARK: A choice the backend cannot enforce is refused, not ignored
+
+    /// The gate keys on `enforcesForcingToolChoice`, not `supportsJSONSchemaResponseFormat`: a backend
+    /// that does not support json_schema `response_format` but enforces forcing choices is admitted,
+    /// and one that supports json_schema but does not enforce them is refused.
+    func testGateKeysOnEnforcesForcingToolChoiceNotJSONSchemaSupport() async throws {
+        let admitted = try await run(
+            payload: payload(stream: false, tools: declared, toolChoice: namedDeclared),
+            backend: CountingBackend(enforcesToolChoice: true, supportsJSONSchema: false))
+        XCTAssertEqual(admitted.head.status, .ok, admitted.body)
+        XCTAssertEqual(admitted.starts, 1)
+
+        let refused = try await run(
+            payload: payload(stream: false, tools: declared, toolChoice: namedDeclared),
+            backend: CountingBackend(enforcesToolChoice: false, supportsJSONSchema: true))
+        assertRefusedBeforeBackend(refused)
+    }
+
+    /// Named choice on a backend without json_schema support: 400 `tool_choice`, no SSE, no start.
+    func testNamedToolChoiceOnNonEnforcingBackendIs400BeforeBackend() async throws {
+        for stream in [false, true] {
+            let result = try await run(
+                payload: payload(stream: stream, tools: declared, toolChoice: namedDeclared))
+            assertRefusedBeforeBackend(result)
+            XCTAssertTrue(result.body.contains("invalid_request_error"), result.body)
+            XCTAssertTrue(result.body.contains("named tool_choice"), result.body)
+            XCTAssertFalse(result.body.contains("data:"), "no SSE bytes: \(result.body)")
+        }
+    }
+
+    func testRequiredToolChoiceOnNonEnforcingBackendIs400BeforeBackend() async throws {
+        for stream in [false, true] {
+            let result = try await run(
+                payload: payload(stream: stream, tools: declared, toolChoice: #""required""#))
+            assertRefusedBeforeBackend(result)
+            XCTAssertTrue(result.body.contains("invalid_request_error"), result.body)
+            XCTAssertTrue(result.body.contains(#"tool_choice \"required\""#), result.body)
+            XCTAssertFalse(result.body.contains("data:"), "no SSE bytes: \(result.body)")
+        }
+    }
+
+    /// `"auto"`, `"none"` and an absent choice need no enforcement and still reach the backend.
+    func testAutoNoneAndAbsentToolChoiceStillReachNonEnforcingBackend() async throws {
+        for stream in [false, true] {
+            for choice in [#""auto""#, #""none""#] {
+                let result = try await run(
+                    payload: payload(stream: stream, tools: declared, toolChoice: choice))
+                XCTAssertEqual(result.head.status, .ok, result.body)
+                XCTAssertEqual(result.starts, 1, choice)
+            }
+        }
+        let absent = try await run(
+            payload: #"{"model":"qwen3-32b","messages":[{"role":"user","content":"Hello"}],"tools":"#
+                + declared + #","max_completion_tokens":8,"temperature":0,"stream":false}"#)
+        XCTAssertEqual(absent.head.status, .ok, absent.body)
+        XCTAssertEqual(absent.starts, 1)
+    }
+
+    /// An enforcing backend is not refused by the gate, for named and `"required"`.
+    func testEnforcingBackendIsNotRefusedForNamedOrRequired() async throws {
+        for choice in [namedDeclared, #""required""#] {
+            let result = try await run(
+                payload: payload(stream: false, tools: declared, toolChoice: choice),
+                backend: CountingBackend(enforcesToolChoice: true))
+            XCTAssertEqual(result.head.status, .ok, result.body)
+            XCTAssertEqual(result.starts, 1, choice)
+        }
+    }
+
+    /// Pre-existing decode validation keeps its own message (and wins over the capability gate) even
+    /// on a backend that cannot enforce.
+    func testDecodeValidationMessagesWinOverCapabilityGate() async throws {
+        let undeclared = try await run(
+            payload: payload(stream: false, tools: declared, toolChoice: namedOther))
+        assertRefusedBeforeBackend(undeclared)
+        XCTAssertFalse(undeclared.body.contains("decoding route"), undeclared.body)
+        let noTools = try await run(
+            payload: payload(stream: false, tools: nil, toolChoice: #""required""#))
+        assertRefusedBeforeBackend(noTools)
+        XCTAssertFalse(noTools.body.contains("decoding route"), noTools.body)
     }
 
     /// `"required"` together with `response_format` is a 400 naming `tool_choice`, before the backend.
@@ -111,7 +196,8 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
         let backend = CountingBackend(
             toolCall: OpenAIToolCall(
                 id: "call_abc", function: .init(name: "get_weather", arguments: #"{"city":"Paris"}"#)),
-            finishReason: .stop)
+            finishReason: .stop,
+            enforcesToolChoice: true)
         let plain = try await run(
             payload: payload(stream: false, tools: declared, toolChoice: #""required""#), backend: backend)
         XCTAssertEqual(plain.head.status, .ok, plain.body)
@@ -137,7 +223,8 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
         let backend = CountingBackend(
             toolCall: OpenAIToolCall(
                 id: "call_abc", function: .init(name: "get_weather", arguments: #"{"city":"Paris"}"#)),
-            finishReason: .stop)
+            finishReason: .stop,
+            enforcesToolChoice: true)
         let plain = try await run(
             payload: payload(stream: false, tools: declared, toolChoice: namedDeclared), backend: backend)
         XCTAssertEqual(plain.head.status, .ok, plain.body)
@@ -166,7 +253,8 @@ final class ToolChoiceValidationHTTPTests: XCTestCase {
             backend: CountingBackend(
                 toolCall: OpenAIToolCall(
                     id: "call_abc", function: .init(name: "get_weather", arguments: #"{"ci"#)),
-                finishReason: .length))
+                finishReason: .length,
+                enforcesToolChoice: true))
         XCTAssertTrue(truncated.body.contains(#""finish_reason":"length""#), truncated.body)
         XCTAssertTrue(truncated.body.contains(#"{\"ci"#), truncated.body)
     }
@@ -178,11 +266,23 @@ private final class CountingBackend: ServingGenerationBackend, Sendable {
     private let starts = OSAllocatedUnfairLock(initialState: 0)
     private let toolCall: OpenAIToolCall?
     private let finishReason: OpenAIChatFinishReason
+    private let enforcesToolChoice: Bool
+    private let supportsJSONSchema: Bool
 
-    init(toolCall: OpenAIToolCall? = nil, finishReason: OpenAIChatFinishReason = .stop) {
+    init(
+        toolCall: OpenAIToolCall? = nil, finishReason: OpenAIChatFinishReason = .stop,
+        enforcesToolChoice: Bool = false, supportsJSONSchema: Bool = false
+    ) {
+        self.supportsJSONSchema = supportsJSONSchema
         self.toolCall = toolCall
         self.finishReason = finishReason
+        self.enforcesToolChoice = enforcesToolChoice
     }
+
+    /// The capability the HTTP gate reads for a named or `"required"` `tool_choice`.
+    var enforcesForcingToolChoice: Bool { enforcesToolChoice }
+    /// Independent of `enforcesForcingToolChoice`, so a test can prove the gate keys on the latter.
+    var supportsJSONSchemaResponseFormat: Bool { supportsJSONSchema }
 
     var startCount: Int { starts.withLock { $0 } }
 

@@ -306,10 +306,13 @@ public extension OpenAIChatCompletionRequest {
     /// function; see `OpenAIToolSpec.forcedArgumentsFormat()`); `"required"` masks a union over every
     /// declared tool (the reply is exactly one call, to a declared function, with that function's
     /// arguments schema-constrained; see `[OpenAIToolSpec].requiredToolUnionFormat()`). Everywhere
-    /// else -- continuous batching, MTP/speculative, a checkpoint whose tokenizer cannot host the mask
-    /// -- the choice is validated at decode time (it needs a non-empty `tools`, and a named function
-    /// must be declared) but NOT enforced: a model that answers in plain text still returns 200 with
-    /// `finish_reason` `"stop"`.
+    /// else -- continuous batching, speculative/MTP routes (including an in-checkpoint MTP drafter), a
+    /// checkpoint whose tokenizer cannot host the mask -- the choice cannot be enforced, so it is
+    /// refused with a 400 (`param: "tool_choice"`, see
+    /// `validateToolChoiceCapability`) before any generation rather than answered in prose. It is
+    /// still validated at decode time first (it needs a non-empty `tools`, and a named function must
+    /// be declared), and those messages take precedence. `auto`, `none` and an absent choice are
+    /// never refused.
     var activeTools: [OpenAIToolSpec] {
         switch toolChoice {
         case .none:

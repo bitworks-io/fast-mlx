@@ -537,25 +537,41 @@ final class ScalarRequiredToolChoiceEnforcementTests: XCTestCase {
         XCTAssertEqual(named.finishReason, "stop")
     }
 
-    func testRequiredWithoutSchemaSupportKeepsValidatedOnlyBehavior() async throws {
+    /// `"required"` this backend cannot enforce is a 400 on `tool_choice` -- never prose with 200 --
+    /// through the HTTP gate AND from the backend directly (defense in depth). No generation runs.
+    func testRequiredWithoutSchemaSupportIsRefusedNotIgnored() async throws {
         let rig = makeRig(schemaSupportEnabled: false)
-        let result = try await send(rig.backend, payload: payload())
-        XCTAssertEqual(result.head.status, .ok, result.body)
-        XCTAssertEqual(result.message["content"] as? String, "Sure it!")
-        XCTAssertTrue(result.toolCalls.isEmpty)
-        // And the enforcement-only refusals do not fire where nothing is enforced.
-        let unsupported = try await send(rig.backend, payload: payload(tools: [weatherTool, patternedTool]))
-        XCTAssertEqual(unsupported.head.status, .ok, unsupported.body)
+        for stream in [false, true] {
+            let result = try await send(rig.backend, payload: payload(stream: stream))
+            XCTAssertEqual(result.head.status, .badRequest, result.body)
+            XCTAssertEqual(result.errorParam, "tool_choice", result.body)
+            XCTAssertFalse(result.body.contains("data:"), result.body)
+        }
+        try await assertBackendRefusesRequired(rig)
     }
 
-    func testRequiredOnSpeculativeRouteKeepsValidatedOnlyBehavior() async throws {
+    func testRequiredOnSpeculativeRouteIsRefusedNotIgnored() async throws {
         let rig = makeRig(isNonSpeculativeScalarRoute: false)
-        let result = try await send(rig.backend, payload: payload())
-        XCTAssertEqual(result.head.status, .ok, result.body)
-        XCTAssertEqual(result.message["content"] as? String, "Sure it!")
-        XCTAssertTrue(result.toolCalls.isEmpty)
-        let unsupported = try await send(rig.backend, payload: payload(tools: [weatherTool, patternedTool]))
-        XCTAssertEqual(unsupported.head.status, .ok, unsupported.body)
+        for stream in [false, true] {
+            let result = try await send(rig.backend, payload: payload(stream: stream))
+            XCTAssertEqual(result.head.status, .badRequest, result.body)
+            XCTAssertEqual(result.errorParam, "tool_choice", result.body)
+        }
+        try await assertBackendRefusesRequired(rig)
+    }
+
+    /// The backend refuses by itself (request built without the HTTP decode/gate).
+    private func assertBackendRefusesRequired(
+        _ rig: Rig, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        let request = try OpenAIChatCompletionRequest.decodeStrict(from: Data(payload().utf8))
+        do {
+            _ = try await rig.backend.start(request)
+            XCTFail("expected a tool_choice refusal", file: file, line: line)
+        } catch OpenAIServingError.invalidRequest(_, let param) {
+            XCTAssertEqual(param, "tool_choice", file: file, line: line)
+        }
+        XCTAssertEqual(rig.model.forwardCalls, 0, file: file, line: line)
     }
 
     // MARK: Order -- penalties -> logit_bias -> mask

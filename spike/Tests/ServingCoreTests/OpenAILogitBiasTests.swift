@@ -184,5 +184,65 @@ final class OpenAILogitBiasTests: XCTestCase {
             }
         }
         XCTAssertFalse(Bare().supportsLogitBias)
+        XCTAssertFalse(Bare().enforcesForcingToolChoice)
+    }
+
+    // MARK: forcing tool_choice capability gate (`validateToolChoiceCapability`)
+
+    private func toolChoiceRequest(
+        _ choice: OpenAIToolChoice, promptInput: ServingPromptInput = .chat
+    ) -> OpenAIChatCompletionRequest {
+        var request = OpenAIChatCompletionRequest(
+            model: "m", messages: [OpenAIChatMessage(role: .user, text: "hi")],
+            maxCompletionTokens: 4, temperature: 0, choiceCount: 1, stream: false, stop: [])
+        request.toolChoice = choice
+        request.promptInput = promptInput
+        return request
+    }
+
+    private func assertToolChoiceRefused(
+        _ request: OpenAIChatCompletionRequest, enforces: Bool,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        do {
+            try validateToolChoiceCapability(request: request, backendEnforcesToolChoice: enforces)
+            XCTFail("expected a tool_choice refusal", file: file, line: line)
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.type, .invalidRequest, file: file, line: line)
+            XCTAssertEqual(error.openAIError.param, "tool_choice", file: file, line: line)
+        } catch {
+            XCTFail("unexpected error \(error)", file: file, line: line)
+        }
+    }
+
+    func testToolChoiceGateAutoAndNonePassOnANonEnforcingBackend() {
+        for choice: OpenAIToolChoice in [.auto, .none] {
+            XCTAssertNoThrow(
+                try validateToolChoiceCapability(
+                    request: toolChoiceRequest(choice), backendEnforcesToolChoice: false))
+        }
+    }
+
+    func testToolChoiceGateRefusesForcingChoicesOnANonEnforcingBackend() {
+        for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
+            assertToolChoiceRefused(toolChoiceRequest(choice), enforces: false)
+        }
+    }
+
+    func testToolChoiceGateAdmitsForcingChoicesOnAnEnforcingBackendForChat() {
+        for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
+            XCTAssertNoThrow(
+                try validateToolChoiceCapability(
+                    request: toolChoiceRequest(choice), backendEnforcesToolChoice: true))
+        }
+    }
+
+    /// Enforcement only runs for a chat-templated prompt, so an in-process raw-text request carrying
+    /// a forcing choice is refused even on an enforcing backend (closes a fail-open).
+    func testToolChoiceGateRefusesForcingChoicesForRawTextEvenOnAnEnforcingBackend() {
+        for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
+            assertToolChoiceRefused(
+                toolChoiceRequest(choice, promptInput: .rawText("Once upon a time")), enforces: true)
+        }
     }
 }

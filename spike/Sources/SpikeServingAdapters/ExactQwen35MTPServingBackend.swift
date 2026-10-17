@@ -266,6 +266,12 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
     /// route is started. The MTP runner never sees a bias.
     public nonisolated var supportsLogitBias: Bool { scalarFallback.supportsLogitBias }
 
+    /// A forcing `tool_choice` (named or `"required"`) always carries active tools, which make the
+    /// request ineligible for speculation (`.scalarFallback(.activeTools)`), so it is always served
+    /// by the scalar fallback. This wrapper therefore enforces it if and only if that fallback does;
+    /// otherwise the HTTP gate refuses first and no route is started.
+    public nonisolated var enforcesForcingToolChoice: Bool { scalarFallback.enforcesForcingToolChoice }
+
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
@@ -279,6 +285,11 @@ public actor ExactQwen35MTPServingBackend: ServingGenerationBackend {
                 "logit_bias is not supported by the loaded model's decoding route",
                 param: "logit_bias")
         }
+        // A forcing `tool_choice` is always served by the scalar fallback (active tools), so it is
+        // refused here unless that fallback enforces it; refused before any route starts rather than
+        // answered in prose.
+        try validateToolChoiceCapability(
+            request: request, backendEnforcesToolChoice: enforcesForcingToolChoice)
         // This backend only knows how to speculate over a CHAT-templated prompt; fail closed rather
         // than falling back to the scalar route, which would silently serve a raw-text completion off
         // a backend explicitly documented as "only knows chat templates" for this route.

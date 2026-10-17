@@ -422,6 +422,38 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             return
         }
 
+        // A named function or `"required"` `tool_choice` demands a tool call. Only a backend that can
+        // enforce it (`enforcesForcingToolChoice`: the scalar route with the json_schema mask, decoder
+        // seam and loaded schema support, or a wrapper whose fallback is that route); every other route is
+        // refused here with a 400 BEFORE `backend.start(_:)` rather than answer in prose. `auto`,
+        // `none` and an absent choice always pass.
+        do {
+            try validateToolChoiceCapability(
+                request: request,
+                backendEnforcesToolChoice: backend.enforcesForcingToolChoice)
+        } catch let error as OpenAIServingError {
+            writeError(
+                error,
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context,
+                requestLogStream: request.stream,
+                requestLogModel: configuration.launchedModel,
+                requestLogIgnoredFields: request.ignoredFields)
+            return
+        } catch {
+            // `validateToolChoiceCapability` only ever throws `OpenAIServingError`; this catch-all
+            // exists solely so the `do` block's error type does not widen to `any Error`.
+            writeError(
+                .invalidRequest(
+                    "tool_choice cannot be enforced by the loaded model's decoding route",
+                    param: "tool_choice"),
+                status: .badRequest,
+                keepAlive: head.isKeepAlive,
+                context: context)
+            return
+        }
+
         // Serving evidence recording has no way to serialize per-token logprobs into
         // `ServingEvidence.Request`/`Response` today — fail closed with a normal OpenAI-style 400
         // BEFORE any evidence request construction, exactly like the `isLegacyCompletions` guard

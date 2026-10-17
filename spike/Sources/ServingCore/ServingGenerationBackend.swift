@@ -28,6 +28,15 @@ public protocol ServingGenerationBackend: Sendable {
     /// `validateLogitBiasCapability` at the single dispatch point rather than serve an unbiased
     /// response to a caller who asked for a bias.
     var supportsLogitBias: Bool { get }
+    /// Whether this backend's decoding route can ENFORCE a forcing `tool_choice` (a named function
+    /// or `"required"`), i.e. guarantee the reply is a tool call rather than prose. Defaults to
+    /// `false` (fail closed): only the scalar route that can run the json_schema mask declares
+    /// `true`, and a route-switching wrapper reports whatever the route that serves forcing choices
+    /// reports. `validateToolChoiceCapability` must be called at the single dispatch point before
+    /// `start(_:)` so a request demanding a tool call is refused with a 400 rather than answered in
+    /// prose by a route that cannot force one. Deliberately separate from
+    /// `supportsJSONSchemaResponseFormat`, which gates `response_format`.
+    var enforcesForcingToolChoice: Bool { get }
 }
 
 extension ServingGenerationBackend {
@@ -45,6 +54,7 @@ extension ServingGenerationBackend {
     public var supportsJSONObjectResponseFormat: Bool { false }
     public var supportsJSONSchemaResponseFormat: Bool { false }
     public var supportsLogitBias: Bool { false }
+    public var enforcesForcingToolChoice: Bool { false }
 }
 
 /// The single ServingCore-level admission check for `logit_bias` against a backend's declared
@@ -62,6 +72,47 @@ public func validateLogitBiasCapability(
         throw OpenAIServingError.invalidRequest(
             "logit_bias is not supported by the loaded model's decoding route",
             param: "logit_bias")
+    }
+}
+
+/// The single ServingCore-level admission check for a forcing `tool_choice` (a named function or
+/// `"required"`) against whether the dispatched backend can ENFORCE it (today: the scalar route
+/// that can run the json_schema mask; see `ServingGenerationBackend.enforcesForcingToolChoice`).
+/// Enforcement also requires a chat-templated prompt (`promptInput == .chat`). Called at the one
+/// dispatch point before `backend.start(_:)` (alongside `validateLogitBiasCapability`) and again
+/// inside each backend's `start` as defense in depth, so a route that cannot force a tool call
+/// never answers a caller who demanded one in prose with a 200. `auto`, `none` and an absent choice
+/// need no enforcement and always pass. Uses an EXHAUSTIVE `switch` over `request.toolChoice` (no
+/// `default:`) so a future `OpenAIToolChoice` case cannot silently skip this gate and fail OPEN.
+/// The message never echoes the client's function name. Throws `OpenAIServingError.invalidRequest`
+/// with `param: "tool_choice"`.
+public func validateToolChoiceCapability(
+    request: OpenAIChatCompletionRequest,
+    backendEnforcesToolChoice: Bool
+) throws {
+    // `/v1/completions` always decodes `toolChoice` as `.none`, so HTTP never reaches this with a
+    // raw-text prompt; the extra term closes an in-process fail-open (the backend's enforcement
+    // blocks only run for a chat prompt).
+    let enforced = backendEnforcesToolChoice && request.promptInput == .chat
+    switch request.toolChoice {
+    case .none, .auto:
+        return
+    case .function:
+        guard enforced else {
+            throw OpenAIServingError.invalidRequest(
+                "a named tool_choice cannot be enforced by the loaded model's decoding route"
+                    + "; it is enforced only on the non-speculative single-stream route of a model "
+                    + "whose tokenizer supports json_schema constraints",
+                param: "tool_choice")
+        }
+    case .required:
+        guard enforced else {
+            throw OpenAIServingError.invalidRequest(
+                "tool_choice \"required\" cannot be enforced by the loaded model's decoding route"
+                    + "; it is enforced only on the non-speculative single-stream route of a model "
+                    + "whose tokenizer supports json_schema constraints",
+                param: "tool_choice")
+        }
     }
 }
 

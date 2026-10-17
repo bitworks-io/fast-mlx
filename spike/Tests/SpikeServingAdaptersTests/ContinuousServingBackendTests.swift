@@ -147,6 +147,55 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    /// A named or `"required"` `tool_choice` cannot be enforced on the continuous route (no constraint
+    /// seam), so the backend refuses it with a 400 on `tool_choice` before any admission or decode --
+    /// defense in depth behind the HTTP capability gate. `auto`/`none` are unaffected.
+    func testContinuousBatchRouteRefusesNamedAndRequiredToolChoiceWithoutAdmittingAnything()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+        XCTAssertFalse(backend.supportsJSONSchemaResponseFormat)
+
+        for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
+            var forced = request(text: "solo", maxTokens: 2, tools: [continuousWeatherTool])
+            forced.toolChoice = choice
+            do {
+                _ = try await backend.start(forced)
+                XCTFail("continuous route must refuse \(choice) instead of answering in prose")
+            } catch let error as OpenAIServingError {
+                guard case .invalidRequest(_, let param) = error else {
+                    XCTFail("expected invalidRequest, got \(error)")
+                    await backend.shutdown()
+                    return
+                }
+                XCTAssertEqual(param, "tool_choice")
+            }
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [], "a refused request must never be admitted")
+        XCTAssertEqual(recorder.decodeActions, [], "a refused request must never reach a decode step")
+
+        // Control: `auto` with tools is still a normal, admissible request.
+        let handle = try await backend.start(
+            request(text: "solo", maxTokens: 2, tools: [continuousWeatherTool]))
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
     /// The continuous-batch route only knows how to render a CHAT-templated prompt — a legacy
     /// `/v1/completions` request (`.rawText`) must be rejected with `completions_unsupported`
     /// BEFORE anything is rendered or decoded, never silently mistreated as an already-templated

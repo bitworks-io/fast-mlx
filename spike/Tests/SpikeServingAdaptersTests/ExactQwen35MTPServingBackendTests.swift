@@ -376,6 +376,57 @@ final class ExactQwen35MTPServingBackendTests: XCTestCase {
         XCTAssertEqual(runner.snapshot().startCount, 1)
     }
 
+    // A forcing `tool_choice` is always served by the scalar fallback (active tools), so the wrapper
+    // enforces it only if that fallback does. With a non-enforcing fallback it is refused with a 400
+    // on `tool_choice` before either the MTP runner or the fallback starts -- defense in depth behind
+    // the HTTP gate.
+    func testForcedToolChoiceIsRefusedBeforeAnyRouteStartsWhenFallbackDoesNotEnforce() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback()
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+        XCTAssertFalse(backend.supportsJSONSchemaResponseFormat)
+        XCTAssertFalse(backend.enforcesForcingToolChoice)
+
+        for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
+            var forced = request(maxTokens: 2, tools: [weatherTool])
+            forced.toolChoice = choice
+            do {
+                _ = try await backend.start(forced)
+                XCTFail("expected a tool_choice refusal for \(choice)")
+            } catch OpenAIServingError.invalidRequest(_, let param) {
+                XCTAssertEqual(param, "tool_choice")
+            }
+        }
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+        XCTAssertEqual(scalar.snapshot().startCount, 0)
+
+        // Control: `auto` with tools still starts.
+        let handle = try await backend.start(request(maxTokens: 2, tools: [weatherTool]))
+        _ = try await collect(handle.mailbox)
+        XCTAssertEqual(runner.snapshot().startCount + scalar.snapshot().startCount, 1)
+    }
+
+    // When the scalar fallback enforces forcing choices, the wrapper mirrors that and forwards both
+    // forcing choices to it (never to the MTP runner): the wrapper must not refuse what its fallback
+    // enforces. `response_format` gating is unchanged (the wrapper still never claims json_schema).
+    func testForcedToolChoiceIsForwardedToAnEnforcingScalarFallback() async throws {
+        let runner = ScriptedMTPRunner(script: .completed(text: ["mtp"], promptTokens: 1, completionTokens: 1, stopReason: .stop))
+        let scalar = ScriptedScalarFallback(enforcesForcingToolChoice: true)
+        let backend = try makeBackend(runner: runner, scalarFallback: scalar)
+        XCTAssertTrue(backend.enforcesForcingToolChoice)
+        XCTAssertFalse(backend.supportsJSONSchemaResponseFormat)
+
+        for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
+            var forced = request(maxTokens: 2, tools: [weatherTool])
+            forced.toolChoice = choice
+            let handle = try await backend.start(forced)
+            XCTAssertEqual(handle.route, .scalarGreedy)
+            _ = try await collect(handle.mailbox)
+        }
+        XCTAssertEqual(scalar.snapshot().startCount, 2)
+        XCTAssertEqual(runner.snapshot().startCount, 0)
+    }
+
     func testWrapperDoesNotClaimLogitBiasWhenItsScalarFallbackCannotApplyIt() throws {
         let runner = ScriptedMTPRunner(script: .completed(text: [], promptTokens: 1, completionTokens: 0, stopReason: .stop))
         let backend = try makeBackend(runner: runner, scalarFallback: ScriptedScalarFallback())
@@ -646,9 +697,11 @@ private final class ScriptedScalarFallback: ServingGenerationBackend, Sendable {
 
     private let state = OSAllocatedUnfairLock(initialState: State())
     let supportsLogitBias: Bool
+    let enforcesForcingToolChoice: Bool
 
-    init(supportsLogitBias: Bool = false) {
+    init(supportsLogitBias: Bool = false, enforcesForcingToolChoice: Bool = false) {
         self.supportsLogitBias = supportsLogitBias
+        self.enforcesForcingToolChoice = enforcesForcingToolChoice
     }
 
     func start(_ request: OpenAIChatCompletionRequest) async throws -> ServingGenerationHandle {
