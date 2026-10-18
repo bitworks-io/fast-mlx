@@ -16,6 +16,26 @@
   },
   "releases": [
     {
+      "id": "tagged-distribution-v0-1-20",
+      "title": "Publish v0.1.20: enforced tool calls stream their arguments incrementally, and a tool_choice a route cannot enforce is refused with 400",
+      "publishedAt": "2026-10-18T01:50:01Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.20 arm64 macOS distribution: on the plain scalar route, a streamed named or \"required\" tool call now arrives as a head delta carrying the call's id, type and name with empty arguments as soon as the call is known, followed by argument-only fragments as tokens decode, with the union framing of \"required\" stripped so the fragments concatenate to exactly the arguments a non-streamed request returns; and a named or \"required\" tool_choice on a route that cannot enforce it (the continuous-batch route, the speculative route, or a checkpoint whose tokenizer cannot host the mask), which used to be answered with prose, is now refused with a 400 on tool_choice before any generation or stream byte, while auto, none and an absent tool_choice are unchanged. A plain fastmlx serve launch uses the scalar route and is not affected. The bundled quality-card store is unchanged from v0.1.19. Greedy output is identical to the development build on the release check prompts. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "96c7766077425f62b96ec779a008c86d8369e474",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "tagged-distribution-v0-1-19",
       "title": "Publish v0.1.19: tool_choice \"required\" and a named tool_choice are enforced during generation, and logit_bias is honored",
       "publishedAt": "2026-10-17T14:18:36Z",

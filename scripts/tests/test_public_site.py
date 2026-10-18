@@ -395,32 +395,29 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-19",
-                "title": "Publish v0.1.19: tool_choice \"required\" and a named tool_choice are enforced during generation, and logit_bias is honored",
-                "publishedAt": "2026-10-17T14:18:36Z",
+                "id": "tagged-distribution-v0-1-20",
+                "title": "Publish v0.1.20: enforced tool calls stream their arguments incrementally, and a tool_choice a route cannot enforce is refused with 400",
+                "publishedAt": "2026-10-18T01:50:01Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.19 arm64 macOS distribution: on the plain "
-                    "scalar route, tool_choice \"required\" with tools declared now "
-                    "constrains decoding to exactly one call to a declared function "
-                    "whose arguments validate against that function's parameters, "
-                    "with content null, and a named tool_choice produces one call to "
-                    "that function with its arguments masked to its parameters "
-                    "schema, where a schema feature outside the supported subset on "
-                    "any declared tool, a function name outside letters, digits, "
-                    "underscores and hyphens, duplicate names, or response_format "
-                    "together with a named or \"required\" choice is a 400 on "
-                    "tool_choice; and logit_bias, which used to be a 400 whenever "
-                    "non-empty, is now applied after the penalties and before the "
-                    "grammar mask, with a token id at or above the model's "
-                    "vocab_size a 400 on logit_bias and logprobs reported before the "
-                    "bias. The continuous-batch and speculative routes validate "
-                    "tool_choice without enforcing it and still refuse a non-empty "
-                    "logit_bias. The bundled quality-card store is unchanged from "
-                    "v0.1.18. Greedy output is identical to the development build "
-                    "on the release check prompts. The engine still links mlx-swift "
-                    "0.31.6."
+                    "Publishes the v0.1.20 arm64 macOS distribution: on the plain "
+                    "scalar route, a streamed named or \"required\" tool call now "
+                    "arrives as a head delta carrying the call's id, type and name "
+                    "with empty arguments as soon as the call is known, followed by "
+                    "argument-only fragments as tokens decode, with the union "
+                    "framing of \"required\" stripped so the fragments concatenate to "
+                    "exactly the arguments a non-streamed request returns; and a "
+                    "named or \"required\" tool_choice on a route that cannot enforce "
+                    "it (the continuous-batch route, the speculative route, or a "
+                    "checkpoint whose tokenizer cannot host the mask), which used "
+                    "to be answered with prose, is now refused with a 400 on "
+                    "tool_choice before any generation or stream byte, while auto, "
+                    "none and an absent tool_choice are unchanged. A plain fastmlx "
+                    "serve launch uses the scalar route and is not affected. The "
+                    "bundled quality-card store is unchanged from v0.1.19. Greedy "
+                    "output is identical to the development build on the release "
+                    "check prompts. The engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -428,7 +425,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "494f5b62cc78164f715c57ed6ea02089e0d73fb6",
+                "publicCommit": "96c7766077425f62b96ec779a008c86d8369e474",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -445,6 +442,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "96c7766077425f62b96ec779a008c86d8369e474",
                 "494f5b62cc78164f715c57ed6ea02089e0d73fb6",
                 "72eb89473c2d266ba95f6b3e0831801b8b64b7a8",
                 "61a151b41ec081562c41e4eb9e59fb88dd9a0cfa",
