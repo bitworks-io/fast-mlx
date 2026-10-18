@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.parse import unquote, urlsplit
 
+import fastmlx_launch
 import validate_public_repository
 
 # Single source of truth for private markers -- see build_public_site.py's
@@ -1343,6 +1344,11 @@ SERVED_BENCHMARK_ENTRY_KEYS = {
     "rerun",
 }
 SERVED_BENCHMARK_ENGINE_BUILD_KEYS = {"commit"}
+# Mirrors `build_public_site.SERVED_BENCHMARK_ENGINE_BUILD_OPTIONAL_KEYS` /
+# `SERVED_BENCHMARK_SWIFT_ENGINE`: `engineBuild.engine` is optional and its
+# only accepted value is the Swift engine's public binary name.
+SERVED_BENCHMARK_ENGINE_BUILD_OPTIONAL_KEYS = {"engine"}
+SERVED_BENCHMARK_SWIFT_ENGINE = "fastmlx-serve"
 # `combineCommit` mirrors `build_public_site.SERVED_BENCHMARK_HARNESS_KEYS`
 # byte-for-byte -- see that constant's own comment for why it is a
 # SEPARATE commit from `publicCommit` (the harness that MEASURED the row
@@ -5124,7 +5130,9 @@ def _served_benchmark_entry_failures(
 
     if card is not None:
         card_model = card.get("model") if isinstance(card.get("model"), dict) else {}
-        if pack_revision is not None and pack_revision != card_model.get("hfPin"):
+        if pack_revision is not None and not fastmlx_launch._hf_pin_matches_revision(
+            card_model.get("hfPin"), pack_revision
+        ):
             failures.append(f"{label} packRevision does not match its quality card's hfPin")
         card_config = card.get("config") if isinstance(card.get("config"), dict) else {}
         if (
@@ -5137,11 +5145,16 @@ def _served_benchmark_entry_failures(
         ):
             failures.append(f"{label} hardwareClass does not match its quality card or chip")
 
-    failures.extend(
-        key_failures(entry.get("engineBuild"), SERVED_BENCHMARK_ENGINE_BUILD_KEYS, f"{label} engineBuild")
-    )
+    engine_build_keys = set(SERVED_BENCHMARK_ENGINE_BUILD_KEYS)
+    if isinstance(entry.get("engineBuild"), dict):
+        engine_build_keys |= SERVED_BENCHMARK_ENGINE_BUILD_OPTIONAL_KEYS & set(entry["engineBuild"])
+    failures.extend(key_failures(entry.get("engineBuild"), engine_build_keys, f"{label} engineBuild"))
     engine_commit: Optional[str] = None
     if isinstance(entry.get("engineBuild"), dict):
+        if "engine" in entry["engineBuild"] and entry["engineBuild"]["engine"] != SERVED_BENCHMARK_SWIFT_ENGINE:
+            failures.append(
+                f"{label} engineBuild.engine must be {SERVED_BENCHMARK_SWIFT_ENGINE!r} when present"
+            )
         engine_commit = require_str(entry["engineBuild"], "commit", f"{label} engineBuild", failures)
         if engine_commit is not None and not QUALITY_CARD_ENGINE_BUILD_COMMIT.fullmatch(engine_commit):
             failures.append(f"{label} engineBuild.commit is not a 40-hex sha")

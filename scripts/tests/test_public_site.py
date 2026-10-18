@@ -6016,6 +6016,243 @@ class PublicSiteTests(unittest.TestCase):
                 build_public_site.load_served_benchmarks(root, manifest)
             self.assertIn("packRevision does not match", str(context.exception))
 
+    # ------------------------------------------------------------------
+    # Cycle 265 slice 1: the ledger can link a Swift-engine
+    # (`fastmlx-serve`) card. D1 = hfPin prefix rule, D2 = explicit
+    # `engineBuild.engine` discriminator + engine-aware listener vocabulary,
+    # D3 = the speedX gate is unchanged.
+    # ------------------------------------------------------------------
+    SWIFT_ENGINE = "fastmlx-serve"
+
+    def _pin_fixture(self, hf_pin) -> tuple:
+        """(entry, cards_by_id, card) for the REAL first ledger entry, with
+        its card's `model.hfPin` replaced by `hf_pin` (`None` removes it)."""
+        manifest = self._real_quality_manifest()
+        entry = copy.deepcopy(self._real_served_ledger()["entries"][0])
+        cards_by_id = {str(card["id"]): copy.deepcopy(card) for card in manifest["cards"]}
+        card = cards_by_id[entry["cardId"]]
+        card["model"]["hfPin"] = hf_pin
+        return entry, cards_by_id, card
+
+    def _assert_entry_accepted(self, entry: dict, cards_by_id: dict) -> None:
+        build_public_site.validate_served_benchmark_entry(entry, cards_by_id, "entry")
+        self.assertEqual(
+            validate_public_site._served_benchmark_entry_failures(entry, cards_by_id, "entry"), []
+        )
+
+    def _assert_entry_refused(self, entry: dict, cards_by_id: dict, fragment: str) -> None:
+        with self.assertRaises(SystemExit) as context:
+            build_public_site.validate_served_benchmark_entry(entry, cards_by_id, "entry")
+        self.assertIn(fragment, str(context.exception))
+        failures = validate_public_site._served_benchmark_entry_failures(entry, cards_by_id, "entry")
+        self.assertTrue(
+            any(fragment in failure for failure in failures),
+            f"validator mirror did not report {fragment!r}: {failures}",
+        )
+
+    def test_served_ledger_t1_d1_full_pin_and_eight_hex_prefix_link(self) -> None:
+        entry, cards_by_id, _ = self._pin_fixture(None)
+        revision = entry["packRevision"]
+        for pin in (revision, revision[:8], revision[:12], revision[:8].upper()):
+            cards_by_id[entry["cardId"]]["model"]["hfPin"] = pin
+            self._assert_entry_accepted(entry, cards_by_id)
+
+    def test_served_ledger_t1_d1_unusable_or_non_prefix_pin_refused(self) -> None:
+        entry, cards_by_id, _ = self._pin_fixture(None)
+        revision = entry["packRevision"]
+        other = ("0" if revision[0] != "0" else "1") + revision[1:8]
+        for pin in (
+            other,  # 8 hex, not a prefix
+            revision[:7],  # 7 hex: below the minimum usable length
+            "zzzzzzzz",  # 8 chars, not hex
+            revision[:7] + "g",  # prefix-shaped but not hex
+            "",  # empty
+            None,  # no hfPin at all
+            12345678,  # not a string
+        ):
+            cards_by_id[entry["cardId"]]["model"]["hfPin"] = pin
+            self._assert_entry_refused(entry, cards_by_id, "packRevision does not match")
+
+    def test_served_ledger_t1_d1_pack_revision_must_still_be_forty_hex(self) -> None:
+        entry, cards_by_id, _ = self._pin_fixture(None)
+        entry["packRevision"] = entry["packRevision"][:8]
+        cards_by_id[entry["cardId"]]["model"]["hfPin"] = entry["packRevision"]
+        self._assert_entry_refused(entry, cards_by_id, "packRevision is not a 40-hex revision")
+
+    def test_served_ledger_t1_d1_prefix_rule_is_the_launchers_rule(self) -> None:
+        # Imported, never copied: both scripts hold the launcher's own function.
+        self.assertIs(
+            build_public_site.fastmlx_launch._hf_pin_matches_revision,
+            validate_public_site.fastmlx_launch._hf_pin_matches_revision,
+        )
+
+    # -- T2 (D2): the engine discriminator and the two listener vocabularies --
+
+    def _swift_row(self, flags: list) -> dict:
+        """The REAL first ledger row with every role's listener flags
+        replaced by `flags` (a ledger row has `--host`/`--port` stripped)."""
+        entry = self._real_served_ledger()["entries"][0]
+        row = copy.deepcopy(self._real_row(entry["id"]))
+        for role in row["controls"]["flags"]["listenerFlags"]:
+            row["controls"]["flags"]["listenerFlags"][role] = list(flags)
+        return row
+
+    def test_served_ledger_t2_d2_swift_engine_context_flag_derives_context_tokens(self) -> None:
+        row = self._swift_row(["--model", "<path>", "--context", "8192"])
+        derived = build_public_site.derive_served_benchmark_fields_from_ledger_row(
+            row, self.SWIFT_ENGINE
+        )
+        self.assertEqual(derived["contextTokens"], 8192)
+        for key in ("mtp", "drafter", "promptLookup"):
+            self.assertEqual(derived[key], "engine-default")
+
+    def test_served_ledger_t2_d2_swift_engine_vocabulary_refusals(self) -> None:
+        base = ["--model", "<path>"]
+        # Each case asserts its refusal REASON, so a refusal raised by an
+        # earlier, unrelated gate cannot stand in for the one under test.
+        mixed = "carries served-engine flag"
+        cases = {
+            "no --context": (base, "needs exactly one --context"),
+            "--context with --ctx-size": (
+                base + ["--context", "8192", "--ctx-size", "8192"],
+                f"{mixed} --ctx-size",
+            ),
+            "--ctx-size only": (base + ["--ctx-size", "8192"], f"{mixed} --ctx-size"),
+            "--no-mtp": (base + ["--context", "8192", "--no-mtp"], f"{mixed} --no-mtp"),
+            "--no-drafter": (base + ["--context", "8192", "--no-drafter"], f"{mixed} --no-drafter"),
+            "--no-pld": (base + ["--context", "8192", "--no-pld"], f"{mixed} --no-pld"),
+            "--serve": (["--serve"] + base + ["--context", "8192"], f"{mixed} --serve"),
+            "two --context": (
+                base + ["--context", "8192", "--context", "4096"],
+                "needs exactly one --context",
+            ),
+            "non-integer --context": (base + ["--context", "big"], "not a positive integer"),
+            "valueless --context": (base + ["--context"], "not a positive integer"),
+            "zero --context": (base + ["--context", "0"], "not a positive integer"),
+        }
+        for name, (flags, fragment) in cases.items():
+            with self.subTest(name):
+                with self.assertRaises(SystemExit) as context:
+                    build_public_site.derive_served_benchmark_fields_from_ledger_row(
+                        self._swift_row(flags), self.SWIFT_ENGINE
+                    )
+                self.assertIn(fragment, str(context.exception))
+
+    def test_served_ledger_t2_d2_served_engine_refuses_context_and_keeps_its_vocabulary(
+        self,
+    ) -> None:
+        served_flags = ["--serve", "--model", "<path>", "--ctx-size", "262144", "--no-mtp"]
+        derived = build_public_site.derive_served_benchmark_fields_from_ledger_row(
+            self._swift_row(served_flags), None
+        )
+        self.assertEqual(derived["contextTokens"], 262144)
+        self.assertEqual(derived["mtp"], "off")
+        self.assertEqual(derived["drafter"], "engine-default")
+        with self.assertRaises(SystemExit):
+            build_public_site.derive_served_benchmark_fields_from_ledger_row(
+                self._swift_row(served_flags + ["--context", "8192"]), None
+            )
+        # A Swift-engine row that omits the discriminator is a served-engine
+        # row lacking --ctx-size.
+        with self.assertRaises(SystemExit) as context:
+            build_public_site.derive_served_benchmark_fields_from_ledger_row(
+                self._swift_row(["--model", "<path>", "--context", "8192"]), None
+            )
+        self.assertIn("--ctx-size", str(context.exception))
+
+    def test_served_ledger_t2_d2_unknown_engine_value_refused_everywhere(self) -> None:
+        for bad in ("other", "", "FASTMLX-SERVE", None, 1, ["fastmlx-serve"]):
+            with self.subTest(bad):
+                entry, cards_by_id, _ = self._pin_fixture(None)
+                cards_by_id[entry["cardId"]]["model"]["hfPin"] = entry["packRevision"][:8]
+                entry["engineBuild"]["engine"] = bad  # key PRESENT with a bad value
+                self._assert_entry_refused(entry, cards_by_id, "engineBuild.engine")
+        # derive_... takes the engine explicitly: any value but None or the
+        # Swift engine's name is refused there too.
+        for bad in ("other", "", "FASTMLX-SERVE", 1):
+            with self.subTest(derive=bad):
+                with self.assertRaises(SystemExit):
+                    build_public_site.derive_served_benchmark_fields_from_ledger_row(
+                        self._swift_row(["--model", "<path>", "--context", "8192"]), bad
+                    )
+
+    def test_served_ledger_t2_d2_entry_accepts_only_the_swift_engine_value(self) -> None:
+        entry, cards_by_id, _ = self._pin_fixture(None)
+        entry["engineBuild"]["engine"] = self.SWIFT_ENGINE
+        cards_by_id[entry["cardId"]]["model"]["hfPin"] = entry["packRevision"]
+        # Passes every gate, including speedX, because the real card is intact.
+        self._assert_entry_accepted(entry, cards_by_id)
+        # Extra engineBuild keys other than `engine` stay refused.
+        entry["engineBuild"]["extra"] = "x"
+        self._assert_entry_refused(entry, cards_by_id, "engineBuild")
+
+    def _write_engine_row_ledger(
+        self, root: Path, flags: list, engine_in_entry
+    ) -> dict:
+        """Real ledger + rows, except entry 0's row carries `flags` and the
+        entry carries the matching `serving` block and `engine` key."""
+        entry_id = self._real_served_ledger()["entries"][0]["id"]
+
+        def transform(row: dict) -> dict:
+            for role in row["controls"]["flags"]["listenerFlags"]:
+                row["controls"]["flags"]["listenerFlags"][role] = list(flags)
+            return row
+
+        ledger = self._write_mutated_row_fixture(root, entry_id, transform)
+        entry = ledger["entries"][0]
+        entry["serving"] = {
+            "contextTokens": 8192,
+            "mtp": "engine-default",
+            "drafter": "engine-default",
+            "promptLookup": "engine-default",
+        }
+        if engine_in_entry is not None:
+            entry["engineBuild"]["engine"] = engine_in_entry
+        (root / "site/served-benchmarks.json").write_text(json.dumps(ledger), encoding="utf-8")
+        return ledger
+
+    def test_served_ledger_t2_d2_loader_rederives_a_swift_engine_row(self) -> None:
+        manifest = self._real_quality_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_engine_row_ledger(
+                root, ["--model", "<path>", "--context", "8192"], self.SWIFT_ENGINE
+            )
+            loaded = build_public_site.load_served_benchmarks(root, manifest)
+            self.assertEqual(loaded["entries"][0]["engineBuild"]["engine"], self.SWIFT_ENGINE)
+            self.assertEqual(loaded["entries"][0]["serving"]["contextTokens"], 8192)
+
+    def test_served_ledger_t2_d2_loader_refuses_engine_row_mismatches(self) -> None:
+        manifest = self._real_quality_manifest()
+        cases = (
+            # row speaks the Swift vocabulary but the entry omits the engine
+            (["--model", "<path>", "--context", "8192"], None),
+            # entry claims the Swift engine but the row speaks the served vocabulary
+            (["--serve", "--model", "<path>", "--ctx-size", "8192"], self.SWIFT_ENGINE),
+        )
+        for flags, engine in cases:
+            with self.subTest(flags=flags, engine=engine):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self._write_engine_row_ledger(root, flags, engine)
+                    with self.assertRaises(SystemExit):
+                        build_public_site.load_served_benchmarks(root, manifest)
+
+    # -- T3 (D3): the speedX gate is unchanged --
+
+    def test_served_ledger_t3_d3_swift_engine_entry_against_null_speedx_card_refused_for_speedx(
+        self,
+    ) -> None:
+        entry, cards_by_id, card = self._pin_fixture(None)
+        entry["engineBuild"]["engine"] = self.SWIFT_ENGINE
+        card["model"]["hfPin"] = entry["packRevision"][:8]
+        # Control: passes D1 and D2 (and every other gate) with the card's real speedX.
+        self._assert_entry_accepted(entry, cards_by_id)
+        card["legible"]["benefit"]["speedX"] = None
+        self._assert_entry_refused(
+            entry, cards_by_id, "disagrees with its quality card's speedX by more than 3%"
+        )
+
     def test_served_ledger_5_l5_hardware_class_mismatch_refused(self) -> None:
         manifest = self._real_quality_manifest()
         ledger = self._real_served_ledger()
@@ -6757,7 +6994,9 @@ class PublicSiteTests(unittest.TestCase):
                 failures,
             )
             mutated = self._load_mutated_validate_module(
-                '        if pack_revision is not None and pack_revision != card_model.get("hfPin"):\n'
+                '        if pack_revision is not None and not fastmlx_launch._hf_pin_matches_revision(\n'
+                '            card_model.get("hfPin"), pack_revision\n'
+                '        ):\n'
                 '            failures.append(f"{label} packRevision does not match its quality card\'s hfPin")\n'
             )
             mutated_failures = mutated.validate_served_benchmarks(output)

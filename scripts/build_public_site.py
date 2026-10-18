@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import fastmlx_launch
 import validate_public_repository
 
 # Single source of truth for private markers -- this used to be a locally
@@ -281,6 +282,22 @@ SERVED_BENCHMARK_ENTRY_KEYS = {
     "rerun",
 }
 SERVED_BENCHMARK_ENGINE_BUILD_KEYS = {"commit"}
+# `engineBuild.engine` is OPTIONAL and explicit, never inferred from which
+# listener flags happen to be present: absent means the adopted served engine
+# (every entry published before cycle 265), and the ONLY accepted value is the
+# Swift engine's public binary name, which selects the Swift engine's listener
+# flag vocabulary in `derive_served_benchmark_fields_from_ledger_row`.
+SERVED_BENCHMARK_ENGINE_BUILD_OPTIONAL_KEYS = {"engine"}
+SERVED_BENCHMARK_SWIFT_ENGINE = QUALITY_GUIDE_PUBLIC_ENGINE_TOKEN
+# Served-engine-only listener flags: a Swift-engine row carrying any of them
+# is a mixed vocabulary and is refused (as is `--context` on a served-engine row).
+SERVED_BENCHMARK_SWIFT_ENGINE_REFUSED_FLAGS = (
+    "--ctx-size",
+    "--serve",
+    "--no-mtp",
+    "--no-drafter",
+    "--no-pld",
+)
 # `combineCommit` names the public commit whose `scripts/fastmlx_bench.py`
 # actually produced the row's `ratio` via `--combine` -- NOT necessarily the
 # same commit as `publicCommit` (which names the harness that took the raw
@@ -1606,7 +1623,50 @@ def _served_benchmark_row_completion_token_bounds(row: Dict[str, object]) -> Tup
     return min(values), max(values)
 
 
-def derive_served_benchmark_fields_from_ledger_row(row: Dict[str, object]) -> Dict[str, object]:
+def _served_benchmark_context_and_toggles(
+    listener_flags: Sequence[str], engine: Optional[str]
+) -> Tuple[int, str, str, str]:
+    """`(contextTokens, mtp, drafter, promptLookup)` from ONE role's listener
+    flags, under the vocabulary `engine` selects. `engine` is passed in
+    explicitly (a ledger row carries no engine field): `None` is the adopted
+    served engine, `SERVED_BENCHMARK_SWIFT_ENGINE` the Swift engine; anything
+    else is refused. A mixed vocabulary is refused in both directions.
+    """
+
+    if engine is None:
+        context_tokens = None
+        for index, token in enumerate(listener_flags):
+            if token == "--ctx-size":
+                context_tokens = int(listener_flags[index + 1])
+        if context_tokens is None:
+            fail("served-benchmark ledger row has no --ctx-size in listener flags")
+        if "--context" in listener_flags:
+            fail("served-benchmark ledger row has --context but no engine is recorded")
+        mtp = "off" if "--no-mtp" in listener_flags else "engine-default"
+        drafter = "off" if "--no-drafter" in listener_flags else "engine-default"
+        prompt_lookup = "off" if "--no-pld" in listener_flags else "engine-default"
+        return context_tokens, mtp, drafter, prompt_lookup
+    if engine != SERVED_BENCHMARK_SWIFT_ENGINE:
+        fail(f"served-benchmark ledger engine {engine!r} is not a recognised engine")
+    for flag in SERVED_BENCHMARK_SWIFT_ENGINE_REFUSED_FLAGS:
+        if flag in listener_flags:
+            fail(f"served-benchmark ledger row for the Swift engine carries served-engine flag {flag}")
+    values = [
+        listener_flags[index + 1] if index + 1 < len(listener_flags) else None
+        for index, token in enumerate(listener_flags)
+        if token == "--context"
+    ]
+    if len(values) != 1:
+        fail("served-benchmark ledger row for the Swift engine needs exactly one --context")
+    value = values[0]
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value) or int(value) <= 0:
+        fail("served-benchmark ledger row --context is not a positive integer")
+    return int(value), "engine-default", "engine-default", "engine-default"
+
+
+def derive_served_benchmark_fields_from_ledger_row(
+    row: Dict[str, object], engine: Optional[str]
+) -> Dict[str, object]:
     """Re-derive every served-benchmark entry field a LEDGER ROW (the
     public-view row with `--host`/`--port` already stripped from every
     role's `listenerFlags` -- see `served_benchmark_ledger_row_violation`)
@@ -1639,15 +1699,9 @@ def derive_served_benchmark_fields_from_ledger_row(row: Dict[str, object]) -> Di
     drift_pct = round(abs(1 - drift_ratio) * 100, 2)
 
     listener_flags = row["controls"]["flags"]["listenerFlags"]["candidate"]
-    context_tokens = None
-    for index, token in enumerate(listener_flags):
-        if token == "--ctx-size":
-            context_tokens = int(listener_flags[index + 1])
-    if context_tokens is None:
-        fail("served-benchmark ledger row has no --ctx-size in listener flags")
-    mtp = "off" if "--no-mtp" in listener_flags else "engine-default"
-    drafter = "off" if "--no-drafter" in listener_flags else "engine-default"
-    prompt_lookup = "off" if "--no-pld" in listener_flags else "engine-default"
+    context_tokens, mtp, drafter, prompt_lookup = _served_benchmark_context_and_toggles(
+        listener_flags, engine
+    )
 
     min_tokens, max_tokens = _served_benchmark_row_completion_token_bounds(row)
 
@@ -1720,7 +1774,9 @@ def validate_served_benchmark_entry(
     if not COMMIT_SHA.fullmatch(pack_revision):
         fail(f"{label} packRevision is not a 40-hex revision")
     card_model = card.get("model") if isinstance(card.get("model"), dict) else {}
-    if pack_revision != card_model.get("hfPin"):
+    # D1: the card's hfPin may be the full sha or a usable prefix of it, under
+    # the launcher's own rule (imported, not copied).
+    if not fastmlx_launch._hf_pin_matches_revision(card_model.get("hfPin"), pack_revision):
         fail(f"{label} packRevision does not match its quality card's hfPin")
     hardware_class = require_text(entry, "hardwareClass", label)
     if (
@@ -1735,9 +1791,13 @@ def validate_served_benchmark_entry(
         or chip.lower().replace(" ", "-") != hardware_class
     ):
         fail(f"{label} hardwareClass does not match its quality card or chip")
-    engine_build = require_exact_keys(
-        entry.get("engineBuild"), SERVED_BENCHMARK_ENGINE_BUILD_KEYS, f"{label} engineBuild"
-    )
+    raw_engine_build = entry.get("engineBuild")
+    engine_build_keys = set(SERVED_BENCHMARK_ENGINE_BUILD_KEYS)
+    if isinstance(raw_engine_build, dict):
+        engine_build_keys |= SERVED_BENCHMARK_ENGINE_BUILD_OPTIONAL_KEYS & set(raw_engine_build)
+    engine_build = require_exact_keys(raw_engine_build, engine_build_keys, f"{label} engineBuild")
+    if "engine" in engine_build and engine_build["engine"] != SERVED_BENCHMARK_SWIFT_ENGINE:
+        fail(f"{label} engineBuild.engine must be {SERVED_BENCHMARK_SWIFT_ENGINE!r} when present")
     engine_commit = require_text(engine_build, "commit", f"{label} engineBuild")
     if not QUALITY_CARD_ENGINE_BUILD_COMMIT.fullmatch(engine_commit):
         fail(f"{label} engineBuild.commit is not a 40-hex sha")
@@ -1932,7 +1992,9 @@ def validate_served_benchmark_row_file(
     violation = served_benchmark_ledger_row_violation(text, parsed)
     if violation is not None:
         fail(f"{label} row file contains {violation}")
-    derived = derive_served_benchmark_fields_from_ledger_row(parsed)
+    entry_engine_build = entry.get("engineBuild")
+    entry_engine = entry_engine_build.get("engine") if isinstance(entry_engine_build, dict) else None
+    derived = derive_served_benchmark_fields_from_ledger_row(parsed, entry_engine)
     mismatches = _served_benchmark_row_mismatches(entry, derived, label)
     if mismatches:
         fail(mismatches[0])
