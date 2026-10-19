@@ -98,11 +98,64 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
-    /// `logit_bias`: the compiled continuous path has no logit processor, so a non-empty map must be
-    /// REFUSED with a 400 (`param: "logit_bias"`) before any admission or decode -- a silent no-op
-    /// would return an unbiased answer to a caller who asked for a bias. The neutral `[:]` map (what
-    /// `logit_bias: {}` decodes to) is unaffected, and the backend never claims the capability.
-    func testContinuousBatchRouteRefusesNonEmptyLogitBiasWithoutAdmittingAnything()
+    /// `logit_bias` (A7): the capability is declared exactly when the backend knows the model's
+    /// vocabulary width (so every bias id can be bounded before admission). An unknown width fails
+    /// CLOSED: the capability is false and a non-empty map that reaches `start` anyway is refused with
+    /// the generic 400 (`param: "logit_bias"`) before any admission.
+    func testContinuousBatchRouteDeclaresLogitBiasCapabilityOnlyWithKnownVocabulary()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let known = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            logitBiasVocabularySize: 128)
+        XCTAssertTrue(known.supportsLogitBias, "a known vocabulary width enables logit_bias")
+
+        let unknown = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+        XCTAssertFalse(
+            unknown.supportsLogitBias, "an unknown vocabulary width must keep logit_bias off")
+
+        var biased = request(text: "solo", maxTokens: 2)
+        biased.logitBias = [1: -100]
+        do {
+            _ = try await unknown.start(biased)
+            XCTFail("an unknown vocabulary must refuse a logit_bias request")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequest(let message, let param) = error else {
+                XCTFail("expected invalidRequest, got \(error)")
+                return
+            }
+            XCTAssertEqual(param, "logit_bias")
+            XCTAssertEqual(
+                message, "logit_bias is not supported by the loaded model's decoding route")
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [], "a refused request must never be admitted")
+        XCTAssertEqual(recorder.submissions, [], "a refused request must never reach the coordinator")
+        XCTAssertEqual(recorder.decodeActions, [])
+        await known.shutdown()
+        await unknown.shutdown()
+    }
+
+    /// `logit_bias` (A8): an id at or above the vocabulary is a 400 (`param: "logit_bias"`, the scalar
+    /// backend's text) BEFORE any prompt render, admission or coordinator work; the boundary id
+    /// `vocabulary - 1` is admissible. Negative ids are the request decoder's job and not tested here.
+    func testContinuousBatchRouteRefusesOutOfVocabularyLogitBiasWithoutAdmittingAnything()
         async throws
     {
         let recorder = ContinuousRuntimeRecorder()
@@ -119,32 +172,139 @@ final class ContinuousServingBackendTests: XCTestCase {
             coordinator: coordinator,
             promptByText: ["solo": [10]],
             pieces: [1: "s"],
-            stopTokenIDs: [99])
-        XCTAssertFalse(backend.supportsLogitBias, "the continuous route must not claim logit_bias")
+            stopTokenIDs: [99],
+            logitBiasVocabularySize: 128)
 
-        var biased = request(text: "solo", maxTokens: 2)
-        biased.logitBias = [1: -100]
-        do {
-            _ = try await backend.start(biased)
-            XCTFail("continuous route must refuse a logit_bias request instead of ignoring it")
-        } catch let error as OpenAIServingError {
-            guard case .invalidRequest(_, let param) = error else {
-                XCTFail("expected invalidRequest, got \(error)")
-                await backend.shutdown()
-                return
+        for outOfVocabulary in [128, 129, 1_000_000] {
+            var biased = request(text: "solo", maxTokens: 2)
+            biased.logitBias = [1: -100, outOfVocabulary: 5]
+            do {
+                _ = try await backend.start(biased)
+                XCTFail("id \(outOfVocabulary) is outside the vocabulary and must be refused")
+            } catch let error as OpenAIServingError {
+                guard case .invalidRequest(let message, let param) = error else {
+                    XCTFail("expected invalidRequest, got \(error)")
+                    await backend.shutdown()
+                    return
+                }
+                XCTAssertEqual(param, "logit_bias")
+                XCTAssertEqual(
+                    message,
+                    "logit_bias token ids must be smaller than the model's vocabulary size (128)")
             }
-            XCTAssertEqual(param, "logit_bias")
         }
         XCTAssertEqual(recorder.admissionBatchSizes, [], "a refused request must never be admitted")
+        XCTAssertEqual(recorder.submissions, [], "a refused request must never reach the coordinator")
         XCTAssertEqual(recorder.decodeActions, [], "a refused request must never reach a decode step")
 
-        // Control: the neutral empty map is still a normal, admissible request.
-        var neutral = request(text: "solo", maxTokens: 2)
-        neutral.logitBias = [:]
-        let handle = try await backend.start(neutral)
+        // Control: the last in-vocabulary id (and the neutral empty map) are admissible.
+        var edge = request(text: "solo", maxTokens: 2)
+        edge.logitBias = [127: 3]
+        let handle = try await backend.start(edge)
         XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        XCTAssertEqual(recorder.submissions.count, 1)
         _ = await handle.lease.cancel(.clientDisconnected)
         await backend.shutdown()
+    }
+
+    /// Replaces the former `testContinuousBatchRouteRefusesNonEmptyLogitBiasWithoutAdmittingAnything`
+    /// (the route no longer refuses a bias; the runtime applies it per row). A non-empty in-vocabulary
+    /// map is admitted and carried verbatim into the coordinator submission; the neutral map is
+    /// carried as empty.
+    func testContinuousBatchRouteAdmitsInVocabularyLogitBiasAndCarriesItIntoTheSubmission()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            logitBiasVocabularySize: 128)
+
+        var biased = request(text: "solo", maxTokens: 2)
+        biased.logitBias = [1: -100, 7: 2.5]
+        let handle = try await backend.start(biased)
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        XCTAssertEqual(recorder.admissionBatchSizes, [1])
+        XCTAssertEqual(recorder.submissions.count, 1)
+        XCTAssertEqual(recorder.submissions.first?.logitBias, [1: -100, 7: 2.5])
+        XCTAssertEqual(recorder.submissions.first?.requestsSpeculation, false)
+        _ = await handle.lease.cancel(.clientDisconnected)
+
+        var neutral = request(text: "solo", maxTokens: 2)
+        neutral.logitBias = [:]
+        let neutralHandle = try await backend.start(neutral)
+        XCTAssertEqual(recorder.submissions.count, 2)
+        XCTAssertEqual(recorder.submissions.last?.logitBias, [:])
+        _ = await neutralHandle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// `logit_bias` (A10 / B3): on the solo-PLD route a biased request is submitted WITHOUT speculation
+    /// (the runtime refuses bias + speculation, and the verify step must never see a biased row) while
+    /// carrying its bias map, and the decode action is a non-speculative solo step. The control: an
+    /// unbiased request on the same route still requests speculation.
+    func testDynamicAdmissionSoloPLDBiasedRequestIsSubmittedWithoutSpeculation()
+        async throws
+    {
+        func runSolo(bias: [Int: Float]) async throws -> (
+            ServingExecutionRoute, [ContinuousBatchSubmission], [BatchDecodeAction]
+        ) {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 2, queued: 4),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]],
+                    recorder: recorder,
+                    allowsSpeculation: true),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeDynamicBackend(
+                coordinator: coordinator,
+                promptByText: ["solo": [10]],
+                pieces: [1: "s"],
+                stopTokenIDs: [99],
+                logitBiasVocabularySize: 128)
+            var solo = request(text: "solo", maxTokens: 2)
+            solo.logitBias = bias
+            let start = Task { try await backend.start(solo) }
+            await waitUntil {
+                await backend.diagnosticPendingAdmissionRequestCount() == 1
+            }
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+            let handle = try await start.value
+            try await runUntilDecode(coordinator, recorder: recorder)
+            let result = (handle.route, recorder.submissions, recorder.decodeActions)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+            return result
+        }
+
+        let biased = try await runSolo(bias: [1: -100])
+        XCTAssertEqual(biased.0, .soloPLD)
+        XCTAssertEqual(biased.1.count, 1)
+        XCTAssertEqual(biased.1.first?.logitBias, [1: -100])
+        XCTAssertEqual(biased.1.first?.requestsSpeculation, false)
+        XCTAssertEqual(
+            biased.2.first, .solo(BatchRequestID(1), speculationAllowed: false))
+
+        let unbiased = try await runSolo(bias: [:])
+        XCTAssertEqual(unbiased.0, .soloPLD)
+        XCTAssertEqual(unbiased.1.first?.logitBias, [:])
+        XCTAssertEqual(unbiased.1.first?.requestsSpeculation, true)
+        XCTAssertEqual(
+            unbiased.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
     }
 
     /// A named or `"required"` `tool_choice` cannot be enforced on the continuous route (no constraint
@@ -2256,6 +2416,7 @@ private final class ContinuousRuntimeRecorder: Sendable {
     private struct State: Sendable {
         var decodeActions: [BatchDecodeAction] = []
         var admissionBatchSizes: [Int] = []
+        var submissions: [ContinuousBatchSubmission] = []
         var activeRequests = 0
     }
 
@@ -2269,6 +2430,11 @@ private final class ContinuousRuntimeRecorder: Sendable {
         state.withLock { $0.admissionBatchSizes }
     }
 
+    /// Every submission the coordinator handed to the runtime, in admission order.
+    var submissions: [ContinuousBatchSubmission] {
+        state.withLock { $0.submissions }
+    }
+
     func record(_ action: BatchDecodeAction) {
         state.withLock { $0.decodeActions.append(action) }
     }
@@ -2278,6 +2444,10 @@ private final class ContinuousRuntimeRecorder: Sendable {
             $0.admissionBatchSizes.append(count)
             $0.activeRequests += count
         }
+    }
+
+    func admitted(_ admissions: [ContinuousBatchRuntimeAdmission]) {
+        state.withLock { $0.submissions.append(contentsOf: admissions.map(\.submission)) }
     }
 
     func removed() {
@@ -2355,6 +2525,7 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
         admittedIDs.formUnion(admissions.map(\.id))
         recorder.admitted(admissions.count)
+        recorder.admitted(admissions)
     }
 
     func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? {
@@ -2657,7 +2828,8 @@ private func makeBackend(
         maxDeltas: 2,
         maxBytes: 4_096),
     modelCapabilities: ServingModelCapabilities? = nil,
-    thinksByDefault: Bool = false
+    thinksByDefault: Bool = false,
+    logitBiasVocabularySize: Int? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -2673,7 +2845,8 @@ private func makeBackend(
             queueRetryAfterSeconds: 2,
             mailboxCapacity: mailboxCapacity,
             thinksByDefault: thinksByDefault,
-            modelCapabilities: modelCapabilities))
+            modelCapabilities: modelCapabilities,
+            logitBiasVocabularySize: logitBiasVocabularySize))
 }
 
 private func makeDynamicBackend(
@@ -2688,7 +2861,8 @@ private func makeDynamicBackend(
         maxDeltas: 2,
         maxBytes: 4_096),
     renderGate: BlockingRuntimeResourceSnapshotGate? = nil,
-    modelCapabilities: ServingModelCapabilities? = nil
+    modelCapabilities: ServingModelCapabilities? = nil,
+    logitBiasVocabularySize: Int? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -2709,7 +2883,8 @@ private func makeDynamicBackend(
                     maximumBatchRequests: maximumBatchRequests,
                     maximumQueuedRequests: maximumQueuedRequests),
                 coalescing: coalescing),
-            modelCapabilities: modelCapabilities))
+            modelCapabilities: modelCapabilities,
+            logitBiasVocabularySize: logitBiasVocabularySize))
 }
 
 private let continuousWeatherTool = OpenAIToolSpec(

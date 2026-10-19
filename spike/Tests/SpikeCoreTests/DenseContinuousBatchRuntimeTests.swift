@@ -2459,6 +2459,198 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         XCTAssertTrue(replacementSnapshots.isEmpty)
         XCTAssertEqual(replacementResources?.reservedKVBytes, 0)
     }
+
+    // MARK: - Per-row additive logit_bias (cycle 269)
+    //
+    // The tiny model's logits are 100 at exactly one id (the greedy token), 0 elsewhere. Prompt
+    // [10] decodes 11, 22, 44, 88 unbiased; prompt [50] decodes 51, 102, 204, 408.
+
+    private func admitWithBias(
+        _ runtime: DenseContinuousBatchRuntime,
+        id: UInt64,
+        tokens: [Int],
+        bias: [Int: Float],
+        requestsSpeculation: Bool = false,
+        maxOutputTokens: Int = 8
+    ) throws {
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(id),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: tokens,
+                    maxOutputTokens: maxOutputTokens,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: requestsSpeculation,
+                    logitBias: bias)),
+        ])
+    }
+
+    private func soloBiasedTokens(
+        prompt: [Int], bias: [Int: Float], count: Int = 4
+    ) throws -> [Int] {
+        let runtime = try makeRuntime()
+        try admitWithBias(runtime, id: 1, tokens: prompt, bias: bias)
+        try prefill(runtime, id: 1, tokens: prompt, chunks: [prompt.count])
+        return try (0 ..< count).map { _ in
+            try runtime.decode(.solo(BatchRequestID(1), speculationAllowed: false))[0]
+                .tokens[0]
+        }
+    }
+
+    /// Two-row batch (ids 1 and 2); returns each id's tokens over `count` shared steps.
+    private func batchTokens(
+        prompts: [[Int]], biases: [[Int: Float]], count: Int = 4
+    ) throws -> [UInt64: [Int]] {
+        let runtime = try makeRuntime()
+        for (index, prompt) in prompts.enumerated() {
+            let id = UInt64(index + 1)
+            try admitWithBias(runtime, id: id, tokens: prompt, bias: biases[index])
+            try prefill(runtime, id: id, tokens: prompt, chunks: [prompt.count])
+        }
+        let ids = prompts.indices.map { BatchRequestID(UInt64($0 + 1)) }
+        var tokens: [UInt64: [Int]] = [:]
+        for _ in 0 ..< count {
+            for (id, emittedTokens) in emitted(
+                try runtime.decode(.batch(ids, speculationAllowed: false)))
+            {
+                tokens[id, default: []].append(contentsOf: emittedTokens)
+            }
+        }
+        return tokens
+    }
+
+    func testLogitBiasMinusOnGreedyTokenChangesPrefillFinalAndDecodedTokens() throws {
+        let unbiased = try soloBiasedTokens(prompt: [10], bias: [:])
+        XCTAssertEqual(unbiased, [11, 22, 44, 88])
+
+        let biased = try soloBiasedTokens(prompt: [10], bias: [11: -100])
+
+        XCTAssertEqual(biased.count, unbiased.count)
+        // Index 0 is the prefill-final token; later indices come from the scalar step.
+        for (index, pair) in zip(biased, unbiased).enumerated() {
+            XCTAssertNotEqual(pair.0, pair.1, "token \(index) ignored the -100 bias")
+        }
+    }
+
+    func testLogitBiasPlusOnChosenIDForcesItSoloAndInABatch() throws {
+        let solo = try soloBiasedTokens(prompt: [10], bias: [7: 200])
+        XCTAssertEqual(solo, [7, 7, 7, 7])
+
+        let batch = try batchTokens(
+            prompts: [[10], [50]], biases: [[7: 200], [:]])
+        XCTAssertEqual(batch[1], [7, 7, 7, 7])
+        XCTAssertEqual(batch[2], [51, 102, 204, 408])
+
+        // The biased row in the second physical position.
+        let swapped = try batchTokens(
+            prompts: [[50], [10]], biases: [[:], [9: 200]])
+        XCTAssertEqual(swapped[1], [51, 102, 204, 408])
+        XCTAssertEqual(swapped[2], [9, 9, 9, 9])
+    }
+
+    func testLogitBiasSurvivesBatchToSoloDeparture() throws {
+        let runtime = try makeRuntime()
+        for (id, prompt, bias) in [
+            (UInt64(1), [10], [Int: Float]()),
+            (UInt64(2), [50], [7: Float(200)]),
+        ] {
+            try admitWithBias(runtime, id: id, tokens: prompt, bias: bias)
+            try prefill(runtime, id: id, tokens: prompt, chunks: [prompt.count])
+        }
+        let ids = [BatchRequestID(1), BatchRequestID(2)]
+        var biased: [Int] = []
+        for _ in 0 ..< 2 {
+            biased += emitted(try runtime.decode(.batch(ids, speculationAllowed: false)))[2] ?? []
+        }
+        runtime.remove(BatchRequestID(1))
+        for _ in 0 ..< 2 {
+            biased.append(
+                try runtime.decode(.solo(BatchRequestID(2), speculationAllowed: false))[0]
+                    .tokens[0])
+        }
+        XCTAssertEqual(biased, [7, 7, 7, 7])
+    }
+
+    func testUnbiasedRowIsBitIdenticalSoloInAllUnbiasedBatchAndBesideABiasedRow() throws {
+        let solo = try soloBiasedTokens(prompt: [10], bias: [:])
+        let allUnbiased = try batchTokens(
+            prompts: [[10], [50]], biases: [[:], [:]])
+        let besideBiased = try batchTokens(
+            prompts: [[10], [50]], biases: [[:], [7: 200]])
+        let biasedFirst = try batchTokens(
+            prompts: [[50], [10]], biases: [[7: 200], [:]])
+
+        XCTAssertEqual(solo, [11, 22, 44, 88])
+        XCTAssertEqual(allUnbiased[1], solo)
+        XCTAssertEqual(besideBiased[1], solo)
+        XCTAssertEqual(biasedFirst[2], solo)
+        XCTAssertEqual(besideBiased[2], [7, 7, 7, 7])
+        XCTAssertEqual(biasedFirst[1], [7, 7, 7, 7])
+    }
+
+    func testAllZeroLogitBiasMapDecodesIdenticallyToNoMap() throws {
+        let none = try soloBiasedTokens(prompt: [10], bias: [:])
+        let zero = try soloBiasedTokens(prompt: [10], bias: [5: 0, 11: 0])
+        XCTAssertEqual(zero, none)
+
+        let batchNone = try batchTokens(prompts: [[10], [50]], biases: [[:], [:]])
+        let batchZero = try batchTokens(
+            prompts: [[10], [50]], biases: [[5: 0], [11: 0]])
+        XCTAssertEqual(batchZero, batchNone)
+    }
+
+    func testLogitBiasWithSpeculationIsRefusedAndAdmitsNothing() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseExactDrafter(),
+                maxDraft: 3,
+                gate: PLDGate(
+                    window: 8,
+                    minimumSamples: 4,
+                    minAcceptPerStep: 0.5,
+                    cooldown: 8),
+                lookback: 32,
+                compiledVerify: true))
+
+        XCTAssertThrowsError(
+            try admitWithBias(
+                runtime, id: 1, tokens: [10], bias: [7: 5], requestsSpeculation: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .logitBiasWithSpeculation(BatchRequestID(1)))
+        }
+        let refused = runtime.resourceSnapshot()
+        XCTAssertEqual(refused?.reservedKVBytes, 0)
+        XCTAssertEqual(refused?.speculation?.requestedRequests, 0)
+        XCTAssertEqual(refused?.speculation?.activeSessions, 0)
+
+        // The refusal left nothing behind: the same id admits cleanly afterwards.
+        try admitWithBias(runtime, id: 1, tokens: [10], bias: [:])
+        XCTAssertGreaterThan(runtime.resourceSnapshot()?.reservedKVBytes ?? 0, 0)
+    }
+
+    func testLogitBiasIDOutsideTheVocabularyIsRefusedAtAdmission() throws {
+        let runtime = try makeRuntime()
+        for bad in [2_048, 100_000, -1] {
+            XCTAssertThrowsError(
+                try admitWithBias(runtime, id: 1, tokens: [10], bias: [3: 1, bad: 1])
+            ) { error in
+                XCTAssertEqual(
+                    error as? DenseContinuousBatchRuntimeError,
+                    .logitBiasTokenIDOutOfRange(BatchRequestID(1), tokenID: bad))
+            }
+        }
+        XCTAssertEqual(runtime.resourceSnapshot()?.reservedKVBytes, 0)
+
+        // The last valid id is accepted.
+        try admitWithBias(runtime, id: 1, tokens: [10], bias: [2_047: 1])
+        XCTAssertGreaterThan(runtime.resourceSnapshot()?.reservedKVBytes ?? 0, 0)
+    }
 }
 
 // MARK: - Non-final prefill slices do not compute the lm_head

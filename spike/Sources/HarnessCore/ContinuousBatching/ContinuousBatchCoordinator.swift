@@ -200,6 +200,11 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
     /// stop token is published like any other token and only `maxOutputTokens` (or cancellation)
     /// ends it. `stopTokenIDs` is still validated. Defaults to `false` (every prior submission).
     public let ignoresStopTokens: Bool
+    /// The OpenAI `logit_bias` request field: a sparse token-id to additive-bias map applied to this
+    /// row's logits before the greedy reduction. Empty (the default, every prior submission) means
+    /// the row decodes exactly as before. A non-empty map is incompatible with
+    /// `requestsSpeculation`: a biased row never speculates, and the runtime refuses the pair.
+    public let logitBias: [Int: Float]
 
     public init(
         promptTokens: [Int],
@@ -207,7 +212,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         stopTokenIDs: Set<Int>,
         architecture: BatchArchitectureClass,
         requestsSpeculation: Bool = false,
-        ignoresStopTokens: Bool = false
+        ignoresStopTokens: Bool = false,
+        logitBias: [Int: Float] = [:]
     ) {
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
@@ -215,6 +221,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         self.architecture = architecture
         self.requestsSpeculation = requestsSpeculation
         self.ignoresStopTokens = ignoresStopTokens
+        self.logitBias = logitBias
     }
 
     public init(
@@ -223,7 +230,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         eosToken: Int,
         architecture: BatchArchitectureClass,
         requestsSpeculation: Bool = false,
-        ignoresStopTokens: Bool = false
+        ignoresStopTokens: Bool = false,
+        logitBias: [Int: Float] = [:]
     ) {
         self.init(
             promptTokens: promptTokens,
@@ -231,7 +239,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             stopTokenIDs: [eosToken],
             architecture: architecture,
             requestsSpeculation: requestsSpeculation,
-            ignoresStopTokens: ignoresStopTokens)
+            ignoresStopTokens: ignoresStopTokens,
+            logitBias: logitBias)
     }
 }
 

@@ -40,6 +40,11 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     /// Immutable model/host-fit capability. Production serving always supplies this; nil retains
     /// the legacy embedding contract for existing library callers and fixtures.
     public let modelCapabilities: ServingModelCapabilities?
+    /// The model's logits width (`vocab_size` from `config.json`, the same number the dense runtime's
+    /// verified proof carries), used to bound `logit_bias` token ids at admission. `nil` (the default,
+    /// FAIL CLOSED) means the width is unknown, which keeps `ContinuousServingBackend.supportsLogitBias`
+    /// `false` so a non-empty bias is refused rather than applied unchecked.
+    public var logitBiasVocabularySize: Int?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -50,7 +55,8 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         toolCallFormat: ToolCallFormat = .json,
         disableThinkingWhenToolsActive: Bool = false,
         thinksByDefault: Bool = false,
-        modelCapabilities: ServingModelCapabilities? = nil
+        modelCapabilities: ServingModelCapabilities? = nil,
+        logitBiasVocabularySize: Int? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -71,6 +77,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.disableThinkingWhenToolsActive = disableThinkingWhenToolsActive
         self.thinksByDefault = thinksByDefault
         self.modelCapabilities = modelCapabilities
+        self.logitBiasVocabularySize = logitBiasVocabularySize
     }
 }
 
@@ -93,6 +100,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let stopStrings: Set<String>
         /// `ignore_eos`: the coordinator submission must not end this request on a model stop id.
         let ignoreEOS: Bool
+        /// The request's validated `logit_bias` (bounded by the vocabulary in `start`); carried into
+        /// the coordinator submission, where the runtime applies it per row.
+        let logitBias: [Int: Float]
         let activeTools: [OpenAIToolSpec]
         /// The request's `parallel_tool_calls` (`nil` = absent/null). Only an explicit `false`
         /// stops decoding at the first completed tool call.
@@ -181,6 +191,28 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
     }
 
+    /// `logit_bias`: the dense runtime applies the map per row, so a non-empty map is admissible only
+    /// when the model's vocabulary width is known (`supportsLogitBias`), and every id must lie below it
+    /// (an id at or above it would be an out-of-bounds index). Refused with a 400 (`param:
+    /// "logit_bias"`, the scalar backend's texts) before any prompt render, admission or coordinator
+    /// work. The HTTP layer gates on `supportsLogitBias` first; this is the same rule at the backend.
+    private func rejectUnsupportedLogitBias(
+        _ request: OpenAIChatCompletionRequest
+    ) throws {
+        guard !request.logitBias.isEmpty else { return }
+        guard supportsLogitBias, let vocabularySize = configuration.logitBiasVocabularySize else {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias is not supported by the loaded model's decoding route",
+                param: "logit_bias")
+        }
+        if let maximumID = request.logitBias.keys.max(), maximumID >= vocabularySize {
+            throw OpenAIServingError.invalidRequest(
+                "logit_bias token ids must be smaller than the model's vocabulary size "
+                    + "(\(vocabularySize))",
+                param: "logit_bias")
+        }
+    }
+
     /// Reject a request asking for decode controls the greedy-only continuous route can't apply
     /// (honesty: never accept sampling or penalties the compiled path would silently ignore). A
     /// policy-validation failure maps to a 400-class error.
@@ -205,16 +237,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         // `RepetitionContext` is a MULTIPLICATIVE penalty (`x < 0 ? x * penalty : x / penalty`),
         // so its neutral element is `1`, not `0`. Both HF-recommended presets for the deployed
         // model send `repetition_penalty: 1.0`, which must stay admissible here.
-        // `logit_bias` is a logit processor too, and the compiled continuous path has none: refuse a
-        // non-empty map (400, `param: "logit_bias"`) rather than answer unbiased. The backend leaves
-        // `supportsLogitBias` at its `false` protocol default, so the HTTP gate refuses first; this is
-        // the defense in depth for a caller that reaches `start` directly.
-        guard request.logitBias.isEmpty else {
-            throw OpenAIServingError.invalidRequest(
-                "logit_bias is not supported on the continuous-batch route "
-                    + "(no logit processor on the compiled path)",
-                param: "logit_bias")
-        }
+        // `logit_bias` is NOT refused here: the dense runtime applies a per-row additive bias before
+        // every greedy reduction. Its capability and vocabulary bound are enforced by
+        // `rejectUnsupportedLogitBias(_:)` (called first in `start`); sampling and the penalties below
+        // stay refused because the compiled path still has no processor for them.
         if (request.presencePenalty ?? 0) != 0 || (request.frequencyPenalty ?? 0) != 0
             || !DecoderPenalties.repetitionPenaltyIsNeutral(request.repetitionPenalty)
         {
@@ -223,6 +249,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                     + "route (no logit processor on the compiled path)",
                 param: "presence_penalty")
         }
+    }
+
+    /// `true` exactly when the model's vocabulary width is known (`logitBiasVocabularySize`), so every
+    /// `logit_bias` id can be bounded before admission; the dense runtime applies the bias per row.
+    /// An unknown width fails closed (the HTTP gate then refuses a non-empty map with a 400).
+    public nonisolated var supportsLogitBias: Bool {
+        configuration.logitBiasVocabularySize != nil
     }
 
     public func start(
@@ -312,6 +345,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard !stopTokenIDs.isEmpty, stopTokenIDs.allSatisfy({ $0 >= 0 }) else {
             throw ContinuousServingBackendError.invalidStopTokenIDs
         }
+        // `logit_bias` capability and vocabulary bound: before any prompt render or admission.
+        try rejectUnsupportedLogitBias(request)
         // The continuous-batch route decodes greedily (the compiled step folds argmax); a sampled
         // request must be REJECTED here, never silently downgraded to greedy — the honesty
         // invariant. Native sampling is wired on the scalar route (hybrid models, e.g. Qwen3.8).
@@ -351,6 +386,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maximumCompletionTokens: maximumCompletionTokens,
             stopStrings: modelStopStrings.union(request.stop),
             ignoreEOS: request.ignoreEOS,
+            logitBias: request.logitBias,
             activeTools: activeTools,
             parallelToolCalls: request.parallelToolCalls,
             completionBudgetResolution: completionBudgetResolution,
@@ -748,8 +784,12 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maxOutputTokens: prepared.maximumCompletionTokens,
             stopTokenIDs: stopTokenIDs,
             architecture: .denseAttention,
-            requestsSpeculation: route == .soloPLD,
-            ignoresStopTokens: prepared.ignoreEOS)
+            // A biased row is never speculative (the runtime refuses the pair, and the verify step must
+            // never see a biased row): a biased request on the solo-PLD route decodes without
+            // speculation. An unbiased request on that route still requests it.
+            requestsSpeculation: route == .soloPLD && prepared.logitBias.isEmpty,
+            ignoresStopTokens: prepared.ignoreEOS,
+            logitBias: prepared.logitBias)
     }
 
     private func submitToCoordinator(

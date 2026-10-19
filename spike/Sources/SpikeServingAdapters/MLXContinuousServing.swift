@@ -517,6 +517,12 @@ public func loadContinuousServingModel(
         modelDirectory: configuration.modelDirectory,
         hybridAdmitted: proof.verifiedHybridGeometry != nil)
     backendConfiguration.scorecardTraceCapacity = configuration.traceLimit
+    // `logit_bias`: the dense runtime applies it per row; the model's own `vocab_size` (the same
+    // `config.json` value the runtime's verified proof carries) bounds every bias id at admission. An
+    // unreadable config leaves it `nil`, which keeps `ContinuousServingBackend.supportsLogitBias`
+    // `false` (a non-empty bias is then refused, never applied unchecked).
+    backendConfiguration.logitBiasVocabularySize = scalarServingModelVocabSize(
+        modelDirectory: configuration.modelDirectory)
     let backend = ContinuousServingBackend(
         launchedModel: configuration.launchedModel,
         coordinator: coordinator,
