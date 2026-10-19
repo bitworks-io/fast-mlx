@@ -281,11 +281,19 @@ were not measured under the same workload); every input's C-tokens is
 ``verified``; every input's C-owner is ``verified`` (a card-grade ratio
 needs every arm's socket owner proven, same as ratio mode); every
 input's C-flags captured an argv, and the three captured argvs (split
-with ``shlex.split``) have the same length and differ from each other in
-AT MOST one position -- the model path is the only argument a caller's
-own invocation is expected to vary between arms, so a second differing
-flag means the three servers were not run under comparably-configured
-invocations; C-drift passes over the reference rows' own first/last
+with ``shlex.split``) have the same length and differ from each other
+ONLY at the value positions of ``MODEL_IDENTIFYING_FLAGS`` (``--model``
+for the served engine; ``--model-path`` and ``--model`` for the Swift
+engine, fastmlx-serve, whose request id necessarily differs with its
+weights directory) -- the model is the only thing a caller's own
+invocation is expected to vary between arms, so any other differing flag
+(a port, a context, a limit) means the three servers were not run under
+comparably-configured invocations. For a Swift-engine triple (all three
+rows carry a ``--model-path``, see ``_listener_model_path_argument``),
+model identity is the ``--model-path`` value: the references must agree
+on it, on ``--model`` and on the display id, and the candidate's must
+differ from the reference's (the same path under a new ``--model`` id is
+the same weights); C-drift passes over the reference rows' own first/last
 medians (identical semantics to ratio mode's own C-drift); and neither
 the combined reference median nor the candidate's own median is
 ``None``. An unreadable file or one that is not valid JSON is a harder
@@ -1926,12 +1934,83 @@ def _listener_model_argument(cmdline: "Optional[str]") -> Optional[str]:
     return None
 
 
+# The listener flags whose VALUE identifies the model under test. These are
+# the only argv positions that may differ between the three --combine rows:
+# the served engine names its model with ``--model``; the Swift engine
+# (fastmlx-serve) names the weights directory with ``--model-path`` AND a
+# request id with ``--model``, and both necessarily differ between arms.
+MODEL_IDENTIFYING_FLAGS = frozenset({"--model", "--model-path"})
+
+
+def _listener_model_path_argument(cmdline: "Optional[str]") -> Optional[str]:
+    """Extracts the ``--model-path`` argument's raw VALUE from one row's own
+    captured ``controls.flags.listenerCmdline`` string, with the same
+    ``shlex.split`` tokenizer and the same ``None`` contract as
+    ``_listener_model_argument`` (which it deliberately does not change):
+    ``None`` -- never a partial value -- when ``cmdline`` is not a non-empty
+    string, fails to split, or carries no ``--model-path`` with a non-empty
+    value. Both ``--model-path V`` and ``--model-path=V`` are recognised.
+    """
+    if not isinstance(cmdline, str) or not cmdline:
+        return None
+    try:
+        tokens = shlex.split(cmdline)
+    except ValueError:
+        return None
+    for index, token in enumerate(tokens):
+        if token == "--model-path":
+            if index + 1 < len(tokens) and tokens[index + 1]:
+                return tokens[index + 1]
+            return None
+        if token.startswith("--model-path="):
+            value = token.partition("=")[2]
+            return value or None
+    return None
+
+
+def _model_identifying_positions(argv: "Sequence[str]") -> "set":
+    """The argv indices that are the VALUE of a model-identifying flag: the
+    token after ``--flag`` (space form), or the whole token for the
+    ``--flag=value`` form.
+    """
+    positions = set()
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in MODEL_IDENTIFYING_FLAGS:
+            positions.add(index + 1)
+            index += 2
+            continue
+        if token.partition("=")[0] in MODEL_IDENTIFYING_FLAGS and "=" in token:
+            positions.add(index)
+        index += 1
+    return positions
+
+
+def _argv_position_flag_name(argv: "Sequence[str]", position: int) -> str:
+    """Names the flag a differing argv position belongs to, for a refusal
+    reason: the token itself when it is a ``--flag`` (or ``--flag=V``, name
+    only), the preceding ``--flag`` when it is that flag's value, else
+    ``argv[N]``. Never prints a value.
+    """
+    token = argv[position]
+    if token.startswith("--"):
+        return token.partition("=")[0]
+    if position > 0 and argv[position - 1].startswith("--"):
+        return argv[position - 1]
+    return f"argv[{position}]"
+
+
 def _combine_flags_control(loaded: "Sequence[dict]") -> dict:
     """Every input's C-flags must have captured an argv, AND the three
     captured argvs (split with ``shlex.split``) must have the same length
-    and differ from each other in AT MOST one position -- the model path is
-    the only argument a caller's own invocation is expected to vary between
-    arms (see module docstring's --combine section).
+    and may differ from each other ONLY at the value positions of the
+    model-identifying flags (``MODEL_IDENTIFYING_FLAGS``: ``--model`` for
+    the served engine; ``--model-path`` and ``--model`` for the Swift
+    engine) -- the model is the only thing a caller's own invocation is
+    expected to vary between arms (see module docstring's --combine
+    section). Any other differing position (a port, a context, a limit,
+    the binary) is refused, naming its flag.
     """
     per_role_status = {
         role: _nested_status(entry["row"], "controls", "flags", "status")
@@ -1993,25 +2072,31 @@ def _combine_flags_control(loaded: "Sequence[dict]") -> dict:
                 "to vary between arms"
             ),
         }
-    worst_diff = 0
-    worst_pair = None
     for (role_a, argv_a), (role_b, argv_b) in itertools.combinations(split.items(), 2):
-        diff_positions = sum(1 for a, b in zip(argv_a, argv_b) if a != b)
-        if diff_positions > worst_diff:
-            worst_diff = diff_positions
-            worst_pair = (role_a, role_b)
-    if worst_diff > 1:
-        role_a, role_b = worst_pair
-        return {
-            "status": "mismatch",
-            "perRole": per_role_status,
-            "listenerCmdline": per_role_cmdline,
-            "reason": (
-                f"captured listener argv differs in {worst_diff} position(s) "
-                f"between {role_a} and {role_b} -- only the model path may "
-                "vary between arms"
-            ),
-        }
+        allowed = _model_identifying_positions(argv_a) & _model_identifying_positions(argv_b)
+        disallowed = [
+            position
+            for position, (a, b) in enumerate(zip(argv_a, argv_b))
+            if a != b and position not in allowed
+        ]
+        if disallowed:
+            names = []
+            for position in disallowed:
+                name = _argv_position_flag_name(argv_a, position)
+                if name not in names:
+                    names.append(name)
+            return {
+                "status": "mismatch",
+                "perRole": per_role_status,
+                "listenerCmdline": per_role_cmdline,
+                "reason": (
+                    f"captured listener argv differs in {len(disallowed)} "
+                    f"position(s) outside the model-identifying flags "
+                    f"({', '.join(sorted(MODEL_IDENTIFYING_FLAGS))}) between "
+                    f"{role_a} and {role_b}: {', '.join(names)} -- only the "
+                    "model may vary between arms"
+                ),
+            }
     return {
         "status": "captured",
         "perRole": per_role_status,
@@ -2162,6 +2247,18 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
     candidate_cmdline = _nested_status(
         candidate_in["row"], "controls", "flags", "listenerCmdline"
     )
+    # Swift engine (fastmlx-serve): the weights directory is --model-path
+    # and --model is only a required request id. When all three rows carry
+    # a --model-path, THAT is the model identity (the request ids are
+    # compared too, fail-closed, between the references only).
+    swift_ref_first_path = _listener_model_path_argument(ref_first_cmdline)
+    swift_ref_last_path = _listener_model_path_argument(ref_last_cmdline)
+    swift_candidate_path = _listener_model_path_argument(candidate_cmdline)
+    use_swift_model_path = (
+        swift_ref_first_path is not None
+        and swift_ref_last_path is not None
+        and swift_candidate_path is not None
+    )
     ref_first_model_path = _listener_model_argument(ref_first_cmdline)
     ref_last_model_path = _listener_model_argument(ref_last_cmdline)
     candidate_model_path = _listener_model_argument(candidate_cmdline)
@@ -2171,7 +2268,26 @@ def run_combine(args: argparse.Namespace) -> "tuple[int, Optional[dict]]":
         and candidate_model_path is not None
     )
     if refusal_reason is None:
-        if use_listener_model_path:
+        if use_swift_model_path:
+            if (
+                swift_ref_first_path != swift_ref_last_path
+                or ref_first_model_path != ref_last_model_path
+                or ref_first_model != ref_last_model
+            ):
+                refusal_reason = (
+                    "the two reference rows name different models "
+                    f"(listener --model-path {swift_ref_first_path!r} vs "
+                    f"{swift_ref_last_path!r}; --model {ref_first_model_path!r} "
+                    f"vs {ref_last_model_path!r}; "
+                    f"display ids {ref_first_model!r} vs {ref_last_model!r})"
+                )
+            elif swift_candidate_path == swift_ref_first_path:
+                refusal_reason = (
+                    f"the candidate names the same model (listener --model-path "
+                    f"{swift_candidate_path!r}, display id {candidate_model!r}) "
+                    "as the reference -- a ratio needs two different models"
+                )
+        elif use_listener_model_path:
             # The two references must agree on BOTH the path and the display
             # id: a matching path whose served id changed between the two
             # reference measurements is not provably the same model (fail

@@ -6106,6 +6106,38 @@ class PublicSiteTests(unittest.TestCase):
         for key in ("mtp", "drafter", "promptLookup"):
             self.assertEqual(derived[key], "engine-default")
 
+    def test_served_ledger_swift_model_path_row_derives_context_and_passes_row_checks(self) -> None:
+        # The Swift engine's real redacted listener flags (`--model-path
+        # <path>` plus a plain `--model` request id): the ledger-row
+        # marker/placeholder check and the context derivation must accept
+        # them, while `<path>` after any other flag is still refused.
+        flags = [
+            "--model-path", "<path>", "--model", "qwen3-0p6b-4bit",
+            "--memory-limit-bytes", "12000000000", "--cache-limit-bytes", "3000000000",
+            "--context", "4096",
+        ]
+        row = self._swift_row(flags)
+        derived = build_public_site.derive_served_benchmark_fields_from_ledger_row(
+            row, self.SWIFT_ENGINE
+        )
+        self.assertEqual(derived["contextTokens"], 4096)
+        text = json.dumps(row, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        self.assertIsNone(build_public_site.served_benchmark_ledger_row_violation(text, row))
+        misplaced = self._swift_row(
+            ["--model-path", "<path>", "--model", "<path>x", "--context", "4096"]
+        )
+        text = json.dumps(misplaced, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        self.assertEqual(
+            build_public_site.served_benchmark_ledger_row_violation(text, misplaced),
+            "a misplaced <path> placeholder",
+        )
+        other = self._swift_row(["--model-path", "x", "--context", "<path>"])
+        text = json.dumps(other, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        self.assertEqual(
+            build_public_site.served_benchmark_ledger_row_violation(text, other),
+            "a misplaced <path> placeholder",
+        )
+
     def test_served_ledger_t2_d2_swift_engine_vocabulary_refusals(self) -> None:
         base = ["--model", "<path>"]
         # Each case asserts its refusal REASON, so a refusal raised by an

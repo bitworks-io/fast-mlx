@@ -2122,6 +2122,131 @@ class FastmlxBenchTestCase(unittest.TestCase):
         self.assertIsNone(doc["ratio"])
         self.assertIn("argv differs", stderr)
 
+    # -- Swift engine (fastmlx-serve) listener argv: BOTH --model-path (the
+    # weights directory) and --model (the request id) name the model, so
+    # both may differ between arms; every other position (port, context,
+    # a limit, the binary) must still be identical.
+    _SWIFT_BIN = "/x/bin/fastmlx-serve"
+
+    def _swift_cmdline(self, path, model_id, *, port=8964, context=4096, memory=12000000000):
+        return (
+            f"{self._SWIFT_BIN} --model-path {path} --model {model_id} "
+            f"--memory-limit-bytes {memory} --cache-limit-bytes 3000000000 "
+            f"--context {context} --host 127.0.0.1 --port {port}"
+        )
+
+    def _swift_trio(self, *, ref_first=None, ref_last=None, candidate=None):
+        ref_cmd = self._swift_cmdline("/p/Qwen3-0.6B-8bit", "qwen3-0p6b-8bit")
+        cand_cmd = self._swift_cmdline("/p/Qwen3-0.6B-4bit", "qwen3-0p6b-4bit")
+        return {
+            "ref_first": _combine_fixture_row(
+                "qwen3-0p6b-8bit", [100.0, 110.0], listener_cmdline=ref_first or ref_cmd
+            ),
+            "ref_last": _combine_fixture_row(
+                "qwen3-0p6b-8bit", [100.0, 110.0], listener_cmdline=ref_last or ref_cmd
+            ),
+            "candidate": _combine_fixture_row(
+                "qwen3-0p6b-4bit", [200.0, 210.0, 205.0], listener_cmdline=candidate or cand_cmd
+            ),
+        }
+
+    def _combine_swift(self, trio):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = self._write_combine_trio(tmp_dir, trio)
+            return self._run_main(["--combine", *paths, "--json"])
+
+    def test_combine_swift_triple_differing_only_in_model_path_and_id_succeeds(self):
+        code, stdout, stderr = self._combine_swift(self._swift_trio())
+        self.assertEqual(code, 0, stderr)
+        doc = json.loads(stdout)
+        self.assertEqual(doc["ratio"], 205.0 / 105.0)
+        self.assertEqual(doc["controls"]["flags"]["status"], "captured")
+
+    def test_combine_swift_triple_refuses_a_differing_port(self):
+        trio = self._swift_trio(
+            candidate=self._swift_cmdline("/p/Qwen3-0.6B-4bit", "qwen3-0p6b-4bit", port=8965)
+        )
+        code, stdout, stderr = self._combine_swift(trio)
+        self.assertEqual(code, 1)
+        self.assertIsNone(json.loads(stdout)["ratio"])
+        self.assertIn("argv differs", stderr)
+        self.assertIn("--port", stderr)
+
+    def test_combine_swift_triple_refuses_a_differing_context(self):
+        trio = self._swift_trio(
+            candidate=self._swift_cmdline("/p/Qwen3-0.6B-4bit", "qwen3-0p6b-4bit", context=8192)
+        )
+        code, stdout, stderr = self._combine_swift(trio)
+        self.assertEqual(code, 1)
+        self.assertIsNone(json.loads(stdout)["ratio"])
+        self.assertIn("argv differs", stderr)
+        self.assertIn("--context", stderr)
+
+    def test_combine_swift_triple_refuses_a_differing_limit(self):
+        trio = self._swift_trio(
+            candidate=self._swift_cmdline(
+                "/p/Qwen3-0.6B-4bit", "qwen3-0p6b-4bit", memory=13000000000
+            )
+        )
+        code, stdout, stderr = self._combine_swift(trio)
+        self.assertEqual(code, 1)
+        self.assertIn("argv differs", stderr)
+        self.assertIn("--memory-limit-bytes", stderr)
+
+    def test_combine_swift_refuses_candidate_with_reference_path_but_new_id(self):
+        # Same weights directory under a different request id is the same
+        # model: the candidate must differ by --model-path.
+        trio = self._swift_trio(
+            candidate=self._swift_cmdline("/p/Qwen3-0.6B-8bit", "qwen3-0p6b-4bit")
+        )
+        code, stdout, stderr = self._combine_swift(trio)
+        self.assertEqual(code, 1)
+        self.assertIsNone(json.loads(stdout)["ratio"])
+        self.assertIn("the candidate names the same model", stderr)
+
+    def test_combine_swift_refuses_reference_rows_with_different_model_paths(self):
+        trio = self._swift_trio(
+            ref_last=self._swift_cmdline("/p/Other-8bit", "qwen3-0p6b-8bit")
+        )
+        code, stdout, stderr = self._combine_swift(trio)
+        self.assertEqual(code, 1)
+        self.assertIsNone(json.loads(stdout)["ratio"])
+        self.assertIn("the two reference rows name different models", stderr)
+
+    def test_combine_swift_refuses_reference_rows_with_different_request_ids(self):
+        trio = self._swift_trio(
+            ref_last=self._swift_cmdline("/p/Qwen3-0.6B-8bit", "other-id")
+        )
+        code, stdout, stderr = self._combine_swift(trio)
+        self.assertEqual(code, 1)
+        self.assertIn("the two reference rows name different models", stderr)
+
+    def test_combine_swift_equals_form_model_path_may_differ(self):
+        ref = (
+            f"{self._SWIFT_BIN} --model-path=/p/Qwen3-0.6B-8bit --model=qwen3-0p6b-8bit "
+            "--context 4096 --port 8964"
+        )
+        cand = (
+            f"{self._SWIFT_BIN} --model-path=/p/Qwen3-0.6B-4bit --model=qwen3-0p6b-4bit "
+            "--context 4096 --port 8964"
+        )
+        code, stdout, stderr = self._combine_swift(self._swift_trio(
+            ref_first=ref, ref_last=ref, candidate=cand
+        ))
+        self.assertEqual(code, 0, stderr)
+
+    def test_combine_swift_flag_order_swap_is_refused(self):
+        # The model-identifying VALUE positions may differ; moving a flag to
+        # a different position is a different argv shape and is refused.
+        cand = (
+            f"{self._SWIFT_BIN} --model qwen3-0p6b-4bit --model-path /p/Qwen3-0.6B-4bit "
+            "--memory-limit-bytes 12000000000 --cache-limit-bytes 3000000000 "
+            "--context 4096 --host 127.0.0.1 --port 8964"
+        )
+        code, stdout, stderr = self._combine_swift(self._swift_trio(candidate=cand))
+        self.assertEqual(code, 1)
+        self.assertIn("argv differs", stderr)
+
     # -- Refusal 8: drift between the reference bookends beyond tolerance.
     def test_combine_refuses_drift_beyond_tolerance(self):
         trio = self._combine_baseline()

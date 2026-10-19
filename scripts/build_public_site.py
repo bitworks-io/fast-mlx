@@ -1490,10 +1490,11 @@ def _served_benchmark_row_listener_flags(row: Dict[str, object]) -> Optional[Dic
 
 def _served_benchmark_row_path_misplaced(row: Dict[str, object]) -> bool:
     """AMENDMENT A1: `<path>` is the REQUIRED redaction of `--model`'s value
-    inside a role's `listenerFlags` list -- the ingest tool's own I4 check
-    (`_listener_token_failures`) enforces that `--model`'s value must BE
-    `<path>`, so it is the ONE place `<path>` is legitimate anywhere in a
-    served-benchmark ledger row. Returns `True` if `<path>` appears anywhere
+    (served engine) or `--model-path`'s value (Swift engine) inside a role's
+    `listenerFlags` list -- the ingest tool's own I4 check
+    (`_listener_token_failures`) enforces that exact value for whichever
+    flag the engine's vocabulary redacts, so it is the ONE place `<path>` is
+    legitimate anywhere in a served-benchmark ledger row. Returns `True` if `<path>` appears anywhere
     ELSE in `row` -- a different flag's value inside a `listenerFlags` list,
     a longer string such as `--key=<path>` (an EXACT-match requirement at
     the permitted position, not a substring one), inside another string
@@ -1518,7 +1519,11 @@ def _served_benchmark_row_path_misplaced(row: Dict[str, object]) -> bool:
                 for index, token in enumerate(node):
                     if not isinstance(token, str) or "<path>" not in token:
                         continue
-                    if token == "<path>" and index > 0 and node[index - 1] == "--model":
+                    if (
+                        token == "<path>"
+                        and index > 0
+                        and node[index - 1] in ("--model", "--model-path")
+                    ):
                         continue
                     return True
                 return False
