@@ -16,6 +16,26 @@
   },
   "releases": [
     {
+      "id": "tagged-distribution-v0-1-21",
+      "title": "Publish v0.1.21: fastmlx bench --combine accepts fastmlx-serve triples, and the continuous-batch route accepts logit_bias",
+      "publishedAt": "2026-10-20T02:19:26Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.21 arm64 macOS distribution: fastmlx bench --combine now accepts a triple of fastmlx-serve runs, where only the --model and --model-path values may differ between the arms and every other argument must match; and the continuous-batch route now accepts a per-request logit_bias, which it used to refuse when non-empty, with a token id at or above the model's vocab_size a 400 on logit_bias. A plain fastmlx serve launch uses the scalar route and is not affected. The bundled quality-card store is unchanged from v0.1.20. Greedy output is identical to the development build on the release check prompts. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "18503a59cbf442b57f4c141bc6c7b969852fd749",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "tagged-distribution-v0-1-20",
       "title": "Publish v0.1.20: enforced tool calls stream their arguments incrementally, and a tool_choice a route cannot enforce is refused with 400",
       "publishedAt": "2026-10-18T01:50:01Z",
