@@ -254,12 +254,11 @@ public enum FastMLXServeArgumentError:
     /// is a dry-run return path that resolves a pick and exits without ever serving a request, so
     /// the flag would be silently inert there too.
     case defaultSamplingWithQuantPickOnly
-    /// `ContinuousServingBackend` rejects `.sampled` with HTTP 400 (see its own admission check),
-    /// so turning param-less traffic into sampled traffic on a continuous route would convert
-    /// every affected request into a hard failure rather than silently ignoring the flag -- refuse
-    /// at parse time instead, mirroring `chatTemplateWithContinuousBatch` /
-    /// `ngramOffloadPlanWithContinuousBatch`'s identical "the flag would be silently
-    /// dropped/ignored" shape.
+    /// `ContinuousServingBackend` samples a request's OWN sampling fields but has no defaults seam
+    /// (its policy resolves with no defaults), so on a continuous route the flag would be silently
+    /// inert for param-less traffic -- refuse at parse time instead, mirroring
+    /// `chatTemplateWithContinuousBatch` / `ngramOffloadPlanWithContinuousBatch`'s identical "the
+    /// flag would be silently dropped/ignored" shape.
     case defaultSamplingWithContinuousBatch
     /// The exact Qwen3.5 MTP route falls back to scalar decoding on any non-greedy sampling
     /// (`ExactQwen35MTPServingAdmission` -> `.scalarFallback(.sampledGeneration)`), so enabling
@@ -409,7 +408,7 @@ public enum FastMLXServeArgumentError:
                 + "return path exits without ever serving one"
         case .defaultSamplingWithContinuousBatch:
             "--default-sampling generation-config is not supported with continuous batching: "
-                + "ContinuousServingBackend rejects a sampled request with HTTP 400"
+                + "that route samples only from each request's own sampling fields"
         case .defaultSamplingWithExactQwen35MTP:
             "--default-sampling generation-config is not supported with --exact-qwen35-mtp: that "
                 + "route falls back to scalar decoding on any non-greedy sampling, so every "
@@ -866,8 +865,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// otherwise silently ignore this flag or regress accepted behavior when it converts
     /// param-less traffic into sampled traffic: `--scripted` and `--quant-pick-only` never serve a
     /// request at all (`defaultSamplingWithScripted` / `defaultSamplingWithQuantPickOnly`);
-    /// continuous batching's `ContinuousServingBackend` rejects `.sampled` with HTTP 400
-    /// (`defaultSamplingWithContinuousBatch`); `--exact-qwen35-mtp` falls back to scalar decoding
+    /// continuous batching's `ContinuousServingBackend` samples only from a request's own fields and
+    /// has no defaults seam (`defaultSamplingWithContinuousBatch`); `--exact-qwen35-mtp` falls back to scalar decoding
     /// on any non-greedy sampling (`defaultSamplingWithExactQwen35MTP`); and `--qwen4exp-mtp`
     /// without `--qwen4exp-sampled-mtp` would move every param-less request from accelerated
     /// greedy MTP to unaccelerated scalar decode (`defaultSamplingWithInCheckpointMTPRequiresSampledMTP`).

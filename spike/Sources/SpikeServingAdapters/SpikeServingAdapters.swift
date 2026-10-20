@@ -888,7 +888,9 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         }
     }
 
-    private static func openAIError(for error: ServingSamplingPolicyError) -> OpenAIServingError {
+    /// The 400 for a rejected sampling field, naming that field as `param`. Module-internal so the
+    /// continuous-batch route maps `ServingSamplingPolicyError` identically to this scalar route.
+    static func openAIError(for error: ServingSamplingPolicyError) -> OpenAIServingError {
         switch error {
         case .nonFiniteTemperature, .temperatureOutOfRange:
             return .invalidRequest("temperature must be finite and in (0, 2]", param: "temperature")

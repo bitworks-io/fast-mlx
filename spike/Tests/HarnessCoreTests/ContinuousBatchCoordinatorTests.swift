@@ -1407,4 +1407,32 @@ final class ContinuousBatchCoordinatorTests: XCTestCase {
         XCTAssertEqual(actual, expected)
         await coordinator.shutdown()
     }
+
+    func testSubmissionSamplingDefaultsToNilAndParticipatesInEqualityOnBothInits() {
+        let greedy = submission([10])
+        XCTAssertNil(greedy.sampling)
+
+        let sampling = ContinuousBatchRowSampling(temperature: 0.8, topK: 5, seed: 7)
+        XCTAssertEqual(sampling.topP, 1)
+        XCTAssertEqual(sampling.minP, 0)
+        XCTAssertEqual(ContinuousBatchRowSampling(temperature: 1).topK, 0)
+        XCTAssertNil(ContinuousBatchRowSampling(temperature: 1).seed)
+
+        let viaStopSet = ContinuousBatchSubmission(
+            promptTokens: [10], maxOutputTokens: 16, stopTokenIDs: [2],
+            architecture: .denseAttention, sampling: sampling)
+        let viaEOS = ContinuousBatchSubmission(
+            promptTokens: [10], maxOutputTokens: 16, eosToken: 2,
+            architecture: .denseAttention, sampling: sampling)
+        XCTAssertEqual(viaStopSet.sampling, sampling)
+        XCTAssertEqual(viaEOS.sampling, sampling)
+        XCTAssertEqual(viaStopSet, viaEOS)
+        XCTAssertNotEqual(viaStopSet, greedy)
+        XCTAssertNotEqual(
+            viaStopSet,
+            ContinuousBatchSubmission(
+                promptTokens: [10], maxOutputTokens: 16, eosToken: 2,
+                architecture: .denseAttention,
+                sampling: ContinuousBatchRowSampling(temperature: 0.8, topK: 5, seed: 8)))
+    }
 }

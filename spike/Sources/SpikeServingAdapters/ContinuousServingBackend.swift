@@ -116,6 +116,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         /// The request's validated `logit_bias` (bounded by the vocabulary in `start`); carried into
         /// the coordinator submission, where the runtime applies it per row.
         let logitBias: [Int: Float]
+        /// The request's per-row sampling (`nil` = greedy), resolved once in `start` from the
+        /// request's own fields; carried into the coordinator submission.
+        let sampling: ContinuousBatchRowSampling?
         let activeTools: [OpenAIToolSpec]
         /// The request's `parallel_tool_calls` (`nil` = absent/null). Only an explicit `false`
         /// stops decoding at the first completed tool call.
@@ -237,24 +240,19 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
     }
 
-    /// Reject a request asking for decode controls the greedy-only continuous route can't apply
-    /// (honesty: never accept sampling or penalties the compiled path would silently ignore). A
-    /// policy-validation failure maps to a 400-class error.
-    private static func rejectUnsupportedDecodeControls(
+    /// Resolve the request's sampling and reject the decode controls this route can't apply
+    /// (honesty: never accept penalties the compiled path would silently ignore). Sampling
+    /// (`temperature` > 0) is served: the policy is resolved once, with no defaults, and returned as
+    /// the per-row sampling (`nil` = greedy). A policy-validation failure maps to a 400-class error.
+    private static func resolveSamplingRejectingUnsupportedDecodeControls(
         _ request: OpenAIChatCompletionRequest
-    ) throws {
+    ) throws -> ContinuousBatchRowSampling? {
         let policy: ServingSamplingPolicy
         do {
             policy = try ServingSamplingPolicy.resolve(from: request)
-        } catch is ServingSamplingPolicyError {
-            throw OpenAIServingError.invalidRequest(
-                "invalid sampling parameters", param: "temperature")
-        }
-        if case .sampled = policy {
-            throw OpenAIServingError.invalidRequest(
-                "sampling (temperature > 0) is not supported on the continuous-batch route; "
-                    + "send temperature 0 for greedy decoding",
-                param: "temperature")
+        } catch let error as ServingSamplingPolicyError {
+            // Same mapping as the scalar route: each rejected field is named as its own `param`.
+            throw ScalarServingBackend.openAIError(for: error)
         }
         // `repetitionPenalty` is checked for non-neutrality via the shared `DecoderPenalties`
         // helper, not `(x ?? 0) != 0` like the additive presence/frequency knobs: the vendored
@@ -263,8 +261,8 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         // model send `repetition_penalty: 1.0`, which must stay admissible here.
         // `logit_bias` is NOT refused here: the dense runtime applies a per-row additive bias before
         // every greedy reduction. Its capability and vocabulary bound are enforced by
-        // `rejectUnsupportedLogitBias(_:)` (called first in `start`); sampling and the penalties below
-        // stay refused because the compiled path still has no processor for them.
+        // `rejectUnsupportedLogitBias(_:)` (called first in `start`); the penalties below stay refused
+        // because the compiled path still has no processor for them.
         if (request.presencePenalty ?? 0) != 0 || (request.frequencyPenalty ?? 0) != 0
             || !DecoderPenalties.repetitionPenaltyIsNeutral(request.repetitionPenalty)
         {
@@ -272,6 +270,24 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 "presence/frequency/repetition penalties are not supported on the continuous-batch "
                     + "route (no logit processor on the compiled path)",
                 param: "presence_penalty")
+        }
+        return rowSampling(for: policy)
+    }
+
+    /// The per-row sampling for a resolved policy, built exactly as the scalar route's
+    /// `MLXDecoder.setSampling` builds its `TopPSampler`: Float values, an absent top-k or min-p as
+    /// `0` (off), and the `Int64` request seed reinterpreted by bit pattern. `.greedy` is `nil`.
+    static func rowSampling(for policy: ServingSamplingPolicy) -> ContinuousBatchRowSampling? {
+        switch policy {
+        case .greedy:
+            return nil
+        case let .sampled(temperature, topP, topK, minP, seed):
+            return ContinuousBatchRowSampling(
+                temperature: Float(temperature),
+                topP: Float(topP),
+                topK: topK ?? 0,
+                minP: Float(minP ?? 0),
+                seed: seed.map { UInt64(bitPattern: $0) })
         }
     }
 
@@ -386,10 +402,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
         // `logit_bias` capability and vocabulary bound: before any prompt render or admission.
         try rejectUnsupportedLogitBias(request)
-        // The continuous-batch route decodes greedily (the compiled step folds argmax); a sampled
-        // request must be REJECTED here, never silently downgraded to greedy — the honesty
-        // invariant. Native sampling is wired on the scalar route (hybrid models, e.g. Qwen3.8).
-        try Self.rejectUnsupportedDecodeControls(request)
+        // A sampled request (temperature > 0) is served: the row carries its own sampler (resolved
+        // once here, no defaults) and the runtime draws one token per step from the adjusted logits.
+        // Penalties stay refused (400): never accept a control the compiled path would silently
+        // ignore. Invalid sampling values are a 400.
+        let sampling = try Self.resolveSamplingRejectingUnsupportedDecodeControls(request)
 
         let activeTools = request.activeTools
         // Resolve thinking ONCE and use the SAME value for the prompt render and the reasoning gate —
@@ -430,6 +447,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             stopStrings: modelStopStrings.union(request.stop),
             ignoreEOS: request.ignoreEOS,
             logitBias: request.logitBias,
+            sampling: sampling,
             activeTools: activeTools,
             parallelToolCalls: request.parallelToolCalls,
             completionBudgetResolution: completionBudgetResolution,
@@ -933,14 +951,15 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maxOutputTokens: prepared.maximumCompletionTokens,
             stopTokenIDs: stopTokenIDs,
             architecture: .denseAttention,
-            // A biased or masked row is never speculative (the runtime refuses either pair, and the
-            // verify step must never see such a row): a biased or masked request on the solo-PLD route
-            // decodes without speculation. An unconstrained request on that route still requests it.
+            // A biased, masked or sampled row is never speculative (the runtime refuses each pair, and
+            // the verify step must never see such a row): such a request on the solo-PLD route decodes
+            // without speculation. An unconstrained greedy request on that route still requests it.
             requestsSpeculation: route == .soloPLD && prepared.logitBias.isEmpty
-                && prepared.tokenMask == nil,
+                && prepared.tokenMask == nil && prepared.sampling == nil,
             ignoresStopTokens: prepared.ignoreEOS,
             logitBias: prepared.logitBias,
-            tokenMask: prepared.tokenMask)
+            tokenMask: prepared.tokenMask,
+            sampling: prepared.sampling)
     }
 
     private func submitToCoordinator(

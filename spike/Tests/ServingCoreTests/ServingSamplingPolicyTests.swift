@@ -78,6 +78,21 @@ final class ServingSamplingPolicyTests: XCTestCase {
             .nonFiniteTemperature)
     }
 
+    /// A temperature so small that `1 / Float(temperature)` overflows (or `Float(temperature)`
+    /// underflows to zero) would make the sampler divide by ~0 and silently draw a wrong token.
+    func testResolutionRejectsTemperatureWhoseFloatReciprocalIsNotFinite() throws {
+        for temperature in [1e-45, 1e-40] {
+            assertThrows(
+                try ServingSamplingPolicy.resolve(temperature: temperature, topP: nil, seed: nil),
+                .temperatureOutOfRange(temperature))
+        }
+        for temperature in [1e-6, 0.01] {
+            XCTAssertEqual(
+                try ServingSamplingPolicy.resolve(temperature: temperature, topP: nil, seed: nil),
+                .sampled(temperature: temperature, topP: 1.0, topK: nil, minP: nil, seed: nil))
+        }
+    }
+
     func testResolutionRejectsInvalidTopP() {
         assertThrows(
             try ServingSamplingPolicy.resolve(temperature: 0.7, topP: -0.1, seed: nil),

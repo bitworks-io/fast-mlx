@@ -207,6 +207,37 @@ public protocol ContinuousBatchRowTokenMask: AnyObject, Sendable {
     func advance(token: Int)
 }
 
+/// Per-row sampling parameters for the continuous-batch route (`temperature > 0`). The values are
+/// the ones the scalar route hands the vendored `TopPSampler`; the dense runtime builds one
+/// sampler per sampled row at admission and keeps it for the row's lifetime. Declared here (pure,
+/// MLX-free) because `ContinuousBatchSubmission` carries it.
+public struct ContinuousBatchRowSampling: Sendable, Equatable {
+    /// Softmax temperature, `> 0`.
+    public let temperature: Float
+    /// Nucleus mass in `(0, 1]`; `1` turns top-p off.
+    public let topP: Float
+    /// Keep only the `topK` most likely ids; `0` turns top-k off.
+    public let topK: Int
+    /// Drop ids below `minP` times the top probability; `0` turns min-p off.
+    public let minP: Float
+    /// RNG seed for reproducible draws; `nil` seeds from entropy.
+    public let seed: UInt64?
+
+    public init(
+        temperature: Float,
+        topP: Float = 1,
+        topK: Int = 0,
+        minP: Float = 0,
+        seed: UInt64? = nil
+    ) {
+        self.temperature = temperature
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.seed = seed
+    }
+}
+
 public struct ContinuousBatchSubmission: Sendable, Equatable {
     public let promptTokens: [Int]
     public let maxOutputTokens: Int
@@ -227,6 +258,10 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
     /// A mask is incompatible with `requestsSpeculation`: the runtime refuses the pair. Equality
     /// compares the mask by identity.
     public let tokenMask: (any ContinuousBatchRowTokenMask)?
+    /// Per-row sampling (`temperature > 0`). `nil` (the default, every prior submission) leaves the
+    /// row greedy. Sampling is incompatible with `requestsSpeculation`: a sampled row never
+    /// speculates, and the runtime refuses the pair.
+    public let sampling: ContinuousBatchRowSampling?
 
     public static func == (lhs: ContinuousBatchSubmission, rhs: ContinuousBatchSubmission) -> Bool {
         lhs.promptTokens == rhs.promptTokens
@@ -237,6 +272,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             && lhs.ignoresStopTokens == rhs.ignoresStopTokens
             && lhs.logitBias == rhs.logitBias
             && lhs.tokenMask === rhs.tokenMask
+            && lhs.sampling == rhs.sampling
     }
 
     public init(
@@ -247,7 +283,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         requestsSpeculation: Bool = false,
         ignoresStopTokens: Bool = false,
         logitBias: [Int: Float] = [:],
-        tokenMask: (any ContinuousBatchRowTokenMask)? = nil
+        tokenMask: (any ContinuousBatchRowTokenMask)? = nil,
+        sampling: ContinuousBatchRowSampling? = nil
     ) {
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
@@ -257,6 +294,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         self.ignoresStopTokens = ignoresStopTokens
         self.logitBias = logitBias
         self.tokenMask = tokenMask
+        self.sampling = sampling
     }
 
     public init(
@@ -267,7 +305,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         requestsSpeculation: Bool = false,
         ignoresStopTokens: Bool = false,
         logitBias: [Int: Float] = [:],
-        tokenMask: (any ContinuousBatchRowTokenMask)? = nil
+        tokenMask: (any ContinuousBatchRowTokenMask)? = nil,
+        sampling: ContinuousBatchRowSampling? = nil
     ) {
         self.init(
             promptTokens: promptTokens,
@@ -277,7 +316,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             requestsSpeculation: requestsSpeculation,
             ignoresStopTokens: ignoresStopTokens,
             logitBias: logitBias,
-            tokenMask: tokenMask)
+            tokenMask: tokenMask,
+            sampling: sampling)
     }
 }
 

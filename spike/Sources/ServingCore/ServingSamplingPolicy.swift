@@ -46,7 +46,12 @@ public enum ServingSamplingPolicy: Equatable, Sendable {
         guard temperature.isFinite else {
             throw ServingSamplingPolicyError.nonFiniteTemperature
         }
-        guard temperature > 0, temperature <= 2 else {
+        // The sampler scales logits by `1 / Float(temperature)`. A temperature so small that the
+        // float32 value underflows to zero (or its reciprocal overflows to infinity) would divide
+        // by ~0 and silently draw a wrong token, so it is out of range too.
+        guard temperature > 0, temperature <= 2,
+            Float(temperature) > 0, (1 / Float(temperature)).isFinite
+        else {
             throw ServingSamplingPolicyError.temperatureOutOfRange(temperature)
         }
 

@@ -47,11 +47,33 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
-    /// The continuous-batch route decodes greedily (the compiled step folds argmax). A sampled
-    /// request (temperature > 0) must be REJECTED here, never silently downgraded to greedy — the
-    /// honesty invariant that replaces the removed global `temperature must be 0` guard. Native
-    /// sampling is served on the scalar route used by hybrid models (e.g. Qwen3.8).
-    func testContinuousBatchRouteRejectsSampledRequestInsteadOfSilentGreedy()
+    /// Sampling on the continuous route (cycle 276, slice 2): the policy maps to the submission's
+    /// `ContinuousBatchRowSampling` exactly as the scalar route's `MLXDecoder.setSampling` builds its
+    /// `TopPSampler` (Float values, absent top-k/min-p as 0, the Int64 seed by bit pattern).
+    func testRowSamplingMappingMatchesTheScalarRouteTopPSamplerArguments() {
+        XCTAssertNil(ContinuousServingBackend.rowSampling(for: .greedy))
+
+        XCTAssertEqual(
+            ContinuousServingBackend.rowSampling(
+                for: .sampled(temperature: 0.8, topP: 1, topK: nil, minP: nil, seed: nil)),
+            ContinuousBatchRowSampling(
+                temperature: Float(0.8), topP: 1, topK: 0, minP: 0, seed: nil))
+
+        XCTAssertEqual(
+            ContinuousServingBackend.rowSampling(
+                for: .sampled(temperature: 0.7, topP: 0.9, topK: 40, minP: 0.05, seed: 7)),
+            ContinuousBatchRowSampling(
+                temperature: Float(0.7), topP: Float(0.9), topK: 40, minP: Float(0.05), seed: 7))
+
+        let negativeSeed = ContinuousServingBackend.rowSampling(
+            for: .sampled(temperature: 1, topP: 1, topK: nil, minP: nil, seed: -1))
+        XCTAssertEqual(negativeSeed?.seed, 18_446_744_073_709_551_615)
+    }
+
+    /// A sampled request (temperature > 0) is ADMITTED on the continuous route and the coordinator
+    /// receives the mapped sampling; a greedy request carries none. Replaces the former
+    /// `testContinuousBatchRouteRejectsSampledRequestInsteadOfSilentGreedy`.
+    func testContinuousBatchRouteAdmitsSampledRequestAndCarriesSamplingIntoTheSubmission()
         async throws
     {
         let recorder = ContinuousRuntimeRecorder()
@@ -64,18 +86,77 @@ final class ContinuousServingBackendTests: XCTestCase {
             automaticDrive: false,
             publicationCapacity: 1,
             traceLimit: 32)
-        let backend = makeDynamicBackend(
+        let backend = makeBackend(
             coordinator: coordinator,
             promptByText: ["solo": [10]],
             pieces: [1: "s"],
             stopTokenIDs: [99])
 
         var sampled = request(text: "solo", maxTokens: 2)
-        sampled.temperature = 1.0
+        sampled.temperature = 0.8
+        sampled.seed = 7
+        let handle = try await backend.start(sampled)
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        XCTAssertEqual(recorder.submissions.count, 1)
+        XCTAssertEqual(
+            recorder.submissions.first?.sampling,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.8), topP: 1, topK: 0, minP: 0, seed: 7))
+        _ = await handle.lease.cancel(.clientDisconnected)
 
+        let greedy = request(text: "solo", maxTokens: 2)
+        let greedyHandle = try await backend.start(greedy)
+        XCTAssertEqual(recorder.submissions.count, 2)
+        XCTAssertNil(recorder.submissions.last?.sampling)
+        _ = await greedyHandle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// Penalties and invalid sampling values are still 400s on the continuous route, before any
+    /// admission.
+    func testContinuousBatchRouteStillRefusesPenaltiesAndInvalidSamplingValues()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        // A penalized request (greedy, but presence_penalty != 0) is refused: the compiled path has
+        // no logit processor, so accepting it would be a silent no-op. Same for a sampled one.
+        for temperature in [0.0, 0.8] {
+            var penalized = request(text: "solo", maxTokens: 2)
+            penalized.temperature = temperature
+            penalized.presencePenalty = 1.5
+            do {
+                _ = try await backend.start(penalized)
+                XCTFail("continuous route must reject a penalized request (T=\(temperature))")
+            } catch let error as OpenAIServingError {
+                guard case .invalidRequest(_, let param) = error else {
+                    XCTFail("expected invalidRequest, got \(error)")
+                    await backend.shutdown()
+                    return
+                }
+                XCTAssertEqual(param, "presence_penalty")
+            }
+        }
+
+        var invalid = request(text: "solo", maxTokens: 2)
+        invalid.temperature = 3.0
         do {
-            _ = try await backend.start(sampled)
-            XCTFail("continuous route must reject a sampled request, not serve it greedily")
+            _ = try await backend.start(invalid)
+            XCTFail("temperature 3.0 is out of range and must be refused")
         } catch let error as OpenAIServingError {
             guard case .invalidRequest(_, let param) = error else {
                 XCTFail("expected invalidRequest, got \(error)")
@@ -84,18 +165,118 @@ final class ContinuousServingBackendTests: XCTestCase {
             }
             XCTAssertEqual(param, "temperature")
         }
-
-        // A penalized request (greedy — temp 0 — but presence_penalty > 0) is ALSO rejected: the
-        // compiled continuous path has no logit processor, so accepting it would be a silent no-op.
-        var penalized = request(text: "solo", maxTokens: 2)
-        penalized.presencePenalty = 1.5
-        do {
-            _ = try await backend.start(penalized)
-            XCTFail("continuous route must reject a penalized request")
-        } catch is OpenAIServingError {
-            // expected
-        }
+        XCTAssertEqual(recorder.submissions, [], "a refused request must never reach the coordinator")
         await backend.shutdown()
+    }
+
+    /// Each invalid sampling field is a 400 naming ITS OWN `param` (the scalar route's mapping, shared
+    /// byte for byte), not a blanket `temperature`.
+    func testContinuousBatchRouteNamesTheOffendingSamplingParameter() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        let cases: [(String, (inout OpenAIChatCompletionRequest) -> Void, OpenAIServingError)] = [
+            (
+                "temperature 3.0", { $0.temperature = 3.0 },
+                .invalidRequest("temperature must be finite and in (0, 2]", param: "temperature")
+            ),
+            (
+                "top_p 0", { $0.temperature = 0.8; $0.topP = 0 },
+                .invalidRequest("top_p must be finite and in (0, 1]", param: "top_p")
+            ),
+            (
+                "top_k 0", { $0.temperature = 0.8; $0.topK = 0 },
+                .invalidRequest("top_k must be greater than zero", param: "top_k")
+            ),
+            (
+                "min_p 2", { $0.temperature = 0.8; $0.minP = 2 },
+                .invalidRequest("min_p must be finite and in [0, 1]", param: "min_p")
+            ),
+        ]
+        for (label, configure, expected) in cases {
+            var invalid = request(text: "solo", maxTokens: 2)
+            configure(&invalid)
+            do {
+                _ = try await backend.start(invalid)
+                XCTFail("\(label) must be refused")
+            } catch let error as OpenAIServingError {
+                XCTAssertEqual(error, expected, label)
+            }
+        }
+        XCTAssertEqual(recorder.submissions, [], "a refused request must never reach the coordinator")
+        await backend.shutdown()
+    }
+
+    /// On the solo-PLD route a sampled request is submitted WITHOUT speculation (the runtime refuses
+    /// sampling + speculation) while carrying its sampling; the control, an unconstrained greedy
+    /// request on the same route, still requests speculation.
+    func testDynamicAdmissionSoloPLDSampledRequestIsSubmittedWithoutSpeculation()
+        async throws
+    {
+        func runSolo(temperature: Double) async throws -> (
+            ServingExecutionRoute, [ContinuousBatchSubmission], [BatchDecodeAction]
+        ) {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 2, queued: 4),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]],
+                    recorder: recorder,
+                    allowsSpeculation: true),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeDynamicBackend(
+                coordinator: coordinator,
+                promptByText: ["solo": [10]],
+                pieces: [1: "s"],
+                stopTokenIDs: [99])
+            var solo = request(text: "solo", maxTokens: 2)
+            solo.temperature = temperature
+            solo.seed = 7
+            let start = Task { try await backend.start(solo) }
+            await waitUntil {
+                await backend.diagnosticPendingAdmissionRequestCount() == 1
+            }
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+            let handle = try await start.value
+            try await runUntilDecode(coordinator, recorder: recorder)
+            let result = (handle.route, recorder.submissions, recorder.decodeActions)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+            return result
+        }
+
+        let sampled = try await runSolo(temperature: 0.8)
+        XCTAssertEqual(sampled.0, .soloPLD)
+        XCTAssertEqual(sampled.1.count, 1)
+        XCTAssertEqual(
+            sampled.1.first?.sampling,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.8), topP: 1, topK: 0, minP: 0, seed: 7))
+        XCTAssertEqual(sampled.1.first?.requestsSpeculation, false)
+        XCTAssertEqual(
+            sampled.2.first, .solo(BatchRequestID(1), speculationAllowed: false))
+
+        let greedy = try await runSolo(temperature: 0)
+        XCTAssertEqual(greedy.0, .soloPLD)
+        XCTAssertNil(greedy.1.first?.sampling)
+        XCTAssertEqual(greedy.1.first?.requestsSpeculation, true)
+        XCTAssertEqual(
+            greedy.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
     }
 
     /// `logit_bias` (A7): the capability is declared exactly when the backend knows the model's
