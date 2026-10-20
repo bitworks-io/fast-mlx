@@ -351,13 +351,11 @@ final class ResponseFormatCapabilityDefaultsAcrossBackendsTests: XCTestCase {
         XCTAssertFalse(backend.supportsJSONObjectResponseFormat)
     }
 
-    /// `ContinuousServingBackend` is NOT constructed here (its `ContinuousBatchCoordinator`
-    /// dependency needs a runtime fixture heavier than a capability-only test warrants) — verified
-    /// instead by static inspection: `grep -n "supportsJSONObjectResponseFormat\|
-    /// supportsJSONSchemaResponseFormat" ContinuousServingBackend.swift` returns no match, so it
-    /// inherits `ServingGenerationBackend`'s `false` default identically to the MTP backend above.
-    /// Recorded here (rather than silently omitted) per this stage's task spec: "if such backends
-    /// are constructible in tests" — this one was judged not cheaply so, unlike the MTP backend.
+    /// `ContinuousServingBackend` is NOT constructed here. Since cycle 274 it declares
+    /// `supportsJSONObjectResponseFormat`/`supportsJSONSchemaResponseFormat` from its configured
+    /// constraint support (the dense runtime applies them as a per-row token mask), and that is
+    /// asserted by construction in `ContinuousServingBackendTests`
+    /// `testConstraintCapabilityFlagsFollowTheConfiguredSupport`, not here.
     func testContinuousServingBackendCapabilityDefaultIsVerifiedStaticallyNotByConstruction() {
         // Intentionally empty: see the doc comment above for the static verification this records.
     }

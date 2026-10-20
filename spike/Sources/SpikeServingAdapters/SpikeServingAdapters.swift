@@ -339,29 +339,6 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         var enforcedStream: EnforcedToolCallStream?
     }
 
-    /// Incremental form of an enforced call: the post-reasoning generated text is fed in as it is
-    /// decoded and comes out as the call's name (once, when the call is known) plus the bytes that
-    /// belong to its `arguments`. Named: the generated text IS the arguments, so the head goes out
-    /// with the first non-empty text. Required: the union document's frame is stripped and the
-    /// wrapper's closing brace held back (`ToolUnionArgumentStream`).
-    private enum EnforcedToolCallStream {
-        case named(name: String, headSent: Bool)
-        case union(ToolUnionArgumentStream)
-
-        mutating func consume(_ text: String) -> (name: String?, arguments: String) {
-            switch self {
-            case .named(let name, let headSent):
-                guard !text.isEmpty else { return (nil, "") }
-                self = .named(name: name, headSent: true)
-                return (headSent ? nil : name, text)
-            case .union(var stream):
-                let output = stream.consume(text)
-                self = .union(stream)
-                return (output.name, output.arguments)
-            }
-        }
-    }
-
     private let launchedModel: String
     private let inference: InferenceActor
     private let codec: any ScalarServingTextCodec

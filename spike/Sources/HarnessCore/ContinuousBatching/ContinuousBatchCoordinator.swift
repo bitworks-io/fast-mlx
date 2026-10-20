@@ -190,6 +190,23 @@ extension ContinuousBatchRuntime {
     public func resourceSnapshot() -> ContinuousBatchRuntimeResourceSnapshot? { nil }
 }
 
+/// A per-row, per-step token mask for the continuous-batch route.
+///
+/// The runtime asks for the allowed-id bitset of a row's NEXT token, then reports each emitted
+/// token with `advance(token:)`, exactly once per emitted token and in emission order, so the
+/// bitset a step sees always reflects every earlier emitted token. Both calls are non-throwing:
+/// a conformer records its own failure (and answers `nil`, "unconstrained") so one row's failure
+/// can never fail a batch step that other rows share. Declared here (pure, MLX-free) because
+/// `ContinuousBatchSubmission` carries it; the dense runtime in `SpikeCore` consumes it.
+public protocol ContinuousBatchRowTokenMask: AnyObject, Sendable {
+    /// The ids allowed for the row's next token: bit `id` is `[id >> 6] & (1 << (id & 63))`.
+    /// `nil` means unconstrained for this step. Logits columns at or beyond the bitset's width are
+    /// disallowed; bits at or beyond the logits width are ignored.
+    func allowedTokenBitset() -> [UInt64]?
+    /// Called once per emitted token, in emission order.
+    func advance(token: Int)
+}
+
 public struct ContinuousBatchSubmission: Sendable, Equatable {
     public let promptTokens: [Int]
     public let maxOutputTokens: Int
@@ -205,6 +222,22 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
     /// the row decodes exactly as before. A non-empty map is incompatible with
     /// `requestsSpeculation`: a biased row never speculates, and the runtime refuses the pair.
     public let logitBias: [Int: Float]
+    /// A per-row, per-step allowed-token mask (named/required `tool_choice`, `response_format`).
+    /// `nil` (the default, every prior submission) leaves the row on the unmasked compiled steps.
+    /// A mask is incompatible with `requestsSpeculation`: the runtime refuses the pair. Equality
+    /// compares the mask by identity.
+    public let tokenMask: (any ContinuousBatchRowTokenMask)?
+
+    public static func == (lhs: ContinuousBatchSubmission, rhs: ContinuousBatchSubmission) -> Bool {
+        lhs.promptTokens == rhs.promptTokens
+            && lhs.maxOutputTokens == rhs.maxOutputTokens
+            && lhs.stopTokenIDs == rhs.stopTokenIDs
+            && lhs.architecture == rhs.architecture
+            && lhs.requestsSpeculation == rhs.requestsSpeculation
+            && lhs.ignoresStopTokens == rhs.ignoresStopTokens
+            && lhs.logitBias == rhs.logitBias
+            && lhs.tokenMask === rhs.tokenMask
+    }
 
     public init(
         promptTokens: [Int],
@@ -213,7 +246,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         architecture: BatchArchitectureClass,
         requestsSpeculation: Bool = false,
         ignoresStopTokens: Bool = false,
-        logitBias: [Int: Float] = [:]
+        logitBias: [Int: Float] = [:],
+        tokenMask: (any ContinuousBatchRowTokenMask)? = nil
     ) {
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
@@ -222,6 +256,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         self.requestsSpeculation = requestsSpeculation
         self.ignoresStopTokens = ignoresStopTokens
         self.logitBias = logitBias
+        self.tokenMask = tokenMask
     }
 
     public init(
@@ -231,7 +266,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         architecture: BatchArchitectureClass,
         requestsSpeculation: Bool = false,
         ignoresStopTokens: Bool = false,
-        logitBias: [Int: Float] = [:]
+        logitBias: [Int: Float] = [:],
+        tokenMask: (any ContinuousBatchRowTokenMask)? = nil
     ) {
         self.init(
             promptTokens: promptTokens,
@@ -240,7 +276,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             architecture: architecture,
             requestsSpeculation: requestsSpeculation,
             ignoresStopTokens: ignoresStopTokens,
-            logitBias: logitBias)
+            logitBias: logitBias,
+            tokenMask: tokenMask)
     }
 }
 

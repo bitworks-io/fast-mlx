@@ -327,8 +327,8 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # fixture is a byte copy of the already-public site/quality-guides.json (sha256 d96156a2...); neither names a host,
 # credential or machine-local path, and the projection validator's marker sweep passed on them.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1052,
-    "pathModeSha256": "840c9702820a1a6f9a7fc799b89a743377999a35297cc14c08e2fdbe8fa1b872",
+    "pathCount": 1056,
+    "pathModeSha256": "a6b26e1aeea809580b4f300493b975a2f33a8db295ec328702ddcea80aa5964e",
 }
 
 

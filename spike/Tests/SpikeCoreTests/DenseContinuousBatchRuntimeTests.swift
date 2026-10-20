@@ -221,6 +221,58 @@ private final class TinyDelayedNonFiniteLanguageModel:
     }
 }
 
+/// Like `TinyDelayedNonFiniteLanguageModel`, but the row at `invalidInput` stays FINITE in the
+/// column the next token wants (input + 1) and carries `poison` in ONE other column. A mask that
+/// disallows that column leaves the masked row's maximum finite, so only a guard on the RAW
+/// logits can see the poison (`-inf` and `+inf` are the cases the masked maximum cannot catch).
+private final class TinyDelayedPoisonedColumnLanguageModel:
+    Module, LanguageModel, KVCacheDimensionProvider
+{
+    let kvHeads = [1]
+    private let invalidInput: Int32
+    private let poison: Float
+    private let poisonColumn: Int32
+
+    init(invalidInput: Int32, poison: Float, poisonColumn: Int32 = 500) {
+        self.invalidInput = invalidInput
+        self.poison = poison
+        self.poisonColumn = poisonColumn
+    }
+
+    func prepare(
+        _ input: LMInput,
+        cache: [KVCache],
+        windowSize: Int?
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ inputs: MLXArray,
+        cache: [KVCache]?
+    ) -> MLXArray {
+        let values = inputs.asType(.float32).reshaped([
+            inputs.dim(0), 1, inputs.dim(1), 1,
+        ])
+        guard let cache = cache?.first else {
+            preconditionFailure("tiny poisoned-column model requires one cache")
+        }
+        _ = cache.update(keys: values, values: values)
+
+        let targets = (inputs.asType(.int32) + 1).expandedDimensions(axis: -1)
+        let vocabulary = MLXArray(Int32(0) ..< Int32(2_048))
+            .reshaped([1, 1, 2_048])
+        let finite = (targets .== vocabulary).asType(.float32) * 100
+        // A full-shaped array, not a scalar: the compiled step would inline a scalar NaN/inf as
+        // a bare `nan`/`inf` identifier in its JIT Metal source, which does not build.
+        let poisonRow = MLXArray.full([1, 1, 2_048], values: MLXArray(poison))
+        let poisoned = which(vocabulary .== MLXArray(poisonColumn), poisonRow, finite)
+        let invalid = (inputs.asType(.int32) .== invalidInput)
+            .expandedDimensions(axis: -1)
+        return which(invalid, poisoned, finite)
+    }
+}
+
 final class DenseContinuousBatchRuntimeTests: XCTestCase {
     private func makeRuntime(
         allocationChunk: Int = 4,
@@ -2650,6 +2702,478 @@ final class DenseContinuousBatchRuntimeTests: XCTestCase {
         // The last valid id is accepted.
         try admitWithBias(runtime, id: 1, tokens: [10], bias: [2_047: 1])
         XCTAssertGreaterThan(runtime.resourceSnapshot()?.reservedKVBytes ?? 0, 0)
+    }
+
+    // MARK: - Per-row, per-step token mask (cycle 274)
+    //
+    // `ScriptedMask` allows exactly the script's ids for the row's next token and records every
+    // `advance`. The step index is the number of advances so far, so the bitset a step sees
+    // reflects every earlier emitted token. The tiny model's greedy token is irrelevant while the
+    // script allows a single id: -inf everywhere else leaves that id as the only finite column.
+
+    private func admitWithMask(
+        _ runtime: DenseContinuousBatchRuntime,
+        id: UInt64,
+        tokens: [Int],
+        mask: (any ContinuousBatchRowTokenMask)?,
+        bias: [Int: Float] = [:],
+        requestsSpeculation: Bool = false,
+        maxOutputTokens: Int = 16
+    ) throws {
+        try runtime.admit([
+            ContinuousBatchRuntimeAdmission(
+                id: BatchRequestID(id),
+                submission: ContinuousBatchSubmission(
+                    promptTokens: tokens,
+                    maxOutputTokens: maxOutputTokens,
+                    eosToken: 2,
+                    architecture: .denseAttention,
+                    requestsSpeculation: requestsSpeculation,
+                    logitBias: bias,
+                    tokenMask: mask)),
+        ])
+    }
+
+    private func solo(_ runtime: DenseContinuousBatchRuntime, _ id: UInt64) throws -> Int {
+        try runtime.decode(.solo(BatchRequestID(id), speculationAllowed: false))[0].tokens[0]
+    }
+
+    private func drain(_ runtime: DenseContinuousBatchRuntime, _ id: UInt64) throws -> Int {
+        try runtime.decode(.drainSoloPipeline(BatchRequestID(id)))[0].tokens[0]
+    }
+
+    /// Solo decode of `count` tokens: pipelined steps with a synchronous drain every 4th token.
+    private func soloMaskedTokens(
+        prompt: [Int], mask: (any ContinuousBatchRowTokenMask)?,
+        bias: [Int: Float] = [:], count: Int
+    ) throws -> [Int] {
+        let runtime = try makeRuntime()
+        try admitWithMask(runtime, id: 1, tokens: prompt, mask: mask, bias: bias)
+        try prefill(runtime, id: 1, tokens: prompt, chunks: [prompt.count], maxOutputTokens: 16)
+        var tokens: [Int] = []
+        for index in 0 ..< count {
+            if index % 4 == 3 {
+                tokens.append(try drain(runtime, 1))
+            } else {
+                tokens.append(try solo(runtime, 1))
+            }
+        }
+        return tokens
+    }
+
+    /// Shared batch over ids 1...n; returns each id's tokens over `count` shared steps.
+    private func maskedBatchTokens(
+        prompts: [[Int]], masks: [(any ContinuousBatchRowTokenMask)?],
+        biases: [[Int: Float]]? = nil, count: Int
+    ) throws -> [UInt64: [Int]] {
+        let runtime = try makeRuntime()
+        for (index, prompt) in prompts.enumerated() {
+            let id = UInt64(index + 1)
+            try admitWithMask(
+                runtime, id: id, tokens: prompt, mask: masks[index],
+                bias: biases?[index] ?? [:])
+            try prefill(runtime, id: id, tokens: prompt, chunks: [prompt.count], maxOutputTokens: 16)
+        }
+        let ids = prompts.indices.map { BatchRequestID(UInt64($0 + 1)) }
+        var tokens: [UInt64: [Int]] = [:]
+        for _ in 0 ..< count {
+            for (id, emittedTokens) in emitted(
+                try runtime.decode(.batch(ids, speculationAllowed: false)))
+            {
+                tokens[id, default: []].append(contentsOf: emittedTokens)
+            }
+        }
+        return tokens
+    }
+
+    func testScriptedMaskForcesTheExactScriptSoloThroughPrefillFinalPipelineAndDrain() throws {
+        let script = [7, 9, 5, 3, 7, 9, 5, 3, 13]
+        let mask = ScriptedMask(allowed: script.map { [$0] })
+
+        let tokens = try soloMaskedTokens(prompt: [10], mask: mask, count: script.count)
+
+        XCTAssertEqual(tokens, script)
+        // The staged-but-unemitted lookahead token is never advanced.
+        XCTAssertEqual(mask.advanced, script)
+    }
+
+    func testScriptedMaskForcesTheScriptOnABatchRowBesideAnUnmaskedPartner() throws {
+        let script = [7, 9, 5, 3, 13, 21]
+        let masked = try maskedBatchTokens(
+            prompts: [[10], [50]],
+            masks: [ScriptedMask(allowed: script.map { [$0] }), nil],
+            count: script.count)
+        // Same batch shape, an unmasked control in the masked row's place.
+        let control = try maskedBatchTokens(
+            prompts: [[10], [50]], masks: [nil, nil], count: script.count)
+        XCTAssertEqual(masked[1], script)
+        XCTAssertEqual(masked[2], control[2])
+        XCTAssertEqual(masked[2], [51, 102, 204, 408, 816, 1_632])
+
+        // The masked row in the second physical position.
+        let swapped = try maskedBatchTokens(
+            prompts: [[50], [10]],
+            masks: [nil, ScriptedMask(allowed: script.map { [$0] })],
+            count: script.count)
+        XCTAssertEqual(swapped[2], script)
+        XCTAssertEqual(swapped[1], control[2])
+    }
+
+    func testBothRowsMaskedDifferentlyGetTheirOwnPerStepRows() throws {
+        let first = [7, 9, 5, 3]
+        let second = [40, 41, 42, 43]
+        let tokens = try maskedBatchTokens(
+            prompts: [[10], [50]],
+            masks: [
+                ScriptedMask(allowed: first.map { [$0] }),
+                ScriptedMask(allowed: second.map { [$0] }),
+            ],
+            count: 4)
+        XCTAssertEqual(tokens[1], first)
+        XCTAssertEqual(tokens[2], second)
+    }
+
+    func testAdvanceReceivesExactlyTheEmittedTokensAcrossSoloBatchSoloTransitions() throws {
+        let runtime = try makeRuntime()
+        let scriptOne = [7, 9, 5, 3, 13, 21, 8, 6, 4, 2, 17, 19]
+        let scriptTwo = [40, 41, 42, 43, 44, 45, 46, 47]
+        let maskOne = ScriptedMask(allowed: scriptOne.map { [$0] })
+        let maskTwo = ScriptedMask(allowed: scriptTwo.map { [$0] })
+        try admitWithMask(runtime, id: 1, tokens: [10], mask: maskOne)
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 16)
+        try admitWithMask(runtime, id: 2, tokens: [50], mask: maskTwo)
+        try prefill(runtime, id: 2, tokens: [50], chunks: [1], maxOutputTokens: 16)
+
+        var emittedOne: [Int] = []
+        var emittedTwo: [Int] = []
+        // Solo: id 1 alone through a pipelined step, a pipelined step and a drain.
+        emittedOne.append(try solo(runtime, 1))
+        emittedOne.append(try solo(runtime, 1))
+        emittedOne.append(try drain(runtime, 1))
+        XCTAssertEqual(maskOne.advanced, emittedOne)
+        XCTAssertEqual(maskTwo.advanced, [])
+
+        // The partner joins.
+        let ids = [BatchRequestID(1), BatchRequestID(2)]
+        for _ in 0 ..< 3 {
+            let step = emitted(try runtime.decode(.batch(ids, speculationAllowed: false)))
+            emittedOne += step[1] ?? []
+            emittedTwo += step[2] ?? []
+            XCTAssertEqual(maskOne.advanced, emittedOne)
+            XCTAssertEqual(maskTwo.advanced, emittedTwo)
+        }
+
+        // The partner leaves; id 1 is solo again.
+        runtime.remove(BatchRequestID(2))
+        emittedOne.append(try solo(runtime, 1))
+        emittedOne.append(try solo(runtime, 1))
+        emittedOne.append(try drain(runtime, 1))
+
+        XCTAssertEqual(emittedOne, Array(scriptOne.prefix(emittedOne.count)))
+        XCTAssertEqual(emittedTwo, Array(scriptTwo.prefix(emittedTwo.count)))
+        XCTAssertEqual(maskOne.advanced, emittedOne)
+        XCTAssertEqual(maskTwo.advanced, emittedTwo)
+        XCTAssertEqual(emittedOne.count, 9)
+        XCTAssertEqual(emittedTwo.count, 3)
+    }
+
+    func testMaskThatAlwaysReturnsNilDecodesIdenticallyToNoMaskSoloAndInABatch() throws {
+        let none = try soloMaskedTokens(prompt: [10], mask: nil, count: 5)
+        let nilMask = ScriptedMask(allowed: [nil])
+        let masked = try soloMaskedTokens(prompt: [10], mask: nilMask, count: 5)
+        XCTAssertEqual(none, [11, 22, 44, 88, 176])
+        XCTAssertEqual(masked, none)
+        XCTAssertEqual(nilMask.advanced, none)
+
+        let batchNone = try maskedBatchTokens(
+            prompts: [[10], [50]], masks: [nil, nil], count: 4)
+        let batchMasks = [ScriptedMask(allowed: [nil]), ScriptedMask(allowed: [nil])]
+        let batchMasked = try maskedBatchTokens(
+            prompts: [[10], [50]], masks: batchMasks, count: 4)
+        XCTAssertEqual(batchMasked, batchNone)
+        XCTAssertEqual(batchMasks[0].advanced, batchNone[1])
+        XCTAssertEqual(batchMasks[1].advanced, batchNone[2])
+    }
+
+    func testMaskComposesWithBiasDisallowedPlusHundredNeverWinsAndBiasOrdersAllowedIDs() throws {
+        let allowed = [[20, 21, 22]]
+        // +100 on a disallowed id never wins; +3 on 21 orders the allowed ids.
+        let bias: [Int: Float] = [5: 100, 21: 3, 22: 2]
+        let soloTokens = try soloMaskedTokens(
+            prompt: [10], mask: ScriptedMask(allowed: allowed), bias: bias, count: 4)
+        XCTAssertEqual(soloTokens, [21, 21, 21, 21])
+
+        let reordered = try soloMaskedTokens(
+            prompt: [10], mask: ScriptedMask(allowed: allowed),
+            bias: [5: 100, 22: 3, 21: 2], count: 4)
+        XCTAssertEqual(reordered, [22, 22, 22, 22])
+
+        let batch = try maskedBatchTokens(
+            prompts: [[10], [50]],
+            masks: [ScriptedMask(allowed: allowed), nil],
+            biases: [bias, [:]], count: 4)
+        XCTAssertEqual(batch[1], [21, 21, 21, 21])
+        XCTAssertEqual(batch[2], [51, 102, 204, 408])
+
+        // Bias on a masked row beside a biased-only partner.
+        let biasedPartner = try maskedBatchTokens(
+            prompts: [[10], [50]],
+            masks: [ScriptedMask(allowed: allowed), nil],
+            biases: [bias, [7: 200]], count: 4)
+        XCTAssertEqual(biasedPartner[1], [21, 21, 21, 21])
+        XCTAssertEqual(biasedPartner[2], [7, 7, 7, 7])
+    }
+
+    func testTokenMaskWithSpeculationIsRefusedAndAdmitsNothing() throws {
+        let runtime = try makeRuntime(
+            allocationChunk: 8,
+            maxContextTokens: 128,
+            initialDecodeReserve: 16,
+            soloPLDConfiguration: SpecDecodeConfig(
+                drafter: TinyDenseExactDrafter(),
+                maxDraft: 3,
+                gate: PLDGate(
+                    window: 8,
+                    minimumSamples: 4,
+                    minAcceptPerStep: 0.5,
+                    cooldown: 8),
+                lookback: 32,
+                compiledVerify: true))
+
+        XCTAssertThrowsError(
+            try admitWithMask(
+                runtime, id: 1, tokens: [10], mask: ScriptedMask(allowed: [[7]]),
+                requestsSpeculation: true)
+        ) { error in
+            XCTAssertEqual(
+                error as? DenseContinuousBatchRuntimeError,
+                .tokenMaskWithSpeculation(BatchRequestID(1)))
+        }
+        let refused = runtime.resourceSnapshot()
+        XCTAssertEqual(refused?.reservedKVBytes, 0)
+        XCTAssertEqual(refused?.speculation?.requestedRequests, 0)
+        XCTAssertEqual(refused?.speculation?.activeSessions, 0)
+
+        // The refusal left nothing behind: the same id admits cleanly afterwards.
+        try admitWithMask(runtime, id: 1, tokens: [10], mask: nil)
+        XCTAssertGreaterThan(runtime.resourceSnapshot()?.reservedKVBytes ?? 0, 0)
+    }
+
+    func testMaskIDsBeyondTheLogitsWidthAreIgnoredAndColumnsBeyondTheBitsetNeverWin() throws {
+        // The tiny model's logits are 2048 wide. Ids 2048, 3000 and 4095 sit beyond the logits;
+        // only 13 is a real column.
+        let wide = ScriptedMask.bitset(of: [13, 2_048, 3_000, 4_095])
+        XCTAssertEqual(wide.count, 64)
+        let tokens = try soloMaskedTokens(
+            prompt: [10], mask: ScriptedMask(bitsets: [wide]), count: 4)
+        XCTAssertEqual(tokens, [13, 13, 13, 13])
+        let batch = try maskedBatchTokens(
+            prompts: [[10], [50]],
+            masks: [ScriptedMask(bitsets: [wide]), nil], count: 3)
+        XCTAssertEqual(batch[1], [13, 13, 13])
+        XCTAssertEqual(batch[2], [51, 102, 204])
+
+        // A one-word bitset (ids 0..<64) leaves every logits column from 64 up at -inf, even the
+        // model's own 100-valued greedy column (11 first, then 22, 44).
+        let narrow = ScriptedMask.bitset(of: [60, 61])
+        XCTAssertEqual(narrow.count, 1)
+        let narrowTokens = try soloMaskedTokens(
+            prompt: [10], mask: ScriptedMask(bitsets: [narrow]), count: 5)
+        XCTAssertEqual(Set(narrowTokens).subtracting([60, 61]), [])
+        let narrowBatch = try maskedBatchTokens(
+            prompts: [[10], [50]],
+            masks: [ScriptedMask(bitsets: [narrow]), ScriptedMask(bitsets: [narrow])],
+            count: 4)
+        for tokens in narrowBatch.values {
+            XCTAssertEqual(Set(tokens).subtracting([60, 61]), [])
+            XCTAssertTrue(tokens.allSatisfy { $0 < 64 })
+        }
+    }
+
+    // MARK: - Hardening: a mask with no allowed column inside the logits width (cycle 274 follow-up)
+
+    func testMaskWithNoColumnInsideTheLogitsWidthIsUnconstrainedAndNeverFailsTheStep() throws {
+        // The tiny model's logits are 2048 wide. Every set bit sits at or beyond it (or there is
+        // no set bit at all), so the row builder has no allowed column. Such a row must decode
+        // exactly like an unmasked row instead of reading back the `-1` sentinel and throwing
+        // `invalidTokenID`, which the coordinator would turn into `failAll(terminal: true)`.
+        let bitsets: [[UInt64]] = [
+            ScriptedMask.bitset(of: [2_048, 3_000, 4_095]),
+            ScriptedMask.bitset(of: [2_048]),
+            [0],
+            [],
+        ]
+        let soloControl = try soloMaskedTokens(prompt: [10], mask: nil, count: 6)
+        XCTAssertEqual(soloControl, [11, 22, 44, 88, 176, 352])
+        let batchControl = try maskedBatchTokens(
+            prompts: [[10], [50]], masks: [nil, nil], count: 4)
+
+        for bitset in bitsets {
+            // (a) Solo: prefill-final, pipelined steps and a drain do not throw.
+            let soloMask = ScriptedMask(bitsets: [bitset])
+            let solo = try soloMaskedTokens(prompt: [10], mask: soloMask, count: 6)
+            XCTAssertEqual(solo, soloControl)
+            // (c) `advance` still receives every emitted token.
+            XCTAssertEqual(soloMask.advanced, solo)
+
+            // (b) In a batch beside an unmasked partner, in either physical position.
+            let first = ScriptedMask(bitsets: [bitset])
+            let masked = try maskedBatchTokens(
+                prompts: [[10], [50]], masks: [first, nil], count: 4)
+            XCTAssertEqual(masked[1], batchControl[1])
+            XCTAssertEqual(masked[2], batchControl[2])
+            XCTAssertEqual(first.advanced, masked[1])
+
+            let second = ScriptedMask(bitsets: [bitset])
+            let swapped = try maskedBatchTokens(
+                prompts: [[10], [50]], masks: [nil, second], count: 4)
+            XCTAssertEqual(swapped[1], batchControl[1])
+            XCTAssertEqual(swapped[2], batchControl[2])
+            XCTAssertEqual(second.advanced, swapped[2])
+        }
+    }
+
+    func testMaskThatLeavesTheLogitsWidthMidStreamIsUnconstrainedForThatStepOnly() throws {
+        // Step 0 allows 7, step 1 has only out-of-width ids (unconstrained: the model's own
+        // greedy token follows 10, 7), step 2 allows 9 again.
+        let beyond = ScriptedMask.bitset(of: [3_000])
+        let script: [[UInt64]] = [
+            ScriptedMask.bitset(of: [7]), beyond, ScriptedMask.bitset(of: [9]),
+        ]
+        let solo = ScriptedMask(bitsets: script)
+        let soloTokens = try soloMaskedTokens(prompt: [10], mask: solo, count: 3)
+        XCTAssertEqual(soloTokens.first, 7)
+        XCTAssertEqual(soloTokens.last, 9)
+        XCTAssertEqual(solo.advanced, soloTokens)
+
+        let batchMask = ScriptedMask(bitsets: script)
+        let batch = try maskedBatchTokens(
+            prompts: [[10], [50]], masks: [batchMask, nil], count: 3)
+        XCTAssertEqual(batch[1], soloTokens)
+        XCTAssertEqual(batch[2], [51, 102, 204])
+        XCTAssertEqual(batchMask.advanced, soloTokens)
+    }
+
+    // MARK: - Hardening: the raw-logit finite guard on masked rows (cycle 274 follow-up)
+
+    /// Solo decode of two tokens on `model` with `mask`: the first decode must emit `[11]`, the
+    /// second reads back the `-1` sentinel. Returns the second decode's error.
+    private func soloSentinelError(
+        model: some LanguageModel & KVCacheDimensionProvider & Module,
+        mask: (any ContinuousBatchRowTokenMask)?
+    ) throws -> DenseContinuousBatchRuntimeError? {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: model, allocationChunk: 4, maxContextTokens: 16, initialDecodeReserve: 8)
+        try admitWithMask(runtime, id: 1, tokens: [10], mask: mask, maxOutputTokens: 4)
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 4)
+        XCTAssertEqual(try solo(runtime, 1), 11)
+        do {
+            _ = try solo(runtime, 1)
+            return nil
+        } catch {
+            return error as? DenseContinuousBatchRuntimeError
+        }
+    }
+
+    /// Shared batch of ids 1 and 2 (both prompt `[10]`, id 1 carries `mask`): the first step must
+    /// emit `[11]` for both, the second reads back the `-1` sentinel. Returns the second error.
+    private func batchSentinelError(
+        model: some LanguageModel & KVCacheDimensionProvider & Module,
+        mask: (any ContinuousBatchRowTokenMask)?
+    ) throws -> DenseContinuousBatchRuntimeError? {
+        let runtime = try DenseContinuousBatchRuntime(
+            testing: model, allocationChunk: 4, maxContextTokens: 16, initialDecodeReserve: 8)
+        try admitWithMask(runtime, id: 1, tokens: [10], mask: mask, maxOutputTokens: 4)
+        try prefill(runtime, id: 1, tokens: [10], chunks: [1], maxOutputTokens: 4)
+        try admitWithMask(runtime, id: 2, tokens: [10], mask: nil, maxOutputTokens: 4)
+        try prefill(runtime, id: 2, tokens: [10], chunks: [1], maxOutputTokens: 4)
+        let ids = [BatchRequestID(1), BatchRequestID(2)]
+        XCTAssertEqual(
+            emitted(try runtime.decode(.batch(ids, speculationAllowed: false))),
+            [1: [11], 2: [11]])
+        do {
+            _ = try runtime.decode(.batch(ids, speculationAllowed: false))
+            return nil
+        } catch {
+            return error as? DenseContinuousBatchRuntimeError
+        }
+    }
+
+    func testMaskedRowsFailClosedOnNonFiniteRawLogitsExactlyLikeUnmaskedRows() throws {
+        let sentinel = DenseContinuousBatchRuntimeError.invalidTokenID(BatchRequestID(1), -1)
+        // Step 0 allows 11 (the model's own token), step 1 allows 12, which stays the finite
+        // column of the poisoned row; the poison sits in column 500, which the mask disallows.
+        func script() -> ScriptedMask { ScriptedMask(allowed: [[11], [12]]) }
+        let fixtures: [(name: String, model: () -> any (LanguageModel & KVCacheDimensionProvider & Module))] = [
+            ("NaN row", { TinyDelayedNonFiniteLanguageModel(invalidInput: 11) }),
+            (
+                "NaN column",
+                { TinyDelayedPoisonedColumnLanguageModel(invalidInput: 11, poison: .nan) }
+            ),
+            (
+                "+inf column",
+                { TinyDelayedPoisonedColumnLanguageModel(invalidInput: 11, poison: .infinity) }
+            ),
+            (
+                "-inf column",
+                { TinyDelayedPoisonedColumnLanguageModel(invalidInput: 11, poison: -.infinity) }
+            ),
+        ]
+        for fixture in fixtures {
+            // Unmasked controls pin the parity: the sentinel and the error are the same.
+            XCTAssertEqual(
+                try soloSentinelError(model: fixture.model(), mask: nil), sentinel,
+                "unmasked solo control: \(fixture.name)")
+            XCTAssertEqual(
+                try batchSentinelError(model: fixture.model(), mask: nil), sentinel,
+                "unmasked batch control: \(fixture.name)")
+            // Masked solo row and masked row in a batch.
+            XCTAssertEqual(
+                try soloSentinelError(model: fixture.model(), mask: script()), sentinel,
+                "masked solo: \(fixture.name)")
+            XCTAssertEqual(
+                try batchSentinelError(model: fixture.model(), mask: script()), sentinel,
+                "masked batch: \(fixture.name)")
+        }
+    }
+}
+
+/// Test double for `ContinuousBatchRowTokenMask`: the bitset for the row's NEXT token is
+/// `bitsets[advanced.count]` (the last entry repeats), and every `advance` is recorded.
+private final class ScriptedMask: ContinuousBatchRowTokenMask, @unchecked Sendable {
+    private let lock = NSLock()
+    private let bitsets: [[UInt64]?]
+    private var recorded: [Int] = []
+
+    init(bitsets: [[UInt64]?]) { self.bitsets = bitsets }
+
+    /// One entry per step: the allowed ids, or `nil` for unconstrained.
+    convenience init(allowed: [[Int]?]) {
+        self.init(bitsets: allowed.map { $0.map(ScriptedMask.bitset(of:)) })
+    }
+
+    static func bitset(of ids: [Int]) -> [UInt64] {
+        var words = [UInt64](repeating: 0, count: (ids.max() ?? 0) / 64 + 1)
+        for id in ids { words[id >> 6] |= UInt64(1) << UInt64(id & 63) }
+        return words
+    }
+
+    var advanced: [Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    func allowedTokenBitset() -> [UInt64]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return bitsets[min(recorded.count, bitsets.count - 1)]
+    }
+
+    func advance(token: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        recorded.append(token)
     }
 }
 

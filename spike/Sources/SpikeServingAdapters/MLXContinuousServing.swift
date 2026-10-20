@@ -523,6 +523,17 @@ public func loadContinuousServingModel(
     // `false` (a non-empty bias is then refused, never applied unchecked).
     backendConfiguration.logitBiasVocabularySize = scalarServingModelVocabSize(
         modelDirectory: configuration.modelDirectory)
+    // Named/`"required"` `tool_choice` and `response_format` `json_object`/`json_schema`: the dense
+    // runtime applies the grammar as a per-row, per-step token mask. Built the way the scalar load
+    // builds it, from THIS checkpoint's own tokenizer; never lets loading fail (any problem logs one
+    // `support=disabled` line and leaves the support `nil`, which keeps the capability `false` so
+    // the request is refused with a 400 rather than served as free text). `json_schema` support is
+    // derived from the `json_object` support (identical prerequisites, one shared trie build).
+    backendConfiguration.jsonObjectConstraintSupport = loadScalarServingJSONObjectConstraintSupport(
+        modelDirectory: configuration.modelDirectory,
+        tokenizer: context.tokenizer)
+    backendConfiguration.jsonSchemaConstraintSupport = loadScalarServingJSONSchemaConstraintSupport(
+        sharing: backendConfiguration.jsonObjectConstraintSupport)
     let backend = ContinuousServingBackend(
         launchedModel: configuration.launchedModel,
         coordinator: coordinator,

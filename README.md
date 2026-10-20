@@ -94,7 +94,7 @@ non-loopback `--host`).
 
 The default launch serves on the continuous-batch route, which is greedy only. Pass `--single-stream`
 to serve on the single-stream scalar route instead, for sampling (`temperature` > 0), penalties,
-logprobs, `/v1/completions`, `response_format` and `--chat-template`; it cannot be
+logprobs, `/v1/completions` and `--chat-template`; it cannot be
 combined with `--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
 
 Call it with the standard OpenAI shape, including tools:
@@ -160,13 +160,16 @@ against the schema). This covers the OpenAI SDK's `client.chat.completions.parse
 - Properties are generated in declared order, and optional ones may be omitted.
 - With thinking on, reasoning is generated first and the constraint applies to the reply.
 
-Both formats are served only by the single-stream scalar route (`serve.sh --single-stream`) and its
-non-speculative decoders.
-Speculative and continuous-batch routes return a 400, and so does combining either format with
-`tools`, `logprobs` or `stop`.
+Both formats are served by the default continuous-batch route and by the single-stream scalar route
+(`serve.sh --single-stream`) with its non-speculative decoders. On the continuous-batch route the
+constraint is a per-request token mask that changes every step, so a constrained request shares a
+batch with unconstrained ones and never changes their output; on `--continuous-dynamic-pld` a
+constrained request decodes without speculation.
+Speculative/MTP scalar routes, and a checkpoint whose tokenizer cannot host the mask, return a 400,
+and so does combining either format with `tools`, `logprobs` or `stop`.
 
 A named function, `"tool_choice":{"type":"function","function":{"name":X}}`, is enforced on the same
-scalar route. X's `parameters` are compiled with the `json_schema` subset above (an absent or empty
+routes (the default continuous-batch route and the non-speculative scalar route). X's `parameters` are compiled with the `json_schema` subset above (an absent or empty
 `parameters` is an empty object) and masked during decoding, so the reply is exactly one `tool_calls`
 entry for X whose arguments parse and validate, with `content: null` and `finish_reason` `"stop"`.
 Instructor's default tools mode and other "structured output through a tool" helpers rely on this.
@@ -178,7 +181,7 @@ writes them (never before reasoning ends). These
 return a 400 on `tool_choice` before any generation: a schema outside the subset, `response_format`
 on the same request, or a thinking request whose tokenizer has no `</think>` token.
 
-`tool_choice: "required"` is enforced the same way on the single-stream scalar route: the reply is
+`tool_choice: "required"` is enforced the same way, on the same routes: the reply is
 exactly one tool call, to one of the declared functions, with `content: null` and that function's
 `arguments` constrained to its `parameters` schema. The model picks which function; the server
 guarantees it is a declared one. Thinking, `finish_reason` and streaming behave as for a named
@@ -186,11 +189,10 @@ function; the head carries the chosen name once the model has written it, and on
 value is streamed (the `{"name": ..., "arguments": ...}` framing is not). The same 400 on
 `tool_choice` applies, and so does one for a declared name with a character
 outside `[A-Za-z0-9_-]` or a duplicated name. Limit: one call only, so there are no parallel calls
-under `"required"` on this route. On the continuous-batch and speculative/MTP routes (including an in-checkpoint MTP drafter), and on a
-checkpoint whose tokenizer cannot host the mask, `"required"` and a named function cannot be enforced,
-so they are refused with a 400 (`invalid_request_error`, `param` `tool_choice`) before any generation
-or SSE header, never answered in prose. They are enforced only on the non-speculative single-stream
-scalar route.
+under `"required"`. On the speculative/MTP scalar routes (including an in-checkpoint MTP drafter), and
+on a checkpoint whose tokenizer cannot host the mask, `"required"` and a named function cannot be
+enforced, so they are refused with a 400 (`invalid_request_error`, `param` `tool_choice`) before any
+generation or SSE header, never answered in prose.
 `"auto"`, `"none"` and an absent `tool_choice` are unaffected.
 
 `POST /v1/completions` (the legacy OpenAI text-completions shape) is also served, for older clients

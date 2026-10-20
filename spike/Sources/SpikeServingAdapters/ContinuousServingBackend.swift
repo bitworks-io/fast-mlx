@@ -45,6 +45,15 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     /// FAIL CLOSED) means the width is unknown, which keeps `ContinuousServingBackend.supportsLogitBias`
     /// `false` so a non-empty bias is refused rather than applied unchecked.
     public var logitBiasVocabularySize: Int?
+    /// Load-time `response_format: json_object` support (the byte-classification table of this
+    /// checkpoint's tokenizer; see `loadScalarServingJSONObjectConstraintSupport`). `nil` (the default,
+    /// FAIL CLOSED) keeps `ContinuousServingBackend.supportsJSONObjectResponseFormat` `false`.
+    public var jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport?
+    /// Load-time `response_format: json_schema` support, derived from `jsonObjectConstraintSupport`
+    /// (`loadScalarServingJSONSchemaConstraintSupport`). Also what enforces a named or `"required"`
+    /// `tool_choice`. `nil` (the default, FAIL CLOSED) keeps `supportsJSONSchemaResponseFormat` and
+    /// `enforcesForcingToolChoice` `false`.
+    public var jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -56,7 +65,9 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         disableThinkingWhenToolsActive: Bool = false,
         thinksByDefault: Bool = false,
         modelCapabilities: ServingModelCapabilities? = nil,
-        logitBiasVocabularySize: Int? = nil
+        logitBiasVocabularySize: Int? = nil,
+        jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
+        jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -78,6 +89,8 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.thinksByDefault = thinksByDefault
         self.modelCapabilities = modelCapabilities
         self.logitBiasVocabularySize = logitBiasVocabularySize
+        self.jsonObjectConstraintSupport = jsonObjectConstraintSupport
+        self.jsonSchemaConstraintSupport = jsonSchemaConstraintSupport
     }
 }
 
@@ -113,6 +126,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let separatesReasoning: Bool
         let outputTokenTraceLimit: Int?
         let completedTraceCapacity: Int
+        /// The per-row token mask for a named/`"required"` `tool_choice` or a `response_format`
+        /// (`nil` for every other request). Carried into the coordinator submission, where the runtime
+        /// advances it with each emitted token; the backend reads its `recordedFailure`.
+        let tokenMask: (any ContinuousServingFailureRecordingMask)?
+        /// Incremental call assembly for an ENFORCED `tool_choice` (`nil` for every other request,
+        /// including `response_format`, whose output is plain content).
+        let enforcedStream: EnforcedToolCallStream?
     }
 
     private struct PendingAdmission {
@@ -142,6 +162,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let completedTraceCapacity: Int
         var outputTokenTrace: [Int] = []
         var outputTokenTraceTruncated = false
+        let tokenMask: (any ContinuousServingFailureRecordingMask)?
+        /// Incremental tool-call assembly for an enforced `tool_choice` (`nil` for every other
+        /// request): turns the post-reasoning generated text into a call head plus argument fragments.
+        var enforcedStream: EnforcedToolCallStream?
     }
 
     private let launchedModel: String
@@ -258,6 +282,21 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         configuration.logitBiasVocabularySize != nil
     }
 
+    /// `response_format: json_object` is served exactly when the checkpoint's constraint support was
+    /// loaded: the dense runtime applies the grammar as a per-row, per-step token mask.
+    public nonisolated var supportsJSONObjectResponseFormat: Bool {
+        configuration.jsonObjectConstraintSupport != nil
+    }
+
+    /// `response_format: json_schema`, likewise (the schema support is derived from the object support).
+    public nonisolated var supportsJSONSchemaResponseFormat: Bool {
+        configuration.jsonSchemaConstraintSupport != nil
+    }
+
+    /// A named or `"required"` `tool_choice` is enforced exactly when the json_schema mask is
+    /// available: this is precisely the condition of the enforcement blocks in `buildTokenMask`.
+    public nonisolated var enforcesForcingToolChoice: Bool { supportsJSONSchemaResponseFormat }
+
     public func start(
         _ request: OpenAIChatCompletionRequest
     ) async throws -> ServingGenerationHandle {
@@ -336,9 +375,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 param: "logprobs",
                 code: "logprobs_unsupported")
         }
-        // This route has no per-row constraint seam, so a named or `"required"` `tool_choice` cannot
-        // be enforced: refuse it (400, `param: "tool_choice"`) before any admission or decode, never
-        // answer in prose. Defense in depth behind the HTTP capability gate.
+        // A named or `"required"` `tool_choice` is refused (400, `param: "tool_choice"`) unless this
+        // route can enforce it (`enforcesForcingToolChoice`: the json_schema mask is loaded), before
+        // any admission or decode, never answered in prose. Defense in depth behind the HTTP gate.
         try validateToolChoiceCapability(
             request: request, backendEnforcesToolChoice: enforcesForcingToolChoice)
         try request.requireLaunchedModel(launchedModel)
@@ -361,6 +400,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let separatesReasoning = servingSeparatesReasoning(
             thinksByDefault: configuration.thinksByDefault,
             resolvedEnableThinking: resolvedEnableThinking)
+        // Named/`"required"` `tool_choice` and `response_format` masks: every refusal is raised here,
+        // BEFORE the prompt render and any admission.
+        let constraint = try await buildTokenMask(
+            request, separatesReasoning: separatesReasoning)
         let promptTokens = try codec.render(
             messages: request.messages,
             tools: activeTools,
@@ -392,7 +435,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             completionBudgetResolution: completionBudgetResolution,
             separatesReasoning: separatesReasoning,
             outputTokenTraceLimit: outputTokenTraceLimit,
-            completedTraceCapacity: completedTraceCapacity)
+            completedTraceCapacity: completedTraceCapacity,
+            tokenMask: constraint.mask,
+            enforcedStream: constraint.enforcedStream)
         switch configuration.admission {
         case .immediateBatchNoSpec:
             let handles = try await submitToCoordinator(
@@ -413,6 +458,110 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             try await validateDynamicAdmission(prepared)
             return try await waitForDynamicAdmission(prepared)
         }
+    }
+
+    /// The per-request constraint mask, built exactly as the scalar `ScalarServingBackend.start` builds
+    /// its constraint (same refusals, same messages, same `param`s, same single-constraint rule): a
+    /// named `tool_choice` masks one function's arguments, `"required"` a union over every declared
+    /// tool, `response_format` the json_object/json_schema grammar. A thinking request
+    /// (`separatesReasoning`) keeps the mask inactive until `</think>`, so it needs a resolvable
+    /// think-end id and is refused without one. `enforcedStream` is non-nil exactly for an enforced
+    /// `tool_choice`, whose output is released as a call head plus argument fragments.
+    private func buildTokenMask(
+        _ request: OpenAIChatCompletionRequest,
+        separatesReasoning: Bool
+    ) async throws -> (
+        mask: (any ContinuousServingFailureRecordingMask)?,
+        enforcedStream: EnforcedToolCallStream?
+    ) {
+        var mask: (any ContinuousServingFailureRecordingMask)?
+        var enforcedStream: EnforcedToolCallStream?
+        // Named `tool_choice` (the capability gate above already refused it without the support).
+        if request.promptInput == .chat, let tool = request.namedToolChoice,
+            supportsJSONSchemaResponseFormat, let support = configuration.jsonSchemaConstraintSupport
+        {
+            guard request.responseFormat == nil else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format is not supported together with a named tool_choice",
+                    param: "tool_choice")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "a named tool_choice cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "tool_choice")
+            }
+            let argumentsFormat = try tool.forcedArgumentsFormat()
+            // `await support.table` never builds the trie on this actor's executor (the build runs on
+            // a detached task started at load time); it suspends only until that task completes.
+            mask = ContinuousServingRowTokenMask(
+                constraint: JSONSchemaTokenConstraint(
+                    table: await support.table, format: argumentsFormat),
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+            enforcedStream = .named(name: tool.name, headSent: false)
+        }
+        // `tool_choice: "required"`: same conditions and rules, a union mask over EVERY declared tool.
+        if request.promptInput == .chat, case .required = request.toolChoice,
+            supportsJSONSchemaResponseFormat, let support = configuration.jsonSchemaConstraintSupport
+        {
+            guard request.responseFormat == nil else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format is not supported together with tool_choice \"required\"",
+                    param: "tool_choice")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "tool_choice \"required\" cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "tool_choice")
+            }
+            let union = try request.tools.requiredToolUnionFormat()
+            mask = ContinuousServingRowTokenMask(
+                constraint: ToolUnionTokenConstraint(table: await support.table, format: union),
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+            enforcedStream = .union(ToolUnionArgumentStream(format: union))
+        }
+        // Exhaustive `switch` (no `default:`): a future `ServingResponseFormat` case must not fall
+        // through and be silently served as free text.
+        switch request.responseFormat {
+        case nil:
+            break
+        case .jsonObject:
+            guard let support = configuration.jsonObjectConstraintSupport else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object is not supported by the loaded model's decoding route",
+                    param: "response_format")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_object cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "response_format")
+            }
+            mask = ContinuousServingRowTokenMask(
+                constraint: JSONObjectTokenConstraint(table: await support.table),
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+        case .jsonSchema(let format):
+            guard let support = configuration.jsonSchemaConstraintSupport else {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_schema is not supported by the loaded model's decoding route",
+                    param: "response_format")
+            }
+            if separatesReasoning, support.thinkEndTokenID == nil {
+                throw OpenAIServingError.invalidRequest(
+                    "response_format json_schema cannot be honored for a thinking request when the "
+                        + "loaded tokenizer has no resolvable </think> token",
+                    param: "response_format")
+            }
+            mask = ContinuousServingRowTokenMask(
+                constraint: JSONSchemaTokenConstraint(table: await support.table, format: format),
+                activeFromStart: !separatesReasoning,
+                thinkEndTokenID: support.thinkEndTokenID)
+        }
+        return (mask, enforcedStream)
     }
 
     public func snapshot() async -> ContinuousServingBackendSnapshot {
@@ -784,12 +933,14 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maxOutputTokens: prepared.maximumCompletionTokens,
             stopTokenIDs: stopTokenIDs,
             architecture: .denseAttention,
-            // A biased row is never speculative (the runtime refuses the pair, and the verify step must
-            // never see a biased row): a biased request on the solo-PLD route decodes without
-            // speculation. An unbiased request on that route still requests it.
-            requestsSpeculation: route == .soloPLD && prepared.logitBias.isEmpty,
+            // A biased or masked row is never speculative (the runtime refuses either pair, and the
+            // verify step must never see such a row): a biased or masked request on the solo-PLD route
+            // decodes without speculation. An unconstrained request on that route still requests it.
+            requestsSpeculation: route == .soloPLD && prepared.logitBias.isEmpty
+                && prepared.tokenMask == nil,
             ignoresStopTokens: prepared.ignoreEOS,
-            logitBias: prepared.logitBias)
+            logitBias: prepared.logitBias,
+            tokenMask: prepared.tokenMask)
     }
 
     private func submitToCoordinator(
@@ -861,8 +1012,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             onCancelWithReason: { [weak self] reason in
                 await self?.cancel(id: id, reason: reason)
             })
+        // An enforced `tool_choice` never runs the family parser: the generated text IS the arguments
+        // (see `publish`), so the processor stays nil and only the reasoning gate remains.
+        let isEnforced = prepared.enforcedStream != nil
         let toolCallProcessor: ToolCallProcessor? =
-            prepared.activeTools.isEmpty
+            prepared.activeTools.isEmpty || isEnforced
             ? nil
             : ToolCallProcessor(
                 format: configuration.toolCallFormat,
@@ -880,12 +1034,14 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             stopFilter: ServingStopStringFilter(
                 stopStrings: prepared.stopStrings),
             toolCallProcessor: toolCallProcessor,
-            reasoningGate: toolCallProcessor != nil && prepared.separatesReasoning
+            reasoningGate: (toolCallProcessor != nil || isEnforced) && prepared.separatesReasoning
                 ? ReasoningPhaseToolCallGate() : nil,
             parallelToolCalls: prepared.parallelToolCalls,
             responseID: responseID,
             outputTokenTraceLimit: prepared.outputTokenTraceLimit,
-            completedTraceCapacity: prepared.completedTraceCapacity)
+            completedTraceCapacity: prepared.completedTraceCapacity,
+            tokenMask: prepared.tokenMask,
+            enforcedStream: prepared.enforcedStream)
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -986,6 +1142,12 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard var request = requests[id] else {
             throw CancellationError()
         }
+        // A constraint failure the row's mask recorded (the runtime advances the mask BEFORE this
+        // token reaches us) fails THIS request before the token is published, as the scalar decoder
+        // throws a recorded failure right after sampling. Other rows are unaffected.
+        if let failure = request.tokenMask?.recordedFailure {
+            throw failure
+        }
 
         request.generatedTokenCount += 1
         if let limit = request.outputTokenTraceLimit {
@@ -1006,7 +1168,20 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             try Task.checkCancellation()
         }
         if let text = output?.text {
-            if let processor = request.toolCallProcessor {
+            if request.enforcedStream != nil {
+                var argumentsText = text
+                if var gate = request.reasoningGate {
+                    // Reasoning (through the first `</think>`) is shown unmasked as before; only the
+                    // bytes after it are the call's arguments.
+                    let routed = gate.route(text)
+                    requests[id]?.reasoningGate = gate
+                    if !routed.passthrough.isEmpty {
+                        try await request.mailbox.send(.text(routed.passthrough))
+                    }
+                    argumentsText = routed.toParser
+                }
+                try await publishEnforcedToolText(argumentsText, for: id)
+            } else if let processor = request.toolCallProcessor {
                 var parserText = text
                 var gated = false
                 if var gate = request.reasoningGate {
@@ -1062,6 +1237,30 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 truncated: request.outputTokenTraceTruncated))
     }
 
+    /// Feeds post-reasoning text of an enforced `tool_choice` into the incremental call assembly and
+    /// sends what it releases: the head (`.toolCallStart`, with a fresh id) the moment the call is
+    /// known, then the arguments fragment for these bytes. The assembly state is stored before the
+    /// first suspension so a re-entrant call can never see stale state.
+    private func publishEnforcedToolText(
+        _ text: String, for id: ServingRequestID
+    ) async throws {
+        guard !text.isEmpty, let request = requests[id], var stream = request.enforcedStream else {
+            return
+        }
+        let released = stream.consume(text)
+        requests[id]?.enforcedStream = stream
+        if let name = released.name {
+            try await request.mailbox.send(
+                .toolCallStart(
+                    OpenAIToolCall(
+                        id: makeEnforcedToolCallID(format: configuration.toolCallFormat),
+                        function: .init(name: name, arguments: ""))))
+        }
+        if !released.arguments.isEmpty {
+            try await request.mailbox.send(.toolCallArguments(released.arguments))
+        }
+    }
+
     /// End of stream: the stop filter's held tail is the LAST text in stream order, so it is routed
     /// exactly like a chunk -- through the reasoning gate (which also releases a held `</think>`
     /// prefix) and then the tool-call processor -- rather than sent to the client directly. The
@@ -1084,7 +1283,12 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             parserText = routed.toParser
         }
         requests[id] = request
-        if let processor = request.toolCallProcessor {
+        if request.enforcedStream != nil {
+            if !passthrough.isEmpty {
+                try await request.mailbox.send(.text(passthrough))
+            }
+            try await publishEnforcedToolText(parserText, for: id)
+        } else if let processor = request.toolCallProcessor {
             if !passthrough.isEmpty {
                 try await request.mailbox.send(.text(passthrough))
             }

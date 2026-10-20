@@ -307,10 +307,13 @@ final class ContinuousServingBackendTests: XCTestCase {
             unbiased.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
     }
 
-    /// A named or `"required"` `tool_choice` cannot be enforced on the continuous route (no constraint
-    /// seam), so the backend refuses it with a 400 on `tool_choice` before any admission or decode --
+    // MARK: - Named / required `tool_choice` and `response_format` (cycle 274, slice 2)
+
+    /// Replaces the former unconditional refusal. WITHOUT constraint support (the default
+    /// configuration, or a checkpoint whose tokenizer cannot back one) a named or `"required"`
+    /// `tool_choice` is still refused with a 400 on `tool_choice` before any admission or decode --
     /// defense in depth behind the HTTP capability gate. `auto`/`none` are unaffected.
-    func testContinuousBatchRouteRefusesNamedAndRequiredToolChoiceWithoutAdmittingAnything()
+    func testContinuousBatchRouteRefusesNamedAndRequiredToolChoiceWithoutConstraintSupport()
         async throws
     {
         let recorder = ContinuousRuntimeRecorder()
@@ -329,6 +332,8 @@ final class ContinuousServingBackendTests: XCTestCase {
             pieces: [1: "s"],
             stopTokenIDs: [99])
         XCTAssertFalse(backend.supportsJSONSchemaResponseFormat)
+        XCTAssertFalse(backend.supportsJSONObjectResponseFormat)
+        XCTAssertFalse(backend.enforcesForcingToolChoice)
 
         for choice: OpenAIToolChoice in [.function("get_weather"), .required] {
             var forced = request(text: "solo", maxTokens: 2, tools: [continuousWeatherTool])
@@ -348,12 +353,556 @@ final class ContinuousServingBackendTests: XCTestCase {
         XCTAssertEqual(recorder.admissionBatchSizes, [], "a refused request must never be admitted")
         XCTAssertEqual(recorder.decodeActions, [], "a refused request must never reach a decode step")
 
+        // `response_format` without its support is refused the same way, with its own param.
+        for format in [ServingResponseFormat.jsonObject, .jsonSchema(try booleanSchemaFormat())] {
+            var constrained = request(text: "solo", maxTokens: 2)
+            constrained.responseFormat = format
+            do {
+                _ = try await backend.start(constrained)
+                XCTFail("continuous route must refuse \(format) without constraint support")
+            } catch OpenAIServingError.invalidRequest(_, let param) {
+                XCTAssertEqual(param, "response_format")
+            }
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [])
+
         // Control: `auto` with tools is still a normal, admissible request.
         let handle = try await backend.start(
             request(text: "solo", maxTokens: 2, tools: [continuousWeatherTool]))
         XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        XCTAssertNil(recorder.submissions.first?.tokenMask, "an unconstrained request carries no mask")
         _ = await handle.lease.cancel(.clientDisconnected)
         await backend.shutdown()
+    }
+
+    /// The capability flags flip with the loaded support exactly as on the scalar route:
+    /// json_object <- object support, json_schema <- schema support, forcing tool_choice <- schema.
+    func testConstraintCapabilityFlagsFollowTheConfiguredSupport() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        func backend(
+            object: ScalarServingJSONObjectConstraintSupport?,
+            schema: ScalarServingJSONSchemaConstraintSupport?
+        ) -> ContinuousServingBackend {
+            makeBackend(
+                coordinator: coordinator, promptByText: ["solo": [10]], pieces: [1: "s"],
+                stopTokenIDs: [99], jsonObjectConstraintSupport: object,
+                jsonSchemaConstraintSupport: schema)
+        }
+        let both = backend(object: continuousObjectSupport(), schema: continuousSchemaSupport())
+        XCTAssertTrue(both.supportsJSONObjectResponseFormat)
+        XCTAssertTrue(both.supportsJSONSchemaResponseFormat)
+        XCTAssertTrue(both.enforcesForcingToolChoice)
+
+        let objectOnly = backend(object: continuousObjectSupport(), schema: nil)
+        XCTAssertTrue(objectOnly.supportsJSONObjectResponseFormat)
+        XCTAssertFalse(objectOnly.supportsJSONSchemaResponseFormat)
+        XCTAssertFalse(objectOnly.enforcesForcingToolChoice, "forcing needs the json_schema mask")
+
+        let schemaOnly = backend(object: nil, schema: continuousSchemaSupport())
+        XCTAssertFalse(schemaOnly.supportsJSONObjectResponseFormat)
+        XCTAssertTrue(schemaOnly.supportsJSONSchemaResponseFormat)
+        XCTAssertTrue(schemaOnly.enforcesForcingToolChoice)
+    }
+
+    /// (a) A named `tool_choice` is ADMITTED when the json_schema support is configured; the
+    /// submission carries a live mask (the REAL constraint: `{` is the only legal first byte of an
+    /// object) and does not request speculation. (e) `"required"` likewise.
+    func testContinuousBatchRouteAdmitsNamedAndRequiredToolChoiceWithATokenMask() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            jsonSchemaConstraintSupport: continuousSchemaSupport())
+        XCTAssertTrue(backend.enforcesForcingToolChoice)
+
+        let named = try strictRequest(toolChoice: Self.namedChoice("get_weather"))
+        let namedHandle = try await backend.start(named)
+        XCTAssertEqual(namedHandle.route, .continuousBatchNoSpec)
+        XCTAssertEqual(recorder.admissionBatchSizes, [1])
+        let namedMask = try XCTUnwrap(recorder.submissions.first?.tokenMask, "named: mask carried")
+        XCTAssertEqual(recorder.submissions.first?.requestsSpeculation, false)
+        let namedBits = try XCTUnwrap(namedMask.allowedTokenBitset(), "active from the first token")
+        XCTAssertTrue(continuousBit(Int(UInt8(ascii: "{")), in: namedBits))
+        XCTAssertFalse(continuousBit(Int(UInt8(ascii: "x")), in: namedBits))
+        _ = await namedHandle.lease.cancel(.clientDisconnected)
+
+        let required = try strictRequest(toolChoice: #""required""#)
+        let requiredHandle = try await backend.start(required)
+        XCTAssertEqual(recorder.submissions.count, 2)
+        let requiredMask = try XCTUnwrap(recorder.submissions.last?.tokenMask, "required: mask carried")
+        XCTAssertEqual(recorder.submissions.last?.requestsSpeculation, false)
+        let requiredBits = try XCTUnwrap(requiredMask.allowedTokenBitset())
+        XCTAssertTrue(continuousBit(Int(UInt8(ascii: "{")), in: requiredBits))
+        XCTAssertFalse(continuousBit(Int(UInt8(ascii: "x")), in: requiredBits))
+        XCTAssertFalse(namedMask === requiredMask, "one mask per request")
+        _ = await requiredHandle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// (f) `response_format` json_object and json_schema are admitted with a mask.
+    func testContinuousBatchRouteAdmitsJSONObjectAndJSONSchemaResponseFormatsWithATokenMask()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let object = continuousObjectSupport()
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            jsonObjectConstraintSupport: object,
+            jsonSchemaConstraintSupport: loadScalarServingJSONSchemaConstraintSupport(sharing: object))
+
+        var objectRequest = request(text: "solo", maxTokens: 2)
+        objectRequest.responseFormat = .jsonObject
+        let objectHandle = try await backend.start(objectRequest)
+        let objectMask = try XCTUnwrap(recorder.submissions.last?.tokenMask, "json_object: mask carried")
+        let objectBits = try XCTUnwrap(objectMask.allowedTokenBitset())
+        XCTAssertTrue(continuousBit(Int(UInt8(ascii: "{")), in: objectBits))
+        XCTAssertFalse(continuousBit(Int(UInt8(ascii: "x")), in: objectBits))
+        _ = await objectHandle.lease.cancel(.clientDisconnected)
+
+        var schemaRequest = request(text: "solo", maxTokens: 2)
+        schemaRequest.responseFormat = .jsonSchema(try booleanSchemaFormat())
+        let schemaHandle = try await backend.start(schemaRequest)
+        XCTAssertEqual(recorder.submissions.count, 2)
+        let schemaMask = try XCTUnwrap(recorder.submissions.last?.tokenMask, "json_schema: mask carried")
+        let schemaBits = try XCTUnwrap(schemaMask.allowedTokenBitset())
+        XCTAssertTrue(continuousBit(Int(UInt8(ascii: "t")), in: schemaBits))
+        XCTAssertFalse(continuousBit(Int(UInt8(ascii: "{")), in: schemaBits), "boolean schema: no object")
+        _ = await schemaHandle.lease.cancel(.clientDisconnected)
+
+        // json_object support alone does not admit json_schema (and vice versa is covered by flags).
+        let objectOnly = makeBackend(
+            coordinator: coordinator, promptByText: ["solo": [10]], pieces: [1: "s"],
+            stopTokenIDs: [99], jsonObjectConstraintSupport: continuousObjectSupport())
+        do {
+            _ = try await objectOnly.start(schemaRequest)
+            XCTFail("json_schema without schema support must be refused")
+        } catch OpenAIServingError.invalidRequest(_, let param) {
+            XCTAssertEqual(param, "response_format")
+        }
+        XCTAssertEqual(recorder.submissions.count, 2, "the refused request was never admitted")
+        await backend.shutdown()
+    }
+
+    /// (c) A `response_format` together with a named or `"required"` `tool_choice` is refused on
+    /// `tool_choice` (the scalar route's rule), before any admission.
+    func testResponseFormatTogetherWithForcingToolChoiceIsRefusedBeforeAdmission() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let object = continuousObjectSupport()
+        let backend = makeBackend(
+            coordinator: coordinator, promptByText: ["solo": [10]], pieces: [1: "s"],
+            stopTokenIDs: [99], jsonObjectConstraintSupport: object,
+            jsonSchemaConstraintSupport: loadScalarServingJSONSchemaConstraintSupport(sharing: object))
+
+        for choice in [Self.namedChoice("get_weather"), #""required""#] {
+            for format in [ServingResponseFormat.jsonObject, .jsonSchema(try booleanSchemaFormat())] {
+                var conflicting = try strictRequest(toolChoice: choice)
+                conflicting.responseFormat = format
+                do {
+                    _ = try await backend.start(conflicting)
+                    XCTFail("expected a refusal for \(choice) + \(format)")
+                } catch OpenAIServingError.invalidRequest(_, let param) {
+                    XCTAssertEqual(param, "tool_choice")
+                }
+            }
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [])
+        XCTAssertTrue(recorder.submissions.isEmpty)
+        await backend.shutdown()
+    }
+
+    /// (d) A thinking request has no `activeFromStart` mask: without a resolvable `</think>` token
+    /// the constraint could never activate (or would corrupt the reasoning block), so every
+    /// constrained form is refused per request, before admission. WITH a think-end id the same request
+    /// is admitted and its mask is INACTIVE (nil) until the think-end token is emitted.
+    func testThinkingRequestWithoutAThinkEndTokenIsRefusedAndWithOneStartsInactive() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let noThinkEnd = continuousObjectSupport(thinkEndTokenID: nil)
+        let refusing = makeBackend(
+            coordinator: coordinator, promptByText: ["solo": [10]], pieces: [1: "s"],
+            stopTokenIDs: [99], thinksByDefault: true, jsonObjectConstraintSupport: noThinkEnd,
+            jsonSchemaConstraintSupport: loadScalarServingJSONSchemaConstraintSupport(sharing: noThinkEnd))
+
+        var attempts: [(OpenAIChatCompletionRequest, String)] = []
+        attempts.append((try strictRequest(toolChoice: Self.namedChoice("get_weather")), "tool_choice"))
+        attempts.append((try strictRequest(toolChoice: #""required""#), "tool_choice"))
+        var objectRequest = request(text: "solo", maxTokens: 2, enableThinking: true)
+        objectRequest.responseFormat = .jsonObject
+        attempts.append((objectRequest, "response_format"))
+        var schemaRequest = request(text: "solo", maxTokens: 2, enableThinking: true)
+        schemaRequest.responseFormat = .jsonSchema(try booleanSchemaFormat())
+        attempts.append((schemaRequest, "response_format"))
+        for (attempt, expectedParam) in attempts {
+            var thinking = attempt
+            thinking.enableThinking = true
+            do {
+                _ = try await refusing.start(thinking)
+                XCTFail("a thinking request with no </think> token must be refused (\(expectedParam))")
+            } catch OpenAIServingError.invalidRequest(_, let param) {
+                XCTAssertEqual(param, expectedParam)
+            }
+        }
+        XCTAssertEqual(recorder.admissionBatchSizes, [])
+        XCTAssertTrue(recorder.submissions.isEmpty)
+
+        // With a resolvable think-end id the same named request is admitted; its mask is inactive
+        // until the think-end token, then answers the constraint's first-byte set.
+        let withThinkEnd = continuousObjectSupport(thinkEndTokenID: continuousThinkEndID)
+        let accepting = makeBackend(
+            coordinator: coordinator, promptByText: ["solo": [10]], pieces: [1: "s"],
+            stopTokenIDs: [99], thinksByDefault: true,
+            jsonSchemaConstraintSupport: loadScalarServingJSONSchemaConstraintSupport(sharing: withThinkEnd))
+        var thinkingNamed = try strictRequest(toolChoice: Self.namedChoice("get_weather"))
+        thinkingNamed.enableThinking = true
+        let handle = try await accepting.start(thinkingNamed)
+        XCTAssertTrue(handle.separatesReasoning)
+        let mask = try XCTUnwrap(recorder.submissions.first?.tokenMask)
+        XCTAssertNil(mask.allowedTokenBitset(), "thinking phase: unconstrained")
+        mask.advance(token: continuousThinkEndID)
+        let bits = try XCTUnwrap(mask.allowedTokenBitset(), "after </think>: constrained")
+        XCTAssertTrue(continuousBit(Int(UInt8(ascii: "{")), in: bits))
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await accepting.shutdown()
+    }
+
+    /// A masked request on the solo-PLD route is submitted WITHOUT speculation (the runtime refuses
+    /// mask + speculation) and decodes with a non-speculative solo step; an unmasked request on the
+    /// same route still requests speculation.
+    func testDynamicAdmissionSoloPLDMaskedRequestIsSubmittedWithoutSpeculation() async throws {
+        func runSolo(masked: Bool) async throws -> (
+            ServingExecutionRoute, [ContinuousBatchSubmission], [BatchDecodeAction]
+        ) {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 2, queued: 4),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]],
+                    recorder: recorder,
+                    allowsSpeculation: true),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeDynamicBackend(
+                coordinator: coordinator,
+                promptByText: ["solo": [10]],
+                pieces: [1: "s"],
+                stopTokenIDs: [99],
+                jsonSchemaConstraintSupport: continuousSchemaSupport())
+            let solo = masked
+                ? try strictRequest(toolChoice: Self.namedChoice("get_weather"))
+                : request(text: "solo", maxTokens: 2)
+            let start = Task { try await backend.start(solo) }
+            await waitUntil {
+                await backend.diagnosticPendingAdmissionRequestCount() == 1
+            }
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+            let handle = try await start.value
+            try await runUntilDecode(coordinator, recorder: recorder)
+            let result = (handle.route, recorder.submissions, recorder.decodeActions)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+            return result
+        }
+
+        let masked = try await runSolo(masked: true)
+        XCTAssertEqual(masked.0, .soloPLD)
+        XCTAssertEqual(masked.1.count, 1)
+        XCTAssertNotNil(masked.1.first?.tokenMask)
+        XCTAssertEqual(masked.1.first?.requestsSpeculation, false)
+        XCTAssertEqual(masked.2.first, .solo(BatchRequestID(1), speculationAllowed: false))
+
+        let unmasked = try await runSolo(masked: false)
+        XCTAssertEqual(unmasked.0, .soloPLD)
+        XCTAssertNil(unmasked.1.first?.tokenMask)
+        XCTAssertEqual(unmasked.1.first?.requestsSpeculation, true)
+        XCTAssertEqual(unmasked.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
+    }
+
+    // MARK: Enforced output shaping
+
+    /// (g) Named `tool_choice`: the generated text IS the call's arguments. The backend never runs
+    /// the family tool parser; it streams a `.toolCallStart(name)` with the first text and then
+    /// `.toolCallArguments` fragments (byte for byte the generated text), no `.text`, no
+    /// `.toolCalls`. The finish reason is `stop`, exactly as on the scalar route (the HTTP layer
+    /// assembles the single call). The fixture runtime advances the REAL constraint with every
+    /// emitted token, so a script the grammar rejects would fail the request instead.
+    func testNamedToolChoiceStreamsCallHeadThenArgumentFragmentsAndNoContent() async throws {
+        let json = #"{"city":"Paris"}"#
+        let result = try await runEnforced(
+            toolChoice: Self.namedChoice("get_weather"), script: continuousByteIDs(json))
+
+        XCTAssertNil(result.failure)
+        guard case .toolCallStart(let head)? = result.events.first else {
+            return XCTFail("expected the call head first: \(result.events)")
+        }
+        XCTAssertEqual(head.function.name, "get_weather")
+        XCTAssertEqual(head.function.arguments, "")
+        XCTAssertFalse(head.id.isEmpty)
+        XCTAssertEqual(result.events.filter { if case .toolCallStart = $0 { true } else { false } }.count, 1)
+        XCTAssertEqual(result.arguments, json, "argument fragments are the generated text, in order")
+        XCTAssertTrue(result.texts.isEmpty, "no content for an enforced call: \(result.texts)")
+        XCTAssertTrue(result.toolCallBatches.isEmpty, "the family parser must not run")
+        XCTAssertEqual(result.completion?.finishReason, .stop)
+        XCTAssertEqual(result.completion?.usage.completionTokens, json.utf8.count)
+    }
+
+    /// `"required"`: the union document's frame (`{"name": ..., "arguments": `) is stripped; the head
+    /// carries the chosen tool and the fragments concatenate to the arguments value only.
+    func testRequiredToolChoiceStripsTheUnionFrameAndReportsTheChosenTool() async throws {
+        let document = #"{"name": "get_weather", "arguments": {"city":"Paris"}}"#
+        let result = try await runEnforced(
+            toolChoice: #""required""#, script: continuousByteIDs(document))
+
+        XCTAssertNil(result.failure)
+        guard case .toolCallStart(let head)? = result.events.first(where: {
+            if case .toolCallStart = $0 { true } else { false }
+        }) else {
+            return XCTFail("expected a call head: \(result.events)")
+        }
+        XCTAssertEqual(head.function.name, "get_weather")
+        XCTAssertEqual(result.arguments, #"{"city":"Paris"}"#)
+        XCTAssertTrue(result.texts.isEmpty)
+        XCTAssertTrue(result.toolCallBatches.isEmpty)
+        XCTAssertEqual(result.completion?.finishReason, .stop)
+    }
+
+    /// A thinking request: reasoning (through the first `</think>`) is shown as content and does not
+    /// advance the constraint; only the bytes after it are the call's arguments.
+    func testNamedToolChoiceOnAThinkingRequestSeparatesReasoningFromArguments() async throws {
+        let json = #"{"city":"Rome"}"#
+        let script = [Int(UInt8(ascii: "h")), Int(UInt8(ascii: "m")), continuousThinkEndID]
+            + continuousByteIDs(json)
+        let result = try await runEnforced(
+            toolChoice: Self.namedChoice("get_weather"), script: script, thinking: true)
+
+        XCTAssertNil(result.failure, "reasoning tokens must not be fed to the constraint")
+        XCTAssertEqual(result.texts.joined(), "hm</think>")
+        XCTAssertEqual(result.arguments, json)
+        guard case .toolCallStart(let head)? = result.events.first(where: {
+            if case .toolCallStart = $0 { true } else { false }
+        }) else {
+            return XCTFail("expected a call head")
+        }
+        XCTAssertEqual(head.function.name, "get_weather")
+        // The head follows the reasoning text in stream order.
+        let firstTextIndex = result.events.firstIndex { if case .text = $0 { true } else { false } }
+        let headIndex = result.events.firstIndex { if case .toolCallStart = $0 { true } else { false } }
+        XCTAssertLessThan(try XCTUnwrap(firstTextIndex), try XCTUnwrap(headIndex))
+    }
+
+    /// `response_format` output is plain content (the mask makes it JSON); no tool events.
+    func testResponseFormatOutputIsPlainContent() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: continuousByteIDs("true")],
+                recorder: recorder, advancesTokenMasks: true),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator, promptByText: ["solo": [10]], pieces: continuousBytePieces(),
+            stopTokenIDs: [continuousEOSID], mailboxCapacity: .init(maxDeltas: 64, maxBytes: 65_536),
+            jsonSchemaConstraintSupport: continuousSchemaSupport())
+        var constrained = request(text: "solo", maxTokens: 16)
+        constrained.responseFormat = .jsonSchema(try booleanSchemaFormat())
+        let handle = try await backend.start(constrained)
+        let events = try await collect(handle.mailbox)
+
+        let texts = events.compactMap { event -> String? in
+            if case .text(let value) = event { value } else { nil }
+        }
+        XCTAssertEqual(texts.joined(), "true")
+        XCTAssertFalse(events.contains {
+            switch $0 {
+            case .toolCallStart, .toolCallArguments, .toolCalls: true
+            default: false
+            }
+        })
+        guard case .completion(let completion)? = events.last else {
+            return XCTFail("expected a completion last")
+        }
+        XCTAssertEqual(completion.finishReason, .stop)
+        await backend.shutdown()
+    }
+
+    /// An enforced request that exhausts its budget mid-arguments finishes `length` with the partial
+    /// arguments streamed (scalar parity).
+    func testEnforcedToolCallThatHitsTheBudgetFinishesWithLength() async throws {
+        let result = try await runEnforced(
+            toolChoice: Self.namedChoice("get_weather"),
+            script: continuousByteIDs(#"{"city":"Paris"}"#), maxTokens: 5)
+        XCTAssertEqual(result.arguments, #"{"cit"#)
+        XCTAssertEqual(result.completion?.finishReason, .length)
+    }
+
+    // MARK: Failure surfacing
+
+    /// (h) A constraint failure recorded by the mask (here: the script emits a byte the grammar
+    /// forbids) fails THAT request with a backend error before the offending token reaches the
+    /// client, releases its slot, and leaves an unconstrained request on the same coordinator
+    /// untouched.
+    func testRecordedMaskFailureFailsOnlyThatRequestBeforePublishingTheToken() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let valid = Int(UInt8(ascii: "{"))
+        let invalid = Int(UInt8(ascii: "x"))
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [valid, invalid, valid], 11: [1, 2]],
+                recorder: recorder, advancesTokenMasks: true),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        var pieces = continuousBytePieces()
+        pieces[1] = "plain-1"
+        pieces[2] = "plain-2"
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10], "other": [11]],
+            pieces: pieces,
+            stopTokenIDs: [continuousEOSID],
+            mailboxCapacity: .init(maxDeltas: 64, maxBytes: 65_536),
+            jsonSchemaConstraintSupport: continuousSchemaSupport())
+
+        let failing = try await backend.start(
+            try strictRequest(toolChoice: Self.namedChoice("get_weather")))
+        let plain = try await backend.start(request(text: "other", maxTokens: 8))
+
+        var received: [ServingResponseDelta] = []
+        var failure: ServingMailboxError?
+        do {
+            while let event = try await failing.mailbox.next() { received.append(event) }
+            XCTFail("the constrained request must fail, not complete")
+        } catch let error as ServingMailboxError {
+            failure = error
+        }
+        guard case .backend? = failure else {
+            return XCTFail("expected a backend failure, got \(String(describing: failure))")
+        }
+        let args = received.compactMap { event -> String? in
+            if case .toolCallArguments(let value) = event { value } else { nil }
+        }
+        XCTAssertEqual(args.joined(), "{", "only the legal first token was published")
+        XCTAssertFalse(received.contains { if case .completion = $0 { true } else { false } })
+
+        let plainEvents = try await collect(plain.mailbox)
+        XCTAssertEqual(
+            plainEvents.compactMap { event -> String? in
+                if case .text(let value) = event { value } else { nil }
+            },
+            ["plain-1", "plain-2"], "an unconstrained neighbour is unaffected")
+        await waitUntil { await backend.snapshot().activeRequests == 0 }
+        await waitUntil { await backend.snapshot().coordinatorSlots == 0 }
+        await backend.shutdown()
+    }
+
+    // MARK: Helpers
+
+    private static func namedChoice(_ name: String) -> String {
+        #"{"type":"function","function":{"name":"\#(name)"}}"#
+    }
+
+    /// A request decoded the way HTTP does (the forced tool's parameters need the client's key
+    /// order, which only the strict decode preserves).
+    private func strictRequest(toolChoice: String) throws -> OpenAIChatCompletionRequest {
+        let weather =
+            #"{"type":"function","function":{"name":"get_weather","description":"w","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"],"additionalProperties":false}}}"#
+        let payload =
+            #"{"model":"fixture","messages":[{"role":"user","content":"solo"}],"tools":[\#(weather)],"tool_choice":\#(toolChoice),"max_completion_tokens":64,"temperature":0,"stream":true}"#
+        return try OpenAIChatCompletionRequest.decodeStrict(from: Data(payload.utf8))
+    }
+
+    private struct EnforcedRun {
+        var events: [ServingResponseDelta] = []
+        var failure: ServingMailboxError?
+
+        var texts: [String] {
+            events.compactMap { if case .text(let value) = $0 { value } else { nil } }
+        }
+        var arguments: String {
+            events.compactMap { if case .toolCallArguments(let value) = $0 { value } else { nil } }.joined()
+        }
+        var toolCallBatches: [[OpenAIToolCall]] {
+            events.compactMap { if case .toolCalls(let value) = $0 { value } else { nil } }
+        }
+        var completion: ServingGenerationCompletion? {
+            for case .completion(let value) in events { return value }
+            return nil
+        }
+    }
+
+    private func runEnforced(
+        toolChoice: String,
+        script: [Int],
+        thinking: Bool = false,
+        maxTokens: Int = 64
+    ) async throws -> EnforcedRun {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: script],
+                recorder: ContinuousRuntimeRecorder(), advancesTokenMasks: true),
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator, promptByText: ["solo": [10]], pieces: continuousBytePieces(),
+            stopTokenIDs: [continuousEOSID], mailboxCapacity: .init(maxDeltas: 64, maxBytes: 65_536),
+            thinksByDefault: thinking,
+            jsonSchemaConstraintSupport: continuousSchemaSupport(
+                thinkEndTokenID: thinking ? continuousThinkEndID : nil))
+        var forced = try strictRequest(toolChoice: toolChoice)
+        forced.maxCompletionTokens = maxTokens
+        if thinking { forced.enableThinking = true }
+        let handle = try await backend.start(forced)
+        var run = EnforcedRun()
+        do {
+            while let event = try await handle.mailbox.next() { run.events.append(event) }
+        } catch let error as ServingMailboxError {
+            run.failure = error
+        }
+        await backend.shutdown()
+        return run
     }
 
     /// The continuous-batch route only knows how to render a CHAT-templated prompt — a legacy
@@ -2504,26 +3053,37 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     private let allowsSpeculation: Bool
     private let speculativeSoloState: BatchSoloPipelineState
     private let resourceSnapshotGate: BlockingRuntimeResourceSnapshotGate?
+    /// When `true` the fixture plays the real runtime's side of the `ContinuousBatchRowTokenMask`
+    /// contract: after each emitted token it calls `advance(token:)` and then asks for the next
+    /// bitset, BEFORE the backend's `publish` sees the token. The fixture never applies the bitset (its
+    /// script is fixed), so a test chooses a script that either follows or violates the constraint.
+    private let advancesTokenMasks: Bool
     private var admittedIDs: Set<BatchRequestID> = []
     private var promptHeadByID: [BatchRequestID: Int] = [:]
     private var slots: [BatchRequestID: Slot] = [:]
+    private var tokenMasks: [BatchRequestID: any ContinuousBatchRowTokenMask] = [:]
 
     init(
         scriptsByPromptHead: [Int: [Int]],
         recorder: ContinuousRuntimeRecorder,
         allowsSpeculation: Bool = false,
         speculativeSoloState: BatchSoloPipelineState = .speculative,
-        resourceSnapshotGate: BlockingRuntimeResourceSnapshotGate? = nil
+        resourceSnapshotGate: BlockingRuntimeResourceSnapshotGate? = nil,
+        advancesTokenMasks: Bool = false
     ) {
         self.scriptsByPromptHead = scriptsByPromptHead
         self.recorder = recorder
         self.allowsSpeculation = allowsSpeculation
         self.speculativeSoloState = speculativeSoloState
         self.resourceSnapshotGate = resourceSnapshotGate
+        self.advancesTokenMasks = advancesTokenMasks
     }
 
     func admit(_ admissions: [ContinuousBatchRuntimeAdmission]) throws {
         admittedIDs.formUnion(admissions.map(\.id))
+        for admission in admissions {
+            tokenMasks[admission.id] = admission.submission.tokenMask
+        }
         recorder.admitted(admissions.count)
         recorder.admitted(admissions)
     }
@@ -2613,6 +3173,10 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
                 tokens = [slot.script[slot.cursor]]
                 slot.cursor += 1
                 finished = false
+                if advancesTokenMasks, let mask = tokenMasks[id] {
+                    mask.advance(token: tokens[0])
+                    _ = mask.allowedTokenBitset()
+                }
             } else {
                 tokens = []
                 finished = true
@@ -2633,6 +3197,7 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
             recorder.removed()
         }
         promptHeadByID[id] = nil
+        tokenMasks[id] = nil
     }
 }
 
@@ -2829,7 +3394,9 @@ private func makeBackend(
         maxBytes: 4_096),
     modelCapabilities: ServingModelCapabilities? = nil,
     thinksByDefault: Bool = false,
-    logitBiasVocabularySize: Int? = nil
+    logitBiasVocabularySize: Int? = nil,
+    jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
+    jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -2846,7 +3413,9 @@ private func makeBackend(
             mailboxCapacity: mailboxCapacity,
             thinksByDefault: thinksByDefault,
             modelCapabilities: modelCapabilities,
-            logitBiasVocabularySize: logitBiasVocabularySize))
+            logitBiasVocabularySize: logitBiasVocabularySize,
+            jsonObjectConstraintSupport: jsonObjectConstraintSupport,
+            jsonSchemaConstraintSupport: jsonSchemaConstraintSupport))
 }
 
 private func makeDynamicBackend(
@@ -2862,7 +3431,9 @@ private func makeDynamicBackend(
         maxBytes: 4_096),
     renderGate: BlockingRuntimeResourceSnapshotGate? = nil,
     modelCapabilities: ServingModelCapabilities? = nil,
-    logitBiasVocabularySize: Int? = nil
+    logitBiasVocabularySize: Int? = nil,
+    jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
+    jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -2884,7 +3455,9 @@ private func makeDynamicBackend(
                     maximumQueuedRequests: maximumQueuedRequests),
                 coalescing: coalescing),
             modelCapabilities: modelCapabilities,
-            logitBiasVocabularySize: logitBiasVocabularySize))
+            logitBiasVocabularySize: logitBiasVocabularySize,
+            jsonObjectConstraintSupport: jsonObjectConstraintSupport,
+            jsonSchemaConstraintSupport: jsonSchemaConstraintSupport))
 }
 
 private let continuousWeatherTool = OpenAIToolSpec(
@@ -2996,4 +3569,49 @@ private func waitUntil(
         await Task.yield()
     }
     XCTFail("Condition was not reached")
+}
+
+
+// MARK: - Constraint-support fixtures (file-private; shared by the tests above)
+
+private let continuousEOSID = 256
+private let continuousThinkEndID = 257
+
+/// Byte vocabulary: ids 0...255 raw bytes, 256 EOS, 257 `</think>` (banned for JSON). Built the way
+/// production does: an object support, then the schema support derived from it.
+private func continuousObjectSupport(
+    thinkEndTokenID: Int? = nil
+) -> ScalarServingJSONObjectConstraintSupport {
+    var classifications: [TokenByteClassification] = (0...255).map { .bytes([UInt8($0)]) }
+    classifications.append(.eos)
+    classifications.append(.banned)
+    return ScalarServingJSONObjectConstraintSupport(
+        classifications: classifications, thinkEndTokenID: thinkEndTokenID)
+}
+
+private func continuousSchemaSupport(
+    thinkEndTokenID: Int? = nil
+) -> ScalarServingJSONSchemaConstraintSupport {
+    loadScalarServingJSONSchemaConstraintSupport(
+        sharing: continuousObjectSupport(thinkEndTokenID: thinkEndTokenID))!
+}
+
+private func booleanSchemaFormat() throws -> JSONSchemaResponseFormat {
+    let raw = try JSONSchemaSubsetCompiler.parseOrdered(Data(#"{"type":"boolean"}"#.utf8))
+    return try JSONSchemaSubsetCompiler.compile(name: "flag", schema: raw, strict: true)
+}
+
+private func continuousByteIDs(_ text: String) -> [Int] { text.utf8.map { Int($0) } }
+
+private func continuousBytePieces() -> [Int: String] {
+    var pieces: [Int: String] = [:]
+    for id in 0..<128 { pieces[id] = String(UnicodeScalar(UInt8(id))) }
+    pieces[continuousThinkEndID] = "</think>"
+    return pieces
+}
+
+private func continuousBit(_ id: Int, in bitset: [UInt64]) -> Bool {
+    let word = id >> 6
+    guard word < bitset.count else { return false }
+    return bitset[word] & (1 << UInt64(id & 63)) != 0
 }

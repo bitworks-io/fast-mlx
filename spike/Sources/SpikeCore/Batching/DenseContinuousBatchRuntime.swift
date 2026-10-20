@@ -339,6 +339,9 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     /// A submission carried both a non-empty `logit_bias` and `requestsSpeculation`. A biased row
     /// never speculates, so the verify step can never see one.
     case logitBiasWithSpeculation(BatchRequestID)
+    /// A submission carried both a `tokenMask` and `requestsSpeculation`. A masked row never
+    /// speculates, so the verify step can never see one.
+    case tokenMaskWithSpeculation(BatchRequestID)
 }
 
 struct DenseContinuousBatchRuntimeDiagnostics: Equatable {
@@ -389,6 +392,15 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         /// the logits width and dtype are known) and reused by every scalar/batch step. `nil`
         /// exactly when the row is unbiased, which keeps it on the original compiled steps.
         var logitBiasRow: MLXArray?
+        /// The request's per-step token mask, or `nil` for an unmasked row. A masked row always
+        /// uses the biased compiled step variants (its additive row changes every step).
+        let tokenMask: (any ContinuousBatchRowTokenMask)?
+        /// Logits width and dtype, recorded at final prefill for a masked row only (the mask row
+        /// of every later step is built at this geometry). `nil` exactly when `tokenMask` is.
+        var maskGeometry: (width: Int, dtype: DType)?
+
+        /// Whether this row needs the biased compiled step (a static bias row or a mask).
+        var usesBiasedStep: Bool { logitBiasRow != nil || tokenMask != nil }
     }
 
     private struct MaterializedSlot {
@@ -437,6 +449,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     private var speculativePromptTokens: [BatchRequestID: [Int]] = [:]
     /// Admitted non-empty `logit_bias` maps awaiting their slot (created at first prefill).
     private var pendingLogitBias: [BatchRequestID: [Int: Float]] = [:]
+    /// Admitted token masks awaiting their slot (created at first prefill), cleared at final
+    /// prefill and in `remove`, like `pendingLogitBias`.
+    private var pendingTokenMasks: [BatchRequestID: any ContinuousBatchRowTokenMask] = [:]
     private var contextReservations: [BatchRequestID: Int] = [:]
     private var kvCapacityReservations: [BatchRequestID: Int] = [:]
     private var reservedKVBytes = 0
@@ -699,6 +714,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         var additions: [(BatchRequestID, tokens: Int, capacity: Int)] = []
         var speculativeAdditions: [BatchRequestID: [Int]] = [:]
         var biasAdditions: [BatchRequestID: [Int: Float]] = [:]
+        var maskAdditions: [BatchRequestID: any ContinuousBatchRowTokenMask] = [:]
         additions.reserveCapacity(admissions.count)
         for admission in admissions {
             let submission = admission.submission
@@ -708,6 +724,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             }
             if !submission.logitBias.isEmpty {
                 biasAdditions[admission.id] = submission.logitBias
+            }
+            if let mask = submission.tokenMask {
+                maskAdditions[admission.id] = mask
             }
             additions.append(
                 (
@@ -759,6 +778,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         for (id, bias) in biasAdditions {
             pendingLogitBias[id] = bias
+        }
+        for (id, mask) in maskAdditions {
+            pendingTokenMasks[id] = mask
         }
         speculationRequestedRequests = nextSpeculationRequests
         reservedKVBytes = requestedKVBytes
@@ -845,7 +867,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 scalarVerifySteps: [:],
                 scalarTraceCounter: nil,
                 logitBias: pendingLogitBias[work.id] ?? [:],
-                logitBiasRow: nil)
+                logitBiasRow: nil,
+                tokenMask: pendingTokenMasks[work.id],
+                maskGeometry: nil)
         }
 
         guard work.startToken == slot.processedTokens else {
@@ -869,6 +893,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         // through the caches it attends over (the same trade the scalar route made in 41f7dbb0).
         let staged: MLXArray?
         var biasRow: MLXArray?
+        var maskGeometry: (width: Int, dtype: DType)?
         if work.isFinal {
             var finalLogits = logits[0..., -1, 0...]
             // `logit_bias` is added BEFORE the reduction, exactly where the scalar route's
@@ -882,7 +907,26 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 biasRow = row
                 finalLogits = finalLogits + row
             }
-            let token = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(finalLogits)
+            // The token mask applies at the INITIAL state (no `advance` yet: nothing has been
+            // emitted). `slot.logitBiasRow` stays the STATIC bias row; the mask row is added on
+            // top here and rebuilt per step by `currentStepRow`.
+            var maskedToken: MLXArray?
+            if let mask = slot.tokenMask {
+                let geometry = (width: finalLogits.dim(-1), dtype: finalLogits.dtype)
+                maskGeometry = geometry
+                if let bitset = mask.allowedTokenBitset(),
+                    let maskRow = ContinuousBatchRowTokenMaskRow.row(
+                        bitset: bitset, width: geometry.width, dtype: geometry.dtype)
+                {
+                    // `-inf` mask columns are legitimate, so a masked reduction guards the RAW
+                    // logits for non-finite values instead (see `maskedGreedyToken`). A `nil` row
+                    // (no allowed column inside the logits width) stays unconstrained.
+                    maskedToken = ContinuousBatchRowTokenMaskRow.maskedGreedyToken(
+                        logits: logits[0..., -1, 0...],
+                        additive: biasRow.map { $0 + maskRow } ?? maskRow)
+                }
+            }
+            let token = maskedToken ?? CompiledMLXDecoder.greedyTokenOrInvalidSentinel(finalLogits)
             eval([token] + caches.flatMap { $0.innerState() })
             _ = try validatedToken(token, id: work.id)
             staged = token
@@ -912,6 +956,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.prefillComplete = work.isFinal
         slot.stagedToken = staged
         slot.logitBiasRow = biasRow
+        slot.maskGeometry = maskGeometry
         if work.isFinal,
             let promptTokens = speculativePromptTokens[work.id],
             let configuration = soloPLDConfiguration
@@ -927,6 +972,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         if work.isFinal {
             speculativePromptTokens[work.id] = nil
             pendingLogitBias[work.id] = nil
+            pendingTokenMasks[work.id] = nil
         }
     }
 
@@ -979,6 +1025,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         contextReservations[id] = nil
         speculativePromptTokens[id] = nil
         pendingLogitBias[id] = nil
+        pendingTokenMasks[id] = nil
         slots[id] = nil
 
         guard let batch else {
@@ -1080,10 +1127,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         guard let configuration = soloPLDConfiguration,
             let slot = slots[id],
             let session = slot.pldSession,
-            slot.logitBias.isEmpty
+            slot.logitBias.isEmpty,
+            slot.tokenMask == nil
         else {
-            // A biased row is never admitted with speculation, so it has no session; the empty-bias
-            // clause keeps the verify step unreachable for one even if that invariant were broken.
+            // A biased or masked row is never admitted with speculation, so it has no session; the
+            // empty-bias and no-mask clauses keep the verify step unreachable for one even if that
+            // invariant were broken.
             throw DenseContinuousBatchRuntimeError.speculationUnsupported
         }
 
@@ -1188,7 +1237,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.scalarStep = makeScalarStep(
                 caches: caches,
                 counter: traceCounter,
-                biased: slot.logitBiasRow != nil)
+                biased: slot.usesBiasedStep,
+                masked: slot.tokenMask != nil)
         }
         var rollbackFallback = true
         defer {
@@ -1414,7 +1464,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.scalarStep = makeScalarStep(
                 caches: caches,
                 counter: traceCounter,
-                biased: slot.logitBiasRow != nil)
+                biased: slot.usesBiasedStep,
+                masked: slot.tokenMask != nil)
         }
         let following = slot.scalarStep!(scalarStepArguments(slot, current))[0]
         eval([following] + caches.flatMap { $0.innerState() })
@@ -1514,9 +1565,13 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.scalarStep = makeScalarStep(
                 caches: slot.scalarCaches!,
                 counter: traceCounter,
-                biased: slot.logitBiasRow != nil)
+                biased: slot.usesBiasedStep,
+                masked: slot.tokenMask != nil)
         }
         let emitted = try validatedToken(current, id: id)
+        // Readback, advance, build, launch: the masked row for the FOLLOWING token reflects the
+        // token just emitted. Exactly one advance per emitted token.
+        slot.tokenMask?.advance(token: emitted)
         let following = slot.scalarStep!(scalarStepArguments(slot, current))[0]
         if synchronously {
             eval([following] + slot.scalarCaches!.flatMap { $0.innerState() })
@@ -1576,7 +1631,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 caches: batch.caches,
                 batchSize: ids.count,
                 counter: batch.traceCounter,
-                biased: batch.logitBiasMatrix != nil)
+                biased: batch.logitBiasMatrix != nil
+                    || ids.contains { slots[$0]?.tokenMask != nil },
+                masked: ids.contains { slots[$0]?.tokenMask != nil })
         }
 
         let current = batch.stagedTokens
@@ -1589,8 +1646,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 throw DenseContinuousBatchRuntimeError.invalidTokenID(id, token)
             }
         }
-        let following = batch.step!(
-            batch.logitBiasMatrix.map { [current, $0] } ?? [current])[0]
+        // Readback, advance, build, launch. Every masked member advances on its emitted token (in
+        // row order) BEFORE the step's additive matrix is built, so each masked row's mask reflects
+        // every token it has emitted. A batch with a masked member rebuilds the matrix every step.
+        for (id, token) in zip(ids, emitted) {
+            slots[id]?.tokenMask?.advance(token: token)
+        }
+        let stepMatrix = try batchStepMatrix(ids, staticMatrix: batch.logitBiasMatrix)
+        let following = batch.step!(stepMatrix.map { [current, $0] } ?? [current])[0]
         asyncEval(following)
 
         for (id, token) in zip(ids, emitted) {
@@ -1963,10 +2026,55 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         if changed { recomputeReservedKVBytes() }
     }
 
-    /// Arguments of a slot's scalar step: the token, plus the dense bias row for a biased slot.
+    /// Arguments of a slot's scalar step: the token, plus the additive row for a biased or masked
+    /// slot (see `currentStepRow`).
     private func scalarStepArguments(_ slot: Slot, _ token: MLXArray) -> [MLXArray] {
-        guard let row = slot.logitBiasRow else { return [token] }
+        guard let row = currentStepRow(slot) else { return [token] }
         return [token, row]
+    }
+
+    /// The `[1, width]` additive row for the slot's NEXT token: the static bias row (or zeros) plus
+    /// the mask row built from the mask's CURRENT bitset. The caller must already have advanced
+    /// the mask on every emitted token. An unmasked slot returns its static bias row (`nil` when
+    /// unbiased, which keeps it on the original compiled step); a masked slot never returns `nil`.
+    private func currentStepRow(_ slot: Slot) -> MLXArray? {
+        guard let mask = slot.tokenMask else { return slot.logitBiasRow }
+        guard let geometry = slot.maskGeometry else {
+            preconditionFailure("masked slot decoded before its final prefill recorded geometry")
+        }
+        let base =
+            slot.logitBiasRow
+            ?? MLXArray.zeros([1, geometry.width], dtype: geometry.dtype)
+        // A nil bitset, or one with no allowed column inside the logits width (`row` is nil), is
+        // unconstrained for this step: see `ContinuousBatchRowTokenMaskRow.values`.
+        guard let bitset = mask.allowedTokenBitset(),
+            let maskRow = ContinuousBatchRowTokenMaskRow.row(
+                bitset: bitset, width: geometry.width, dtype: geometry.dtype)
+        else { return base }
+        return base + maskRow
+    }
+
+    /// The `[B, width]` additive matrix for one batch step. With no masked member this is the
+    /// static bias matrix from `ensureBatch` (`nil` when no member is biased: the original step).
+    /// With any masked member it is rebuilt from each member's current row: masked members use
+    /// `currentStepRow`, unmasked members their static bias row or an exact zero row.
+    private func batchStepMatrix(
+        _ ids: [BatchRequestID], staticMatrix: MLXArray?
+    ) throws -> MLXArray? {
+        let members = try ids.map { id -> Slot in
+            guard let slot = slots[id] else {
+                throw DenseContinuousBatchRuntimeError.unknownRequest(id)
+            }
+            return slot
+        }
+        guard let geometry = members.lazy.compactMap({ $0.maskGeometry }).first else {
+            return staticMatrix
+        }
+        let zeroRow = MLXArray.zeros([1, geometry.width], dtype: geometry.dtype)
+        let rows = members.map { currentStepRow($0) ?? zeroRow }
+        let stacked = concatenated(rows, axis: 0)
+        eval(stacked)
+        return stacked
     }
 
     /// The dense `[1, width]` additive bias row, built exactly like the scalar route's
@@ -1991,7 +2099,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// therefore its tokens) cannot change. `biased == true` compiles a separate variant that takes
     /// the slot's dense bias row as `arguments[1]` and adds it before the greedy reduction.
     private func makeScalarStep(
-        caches: [any ContinuousScalarRowCache], counter: TraceCounter, biased: Bool = false
+        caches: [any ContinuousScalarRowCache], counter: TraceCounter, biased: Bool = false,
+        masked: Bool = false
     ) -> Step {
         let model = self.model
         // A scalar row IS the model cache: a dense row is the `CompiledCache` the model updates,
@@ -2018,7 +2127,18 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     logits[0..., -1, 0...] + arguments[1]),
             ]
         }
-        let step = biased ? biasedStep : plainStep
+        // A masked row's additive argument carries `-inf` columns, so it reduces with
+        // `maskedGreedyToken` (raw-logit finite guard) instead of the all-finite guard.
+        let maskedStep: Step = { arguments in
+            counter.count += 1
+            let input = arguments[0].reshaped([1, 1])
+            let logits = model(input, cache: modelCaches)
+            return [
+                ContinuousBatchRowTokenMaskRow.maskedGreedyToken(
+                    logits: logits[0..., -1, 0...], additive: arguments[1]),
+            ]
+        }
+        let step = masked ? maskedStep : (biased ? biasedStep : plainStep)
         // Weights and fused projections enter as compile STATE (tracer inputs),
         // never captured constants -- see `compiledStepExtraState`.
         return compile(
@@ -2053,7 +2173,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         caches: [any ContinuousBatchedRowCache],
         batchSize: Int,
         counter: TraceCounter,
-        biased: Bool = false
+        biased: Bool = false,
+        masked: Bool = false
     ) -> Step {
         let model = self.model
         // A batched row WRAPS its model cache (dense → self, recurrent → the inner `MambaCache`),
@@ -2082,7 +2203,16 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     logits[0..., -1, 0...] + arguments[1]),
             ]
         }
-        let step = biased ? biasedStep : plainStep
+        let maskedStep: Step = { arguments in
+            counter.count += 1
+            let input = arguments[0].reshaped([batchSize, 1])
+            let logits = model(input, cache: modelCaches)
+            return [
+                ContinuousBatchRowTokenMaskRow.maskedGreedyToken(
+                    logits: logits[0..., -1, 0...], additive: arguments[1]),
+            ]
+        }
+        let step = masked ? maskedStep : (biased ? biasedStep : plainStep)
         // See `compiledStepExtraState`.
         return compile(
             inputs: state + compiledStepExtraState,
@@ -2202,6 +2332,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         // step can never see a biased row.
         if submission.requestsSpeculation, !submission.logitBias.isEmpty {
             throw DenseContinuousBatchRuntimeError.logitBiasWithSpeculation(admission.id)
+        }
+        if submission.requestsSpeculation, submission.tokenMask != nil {
+            throw DenseContinuousBatchRuntimeError.tokenMaskWithSpeculation(admission.id)
         }
         if let outOfRange = submission.logitBias.keys.sorted().first(where: {
             $0 < 0 || $0 >= vocabularySize
