@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "publicIndex": {
-    "pathCount": 1050,
-    "pathModeSha256": "f2b7ada00036420102a4a1b2b9db4cf7d701e135411b67ca5b42825f300afa0b"
+    "pathCount": 1052,
+    "pathModeSha256": "840c9702820a1a6f9a7fc799b89a743377999a35297cc14c08e2fdbe8fa1b872"
   },
   "files": [
     {
@@ -244,6 +244,14 @@
     {
       "source": "scripts/tests/test_card_resolution_conformance.py",
       "destination": "scripts/tests/test_card_resolution_conformance.py"
+    },
+    {
+      "source": "scripts/tests/test_card_store_resolution_stability.py",
+      "destination": "scripts/tests/test_card_store_resolution_stability.py"
+    },
+    {
+      "source": "scripts/tests/fixtures/published-quality-guides-baseline.json",
+      "destination": "scripts/tests/fixtures/published-quality-guides-baseline.json"
     },
     {
       "source": "scripts/tests/test_receipt_binding_conformance.py",

@@ -1,0 +1,1279 @@
+{
+  "schema": "fast-mlx-quality-card-v1",
+  "generatedAt": "2026-10-15T21:36:44Z",
+  "cards": [
+    {
+      "id": "qwen38-flash-next-mixed-4-8bit@m3ultra",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "ef5b919d31534faa1997666f1a22d362cd6383cd"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community mixed pack: 4-bit routed experts, 8-bit other projections"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra",
+        "flagTransfer": {
+          "--mtp": {
+            "greedy": "nondeterministic",
+            "divergentPrompts": 16,
+            "prompts": 40,
+            "maxTokens": 64,
+            "evidence": "mtp-flag-transfer-b1-2026-09-19"
+          }
+        }
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "differs from the 8-bit reference on 2.6% of next tokens; not a silent substitute for it"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "Qwen3.8-Flash-Next, mixed 4/8-bit pack: about 1 next word in 39 differs from an 8-bit conversion of the official weights.",
+        "nextWordDrift": {
+          "oneInK": 39,
+          "top1AgreementPct": 97.44
+        },
+        "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows this pack is closer to the 8-bit reference than the 3.3-bit pack (p = 2.2e-14)",
+        "example": {
+          "status": "measured",
+          "prompt": "A hash table achieves average constant-time",
+          "referenceOutput": " look",
+          "configOutput": " (",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026A hash table achieves average constant-time', the reference picks ' look' and this pack picks ' ('."
+        },
+        "benefit": {
+          "fit": "70.1 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context (86.1 GiB needed with a 16 GiB KV reserve, against an 88 GiB shared-host ceiling). RED on a 96 GB Mac at any context \u2014 the weights alone exceed that machine's 64 GiB ceiling.",
+          "speedX": 1.19,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build fa76a4b5: median 65.4 vs 54.9 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts x 256 tokens, one warmup pass discarded, median of 3 passes; the reference arm ran first and last and drifted 0.29%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
+        }
+      },
+      "rawMetrics": {
+        "top1Disagreement": "64/2496 = 2.56%",
+        "top1DisagreementWilson95": [
+          0.0201,
+          0.0326
+        ],
+        "tvLowerBoundMedian": 0.0047,
+        "tvLowerBoundP95": 0.1077,
+        "klLowerBoundMedianNats": 0.0015,
+        "klLowerBoundP95Nats": 0.0348,
+        "boundsWeakenedPositions": "1557/2496 = 62.4%",
+        "logprobTopK": 20,
+        "promptsSkipped": "1/40",
+        "contextRegime": "native 262,144-token window, no YaRN"
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 62.4% of positions here, so a small value is a floor, not closeness. Controls: self-replay 0/2560, a perturbation control 1/2560 at the perturbed position, and a paired-vs-sequential bridge that reproduced 150/2432 exactly.",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "c640606d22ae516609eb7aceba56ccaad6b9dd68",
+        "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
+        "sourceVerdict": "vs-8bit-reference-cells-b1-b2-2026-09-18",
+        "measuredAt": "2026-09-18T22:30:43Z",
+        "engineBuild": {
+          "commit": "fa76a4b50b3f54af7e9cd927279f5ba2870f02c6"
+        }
+      },
+      "boundary": {
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
+        "unmeasured": [
+          "closeness to the full-precision (BF16) model",
+          "context beyond the native 262,144-token window (YaRN)",
+          "other serving engines",
+          "tool-call quality",
+          "other revisions of the repository (the weights at main 7eaef0fa are byte-identical but the card is pinned to ef5b919d)"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-flash-next-iq-3p3bpw@m3ultra",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "2b7da62be0151a7932e4dfcab1d73c93ccf83f64"
+      },
+      "config": {
+        "quant": {
+          "bits": 3,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community ~3.3 bits-per-weight mixed pack, compared against an 8-bit conversion of the official BF16 weights (the reference)"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "differs from the 8-bit reference on 6.5% of next tokens; not a silent substitute for it"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "Qwen3.8-Flash-Next, 3.3-bit pack: about 1 next word in 15 differs from an 8-bit conversion of the official weights.",
+        "nextWordDrift": {
+          "oneInK": 15,
+          "top1AgreementPct": 93.5
+        },
+        "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows the mixed 4/8-bit pack is closer to this reference (p = 2.2e-14); an earlier peer-vs-peer comparison (this pack vs. the mixed 4/8-bit pack directly, not vs. this 8-bit reference) found 6.2% (150/2432) disagreement, superseded by this reference-based measurement",
+        "example": {
+          "status": "measured",
+          "prompt": "a combination of direct indexing and efficient collision resolution. The process",
+          "referenceOutput": " works",
+          "configOutput": " begins",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026a combination of direct indexing and efficient collision resolution. The process', the reference picks ' works' and this pack picks ' begins'."
+        },
+        "benefit": {
+          "fit": "50.6 GiB resident weights plus a memory-mapped n-gram table. Sized from headers only: GREEN on a 128 GB Mac at the full 262,144-token context, and GREEN on a 96 GB Mac at 65,536 context (58.6 GiB needed with an 8 GiB KV reserve, against a 64 GiB shared-host ceiling) \u2014 where the mixed 4/8-bit pack is RED. This smaller footprint, not speed, is what the 3.3-bit pack buys.",
+          "speedX": 1.07,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build fa76a4b5: median 59.0 vs 54.9 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts x 256 tokens, one warmup pass discarded, median of 3 passes; the reference arm ran first and last and drifted 0.29%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
+        }
+      },
+      "rawMetrics": {
+        "top1Disagreement": "158/2432 = 6.50%",
+        "top1DisagreementWilson95": [
+          0.0558,
+          0.0755
+        ],
+        "tvLowerBoundMedian": 0.0164,
+        "tvLowerBoundP95": 0.2443,
+        "klLowerBoundMedianNats": 0.006,
+        "klLowerBoundP95Nats": 0.1754,
+        "boundsWeakenedPositions": "1526/2432 = 62.7%",
+        "logprobTopK": 20,
+        "promptsSkipped": "2/40",
+        "contextRegime": "native 262,144-token window, no YaRN",
+        "peerDisagreementVsMixed48Pack": "150/2432 = 6.17% (earlier peer-vs-peer comparison against the mixed 4/8-bit pack, superseded by this 8-bit-reference measurement)"
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 62.7% of positions here, so a small value is a floor, not closeness. Controls: self-replay 0/2560, a perturbation control 1/2560 at the perturbed position, and a paired-vs-sequential bridge that reproduced 150/2432 exactly.",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "c640606d22ae516609eb7aceba56ccaad6b9dd68",
+        "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
+        "sourceVerdict": "vs-8bit-reference-cells-b1-b2-2026-09-18",
+        "measuredAt": "2026-09-18T22:37:29Z",
+        "engineBuild": {
+          "commit": "fa76a4b50b3f54af7e9cd927279f5ba2870f02c6"
+        }
+      },
+      "boundary": {
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
+        "unmeasured": [
+          "closeness to the full-precision (BF16) model",
+          "context beyond the native 262,144-token window (YaRN)",
+          "other serving engines",
+          "tool-call quality"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-27b-optiq-4bit@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+        "hfPin": "b04599de"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": true,
+          "note": "261 tensors kept @8 by KL-sensitivity incl. tool-call calibration (mixed-bit)"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "quality-degraded vs 8-bit reference; not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 6 differs from what the full 8-bit model would say.",
+        "nextWordDrift": {
+          "oneInK": 6,
+          "top1AgreementPct": 84.45
+        },
+        "regressionFocus": "code and long-context (long-context top-1 ~80-84%)",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract a real regressing case from the gate task evidence"
+        },
+        "benefit": {
+          "fit": "20.7 GB \u2014 fits a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1": "277/328 = 84.45%",
+        "klMedianNats": 0.004054,
+        "klLongContextTailP95Nats": 11.2,
+        "pplDeltaPct": 15.79,
+        "perEntryTop1": {
+          "prose-capital-of-france": "24/24",
+          "prose-haiku-unified-memory": "24/24",
+          "code-continuous-batching": "20/24",
+          "long-context-mlx-notes-v1": "102/128",
+          "long-context-engineering-docs-16k-v1": "107/128"
+        }
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced vs 8-bit mxfp8 reference",
+        "confound": "different-weights: blends 4-bit quant loss with checkpoint difference",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
+        "corpusId": "measurement-corpus-v2",
+        "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
+        "measuredAt": "2026-09-02T20:35:47Z"
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "tool-call quality"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-27b-oq4@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": "mlx-community/Qwen3.8-27B-oQ4",
+        "hfPin": "fa6d24bb"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": true,
+          "note": "160 tensors kept @5 covering every linear_attn.* / down_proj (more aggressive, smaller)"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "quality-degraded vs 8-bit reference; not a silent default"
+      },
+      "legible": {
+        "tier": "Significant",
+        "headline": "About 1 word in 6 differs from what the full 8-bit model would say.",
+        "nextWordDrift": {
+          "oneInK": 6,
+          "top1AgreementPct": 82.01
+        },
+        "regressionFocus": "code and long-context (long-context top-1 ~73-86%)",
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "extract a real regressing case from the gate task evidence"
+        },
+        "benefit": {
+          "fit": "16.7 GB \u2014 fits a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1": "269/328 = 82.01%",
+        "klMedianNats": 0.005446,
+        "klLongContextTailP95Nats": 16.01,
+        "pplDeltaPct": 91.0,
+        "perEntryTop1": {
+          "prose-capital-of-france": "24/24",
+          "prose-haiku-unified-memory": "24/24",
+          "code-continuous-batching": "18/24",
+          "long-context-mlx-notes-v1": "93/128",
+          "long-context-engineering-docs-16k-v1": "110/128"
+        }
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced vs 8-bit mxfp8 reference",
+        "confound": "different-weights: blends 4-bit quant loss with checkpoint difference",
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
+        "corpusId": "measurement-corpus-v2",
+        "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
+        "measuredAt": "2026-09-02T21:17:13Z"
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "tool-call quality"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-27b-8bit-mxfp8@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": "fast-mlx/target-v3 (8-bit mxfp8 reference)",
+        "hfPin": null
+      },
+      "config": {
+        "quant": {
+          "bits": 8,
+          "groupSize": null,
+          "mixedBit": false,
+          "note": "mxfp8 reference \u2014 the 8-bit reference the other 27B packs are measured against"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "REFERENCE",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "the measurement reference other 27B packs are measured against"
+      },
+      "legible": {
+        "tier": "Near-lossless",
+        "headline": "The 8-bit reference: the quality bar the other 27B packs are measured against.",
+        "nextWordDrift": null,
+        "regressionFocus": null,
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "reference row; not applicable (this IS the reference)"
+        },
+        "benefit": {
+          "fit": "runs on a 128 GB Mac",
+          "speedX": null,
+          "speedXStatus": "reference"
+        }
+      },
+      "rawMetrics": {
+        "pplReference": 2.9202
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "reference config (8-bit reference build)",
+        "confound": null,
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": "f0df53a968bf49b059a1c47410ff9072626d8ec2",
+        "corpusId": "measurement-corpus-v2",
+        "sourceVerdict": "qwen38-27b-calibrated-4bit-regate-v2-2026-09-02.json",
+        "measuredAt": "2026-09-02T20:35:47Z"
+      },
+      "boundary": {
+        "scope": "measurement reference; not independently gated vs full precision in this record",
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "tool-call quality"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-27b-mtp@m3ultra",
+      "model": {
+        "family": "Qwen3.8-27B",
+        "repo": null,
+        "hfPin": null
+      },
+      "config": {
+        "quant": null,
+        "enhancement": "mtp",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "EXACT",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "exact enhancement; identical output"
+      },
+      "legible": {
+        "tier": "Exact",
+        "headline": "Identical output, proven token-for-token \u2014 a free speedup at zero quality cost.",
+        "nextWordDrift": {
+          "oneInK": null,
+          "top1AgreementPct": 100.0
+        },
+        "regressionFocus": null,
+        "example": {
+          "status": "pending",
+          "prompt": null,
+          "referenceOutput": null,
+          "configOutput": null,
+          "note": "exactness gate; no regressing case exists by construction"
+        },
+        "benefit": {
+          "fit": null,
+          "speedX": null,
+          "speedXStatus": "measured-separately-in-mtp-performance-scorecard"
+        }
+      },
+      "rawMetrics": {},
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "MTP exactness gate (teacher-forced logit + decoded-token equality)",
+        "confound": null,
+        "hardware": "Apple M3 Ultra / macOS 26.6.2",
+        "harnessGitSHA": null,
+        "corpusId": null,
+        "sourceVerdict": null,
+        "measuredAt": null
+      },
+      "boundary": {
+        "scope": "exactness proven; decode speedup measured separately",
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "tool-call quality"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-0p6b-4bit@m5",
+      "model": {
+        "family": "Qwen3-0.6B",
+        "repo": "mlx-community/Qwen3-0.6B-4bit",
+        "hfPin": "73e3e38d"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m5",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 13.91% top-1 disagreement (86.09% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 7 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 7,
+          "top1AgreementPct": 86.0938
+        },
+        "regressionFocus": "open-ended enumerative and advisory writing (17-25% next-word drift); canonical technical explanations drift least (5-9%)",
+        "example": {
+          "status": "measured",
+          "prompt": "<think> Okay,",
+          "referenceOutput": " so",
+          "configOutput": " let",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026<think> Okay,', the peer pack picks ' so' and this pack picks ' let'."
+        },
+        "benefit": {
+          "fit": "0.33 GB on disk - fits a 24 GB Mac with room to spare",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 2560,
+        "disagreements": 356,
+        "disagreement_rate": 0.1390625,
+        "tier": "SIGNIFICANT",
+        "wilson_lo": 0.12619890966069058,
+        "wilson_hi": 0.1530076911834834,
+        "tv_lower_bound_median": 0.048132136250098045,
+        "tv_lower_bound_p95": 0.450021616743724,
+        "tv_lower_bound_raw_min": -1.0222757298450347e-06,
+        "kl_lower_bound_median_nats": 0.024091585796186296,
+        "kl_lower_bound_p95_nats": 0.5774919564632153
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M5 / 24 GiB / macOS 26.6.2",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-v1",
+        "sourceVerdict": "peer-divergence-qwen3-0p6b-4bit-vs-8bit-2026-09-20.json",
+        "measuredAt": "2026-09-21T00:16:00Z",
+        "engineBuild": {
+          "commit": "21af3abd339a0752319ba6b4abe3b3880b16da3b"
+        }
+      },
+      "boundary": {
+        "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-0p6b-4bit@m3ultra",
+      "model": {
+        "family": "Qwen3-0.6B",
+        "repo": "mlx-community/Qwen3-0.6B-4bit",
+        "hfPin": "73e3e38d"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 14.41% top-1 disagreement (85.59% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 7 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 7,
+          "top1AgreementPct": 85.5859
+        },
+        "regressionFocus": "open-ended enumerative, procedural and advisory writing (19-25% next-word drift); canonical technical explanations drift least (4.7-9.4%)",
+        "example": {
+          "status": "measured",
+          "prompt": "<think> Okay,",
+          "referenceOutput": " so",
+          "configOutput": " let",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026<think> Okay,', the peer pack picks ' so' and this pack picks ' let'."
+        },
+        "benefit": {
+          "fit": "0.33 GB on disk - negligible against a 256 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 2560,
+        "disagreements": 369,
+        "disagreement_rate": 0.144140625,
+        "tier": "SIGNIFICANT",
+        "wilson_lo": 0.13106781122459543,
+        "wilson_hi": 0.1582798222916843,
+        "tv_lower_bound_median": 0.048867369157473806,
+        "tv_lower_bound_p95": 0.45349123497193794,
+        "tv_lower_bound_raw_min": -8.657405583534228e-07,
+        "kl_lower_bound_median_nats": 0.02505870986727511,
+        "kl_lower_bound_p95_nats": 0.5804167885199208
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-v1",
+        "sourceVerdict": "peer-divergence-qwen3-0p6b-4bit-vs-8bit-m3ultra-2026-09-23.json",
+        "measuredAt": "2026-09-23T05:53:09Z",
+        "engineBuild": {
+          "commit": "a1f002a00d452a0abf662f7174cae0ae25873b85"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-flash-next-iq-3p3bpw@m3ultra-v2696",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "2b7da62be0151a7932e4dfcab1d73c93ccf83f64"
+      },
+      "config": {
+        "quant": {
+          "bits": 3,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community ~3.3 bits-per-weight mixed pack, compared against an 8-bit conversion of the official BF16 weights (the reference)"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 6.04% top-1 disagreement (93.96% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 17 differs from what the peer pack would say (forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed).",
+        "nextWordDrift": {
+          "oneInK": 17,
+          "top1AgreementPct": 93.9556
+        },
+        "regressionFocus": "not localized by task; on the same 2,432 shared positions, an exact paired McNemar test shows the mixed 4/8-bit pack is closer to this reference (p = 2.2e-14); an earlier peer-vs-peer comparison (this pack vs. the mixed 4/8-bit pack directly, not vs. this 8-bit reference) found 6.2% (150/2432) disagreement, superseded by this reference-based measurement",
+        "example": {
+          "status": "measured",
+          "prompt": "a combination of direct indexing and efficient collision resolution. The process",
+          "referenceOutput": " works",
+          "configOutput": " begins",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026a combination of direct indexing and efficient collision resolution. The process', the reference picks ' works' and this pack picks ' begins'."
+        },
+        "benefit": {
+          "fit": "50.6 GiB resident weights plus a memory-mapped n-gram table. GREEN on a 128 GB Mac at the full 262,144-token context (measured on this engine build at a 66.9 GiB peak with a 260,626-token prompt), and GREEN on a 96 GB Mac at 65,536 context: sized from headers at 58.6 GiB (an 8 GiB KV reserve, against a 64 GiB shared-host ceiling) and measured at a 57.9 GiB peak with a 63,242-token prompt \u2014 where the mixed 4/8-bit pack is RED. Peaks were measured on a 256 GB Apple M3 Ultra as wired memory above the idle baseline. On this engine build the two packs decode at about the same speed, so this smaller footprint is what the 3.3-bit pack buys.",
+          "speedX": 1.18,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build 1745ffe8: median 66.6 vs 56.6 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts with up to 256 tokens each (every answer ended after 56 to 75 tokens, so this is short-decode throughput), one warmup pass discarded, median of 3 per-pass pooled rates, decode timed from the first generated token so prompt processing is excluded; the reference arm ran first and last and drifted 0.10%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
+        }
+      },
+      "rawMetrics": {
+        "n": 2432,
+        "disagreements": 147,
+        "disagreement_rate": 0.06044407894736842,
+        "tier": "NOTICEABLE",
+        "wilson_lo": 0.0516482113667642,
+        "wilson_hi": 0.07062635528951286,
+        "tv_lower_bound_median": 0.017986352640847192,
+        "tv_lower_bound_p95": 0.24719751080433192,
+        "tv_lower_bound_raw_min": -7.581471308526488e-07,
+        "kl_lower_bound_median_nats": 0.006030116288734217,
+        "kl_lower_bound_p95_nats": 0.17730240984434625
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 22.0% of positions here, so a small value is a floor, not closeness. Controls on this served-engine build: self-replay 0/2560 (card-C4.json); the perturbation control and paired-vs-sequential bridge measured on the prior engine build were not re-run here. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M3 Ultra / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus sha256:cce2ff8633557347b946f69fe55f8187374cc37e1e3ca1b5c791fb70a656a4b7",
+        "sourceVerdict": "card-B2.json",
+        "measuredAt": "2026-09-28T03:57:47Z",
+        "engineBuild": {
+          "commit": "1745ffe89e4670f1e0c6de22c75a9875b27399de"
+        }
+      },
+      "boundary": {
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
+        "unmeasured": [
+          "perplexity delta"
+        ]
+      }
+    },
+    {
+      "id": "qwen38-flash-next-mixed-4-8bit@m3ultra-v2696",
+      "model": {
+        "family": "Qwen3.8-Flash-Next",
+        "repo": null,
+        "hfPin": "ef5b919d31534faa1997666f1a22d362cd6383cd"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": null,
+          "mixedBit": true,
+          "note": "community mixed pack: 4-bit routed experts, 8-bit other projections"
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 2.59% top-1 disagreement (97.41% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 39 differs from what the peer pack would say (forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed).",
+        "nextWordDrift": {
+          "oneInK": 39,
+          "top1AgreementPct": 97.4053
+        },
+        "regressionFocus": "not localized by task; measured on a fresh 160-prompt corpus, disjoint from the corpus behind the earlier card for this pack",
+        "example": {
+          "status": "measured",
+          "prompt": "In your answer, describe the data structure",
+          "referenceOutput": " and",
+          "configOutput": ",",
+          "note": "Teacher-forced on the 8-bit reference's own text: after '\u2026In your answer, describe the data structure', the reference picks ' and' and this pack picks ','."
+        },
+        "benefit": {
+          "fit": "70.1 GiB resident weights plus a memory-mapped n-gram table. GREEN on a 128 GB Mac at the full 262,144-token context: sized from headers at 86.1 GiB (a 16 GiB KV reserve, against an 88 GiB shared-host ceiling), and measured on this engine build at an 86.5 GiB peak with a 260,626-token prompt. RED on a 96 GB Mac at any context \u2014 the weights alone exceed that machine's 64 GiB ceiling. Peaks were measured on a 256 GB Apple M3 Ultra as wired memory above the idle baseline.",
+          "speedX": 1.19,
+          "speedXStatus": "measured on Apple M3 Ultra at engine build 1745ffe8: median 67.3 vs 56.6 tok/s against the 8-bit reference pack, speculative decoding disabled on every arm, 262,144-token context, concurrency 1, temperature 0, 3 prompts with up to 256 tokens each (every answer ended after 56 to 75 tokens, so this is short-decode throughput), one warmup pass discarded, median of 3 per-pass pooled rates, decode timed from the first generated token so prompt processing is excluded; the reference arm ran first and last and drifted 0.10%. This is a ratio against the 8-bit reference, not against the full-precision model, and it holds for this host, build and prompt set only."
+        }
+      },
+      "rawMetrics": {
+        "n": 9481,
+        "disagreements": 246,
+        "disagreement_rate": 0.025946630102309885,
+        "tier": "NOTICEABLE",
+        "wilson_lo": 0.022933497620694288,
+        "wilson_hi": 0.02934375561262913,
+        "tv_lower_bound_median": 0.004785237525094188,
+        "tv_lower_bound_p95": 0.1121749694285864,
+        "tv_lower_bound_raw_min": -1.7336268522960552e-06,
+        "kl_lower_bound_median_nats": 0.000923664020737891,
+        "kl_lower_bound_p95_nats": 0.03649652412743429
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "forced greedy trajectory from an 8-bit conversion (8-bit experts, projections and n-gram table) of the official BF16 weights, made with the serving engine's own converter; candidate top-1 compared by token text, resynced at each disagreement; top-20 logprobs; one server at a time with identical binary and flags; the reference trajectory was saved and replayed",
+        "confound": "the 8-bit reference is not the full-precision model (token embeddings stay 4-bit in it); it shares a converter with both candidates, so a defect common to all arms would not show; TV/KL are lower bounds, weakened at 22.5% of positions here, so a small value is a floor, not closeness. Controls on this build and corpus: self-replay 0/9993 (card-C4.json); the verdict uses this corpus alone, and an earlier run on the original corpus on this same build (2.43%, interval straddling 2%) is not pooled; the two cards for this pack use different corpora, so their rates are not a like-for-like build comparison. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M3 Ultra / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-B1.json",
+        "measuredAt": "2026-09-28T09:09:17Z",
+        "engineBuild": {
+          "commit": "1745ffe89e4670f1e0c6de22c75a9875b27399de"
+        }
+      },
+      "boundary": {
+        "scope": "an 8-bit-reference comparison for one pack of one model at short context on one hardware class; the fastmlx serve launcher refuses this pack unless opted in when the model's pinned revision matches hfPin; the in-tree Swift server resolves this card by hfPin too, but only when the pinned revision is supplied as --model-revision; it has no pull-receipt fallback, so a launch that omits that flag resolves no card and admits unmeasured",
+        "unmeasured": [
+          "perplexity delta"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-8b-4bit@m5",
+      "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-4bit",
+        "hfPin": "545dc425"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m5",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 6.24% top-1 disagreement (93.76% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 16 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 16,
+          "top1AgreementPct": 93.7598
+        },
+        "regressionFocus": "step-by-step reasoning and list generation drift most (8.3-8.5% next-word drift); technical explanations drift least (3.9%)",
+        "example": {
+          "status": "measured",
+          "prompt": "explain how a Bloom filter works,",
+          "referenceOutput": " right",
+          "configOutput": " especially",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026explain how a Bloom filter works,', the peer pack picks ' right' and this pack picks ' especially'."
+        },
+        "benefit": {
+          "fit": "4.3 GB on disk; served at 4.7 GB MLX peak with 4096 context on a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 10240,
+        "disagreements": 639,
+        "disagreement_rate": 0.06240234375,
+        "tier": "NOTICEABLE",
+        "wilson_lo": 0.057879478496583835,
+        "wilson_hi": 0.06725340880683447,
+        "tv_lower_bound_median": 0.0008732107969615099,
+        "tv_lower_bound_p95": 0.31862037232232987,
+        "tv_lower_bound_raw_min": -1.7890460937142194e-06,
+        "kl_lower_bound_median_nats": 0.00041862628335370255,
+        "kl_lower_bound_p95_nats": 0.32325223689326155
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M5 / 24 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "peer-divergence-qwen3-8b-4bit-vs-8bit-2026-09-30.json",
+        "measuredAt": "2026-09-30T12:38:31Z",
+        "engineBuild": {
+          "commit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d"
+        }
+      },
+      "boundary": {
+        "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-8b-6bit@m5",
+      "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-6bit",
+        "hfPin": "35a99712"
+      },
+      "config": {
+        "quant": {
+          "bits": 6,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m5",
+        "residency": "resident"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "peer-divergence measured 1.58% top-1 disagreement (98.42% agreement) against the peer pack; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 63 differs from what the peer pack would say (teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5).",
+        "nextWordDrift": {
+          "oneInK": 63,
+          "top1AgreementPct": 98.418
+        },
+        "regressionFocus": "list generation drifts most (2.2% next-word drift); technical explanations drift least (0.7%)",
+        "example": {
+          "status": "measured",
+          "prompt": "and what happens when the cache",
+          "referenceOutput": " becomes",
+          "configOutput": " is",
+          "note": "Teacher-forced on the peer pack's own text: after '\u2026and what happens when the cache', the peer pack picks ' becomes' and this pack picks ' is'."
+        },
+        "benefit": {
+          "fit": "6.2 GB on disk; served at 6.8 GB MLX peak with 4096 context on a 24 GB Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "n": 10240,
+        "disagreements": 162,
+        "disagreement_rate": 0.0158203125,
+        "tier": "NEGLIGIBLE",
+        "wilson_lo": 0.013578710068953394,
+        "wilson_hi": 0.01842505142409458,
+        "tv_lower_bound_median": 0.00010720409079012505,
+        "tv_lower_bound_p95": 0.09836660000785023,
+        "tv_lower_bound_raw_min": -1.9254409648894466e-06,
+        "kl_lower_bound_median_nats": 2.452076186024249e-05,
+        "kl_lower_bound_p95_nats": 0.030298510534202693
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement against the 8-bit peer pack of the same model, chat-templated prompts, detail width 5",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. PEER-COMPARISON only, not a deploy verdict: this measures disagreement and rigorous lower bounds on divergence between two candidate packs of the same model; neither arm is a reference/teacher signal for the other, and this does not measure either arm's closeness to any external standard.",
+        "hardware": "Apple M5 / 24 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "peer-divergence-qwen3-8b-6bit-vs-8bit-2026-09-30.json",
+        "measuredAt": "2026-09-30T12:59:32Z",
+        "engineBuild": {
+          "commit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d"
+        }
+      },
+      "boundary": {
+        "scope": "consumer-class serving-admission quality signal for THIS build on THIS hardware class",
+        "unmeasured": [
+          "perplexity delta",
+          "decode throughput (speedX)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-8b-8bit@m3ultra",
+      "model": {
+        "family": "Qwen3-8B",
+        "repo": "mlx-community/Qwen3-8B-8bit",
+        "hfPin": "48a0b75b"
+      },
+      "config": {
+        "quant": {
+          "bits": 8,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "PASS",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "Near-lossless, default-eligible: top-1 99.20% (95% Wilson lower 99.01%), pooled teacher-forced ppl delta 0.1519% (bounds 0.0670% to 0.2368%) against the full-precision (BF16) build"
+      },
+      "legible": {
+        "tier": "Near-lossless",
+        "headline": "About 1 word in 125 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-8B-bf16@85dd0f16, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 125,
+          "top1AgreementPct": 99.1992
+        },
+        "regressionFocus": "list generation drifts most (1.2% next-word drift); code explanations drift least (0.3%). Drift grows with depth: tokens 1-32 of each answer agree 99.63%, tokens 33-64 agree 98.77%. A 256-token re-run found tokens 129-256 agree 98.80%, below the 99% line",
+        "example": {
+          "status": "measured",
+          "prompt": "They are databases that are stored in",
+          "referenceOutput": " multiple",
+          "configOutput": " different",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026They are databases that are stored in', the BF16 build picks ' multiple' and this pack picks ' different'."
+        },
+        "benefit": {
+          "fit": "8.1 GB on disk; served at 8.8 GB MLX peak with 4096 context (measured on the M3 Ultra host)",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 99.1992,
+        "top1WilsonLowerPct": 99.0072,
+        "top1WilsonUpperPct": 99.3543,
+        "pplDeltaPct": 0.151871,
+        "pplDeltaUpperPct": 0.236846,
+        "pplDeltaLowerPct": 0.066968,
+        "pplDeltaIsLowerBound": false,
+        "roundingBound": 0.0008480997770675458,
+        "unobservedLogprobs": 0,
+        "positions": 10240,
+        "disagreements": 82,
+        "candidatePpl": 1.1155142969580942,
+        "referencePpl": 1.1138227209843066,
+        "referenceRepo": "mlx-community/Qwen3-8B-bf16",
+        "referenceHfPin": "85dd0f16",
+        "referencePrecision": "bf16"
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-8B-bf16@85dd0f16, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated thinking pack: the measured 64 tokens are predominantly reasoning-phase, not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. Short-context result: the 95% Wilson lower bound on top-1 agreement (99.007%) clears the 99% line by 0.007 points, and agreement falls with depth (98.77% over tokens 33-64, Wilson [98.43%, 99.04%]). A 256-token re-run on the same build, host and corpus (2026-10-01) reproduced 99.19% over tokens 1-64 (Wilson [98.99%, 99.35%], on the 154 prompts it kept) and found 99.11% over tokens 65-128 (Wilson [98.90%, 99.28%]) and 98.80% over tokens 129-256 (Wilson [98.64%, 98.95%]). Overall it was 98.98% (Wilson [98.87%, 99.07%]), which neither clears nor fails 99%, with ppl delta 0.14% (bounds 0.01% to 0.27%). Near-lossless therefore rests on this card's 64-token measurement only, which clears 99% narrowly; it is not established for longer answers. In that run 6 of 160 prompts were skipped, 5 of them because the 8-bit pack stopped before the reference's trajectory ended, which biases its figures upward. Measured on the M3 Ultra only. A cross-host check on an Apple M5 (24 GiB, 2026-10-03; same build, pack, rig, corpus and BF16 trajectory, two byte-identical M5 runs) found the two hosts' 8-bit top-1 choices differ at 0.63% of positions (65 of 10240, Wilson [0.50%, 0.81%]), 61 of them near-ties within 0.25 nats. That hardware floor is close to this pack's own 0.80% drift from BF16, so the 99% line does not transfer across hardware classes. On the M5 the pack agreed with the BF16 trajectory 99.14% (Wilson [98.94%, 99.30%]) with ppl delta 0.17% (bounds 0.08% to 0.25%). Rig run_peer_divergence_cell.py sha256 01a5bbcf6c866c70\u2026, emitter emit_quality_card_teacher.py sha256 2b9c8d5ac65c552d\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-K8.json",
+        "measuredAt": "2026-10-01T01:47:53Z",
+        "engineBuild": {
+          "commit": "ee2274194afa01ad06ae0bf9e1fe0984ef48d20d"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: on an Apple M5 the same build and pack, teacher-forced on this card's BF16 trajectory, picked a different top-1 token than this host at 0.63% of positions (Wilson [0.50%, 0.81%]) and agreed with BF16 99.14% (Wilson [98.94%, 99.30%]), which neither clears nor fails 99%; short-context only: near-lossless rests on 64 new tokens per prompt (160 prompts, 4096 served context), clearing 99% by 0.007 points; over 256 new tokens it is not established (top-1 98.98%, Wilson [98.87%, 99.07%]; tokens 129-256 98.80%)",
+        "measuredNewTokens": 64,
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+      }
+    },
+    {
+      "id": "qwen3-14b-8bit@m3ultra",
+      "model": {
+        "family": "Qwen3-14B",
+        "repo": "mlx-community/Qwen3-14B-8bit",
+        "hfPin": "da33cf28"
+      },
+      "config": {
+        "quant": {
+          "bits": 8,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "PASS",
+      "admission": {
+        "default": true,
+        "optIn": true,
+        "reason": "Near-lossless, default-eligible: top-1 99.44% (95% Wilson lower 99.27%), pooled teacher-forced ppl delta 0.1384% (bounds 0.0509% to 0.2260%) against the full-precision (BF16) build"
+      },
+      "legible": {
+        "tier": "Near-lossless",
+        "headline": "About 1 word in 180 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-14B-bf16@1ccfce3b, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 180,
+          "top1AgreementPct": 99.4442
+        },
+        "regressionFocus": "list generation drifts most over the first 64 tokens (0.78% next-word drift); code explanations drift least (0.39%). Drift grows with depth: tokens 1-32 agree 99.66%, tokens 33-64 agree 99.22%, tokens 65-128 agree 98.90% (Wilson upper 99.09%). Over 256 tokens step-by-step reasoning drifts most (1.38%)",
+        "example": {
+          "status": "measured",
+          "prompt": "combines them back into a sorted order. Let me think about this step by step",
+          "referenceOutput": ".",
+          "configOutput": ".\n\n",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026combines them back into a sorted order. Let me think about this step by step', the BF16 build picks '.' and this pack picks '.\n\n'."
+        },
+        "benefit": {
+          "fit": "15.7 GB on disk; MLX peak 15.8 GB after the startup prompt (measured on the M3 Ultra host). Does not fit a 24 GiB Mac: the engine's modeled peak at 4096 context is 19.74 GiB (14.61 GiB weights), above a 24 GiB M5's 17.76 GiB Metal working set; plan on a 32 GB or larger Mac",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 99.4442,
+        "top1WilsonLowerPct": 99.2738,
+        "top1WilsonUpperPct": 99.5748,
+        "pplDeltaPct": 0.1384,
+        "pplDeltaUpperPct": 0.225985,
+        "pplDeltaLowerPct": 0.050892,
+        "pplDeltaIsLowerBound": false,
+        "roundingBound": 0.0008742560330940873,
+        "unobservedLogprobs": 0,
+        "positions": 9536,
+        "disagreements": 53,
+        "candidatePpl": 1.119180024086542,
+        "referencePpl": 1.117633215216303,
+        "referenceRepo": "mlx-community/Qwen3-14B-bf16",
+        "referenceHfPin": "1ccfce3b",
+        "referencePrecision": "bf16",
+        "maxNewTokensFilter": 64,
+        "unfilteredPositions": 37945
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Qwen3-14B-bf16@1ccfce3b, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated thinking pack: all 64 measured tokens per prompt are reasoning-phase (in every measured prompt thinking continues well past token 64), not final answer text. Both arms are measured in the identical regime, so the comparison is sound, but this is not drift over user-visible answer prose. One 256-token run (2026-10-07) authored this card from its first 64 tokens per prompt, a scope fixed before the run; its overall 256-token figure neither clears nor fails 99%, so near-lossless is not established for longer answers. 11 of 160 prompts were skipped because the 8-bit pack stopped before the BF16 trajectory ended (9 summarization, 2 instruction-following), so summarization is under-sampled and those positions are unmeasured, which biases agreement upward. Each skipped prompt holds at least one divergence (the early stop itself); even if all 11 fell in tokens 1-64 the Wilson lower bound would be 99.20%, and the 64-token result would fall below 99% only if the 704 missing positions held 30 or more disagreements (4.3%, about 7.7 times the observed rate). Summarization's 64-token figure rests on 15 of its 24 prompts. Prompt clustering does not move the result (design effect 1.00; prompt-clustered lower bound 99.29%). Measured on the v0.1.11 engine; on that engine the Qwen3-8B 8-bit card's observations (82/10240) reproduced byte-identically. Rig sha256 prefix 01a5bbcf6c866c70, emitter emit_quality_card_teacher.py sha256 416bcec54b4ff1de\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-K8.json",
+        "measuredAt": "2026-10-07T04:56:32Z",
+        "engineBuild": {
+          "commit": "fa44eb086d4a4ef0543aa9d64459685b1fc850cf"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: for the Qwen3-8B 8-bit pack an Apple M5 picked a different top-1 token than the M3 Ultra at 0.63% of positions, larger than this card's 0.27-point margin; short-context only: near-lossless rests on the first 64 new tokens per prompt (149 of 160 prompts, 4096 served context), clearing 99% by 0.27 points; over 256 new tokens it is not established (top-1 99.07%, Wilson [98.97%, 99.17%]; tokens 65-128 98.90%, Wilson [98.67%, 99.09%]; tokens 129-256 98.98%, Wilson [98.82%, 99.11%])",
+        "measuredNewTokens": 64,
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+      }
+    },
+    {
+      "id": "mistral-nemo-12b-4bit@m3ultra",
+      "model": {
+        "family": "Mistral-Nemo-12B",
+        "repo": "mlx-community/Mistral-Nemo-Instruct-2407-4bit",
+        "hfPin": "647ca075"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "top-1 91.92% (95% Wilson lower 91.35%), pooled teacher-forced ppl delta 5.9007% (bounds 5.7039% to unbounded) against the full-precision (BF16) build; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 12 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Mistral-Nemo-Instruct-2407-bf16@ff5dcad4, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 12,
+          "top1AgreementPct": 91.9156
+        },
+        "regressionFocus": "instruction-following drifts most over the first 64 tokens (11.31% next-word drift), with summarization close behind (11.26%); code explanations drift least (4.69%). Drift grows only slowly with depth and stays far from the 99% line: tokens 1-32 agree 92.18%, tokens 33-64 agree 91.62%, tokens 65-128 agree 91.57%, tokens 129-256 agree 91.21% (Wilson upper 91.65%). Over 256 tokens instruction-following still drifts most (11.85%) and code explanations least (5.01%); overall top-1 agreement is 91.50% (Wilson [91.20%, 91.80%])",
+        "example": {
+          "status": "measured",
+          "prompt": "A Bloom filter is a probabilistic data structure that",
+          "referenceOutput": " is",
+          "configOutput": " can",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026A Bloom filter is a probabilistic data structure that', the BF16 build picks ' is' and this pack picks ' can'."
+        },
+        "benefit": {
+          "fit": "6.9 GB on disk; MLX peak 6.99 GB after the startup prompt (measured on the M3 Ultra host). Fits a 24 GiB Mac: the engine's modeled peak at 4096 context is 11.54 GiB (6.42 GiB weights), below a 24 GiB M5's 17.76 GiB Metal working set",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 91.9156,
+        "top1WilsonLowerPct": 91.3495,
+        "top1WilsonUpperPct": 92.4476,
+        "pplDeltaPct": 5.900669,
+        "pplDeltaUpperPct": null,
+        "pplDeltaLowerPct": 5.70394,
+        "pplDeltaIsLowerBound": true,
+        "roundingBound": 0.0018593962022685753,
+        "unobservedLogprobs": 6,
+        "positions": 9475,
+        "disagreements": 766,
+        "candidatePpl": 1.3056074409269174,
+        "referencePpl": 1.232860431248934,
+        "referenceRepo": "mlx-community/Mistral-Nemo-Instruct-2407-bf16",
+        "referenceHfPin": "ff5dcad4",
+        "referencePrecision": "bf16",
+        "maxNewTokensFilter": 64,
+        "unfilteredPositions": 33111
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Mistral-Nemo-Instruct-2407-bf16@ff5dcad4, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated instruct pack (the [INST] template with a BOS token): the measured tokens are answer text, not a reasoning phase. Both arms are measured in the identical regime, so the comparison is sound. Scored with EOS decisions visible (`ignore_eos` instrument, rig `d3a81119`) on the BF16 trajectory recorded 2026-10-07; a byte-identical 8-bit bridge re-run showed the environment unchanged. At all 25 BF16 end-of-sequence positions in tokens 1-64 (38 of 38 over 256 tokens) the 4-bit pack also picks `</s>`, and it never picks `</s>` anywhere else, so end-of-sequence decisions are not a source of the drift. One 256-token run (2026-10-07) authored this card from its first 64 tokens per prompt, a scope fixed before the run; its overall figure gives the same verdict: top-1 91.50% (Wilson [91.20%, 91.80%], 33111 positions). 4 of 160 prompts were skipped because the server tokenized a forced trajectory prefix differently than the BF16 trajectory implied (1 code explanation, 1 factual recall, 2 instruction-following), so those positions are unmeasured; even if all 256 of their first-64-token positions had been agreements, the 64-token Wilson upper bound would be 92.65%, far below 99%. Prompt clustering widens the interval but does not change the result (design effect 1.71; prompt-clustered 95% interval 91.17% to 92.61%). 6 of the 9475 logprobs in tokens 1-64 (33 of 33111 over 256 tokens) are unobserved, the BF16 token falling outside the 4-bit pack's top-5 (none at an end-of-sequence position), so the perplexity delta is a lower bound: +5.90% at the point estimate, at least +5.70%. Measured on the v0.1.12 engine (build 449ff559); rig sha256 prefix d3a81119, emitter emit_quality_card_teacher.py sha256 416bcec54b4ff1de\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-K4.json",
+        "measuredAt": "2026-10-07T23:19:34Z",
+        "engineBuild": {
+          "commit": "449ff559582f82265049ee01e8d7505b807bdb9e"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: for the Qwen3-8B 8-bit pack an Apple M5 picked a different top-1 token than the M3 Ultra at 0.63% of positions, so another class is unmeasured even though that floor is small next to the 6.6 points between this card's Wilson upper bound (92.45%) and 99%; short-context only: the verdict rests on the first 64 new tokens per prompt (156 of 160 prompts, 4096 served context); over 256 new tokens top-1 is 91.50% (Wilson [91.20%, 91.80%]; tokens 65-128 91.57%, Wilson [90.95%, 92.15%]; tokens 129-256 91.21%, Wilson [90.75%, 91.65%])",
+        "measuredNewTokens": 64,
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+      }
+    },
+    {
+      "id": "llama-3p2-3b-4bit@m3ultra",
+      "model": {
+        "family": "Llama-3.2-3B",
+        "repo": "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        "hfPin": "7f0dc925"
+      },
+      "config": {
+        "quant": {
+          "bits": 4,
+          "groupSize": 64,
+          "mixedBit": false,
+          "note": null
+        },
+        "enhancement": "none",
+        "hardwareClass": "apple-m3-ultra"
+      },
+      "verdict": "NO_GO",
+      "admission": {
+        "default": false,
+        "optIn": true,
+        "reason": "top-1 93.20% (95% Wilson lower 92.69%), pooled teacher-forced ppl delta 3.1036% (bounds 2.9118% to unbounded) against the full-precision (BF16) build; opt-in only, not a silent default"
+      },
+      "legible": {
+        "tier": "Noticeable",
+        "headline": "About 1 word in 15 differs from what the full-precision (BF16) build would say (teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Llama-3.2-3B-Instruct-bf16@6d88ba43, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494).",
+        "nextWordDrift": {
+          "oneInK": 15,
+          "top1AgreementPct": 93.1975
+        },
+        "regressionFocus": "technical explanation drifts most over the first 64 tokens (8.63% next-word drift), with instruction-following (8.59%) and summarization (8.50%) essentially tied behind it; code explanations drift least (4.82%). Drift does not grow with depth and stays far from the 99% line: tokens 1-32 agree 93.91%, tokens 33-64 agree 92.49%, tokens 65-128 agree 93.46%, tokens 129-256 agree 93.30% (Wilson upper 93.68%). Over 256 tokens summarization drifts most (8.36%, instruction-following 8.33%) and code explanations least (4.52%); overall top-1 agreement is 93.31% (Wilson [93.04%, 93.57%])",
+        "example": {
+          "status": "measured",
+          "prompt": "A Bloom filter is a space-efficient probabilistic data structure",
+          "referenceOutput": ",",
+          "configOutput": " that",
+          "note": "Teacher-forced on the full-precision (BF16) build's own text: after '\u2026A Bloom filter is a space-efficient probabilistic data structure', the BF16 build picks ',' and this pack picks ' that'."
+        },
+        "benefit": {
+          "fit": "1.8 GB on disk; MLX peak 1.97 GB after the startup prompt (measured on the M3 Ultra host). Fits a 24 GiB Mac: the engine's modeled peak at 4096 context is 5.87 GiB (1.68 GiB weights), below a 24 GiB M5's 17.76 GiB Metal working set",
+          "speedX": null,
+          "speedXStatus": "not-measured-on-this-engine"
+        }
+      },
+      "rawMetrics": {
+        "top1AgreementPct": 93.1975,
+        "top1WilsonLowerPct": 92.6913,
+        "top1WilsonUpperPct": 93.671,
+        "pplDeltaPct": 3.103608,
+        "pplDeltaUpperPct": null,
+        "pplDeltaLowerPct": 2.911847,
+        "pplDeltaIsLowerBound": true,
+        "roundingBound": 0.0018616202557842712,
+        "unobservedLogprobs": 5,
+        "positions": 10158,
+        "disagreements": 691,
+        "candidatePpl": 1.2886169272338908,
+        "referencePpl": 1.2498271874310507,
+        "referenceRepo": "mlx-community/Llama-3.2-3B-Instruct-bf16",
+        "referenceHfPin": "6d88ba43",
+        "referencePrecision": "bf16",
+        "maxNewTokensFilter": 64,
+        "unfilteredPositions": 34759
+      },
+      "provenance": {
+        "source": "fast-mlx-measured",
+        "vendor": null,
+        "method": "teacher-forced top-1 agreement and pooled perplexity delta against the full-precision (BF16) reference build mlx-community/Llama-3.2-3B-Instruct-bf16@6d88ba43, over the reference's own greedy trajectory on corpus peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "confound": "chat-templated instruct pack (the Llama 3.2 chat template with its system header carrying the fallback date 26 Jul 2024; the engine supplies the BOS token): the measured tokens are answer text, not a reasoning phase. Both arms are measured in the identical regime, so the comparison is sound. The reference is the BF16 build (mlx-community conversion; the official repository is gated, so its tensors were not checked against it). Scored with EOS decisions visible (`ignore_eos` instrument, rig `d3a81119`) on a BF16 trajectory recorded 2026-10-15 in the same run, on the same host and engine build; a BF16 self-replay of that trajectory gave 0 disagreements in 35015 positions, so the environment did not drift. At all 4 BF16 end-of-sequence positions in tokens 1-64 (41 of 41 over 256 tokens) the 4-bit pack also picks `<|eot_id|>`, and it never picks it anywhere else, so end-of-sequence decisions are not a source of the drift. One 256-token run (2026-10-15) authored this card from its first 64 tokens per prompt, a scope fixed before the run; its overall figure gives the same verdict: top-1 93.31% (Wilson [93.04%, 93.57%], 34759 positions). 1 of 160 prompts was skipped because the server tokenized a forced trajectory prefix differently than the BF16 trajectory implied (1 technical explanation), so those positions are unmeasured; even if all 64 of its first-64-token positions had been agreements, the 64-token Wilson upper bound would be 93.71%, far below 99%. Prompt clustering widens the interval but does not change the result (design effect 1.19; prompt-clustered 95% interval 92.64% to 93.71%). 5 of the 10158 logprobs in tokens 1-64 (28 of 34759 over 256 tokens) are unobserved, the BF16 token falling outside the 4-bit pack's top-5 (none at an end-of-sequence position), so the perplexity delta is a lower bound: +3.10% at the point estimate, at least +2.91%. Measured on the v0.1.16 engine (build 0c9b2f33); rig sha256 prefix d3a81119, emitter emit_quality_card_teacher.py sha256 416bcec54b4ff1de\u2026. Perplexity is pooled teacher-forced over the full-precision (BF16) reference's own greedy trajectory, not natural text; that favors the reference. Logprobs are served bf16-rounded values (bounded by a 2^-8 relative rounding bound) and only the top-5 are observed.",
+        "hardware": "Apple M3 Ultra / 256 GiB / macOS 26.7",
+        "harnessGitSHA": null,
+        "corpusId": "peer-divergence-corpus-b sha256:b95b1ec3bf31ce9282d0edcf86dd48d9eb5e6d996f195efe92be1ef2dfd05494",
+        "sourceVerdict": "card-L4.json",
+        "measuredAt": "2026-10-15T21:34:32Z",
+        "engineBuild": {
+          "commit": "0c9b2f33db1d257cc5e9c060cd49c95c5423b718"
+        }
+      },
+      "boundary": {
+        "scope": "serving-admission quality signal for THIS build, measured on the Apple M3 Ultra class only, and not evidence for any other class: for the Qwen3-8B 8-bit pack an Apple M5 picked a different top-1 token than the M3 Ultra at 0.63% of positions, so another class is unmeasured even though that floor is small next to the 5.3 points between this card's Wilson upper bound (93.67%) and 99%; short-context only: the verdict rests on the first 64 new tokens per prompt (159 of 160 prompts, 4096 served context); over 256 new tokens top-1 is 93.31% (Wilson [93.04%, 93.57%]; tokens 65-128 93.46%, Wilson [92.93%, 93.96%]; tokens 129-256 93.30%, Wilson [92.90%, 93.68%])",
+        "measuredNewTokens": 64,
+        "unmeasured": [
+          "decode throughput (speedX)",
+          "perplexity on natural text (ppl here is teacher-forced over the reference's own greedy trajectory)"
+        ]
+      }
+    }
+  ]
+}

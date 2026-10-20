@@ -2534,6 +2534,60 @@
    "expect": {
     "card": "card-a@hw1"
    }
+  },
+  {
+   "id": "sibling-on-host-class-hides-the-unique-host-match",
+   "why": "Two NO_GO cards on the host class (a revised sibling beside the original) plus one on another class: the host matches two cards, so it is not unique and does not narrow, and the lowest id of the whole pool (the other-class card) wins on every engine build. Adding the same-class sibling therefore changes the card a host used to resolve uniquely.",
+   "repo": "org/pack-a",
+   "revision": null,
+   "hostHardwareClass": "apple-m5",
+   "cards": [
+    {
+     "id": "pack-a@m5",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for pack-a@m5"
+     },
+     "config": {
+      "hardwareClass": "apple-m5"
+     }
+    },
+    {
+     "id": "pack-a@m5-v2",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for pack-a@m5-v2"
+     },
+     "config": {
+      "hardwareClass": "apple-m5"
+     }
+    },
+    {
+     "id": "pack-a@m3ultra",
+     "model": {
+      "repo": "org/pack-a"
+     },
+     "verdict": "NO_GO",
+     "legible": {
+      "tier": "tier-NO_GO",
+      "headline": "headline for pack-a@m3ultra"
+     },
+     "config": {
+      "hardwareClass": "apple-m3-ultra"
+     }
+    }
+   ],
+   "expect": {
+    "card": "pack-a@m3ultra"
+   }
   }
  ]
 }

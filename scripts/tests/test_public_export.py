@@ -320,9 +320,15 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # gate that keeps the tool-call parser out of the reasoning block. Conscious decision to publish: read in full; they hold
 # only the gate and synthetic chunk strings, name no model family, host, credential or machine-local path, and the
 # projection validator's marker sweep passed on them.
+# 2026-10-19, 1050 -> 1052: adds scripts/tests/test_card_store_resolution_stability.py and
+# scripts/tests/fixtures/published-quality-guides-baseline.json, the publish-time gate that a published quality-card store
+# must not change the card any released binary resolves. Conscious decision to publish: read in full; the test holds only
+# the launcher's resolver pins, a pure-Python model of the engine's card selection and synthetic card edits, and the
+# fixture is a byte copy of the already-public site/quality-guides.json (sha256 d96156a2...); neither names a host,
+# credential or machine-local path, and the projection validator's marker sweep passed on them.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1050,
-    "pathModeSha256": "f2b7ada00036420102a4a1b2b9db4cf7d701e135411b67ca5b42825f300afa0b",
+    "pathCount": 1052,
+    "pathModeSha256": "840c9702820a1a6f9a7fc799b89a743377999a35297cc14c08e2fdbe8fa1b872",
 }
 
 
