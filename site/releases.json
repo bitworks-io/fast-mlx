@@ -16,6 +16,26 @@
   },
   "releases": [
     {
+      "id": "tagged-distribution-v0-1-23",
+      "title": "Publish v0.1.23: chat logprobs on the continuous-batch route, and the startup line names the default sampling preset",
+      "publishedAt": "2026-10-21T22:41:53Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.23 arm64 macOS distribution: the continuous-batch route now serves chat logprobs and top_logprobs, which it used to refuse with a 400. Each value is the log-probability from the model's raw output, before sampling transforms, penalties, logit_bias and the token mask, the same meaning as on the scalar route; a logprobs request decodes without speculation. Both serve routes now name the active default sampling preset on the startup line: default_sampling=off, or default_sampling=generation-config with the resolved temperature, top_p, top_k and min_p. The bundled quality-card store is unchanged from v0.1.22. Greedy output is identical to the development build on the release check prompts. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "e505002a38bf7aad32f0392be486b1ae9b7c38d2",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "tagged-distribution-v0-1-22",
       "title": "Publish v0.1.22: the continuous-batch route serves tool_choice, response_format, sampling, penalties and --default-sampling",
       "publishedAt": "2026-10-21T10:23:05Z",

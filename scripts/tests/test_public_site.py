@@ -395,27 +395,25 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-22",
-                "title": "Publish v0.1.22: the continuous-batch route serves tool_choice, response_format, sampling, penalties and --default-sampling",
-                "publishedAt": "2026-10-21T10:23:05Z",
+                "id": "tagged-distribution-v0-1-23",
+                "title": "Publish v0.1.23: chat logprobs on the continuous-batch route, and the startup line names the default sampling preset",
+                "publishedAt": "2026-10-21T22:41:53Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.22 arm64 macOS distribution: the "
-                    "continuous-batch route now serves the request fields it used to "
-                    "refuse with a 400: a named or \"required\" tool_choice and "
-                    "response_format json_object or json_schema, enforced by a "
-                    "per-request token mask; sampling with temperature above zero, "
-                    "top_p, top_k and seed; and presence, frequency and repetition "
-                    "penalties. --default-sampling generation-config now "
-                    "works on continuous launches, refusing fast when the pack has no "
-                    "readable generation_config.json. A request without these fields "
-                    "keeps the original decode steps and output. On "
-                    "--continuous-dynamic-pld these requests decode without "
-                    "speculation, and logprobs is still served only by the scalar "
-                    "route. The bundled quality-card store is unchanged from v0.1.21. "
-                    "Greedy output is identical to the development build on the "
-                    "release check prompts. The engine still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.23 arm64 macOS distribution: the "
+                    "continuous-batch route now serves chat logprobs and "
+                    "top_logprobs, which it used to refuse with a 400. Each value is "
+                    "the log-probability from the model's raw output, before "
+                    "sampling transforms, penalties, logit_bias and the token mask, "
+                    "the same meaning as on the scalar route; a logprobs request "
+                    "decodes without speculation. Both serve routes now name the "
+                    "active default sampling preset on the startup line: "
+                    "default_sampling=off, or default_sampling=generation-config "
+                    "with the resolved temperature, top_p, top_k and min_p. The "
+                    "bundled quality-card store is unchanged from v0.1.22. Greedy "
+                    "output is identical to the development build on the release "
+                    "check prompts. The engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -423,7 +421,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "c24d156965343ad42ceb36d03b97ac8204135914",
+                "publicCommit": "e505002a38bf7aad32f0392be486b1ae9b7c38d2",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -440,6 +438,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "e505002a38bf7aad32f0392be486b1ae9b7c38d2",
                 "c24d156965343ad42ceb36d03b97ac8204135914",
                 "18503a59cbf442b57f4c141bc6c7b969852fd749",
                 "96c7766077425f62b96ec779a008c86d8369e474",
