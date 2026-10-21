@@ -1,20 +1,38 @@
 import Foundation
 import XCTest
 
+import MLX
 import ServingCore
+import HarnessCore
 import SpikeCore
 @testable import SpikeServingAdapters
 
 /// Increment 2 of `docs/task-inbox/2026-09-09-default-sampling-params-DECISION.md`: wires
-/// `--default-sampling generation-config` into the SCALAR serve route only, fail-closed at load.
-/// Increment 1 (the pure resolver, `ServingSamplingPolicy.resolve(from:defaults:)`) is already
-/// covered by `ServingSamplingPolicyTests.swift`; this file covers the isolation invariant that
-/// keeps the default confined to the scalar route, and that the resolved defaults are genuinely
-/// APPLIED at admission, not merely accepted. It no longer covers a `.compiledFP16` load-time
+/// `--default-sampling generation-config` into the SCALAR serve route, fail-closed at load, and
+/// (cycle 278, `docs/task-inbox/2026-10-21-PREDECLARATION-default-sampling-on-the-continuous-route.md`)
+/// into the CONTINUOUS-batch route through the same resolver. `ExactQwen35MTP` is still deliberately
+/// not wired. Increment 1 (the pure resolver, `ServingSamplingPolicy.resolve(from:defaults:)`) is
+/// already covered by `ServingSamplingPolicyTests.swift`; this file covers that each wired route's
+/// backend configuration defaults to no sampling defaults, and that the resolved defaults are
+/// genuinely APPLIED at admission, not merely accepted. The production call-site wiring itself is
+/// pinned by `DefaultSamplingContinuousWiringStructuralTests.swift`. It no longer covers a `.compiledFP16` load-time
 /// refusal — `scalarServingDefaultSamplingDecoderStrategyError` was REMOVED once `.compiledFP16`
 /// became a `RouteSwitchingDecoder` whose general side genuinely supports sampling (see
 /// `RouteSwitchingDecoder`'s doc comment); that combination is now admitted, not refused.
 final class DefaultSamplingServeWiringTests: XCTestCase {
+
+    /// Snapshot the process-global MLX `Memory.memoryLimit` / `Memory.cacheLimit` and return a closure
+    /// restoring them. The load tests below that get PAST the generation-config guard execute
+    /// `Memory.memoryLimit = ...` / `Memory.cacheLimit = ...` before failing on the weight-less
+    /// fixture; restoring in `defer` keeps that from leaking into whichever test runs next.
+    private func captureProcessGlobalMemoryLimits() -> () -> Void {
+        let savedMemoryLimit = Memory.memoryLimit
+        let savedCacheLimit = Memory.cacheLimit
+        return {
+            Memory.memoryLimit = savedMemoryLimit
+            Memory.cacheLimit = savedCacheLimit
+        }
+    }
 
     // The guard-unit tests that used to live here (`scalarServingDefaultSamplingDecoderStrategyError`,
     // refusing `.generationConfig` + `.compiledFP16`) were REMOVED along with that function: once
@@ -189,6 +207,8 @@ final class DefaultSamplingServeWiringTests: XCTestCase {
     {
         let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
         defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        let restoreMemoryLimits = captureProcessGlobalMemoryLimits()
+        defer { restoreMemoryLimits() }
 
         let configuration = makeDefaultSamplingLoadConfiguration(
             modelDirectory: modelDirectory, defaultSampling: .off)
@@ -217,6 +237,8 @@ final class DefaultSamplingServeWiringTests: XCTestCase {
     func testLoadScalarServingModelWithValidGenerationConfigProceedsPastTheGuard() async throws {
         let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
         defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        let restoreMemoryLimits = captureProcessGlobalMemoryLimits()
+        defer { restoreMemoryLimits() }
         try """
             {"do_sample": true, "temperature": 1.0, "top_p": 0.95, "top_k": 20}
             """.write(
@@ -236,6 +258,167 @@ final class DefaultSamplingServeWiringTests: XCTestCase {
         } catch {
             // A non-ScalarServingModelLoadError thrown straight from `loadModel` is also an
             // acceptable pass for this control.
+        }
+    }
+
+    // MARK: - Continuous route (cycle 278): `loadContinuousServingModel` resolves the same artifact
+
+    /// D5(a): on the continuous route a missing `generation_config.json` is refused with the SAME
+    /// `.defaultSamplingGenerationConfigUnavailable(.unreadable)` the scalar load throws, AFTER the
+    /// architecture proof (the qwen3 fixture passes it) and BEFORE any weight load.
+    func testLoadContinuousServingModelRefusesMissingGenerationConfigArtifact() async throws {
+        let modelDirectory = try makeDenseContinuousModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+
+        let configuration = try makeDefaultSamplingContinuousLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .generationConfig)
+
+        do {
+            _ = try await loadContinuousServingModel(configuration: configuration)
+            XCTFail("expected loadContinuousServingModel to refuse a missing generation_config.json")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .defaultSamplingGenerationConfigUnavailable(.unreadable))
+        }
+    }
+
+    /// D5(b): `do_sample: false` is refused with `.samplingNotEnabled` (a different associated value
+    /// than (a)'s), proving the continuous load discriminates WHY the artifact is unusable.
+    func testLoadContinuousServingModelRefusesGenerationConfigWithSamplingDisabled() async throws {
+        let modelDirectory = try makeDenseContinuousModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        try """
+            {"do_sample": false, "temperature": 1.0}
+            """.write(
+                to: modelDirectory.appendingPathComponent("generation_config.json"),
+                atomically: true, encoding: .utf8)
+
+        let configuration = try makeDefaultSamplingContinuousLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .generationConfig)
+
+        do {
+            _ = try await loadContinuousServingModel(configuration: configuration)
+            XCTFail("expected loadContinuousServingModel to refuse do_sample: false")
+        } catch let error as ScalarServingModelLoadError {
+            XCTAssertEqual(error, .defaultSamplingGenerationConfigUnavailable(.samplingNotEnabled))
+        }
+    }
+
+    /// CONTROL for D5: the SAME fixture with `defaultSampling: .off` (no generation_config.json at
+    /// all) passes the proof AND skips the new check, so it fails later on its OWN account (no
+    /// weights) with something other than `.defaultSamplingGenerationConfigUnavailable`. Proves the
+    /// fixture really reaches the check (the proof accepts it) and that the check, not the fixture,
+    /// is what fired in D5. Uses realistic memory limits: reaching past the check mutates the
+    /// process-global `Memory.*` limits (see the scalar controls above).
+    func testLoadContinuousServingModelWithDefaultSamplingOffFailsLaterThanTheGuard() async throws {
+        let modelDirectory = try makeDenseContinuousModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        let restoreMemoryLimits = captureProcessGlobalMemoryLimits()
+        defer { restoreMemoryLimits() }
+
+        let configuration = try makeDefaultSamplingContinuousLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .off)
+
+        do {
+            _ = try await loadContinuousServingModel(configuration: configuration)
+            XCTFail("expected the weight-less fixture to fail the real model load")
+        } catch {
+            assertFailedPastTheGenerationConfigGuard(error)
+        }
+    }
+
+    /// CONTROL for D5, other direction: a VALID `generation_config.json` passes the guard and the load
+    /// fails later (no weights), never with `.defaultSamplingGenerationConfigUnavailable`.
+    func testLoadContinuousServingModelWithValidGenerationConfigProceedsPastTheGuard() async throws {
+        let modelDirectory = try makeDenseContinuousModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        let restoreMemoryLimits = captureProcessGlobalMemoryLimits()
+        defer { restoreMemoryLimits() }
+        try """
+            {"do_sample": true, "temperature": 0.6, "top_p": 0.95, "top_k": 20}
+            """.write(
+                to: modelDirectory.appendingPathComponent("generation_config.json"),
+                atomically: true, encoding: .utf8)
+
+        let configuration = try makeDefaultSamplingContinuousLoadConfiguration(
+            modelDirectory: modelDirectory, defaultSampling: .generationConfig)
+
+        do {
+            _ = try await loadContinuousServingModel(configuration: configuration)
+            XCTFail("expected the weight-less fixture to fail the real model load")
+        } catch {
+            assertFailedPastTheGenerationConfigGuard(error)
+        }
+    }
+
+    /// The load configuration's `defaultSampling` defaults to `.off` and survives validation.
+    func testContinuousServingModelLoadConfigurationDefaultSamplingDefaultsToOffAndSurvivesValidation()
+        throws
+    {
+        let off = try makeDefaultSamplingContinuousLoadConfiguration(
+            modelDirectory: URL(fileURLWithPath: "/tmp"), defaultSampling: nil)
+        XCTAssertEqual(off.defaultSampling, .off)
+
+        let on = try validateContinuousServingModelLoadConfiguration(
+            try makeDefaultSamplingContinuousLoadConfiguration(
+                modelDirectory: URL(fileURLWithPath: "/tmp"), defaultSampling: .generationConfig))
+        XCTAssertEqual(on.defaultSampling, .generationConfig)
+    }
+
+    /// `ContinuousServingBackendConfiguration.samplingDefaults` defaults to `nil`.
+    func testContinuousServingBackendConfigurationSamplingDefaultsDefaultsToNil() {
+        let configuration = ContinuousServingBackendConfiguration(
+            defaultMaximumCompletionTokens: 8,
+            queueRetryAfterSeconds: 1,
+            mailboxCapacity: .init(maxDeltas: 2, maxBytes: 4_096))
+        XCTAssertNil(configuration.samplingDefaults)
+    }
+
+    // MARK: - The shared helper both routes call (`resolveServingDefaultSampling`)
+
+    /// `.off` never reads the artifact: nil even when the directory has no `generation_config.json`.
+    func testResolveServingDefaultSamplingOffReturnsNilWithoutReadingTheArtifact() throws {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        XCTAssertNil(try resolveServingDefaultSampling(.off, modelDirectory: modelDirectory))
+    }
+
+    /// `.generationConfig` returns the artifact's sampling subset.
+    func testResolveServingDefaultSamplingGenerationConfigReturnsTheArtifactDefaults() throws {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        try """
+            {"do_sample": true, "temperature": 0.6, "top_p": 0.95, "top_k": 20}
+            """.write(
+                to: modelDirectory.appendingPathComponent("generation_config.json"),
+                atomically: true, encoding: .utf8)
+        XCTAssertEqual(
+            try resolveServingDefaultSampling(.generationConfig, modelDirectory: modelDirectory),
+            ServingSamplingDefaults(temperature: 0.6, topP: 0.95, topK: 20, minP: nil))
+    }
+
+    /// `.generationConfig` fails closed on every unusable artifact, wrapped as the ONE machine-readable
+    /// load error both routes share.
+    func testResolveServingDefaultSamplingGenerationConfigFailsClosed() throws {
+        let modelDirectory = try makeEmptyDefaultSamplingModelDirectory()
+        defer { try? FileManager.default.removeItem(at: modelDirectory) }
+        XCTAssertThrowsError(
+            try resolveServingDefaultSampling(.generationConfig, modelDirectory: modelDirectory)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .defaultSamplingGenerationConfigUnavailable(.unreadable))
+        }
+        try """
+            {"do_sample": false, "temperature": 1.0}
+            """.write(
+                to: modelDirectory.appendingPathComponent("generation_config.json"),
+                atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(
+            try resolveServingDefaultSampling(.generationConfig, modelDirectory: modelDirectory)
+        ) { error in
+            XCTAssertEqual(
+                error as? ScalarServingModelLoadError,
+                .defaultSamplingGenerationConfigUnavailable(.samplingNotEnabled))
         }
     }
 }
@@ -284,6 +467,70 @@ private func makeEmptyDefaultSamplingModelDirectory() throws -> URL {
         .appendingPathComponent("default-sampling-guard-a-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
     return directory
+}
+
+/// A model directory whose `config.json` passes `DenseContinuousBatchModelProof.verifying` (a dense
+/// `qwen3` config) but holds NO weights or tokenizer, so a continuous load that gets past the
+/// `generation_config.json` guard fails on its own account at the real model load.
+private func makeDenseContinuousModelDirectory() throws -> URL {
+    let directory = try makeEmptyDefaultSamplingModelDirectory()
+    try Data(#"""
+        {"model_type":"qwen3","max_position_embeddings":32768,"vocab_size":2048,
+         "num_hidden_layers":2,"num_key_value_heads":2,"head_dim":16,"torch_dtype":"bfloat16"}
+        """#.utf8)
+        .write(to: directory.appendingPathComponent("config.json"))
+    return directory
+}
+
+/// A control's failure must have come from PAST the guard: not the guard's own error, and not a
+/// proof error either (a proof error would mean the fixture never reached the guard, which would
+/// make the D5 refusals and these controls vacuous).
+private func assertFailedPastTheGenerationConfigGuard(
+    _ error: Error, file: StaticString = #filePath, line: UInt = #line
+) {
+    if case .defaultSamplingGenerationConfigUnavailable? = error as? ScalarServingModelLoadError {
+        XCTFail("the generation_config guard fired unexpectedly: \(error)", file: file, line: line)
+    }
+    XCTAssertFalse(
+        error is DenseContinuousBatchRuntimeError,
+        "the fixture must pass the architecture proof to reach the guard; got \(error)",
+        file: file, line: line)
+}
+
+/// Continuous-route load configuration with realistic (8 GiB / 1 GiB) limits for the same reason as
+/// `makeDefaultSamplingLoadConfiguration`. `defaultSampling: nil` omits the argument entirely (to
+/// exercise the init default).
+private func makeDefaultSamplingContinuousLoadConfiguration(
+    modelDirectory: URL,
+    defaultSampling: FastMLXServeDefaultSampling?
+) throws -> ContinuousServingModelLoadConfiguration {
+    let coordinator = try ContinuousBatchConfiguration(
+        maxActiveSlots: 1, maxPrefillSlots: 1, prefillChunkSize: 128, maxQueuedRequests: 1)
+    let backend = ContinuousServingBackendConfiguration(
+        defaultMaximumCompletionTokens: 8,
+        queueRetryAfterSeconds: 1,
+        mailboxCapacity: .init(maxDeltas: 2, maxBytes: 4_096))
+    guard let defaultSampling else {
+        return ContinuousServingModelLoadConfiguration(
+            launchedModel: "fixture-model",
+            modelDirectory: modelDirectory,
+            memoryLimitBytes: 8 * 1024 * 1024 * 1024,
+            cacheLimitBytes: 1 * 1024 * 1024 * 1024,
+            maxReservedKVBytes: 1 * 1024 * 1024 * 1024,
+            coordinatorConfiguration: coordinator,
+            publicationCapacity: 1,
+            backendConfiguration: backend)
+    }
+    return ContinuousServingModelLoadConfiguration(
+        launchedModel: "fixture-model",
+        modelDirectory: modelDirectory,
+        memoryLimitBytes: 8 * 1024 * 1024 * 1024,
+        cacheLimitBytes: 1 * 1024 * 1024 * 1024,
+        maxReservedKVBytes: 1 * 1024 * 1024 * 1024,
+        coordinatorConfiguration: coordinator,
+        publicationCapacity: 1,
+        backendConfiguration: backend,
+        defaultSampling: defaultSampling)
 }
 
 /// Builds a `ScalarServingModelLoadConfiguration` for the guard (A) call-site tests. Memory/cache

@@ -130,29 +130,47 @@ final class DefaultSamplingServeArgumentTests: XCTestCase {
         XCTAssertTrue(arguments.quantPickOnly)
     }
 
-    // MARK: - Refusal 3: continuous batching
+    // MARK: - Continuous batching (refusal lifted, cycle 278)
 
-    /// Acceptance criterion 7 (load-bearing): --default-sampling generation-config combined with
-    /// --continuous-batch-no-spec throws the SPECIFIC .defaultSamplingWithContinuousBatch error.
-    func testDefaultSamplingWithContinuousBatchThrowsTheSpecificError() {
-        XCTAssertThrowsError(
-            try FastMLXServeArguments.parse([
-                "--continuous-batch-no-spec",
-                "--model-path", "/models/fixture",
-                "--model", "fixture",
-                "--memory-limit-bytes", "68719476736",
-                "--cache-limit-bytes", "8589934592",
-                "--max-reserved-kv-bytes", "4294967296",
-                "--default-sampling", "generation-config",
-            ])
-        ) { error in
-            XCTAssertEqual(
-                error as? FastMLXServeArgumentError,
-                .defaultSamplingWithContinuousBatch)
+    /// D1: --default-sampling generation-config parses with --continuous-batch-no-spec and carries
+    /// `.generationConfig`. The continuous-batch route resolves the checkpoint's defaults at load
+    /// (`loadContinuousServingModel`), so there is no parse-time refusal any more.
+    func testDefaultSamplingGenerationConfigParsesWithContinuousBatchNoSpec() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--continuous-batch-no-spec",
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--max-reserved-kv-bytes", "4294967296",
+            "--default-sampling", "generation-config",
+        ])
+
+        XCTAssertEqual(arguments.defaultSampling, .generationConfig)
+        guard case .continuousBatchNoSpec = arguments.backend else {
+            return XCTFail("expected the continuous-batch-no-spec backend, got \(String(describing: arguments.backend))")
         }
     }
 
-    /// Control for refusal 3: the identical continuous-batch command line with
+    /// D1: the same for --continuous-dynamic-pld.
+    func testDefaultSamplingGenerationConfigParsesWithContinuousDynamicPLD() throws {
+        let arguments = try FastMLXServeArguments.parse([
+            "--continuous-dynamic-pld",
+            "--model-path", "/models/fixture",
+            "--model", "fixture",
+            "--memory-limit-bytes", "68719476736",
+            "--cache-limit-bytes", "8589934592",
+            "--max-reserved-kv-bytes", "4294967296",
+            "--default-sampling", "generation-config",
+        ])
+
+        XCTAssertEqual(arguments.defaultSampling, .generationConfig)
+        guard case .continuousDynamicPLD = arguments.backend else {
+            return XCTFail("expected the continuous-dynamic-pld backend, got \(String(describing: arguments.backend))")
+        }
+    }
+
+    /// Control for the continuous-batch parse: the identical continuous-batch command line with
     /// --default-sampling off parses successfully.
     func testDefaultSamplingOffWithContinuousBatchParsesSuccessfully() throws {
         let arguments = try FastMLXServeArguments.parse([

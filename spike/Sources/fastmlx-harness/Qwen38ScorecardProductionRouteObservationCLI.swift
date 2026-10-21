@@ -873,6 +873,8 @@ private func qwen38ProductionRouteModelLoadConfiguration(
     target: URL
 ) throws -> ContinuousServingModelLoadConfiguration {
     let contextTokens = Int(arguments.contextTokens)
+    // This observation runs with `defaultSampling` at its `.off` default: it does not model
+    // `--default-sampling generation-config`, so param-less requests decode greedy here.
     return ContinuousServingModelLoadConfiguration(
         launchedModel: Qwen38MTPPerformanceScorecardGate.modelArtifactLabel,
         modelDirectory: target,

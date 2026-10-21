@@ -126,6 +126,14 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
     /// threaded into `DenseContinuousBatchModelProof.verifying` so the proof carries qwen3_5's
     /// config-hash-pinned `HybridCacheGeometry`, and the cache-layout validator admits `.recurrentState`.
     public let allowHybridQwen35: Bool
+    /// `--default-sampling` (`FastMLXServeArguments.defaultSampling`). `.generationConfig` makes the load
+    /// resolve `<modelDirectory>/generation_config.json` (shared with the scalar route:
+    /// `resolveServingDefaultSampling`) AFTER the architecture proof and BEFORE any `Memory.*` mutation
+    /// or weight load, failing closed with `ScalarServingModelLoadError.defaultSamplingGenerationConfigUnavailable`,
+    /// and forwards the result into `ContinuousServingBackendConfiguration.samplingDefaults`. Default
+    /// `.off`: no defaults, byte-for-byte the prior behavior. A pack the proof hands to the scalar
+    /// fallback gets the scalar route's own resolution (the executable forwards the flag there too).
+    public let defaultSampling: FastMLXServeDefaultSampling
 
     public init(
         launchedModel: String,
@@ -144,7 +152,8 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
         soloPLDPolicy: ContinuousServingSoloPLDPolicy? = nil,
         startupMessages: [OpenAIChatMessage] = Self.defaultStartupMessages,
         kvQuantTier: KVQuantTier = .fp16,
-        allowHybridQwen35: Bool = false
+        allowHybridQwen35: Bool = false,
+        defaultSampling: FastMLXServeDefaultSampling = .off
     ) {
         self.launchedModel = launchedModel
         self.modelDirectory = modelDirectory
@@ -163,6 +172,7 @@ public struct ContinuousServingModelLoadConfiguration: Sendable {
         self.startupMessages = startupMessages
         self.kvQuantTier = kvQuantTier
         self.allowHybridQwen35 = allowHybridQwen35
+        self.defaultSampling = defaultSampling
     }
 }
 
@@ -437,6 +447,14 @@ public func loadContinuousServingModel(
             hybridGeometry.recurrent.keyHeadDim)
     }
 
+    // `--default-sampling generation-config`: resolve the checkpoint's sampling defaults HERE, through
+    // the SAME helper the scalar load uses -- after the proof and Dk guard above, BEFORE any `Memory.*`
+    // process-global mutation or weight load, so a missing/unparseable/`do_sample:false`/out-of-range
+    // `generation_config.json` fails in milliseconds with the shared
+    // `defaultSamplingGenerationConfigUnavailable` refusal. `nil` unless `.generationConfig`.
+    let defaultSamplingDefaults = try resolveServingDefaultSampling(
+        configuration.defaultSampling, modelDirectory: configuration.modelDirectory)
+
     Memory.memoryLimit = configuration.memoryLimitBytes
     Memory.cacheLimit = configuration.cacheLimitBytes
     Memory.clearCache()
@@ -534,6 +552,10 @@ public func loadContinuousServingModel(
         tokenizer: context.tokenizer)
     backendConfiguration.jsonSchemaConstraintSupport = loadScalarServingJSONSchemaConstraintSupport(
         sharing: backendConfiguration.jsonObjectConstraintSupport)
+    // Request-time sampling defaults (`nil` unless `--default-sampling generation-config` resolved
+    // above). Applied only where `ContinuousServingBackend.start` resolves a request's policy; the
+    // startup validation above runs the coordinator directly and is unaffected.
+    backendConfiguration.samplingDefaults = defaultSamplingDefaults
     let backend = ContinuousServingBackend(
         launchedModel: configuration.launchedModel,
         coordinator: coordinator,

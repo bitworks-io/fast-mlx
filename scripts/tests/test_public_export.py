@@ -326,9 +326,13 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # the launcher's resolver pins, a pure-Python model of the engine's card selection and synthetic card edits, and the
 # fixture is a byte copy of the already-public site/quality-guides.json (sha256 d96156a2...); neither names a host,
 # credential or machine-local path, and the projection validator's marker sweep passed on them.
+# 2026-10-21, 1058 -> 1059: adds spike/Tests/SpikeServingAdaptersTests/DefaultSamplingContinuousWiringStructuralTests.swift
+# (projected with spike/Tests), the structural pins that the continuous-batch load forwards and applies
+# --default-sampling. Conscious decision to publish: read in full; it holds only source-text scans of two projected
+# files, names no model family, host, credential or machine-local path, and the marker sweep passed on it.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1058,
-    "pathModeSha256": "ee6cd4a87fad530ac129220b5415265a5c129c2542569468b9cb60452a6b25bc",
+    "pathCount": 1059,
+    "pathModeSha256": "ea8ad9bff896393e6716471f33ccd92bbd6fcd6c7091fa9d2e94e0ede2b44975",
 }
 
 

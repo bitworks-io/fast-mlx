@@ -54,6 +54,18 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     /// `tool_choice`. `nil` (the default, FAIL CLOSED) keeps `supportsJSONSchemaResponseFormat` and
     /// `enforcesForcingToolChoice` `false`.
     public var jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport?
+    /// `--default-sampling generation-config`: the checkpoint's own `generation_config.json` sampling
+    /// subset, resolved at load (`resolveServingDefaultSampling`). Fills ONLY the sampling fields a
+    /// request omits, through the same `ServingSamplingPolicy.resolve(from:defaults:)` the scalar route
+    /// uses (a request field always wins; an explicit `temperature: 0` stays greedy). `nil` (the
+    /// default) resolves with no defaults: a request that omits its sampling fields is greedy,
+    /// byte-for-byte as before this field existed.
+    ///
+    /// **`loadContinuousServingModel` OWNS this field**: it overwrites it from
+    /// `ContinuousServingModelLoadConfiguration.defaultSampling` (resolved at load), so a value set
+    /// here before loading is discarded. When loading, set the load configuration's `defaultSampling`,
+    /// not this field. Setting it directly only affects a backend constructed without that load path.
+    public var samplingDefaults: ServingSamplingDefaults?
 
     public init(
         defaultMaximumCompletionTokens: Int,
@@ -67,7 +79,8 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         modelCapabilities: ServingModelCapabilities? = nil,
         logitBiasVocabularySize: Int? = nil,
         jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
-        jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil
+        jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
+        samplingDefaults: ServingSamplingDefaults? = nil
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -91,6 +104,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.logitBiasVocabularySize = logitBiasVocabularySize
         self.jsonObjectConstraintSupport = jsonObjectConstraintSupport
         self.jsonSchemaConstraintSupport = jsonSchemaConstraintSupport
+        self.samplingDefaults = samplingDefaults
     }
 }
 
@@ -244,8 +258,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
     }
 
     /// Resolve the request's sampling and penalties. Sampling (`temperature` > 0) is served: the
-    /// policy is resolved once, with no defaults, and returned as the per-row sampling (`nil` =
-    /// greedy); a policy-validation failure maps to a 400-class error. Penalties are served too: they
+    /// policy is resolved once through `ServingSamplingPolicy.resolve(from:defaults:)` (the scalar
+    /// route's resolver: a request field wins per field, an omitted one is filled from `defaults`, an
+    /// explicit `temperature: 0` stays greedy; `defaults == nil` is today's no-defaults behavior) and
+    /// returned as the per-row sampling (`nil` = greedy); a policy-validation failure maps to a
+    /// 400-class error. Penalties are served too: they
     /// map through the same `DecoderPenalties` bridge the scalar route uses (`rowPenalties(for:)`, `nil`
     /// for the neutral set). `repetition_penalty` is MULTIPLICATIVE (the vendored `RepetitionContext`:
     /// `x < 0 ? x * penalty : x / penalty`), so its neutral element is `1`, not `0`; the HF-recommended
@@ -254,11 +271,12 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
     /// `logit_bias` is applied per row by the dense runtime; its capability and vocabulary bound are
     /// enforced by `rejectUnsupportedLogitBias(_:)` (called first in `start`).
     private static func resolveSamplingAndPenalties(
-        _ request: OpenAIChatCompletionRequest
+        _ request: OpenAIChatCompletionRequest,
+        defaults: ServingSamplingDefaults?
     ) throws -> (sampling: ContinuousBatchRowSampling?, penalties: ContinuousBatchRowPenalties?) {
         let policy: ServingSamplingPolicy
         do {
-            policy = try ServingSamplingPolicy.resolve(from: request)
+            policy = try ServingSamplingPolicy.resolve(from: request, defaults: defaults)
         } catch let error as ServingSamplingPolicyError {
             // Same mapping as the scalar route: each rejected field is named as its own `param`.
             throw ScalarServingBackend.openAIError(for: error)
@@ -416,11 +434,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         // `logit_bias` capability and vocabulary bound: before any prompt render or admission.
         try rejectUnsupportedLogitBias(request)
         // A sampled request (temperature > 0) is served: the row carries its own sampler (resolved
-        // once here, no defaults) and the runtime draws one token per step from the adjusted logits.
+        // once here, with `configuration.samplingDefaults` filling omitted fields) and the runtime
+        // draws one token per step from the adjusted logits.
         // Penalties are resolved the same way (through the scalar route's `DecoderPenalties` bridge;
         // `nil` for the neutral set) and the runtime applies them per row. Invalid sampling values
         // are a 400.
-        let (sampling, penalties) = try Self.resolveSamplingAndPenalties(request)
+        let (sampling, penalties) = try Self.resolveSamplingAndPenalties(
+            request, defaults: configuration.samplingDefaults)
 
         let activeTools = request.activeTools
         // Resolve thinking ONCE and use the SAME value for the prompt render and the reasoning gate —

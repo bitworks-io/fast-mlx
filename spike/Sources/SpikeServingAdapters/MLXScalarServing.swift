@@ -989,6 +989,27 @@ public func validateScalarServingModelLoadConfiguration(
     return configuration
 }
 
+/// Resolves `--default-sampling` for a serving load. `.off` is `nil` (no defaults, greedy for a request
+/// that omits its sampling fields). `.generationConfig` reads `<modelDirectory>/generation_config.json`
+/// through `GenerationConfigSamplingDefaults.load`, which fails closed on every unusable artifact
+/// (missing, unparseable, `do_sample: false`, no usable temperature, out-of-range value); each failure is
+/// wrapped as `ScalarServingModelLoadError.defaultSamplingGenerationConfigUnavailable`, so both serving
+/// routes (the scalar load and the continuous-batch load) refuse with the same machine-readable reason
+/// and there is no silent-greedy fallback. Callers invoke it BEFORE any `Memory.*` mutation or weight
+/// load, so a bad artifact fails in milliseconds.
+func resolveServingDefaultSampling(
+    _ mode: FastMLXServeDefaultSampling,
+    modelDirectory: URL
+) throws -> ServingSamplingDefaults? {
+    guard mode == .generationConfig else { return nil }
+    let generationConfigURL = modelDirectory.appendingPathComponent("generation_config.json")
+    do {
+        return try GenerationConfigSamplingDefaults.load(contentsOf: generationConfigURL)
+    } catch let error as GenerationConfigSamplingDefaultsError {
+        throw ScalarServingModelLoadError.defaultSamplingGenerationConfigUnavailable(error)
+    }
+}
+
 /// Load one local text model into the actor-confined scalar route and prove reset parity.
 public func loadScalarServingModel(
     configuration rawConfiguration: ScalarServingModelLoadConfiguration
@@ -1073,19 +1094,8 @@ public func loadScalarServingModel(
     // `generation_config.json` fails in milliseconds instead of after a multi-GB checkpoint load.
     // `GenerationConfigSamplingDefaults.load` itself fails closed on every error path (see its own
     // doc comment) -- there is no silent-greedy fallback here either.
-    let defaultSamplingDefaults: ServingSamplingDefaults?
-    if configuration.defaultSampling == .generationConfig {
-        let generationConfigURL = configuration.modelDirectory.appendingPathComponent(
-            "generation_config.json")
-        do {
-            defaultSamplingDefaults = try GenerationConfigSamplingDefaults.load(
-                contentsOf: generationConfigURL)
-        } catch let error as GenerationConfigSamplingDefaultsError {
-            throw ScalarServingModelLoadError.defaultSamplingGenerationConfigUnavailable(error)
-        }
-    } else {
-        defaultSamplingDefaults = nil
-    }
+    let defaultSamplingDefaults = try resolveServingDefaultSampling(
+        configuration.defaultSampling, modelDirectory: configuration.modelDirectory)
 
     Memory.memoryLimit = configuration.memoryLimitBytes
     Memory.cacheLimit = configuration.cacheLimitBytes

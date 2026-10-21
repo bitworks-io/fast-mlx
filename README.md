@@ -96,6 +96,10 @@ The default launch serves on the continuous-batch route, which samples (`tempera
 `min_p`, `seed`) and applies `presence_penalty`, `frequency_penalty` and `repetition_penalty`. A `seed`
 makes a reply repeatable for the same prompt under the same concurrent load, but only best-effort across
 different loads, because batched and solo logits are not bit-identical.
+`--default-sampling generation-config` works on this default route too: it fills the sampling fields a request
+omits from the checkpoint's own `generation_config.json` (explicit request fields win, and an explicit
+`temperature: 0` stays greedy), and refuses to start if that file is missing or unusable. With
+`--continuous-dynamic-pld` such a request is sampled and so decodes without speculation.
 Pass `--single-stream` to serve on the single-stream scalar route instead, for
 logprobs, `/v1/completions` and `--chat-template`; it cannot be
 combined with `--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
@@ -135,8 +139,8 @@ validation. `logprobs:false`/absent is unchanged — no `logprobs` key at all, b
 before this feature existed.
 
 `"logit_bias":{"<token id>":<bias>}` adds each bias to that token's logit before sampling (greedy
-and sampled) on the single-stream scalar route, and before the greedy pick on the continuous-batch
-route. Keys are base-10 token ids below the model's `vocab_size`, values are in [-100, 100], and at
+and sampled) on the single-stream scalar route, and before the greedy pick or the sampler draw on the
+continuous-batch route. Keys are base-10 token ids below the model's `vocab_size`, values are in [-100, 100], and at
 most 300 entries are allowed; anything else is a 400 on `logit_bias`. On the continuous-batch route
 the bias is per request: a request without one decodes exactly as it would beside other unbiased
 requests, and a biased request does not use prompt-lookup speculation (`--continuous-dynamic-pld`).

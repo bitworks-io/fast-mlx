@@ -1187,9 +1187,11 @@ private func loadScalarServingBackend(
             // `ScalarServingModelLoadConfiguration(` construction site is ever added (for example a
             // new serving route in this file), it must forward this field too.
             offloadPlanCheckOnly: arguments.offloadPlanCheckOnly,
-            // `--default-sampling`: forwarded unconditionally. This is the ONE construction site
-            // that forwards it -- `ExactQwen35MTPServeComposition.scalarConfiguration` deliberately
-            // does NOT, which is what keeps that route's scalar fallback at `defaults: nil`. See
+            // `--default-sampling`: forwarded unconditionally. This is one of TWO construction sites
+            // that forward it (the other is the continuous-batch load in this file, which resolves
+            // the same artifact through the shared `resolveServingDefaultSampling`) --
+            // `ExactQwen35MTPServeComposition.scalarConfiguration` deliberately does NOT, which is
+            // what keeps that route's scalar fallback at `defaults: nil`. See
             // `ScalarServingModelLoadConfiguration.defaultSampling`'s doc comment.
             defaultSampling: arguments.defaultSampling))
     return PreparedServingBackend(
@@ -1526,7 +1528,11 @@ private func prepareBackend(
                 kvQuantTier: try arguments.kvQuantTier.map { try KVQuantAdvisory.validateTier($0) } ?? .fp16,
                 // Opt-in qwen3_5 hybrid admission (--allow-hybrid-qwen35). Off (default) → the proof
                 // throws unsupportedModelFamily and the catch below falls back to scalar serving.
-                allowHybridQwen35: arguments.allowHybridQwen35))
+                allowHybridQwen35: arguments.allowHybridQwen35,
+                // `--default-sampling`: resolved at load by the shared helper (fail-closed, before
+                // any weight load). A pack the proof hands to the scalar fallback below gets the
+                // scalar route's own resolution through `loadScalarServingBackend(arguments:...)`.
+                defaultSampling: arguments.defaultSampling))
         } catch DenseContinuousBatchRuntimeError.unsupportedModelFamily(let family)
             where isScalarServingFallbackEligible(
                 modelType: family,

@@ -112,6 +112,158 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    // MARK: - `--default-sampling generation-config` on the continuous route (cycle 278)
+
+    /// The checkpoint's official Qwen3 preset, as `resolveServingDefaultSampling` would load it.
+    private static let qwen3Preset = ServingSamplingDefaults(
+        temperature: 0.6, topP: 0.95, topK: 20, minP: nil)
+
+    /// Submits one request through a fresh immediate-route backend and returns the submission's row
+    /// sampling.
+    private func submittedSampling(
+        defaults: ServingSamplingDefaults?,
+        edit: (inout OpenAIChatCompletionRequest) -> Void
+    ) async throws -> ContinuousBatchRowSampling? {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            samplingDefaults: defaults)
+        var omitted = request(text: "solo", maxTokens: 2)
+        omitted.temperature = nil
+        edit(&omitted)
+        let handle = try await backend.start(omitted)
+        XCTAssertEqual(recorder.submissions.count, 1)
+        let sampling = recorder.submissions.first?.sampling
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+        return sampling
+    }
+
+    /// D2: with defaults configured, a request that omits every sampling field is submitted with the
+    /// defaults as its row sampling (absent min_p maps to 0, i.e. off).
+    func testDefaultSamplingFillsAnOmittedSamplingRequestIntoTheSubmission() async throws {
+        let sampling = try await submittedSampling(defaults: Self.qwen3Preset) { _ in }
+        XCTAssertEqual(
+            sampling,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.6), topP: Float(0.95), topK: 20, minP: 0, seed: nil))
+
+        let withMinP = try await submittedSampling(
+            defaults: ServingSamplingDefaults(
+                temperature: 0.7, topP: 0.8, topK: 40, minP: 0.05)
+        ) { $0.seed = 7 }
+        XCTAssertEqual(
+            withMinP,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.7), topP: Float(0.8), topK: 40, minP: Float(0.05), seed: 7))
+    }
+
+    /// D3: precedence is the shared resolver's. An explicit `temperature: 0` stays greedy (nil
+    /// sampling) even with defaults; an explicit `top_p` alone wins for that field while the others
+    /// come from the defaults.
+    func testDefaultSamplingPrecedenceExplicitZeroStaysGreedyAndRequestFieldsWin() async throws {
+        let greedy = try await submittedSampling(defaults: Self.qwen3Preset) { $0.temperature = 0 }
+        XCTAssertNil(greedy)
+
+        let topPOnly = try await submittedSampling(defaults: Self.qwen3Preset) { $0.topP = 0.5 }
+        XCTAssertEqual(
+            topPOnly,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.6), topP: Float(0.5), topK: 20, minP: 0, seed: nil))
+
+        let explicitTemperature = try await submittedSampling(defaults: Self.qwen3Preset) {
+            $0.temperature = 1.2
+        }
+        XCTAssertEqual(
+            explicitTemperature,
+            ContinuousBatchRowSampling(
+                temperature: Float(1.2), topP: Float(0.95), topK: 20, minP: 0, seed: nil))
+    }
+
+    /// D4: with no defaults (nil, the default) a request that omits its sampling fields is greedy.
+    func testNoSamplingDefaultsLeavesAnOmittedSamplingRequestGreedy() async throws {
+        let sampling = try await submittedSampling(defaults: nil) { _ in }
+        XCTAssertNil(sampling)
+
+        let explicit = try await submittedSampling(defaults: nil) { $0.temperature = 0.8 }
+        XCTAssertEqual(
+            explicit,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.8), topP: 1, topK: 0, minP: 0, seed: nil))
+    }
+
+    /// D6: on the solo-PLD route a request sampled ONLY through the defaults is submitted without
+    /// speculation (carrying the defaults as its sampling); an explicit-greedy request on the same
+    /// defaults-configured backend still requests speculation.
+    func testDynamicAdmissionSoloPLDDefaultSampledRequestIsSubmittedWithoutSpeculation()
+        async throws
+    {
+        func runSolo(
+            edit: (inout OpenAIChatCompletionRequest) -> Void
+        ) async throws -> (ServingExecutionRoute, [ContinuousBatchSubmission], [BatchDecodeAction]) {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 2, queued: 4),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]],
+                    recorder: recorder,
+                    allowsSpeculation: true),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeDynamicBackend(
+                coordinator: coordinator,
+                promptByText: ["solo": [10]],
+                pieces: [1: "s"],
+                stopTokenIDs: [99],
+                samplingDefaults: Self.qwen3Preset)
+            var solo = request(text: "solo", maxTokens: 2)
+            solo.temperature = nil
+            edit(&solo)
+            let start = Task { try await backend.start(solo) }
+            await waitUntil {
+                await backend.diagnosticPendingAdmissionRequestCount() == 1
+            }
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+            let handle = try await start.value
+            try await runUntilDecode(coordinator, recorder: recorder)
+            let result = (handle.route, recorder.submissions, recorder.decodeActions)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+            return result
+        }
+
+        let defaulted = try await runSolo { $0.seed = 7 }
+        XCTAssertEqual(defaulted.0, .soloPLD)
+        XCTAssertEqual(defaulted.1.count, 1)
+        XCTAssertEqual(
+            defaulted.1.first?.sampling,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.6), topP: Float(0.95), topK: 20, minP: 0, seed: 7))
+        XCTAssertEqual(defaulted.1.first?.requestsSpeculation, false)
+        XCTAssertEqual(
+            defaulted.2.first, .solo(BatchRequestID(1), speculationAllowed: false))
+
+        let greedy = try await runSolo { $0.temperature = 0 }
+        XCTAssertEqual(greedy.0, .soloPLD)
+        XCTAssertNil(greedy.1.first?.sampling)
+        XCTAssertEqual(greedy.1.first?.requestsSpeculation, true)
+        XCTAssertEqual(
+            greedy.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
+    }
+
     /// Invalid sampling values are still 400s on the continuous route, before any admission. (The
     /// penalty 400 that used to sit beside them is gone: penalties are served, see the penalty tests
     /// below.)
@@ -3791,7 +3943,8 @@ private func makeBackend(
     thinksByDefault: Bool = false,
     logitBiasVocabularySize: Int? = nil,
     jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
-    jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil
+    jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
+    samplingDefaults: ServingSamplingDefaults? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -3810,7 +3963,8 @@ private func makeBackend(
             modelCapabilities: modelCapabilities,
             logitBiasVocabularySize: logitBiasVocabularySize,
             jsonObjectConstraintSupport: jsonObjectConstraintSupport,
-            jsonSchemaConstraintSupport: jsonSchemaConstraintSupport))
+            jsonSchemaConstraintSupport: jsonSchemaConstraintSupport,
+            samplingDefaults: samplingDefaults))
 }
 
 private func makeDynamicBackend(
@@ -3828,7 +3982,8 @@ private func makeDynamicBackend(
     modelCapabilities: ServingModelCapabilities? = nil,
     logitBiasVocabularySize: Int? = nil,
     jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
-    jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil
+    jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
+    samplingDefaults: ServingSamplingDefaults? = nil
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -3852,7 +4007,8 @@ private func makeDynamicBackend(
             modelCapabilities: modelCapabilities,
             logitBiasVocabularySize: logitBiasVocabularySize,
             jsonObjectConstraintSupport: jsonObjectConstraintSupport,
-            jsonSchemaConstraintSupport: jsonSchemaConstraintSupport))
+            jsonSchemaConstraintSupport: jsonSchemaConstraintSupport,
+            samplingDefaults: samplingDefaults))
 }
 
 private let continuousWeatherTool = OpenAIToolSpec(
