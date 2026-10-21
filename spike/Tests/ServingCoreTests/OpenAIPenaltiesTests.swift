@@ -3,7 +3,7 @@ import XCTest
 @testable import ServingCore
 
 /// Decode + validation for the OpenAI/HF penalty knobs (presence/frequency in [-2, 2], repetition > 0).
-/// These map to the decoder's logit processor on the scalar route; the continuous route rejects them.
+/// Both the scalar and the continuous-batch route apply them through the vendored penalty processor.
 final class OpenAIPenaltiesTests: XCTestCase {
     private func request(_ json: String) throws -> OpenAIChatCompletionRequest {
         try OpenAIChatCompletionRequest.decodeStrict(from: Data(json.utf8))

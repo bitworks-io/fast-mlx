@@ -93,10 +93,11 @@ to change where it listens, and set `FASTMLX_API_KEY` to require Bearer auth (ma
 non-loopback `--host`).
 
 The default launch serves on the continuous-batch route, which samples (`temperature`, `top_p`, `top_k`,
-`min_p`, `seed`). A `seed` makes a reply repeatable for the same prompt under the same concurrent load,
-but only best-effort across different loads, because batched and solo logits are not bit-identical.
+`min_p`, `seed`) and applies `presence_penalty`, `frequency_penalty` and `repetition_penalty`. A `seed`
+makes a reply repeatable for the same prompt under the same concurrent load, but only best-effort across
+different loads, because batched and solo logits are not bit-identical.
 Pass `--single-stream` to serve on the single-stream scalar route instead, for
-penalties, logprobs, `/v1/completions` and `--chat-template`; it cannot be
+logprobs, `/v1/completions` and `--chat-template`; it cannot be
 combined with `--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
 
 Call it with the standard OpenAI shape, including tools:

@@ -119,6 +119,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         /// The request's per-row sampling (`nil` = greedy), resolved once in `start` from the
         /// request's own fields; carried into the coordinator submission.
         let sampling: ContinuousBatchRowSampling?
+        /// The request's per-row presence/frequency/repetition penalties (`nil` = none, which includes
+        /// the neutral set), resolved once in `start`; carried into the coordinator submission.
+        let penalties: ContinuousBatchRowPenalties?
         let activeTools: [OpenAIToolSpec]
         /// The request's `parallel_tool_calls` (`nil` = absent/null). Only an explicit `false`
         /// stops decoding at the first completed tool call.
@@ -240,13 +243,19 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         }
     }
 
-    /// Resolve the request's sampling and reject the decode controls this route can't apply
-    /// (honesty: never accept penalties the compiled path would silently ignore). Sampling
-    /// (`temperature` > 0) is served: the policy is resolved once, with no defaults, and returned as
-    /// the per-row sampling (`nil` = greedy). A policy-validation failure maps to a 400-class error.
-    private static func resolveSamplingRejectingUnsupportedDecodeControls(
+    /// Resolve the request's sampling and penalties. Sampling (`temperature` > 0) is served: the
+    /// policy is resolved once, with no defaults, and returned as the per-row sampling (`nil` =
+    /// greedy); a policy-validation failure maps to a 400-class error. Penalties are served too: they
+    /// map through the same `DecoderPenalties` bridge the scalar route uses (`rowPenalties(for:)`, `nil`
+    /// for the neutral set). `repetition_penalty` is MULTIPLICATIVE (the vendored `RepetitionContext`:
+    /// `x < 0 ? x * penalty : x / penalty`), so its neutral element is `1`, not `0`; the HF-recommended
+    /// presets for the deployed model send `repetition_penalty: 1.0`, which must add nothing. Invalid
+    /// penalty values never get here: the request parser already refuses them with a 400.
+    /// `logit_bias` is applied per row by the dense runtime; its capability and vocabulary bound are
+    /// enforced by `rejectUnsupportedLogitBias(_:)` (called first in `start`).
+    private static func resolveSamplingAndPenalties(
         _ request: OpenAIChatCompletionRequest
-    ) throws -> ContinuousBatchRowSampling? {
+    ) throws -> (sampling: ContinuousBatchRowSampling?, penalties: ContinuousBatchRowPenalties?) {
         let policy: ServingSamplingPolicy
         do {
             policy = try ServingSamplingPolicy.resolve(from: request)
@@ -254,24 +263,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             // Same mapping as the scalar route: each rejected field is named as its own `param`.
             throw ScalarServingBackend.openAIError(for: error)
         }
-        // `repetitionPenalty` is checked for non-neutrality via the shared `DecoderPenalties`
-        // helper, not `(x ?? 0) != 0` like the additive presence/frequency knobs: the vendored
-        // `RepetitionContext` is a MULTIPLICATIVE penalty (`x < 0 ? x * penalty : x / penalty`),
-        // so its neutral element is `1`, not `0`. Both HF-recommended presets for the deployed
-        // model send `repetition_penalty: 1.0`, which must stay admissible here.
-        // `logit_bias` is NOT refused here: the dense runtime applies a per-row additive bias before
-        // every greedy reduction. Its capability and vocabulary bound are enforced by
-        // `rejectUnsupportedLogitBias(_:)` (called first in `start`); the penalties below stay refused
-        // because the compiled path still has no processor for them.
-        if (request.presencePenalty ?? 0) != 0 || (request.frequencyPenalty ?? 0) != 0
-            || !DecoderPenalties.repetitionPenaltyIsNeutral(request.repetitionPenalty)
-        {
-            throw OpenAIServingError.invalidRequest(
-                "presence/frequency/repetition penalties are not supported on the continuous-batch "
-                    + "route (no logit processor on the compiled path)",
-                param: "presence_penalty")
-        }
-        return rowSampling(for: policy)
+        let penalties = DecoderPenalties(
+            presencePenalty: request.presencePenalty,
+            frequencyPenalty: request.frequencyPenalty,
+            repetitionPenalty: request.repetitionPenalty)
+        return (rowSampling(for: policy), rowPenalties(for: penalties))
     }
 
     /// The per-row sampling for a resolved policy, built exactly as the scalar route's
@@ -289,6 +285,23 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 minP: Float(minP ?? 0),
                 seed: seed.map { UInt64(bitPattern: $0) })
         }
+    }
+
+    /// The per-row penalties for a request's `DecoderPenalties` (the same bridge the scalar route
+    /// builds from the request). `nil` exactly when `isEmpty` holds (the neutral set), so a neutral
+    /// request keeps the unpenalized graph. Otherwise each field is a Float, with a zero
+    /// presence/frequency and a neutral repetition value (`nil`/0/1) as `nil` ("not set").
+    static func rowPenalties(for penalties: DecoderPenalties) -> ContinuousBatchRowPenalties? {
+        guard !penalties.isEmpty else { return nil }
+        func additive(_ value: Double?) -> Float? {
+            guard let value, value != 0 else { return nil }
+            return Float(value)
+        }
+        return ContinuousBatchRowPenalties(
+            presence: additive(penalties.presencePenalty),
+            frequency: additive(penalties.frequencyPenalty),
+            repetition: DecoderPenalties.repetitionPenaltyIsNeutral(penalties.repetitionPenalty)
+                ? nil : penalties.repetitionPenalty.map { Float($0) })
     }
 
     /// `true` exactly when the model's vocabulary width is known (`logitBiasVocabularySize`), so every
@@ -404,9 +417,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         try rejectUnsupportedLogitBias(request)
         // A sampled request (temperature > 0) is served: the row carries its own sampler (resolved
         // once here, no defaults) and the runtime draws one token per step from the adjusted logits.
-        // Penalties stay refused (400): never accept a control the compiled path would silently
-        // ignore. Invalid sampling values are a 400.
-        let sampling = try Self.resolveSamplingRejectingUnsupportedDecodeControls(request)
+        // Penalties are resolved the same way (through the scalar route's `DecoderPenalties` bridge;
+        // `nil` for the neutral set) and the runtime applies them per row. Invalid sampling values
+        // are a 400.
+        let (sampling, penalties) = try Self.resolveSamplingAndPenalties(request)
 
         let activeTools = request.activeTools
         // Resolve thinking ONCE and use the SAME value for the prompt render and the reasoning gate —
@@ -448,6 +462,7 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             ignoreEOS: request.ignoreEOS,
             logitBias: request.logitBias,
             sampling: sampling,
+            penalties: penalties,
             activeTools: activeTools,
             parallelToolCalls: request.parallelToolCalls,
             completionBudgetResolution: completionBudgetResolution,
@@ -951,15 +966,18 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             maxOutputTokens: prepared.maximumCompletionTokens,
             stopTokenIDs: stopTokenIDs,
             architecture: .denseAttention,
-            // A biased, masked or sampled row is never speculative (the runtime refuses each pair, and
-            // the verify step must never see such a row): such a request on the solo-PLD route decodes
-            // without speculation. An unconstrained greedy request on that route still requests it.
+            // A biased, masked, sampled or penalized row is never speculative (the runtime refuses each
+            // pair, and the verify step must never see such a row): such a request on the solo-PLD
+            // route decodes without speculation. An unconstrained greedy request on that route still
+            // requests it.
             requestsSpeculation: route == .soloPLD && prepared.logitBias.isEmpty
-                && prepared.tokenMask == nil && prepared.sampling == nil,
+                && prepared.tokenMask == nil && prepared.sampling == nil
+                && prepared.penalties == nil,
             ignoresStopTokens: prepared.ignoreEOS,
             logitBias: prepared.logitBias,
             tokenMask: prepared.tokenMask,
-            sampling: prepared.sampling)
+            sampling: prepared.sampling,
+            penalties: prepared.penalties)
     }
 
     private func submitToCoordinator(

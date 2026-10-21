@@ -345,6 +345,9 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     /// A submission carried both `sampling` and `requestsSpeculation`. A sampled row never
     /// speculates, so the verify step can never see one.
     case samplingWithSpeculation(BatchRequestID)
+    /// A submission carried both `penalties` and `requestsSpeculation`. A penalized row never
+    /// speculates, so the verify step can never see one.
+    case penaltiesWithSpeculation(BatchRequestID)
 }
 
 struct DenseContinuousBatchRuntimeDiagnostics: Equatable {
@@ -367,6 +370,14 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
 
     private final class TraceCounter {
         var count = 0
+    }
+
+    /// One row's vendored penalty processor (a mutating value type: its token ring advances on
+    /// every `didSample`). Held by reference so every copy of the owning `Slot` (scalar <-> batch
+    /// moves) advances the same ring. Built at admission, one per penalized row, never shared.
+    private final class PenaltyProcessorBox {
+        var processor: any LogitProcessor
+        init(_ processor: any LogitProcessor) { self.processor = processor }
     }
 
     private struct Slot {
@@ -395,6 +406,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         /// the logits width and dtype are known) and reused by every scalar/batch step. `nil`
         /// exactly when the row is unbiased, which keeps it on the original compiled steps.
         var logitBiasRow: MLXArray?
+        /// The same dense `[1, width]` bias row in FLOAT32, kept only for a penalized, biased row.
+        /// The vendored penalty processors promote the logits to float32 (their histogram is
+        /// float32), and the scalar route builds its bias row in the PROCESSED dtype, so a penalized
+        /// row casts this row to the processed dtype instead of adding the raw-dtype
+        /// `logitBiasRow` (a bf16 row would round 0.3 to 0.30078125). `nil` otherwise.
+        var penalizedBiasRow: MLXArray?
         /// The request's per-step token mask, or `nil` for an unmasked row. A masked row always
         /// uses the biased compiled step variants (its additive row changes every step).
         let tokenMask: (any ContinuousBatchRowTokenMask)?
@@ -406,6 +423,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         /// advances the same stream). `nil` for a greedy row. Exactly one `sample` per emitted
         /// token; sampled rows never speculate.
         let sampler: TopPSampler?
+        /// The request's penalty processor, built and prompt-seeded ONCE at admission and kept for
+        /// the slot's lifetime across scalar <-> batch moves. `nil` for an unpenalized row. Exactly
+        /// one `didSample` per emitted token; penalized rows never speculate.
+        let penalizer: PenaltyProcessorBox?
 
         /// Whether this row needs the biased compiled step (a static bias row or a mask).
         var usesBiasedStep: Bool { logitBiasRow != nil || tokenMask != nil }
@@ -463,6 +484,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// Samplers built at admission awaiting their slot (created at first prefill), cleared at final
     /// prefill and in `remove`, like `pendingLogitBias`.
     private var pendingSamplers: [BatchRequestID: TopPSampler] = [:]
+    /// Penalty processors built (and prompt-seeded) at admission awaiting their slot, cleared at
+    /// final prefill and in `remove`, like `pendingSamplers`.
+    private var pendingPenalizers: [BatchRequestID: PenaltyProcessorBox] = [:]
     private var contextReservations: [BatchRequestID: Int] = [:]
     private var kvCapacityReservations: [BatchRequestID: Int] = [:]
     private var reservedKVBytes = 0
@@ -727,6 +751,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         var biasAdditions: [BatchRequestID: [Int: Float]] = [:]
         var maskAdditions: [BatchRequestID: any ContinuousBatchRowTokenMask] = [:]
         var samplerAdditions: [BatchRequestID: TopPSampler] = [:]
+        var penalizerAdditions: [BatchRequestID: PenaltyProcessorBox] = [:]
         additions.reserveCapacity(admissions.count)
         for admission in admissions {
             let submission = admission.submission
@@ -747,6 +772,20 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     topK: sampling.topK,
                     minP: sampling.minP,
                     seed: sampling.seed)
+            }
+            if let penalties = submission.penalties {
+                // Built exactly like `MLXDecoder.setPenalties` and seeded with the FULL prompt
+                // like `MLXDecoder.prefillRawLogits`. `nil` (every penalty neutral) means no
+                // processor at all.
+                var processor = GenerateParameters(
+                    repetitionPenalty: penalties.repetition,
+                    presencePenalty: penalties.presence,
+                    frequencyPenalty: penalties.frequency
+                ).processor()
+                processor?.prompt(MLXArray(submission.promptTokens))
+                if let processor {
+                    penalizerAdditions[admission.id] = PenaltyProcessorBox(processor)
+                }
             }
             additions.append(
                 (
@@ -804,6 +843,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         for (id, sampler) in samplerAdditions {
             pendingSamplers[id] = sampler
+        }
+        for (id, penalizer) in penalizerAdditions {
+            pendingPenalizers[id] = penalizer
         }
         speculationRequestedRequests = nextSpeculationRequests
         reservedKVBytes = requestedKVBytes
@@ -891,9 +933,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 scalarTraceCounter: nil,
                 logitBias: pendingLogitBias[work.id] ?? [:],
                 logitBiasRow: nil,
+                penalizedBiasRow: nil,
                 tokenMask: pendingTokenMasks[work.id],
                 maskGeometry: nil,
-                sampler: pendingSamplers[work.id])
+                sampler: pendingSamplers[work.id],
+                penalizer: pendingPenalizers[work.id])
         }
 
         guard work.startToken == slot.processedTokens else {
@@ -917,6 +961,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         // through the caches it attends over (the same trade the scalar route made in 41f7dbb0).
         let staged: MLXArray?
         var biasRow: MLXArray?
+        var exactBiasRow: MLXArray?
         var maskGeometry: (width: Int, dtype: DType)?
         if work.isFinal {
             var finalLogits = logits[0..., -1, 0...]
@@ -930,6 +975,11 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     id: work.id)
                 biasRow = row
                 finalLogits = finalLogits + row
+                if slot.penalizer != nil {
+                    exactBiasRow = try makeLogitBiasRow(
+                        slot.logitBias, width: finalLogits.dim(-1), dtype: .float32,
+                        id: work.id)
+                }
             }
             // The token mask applies at the INITIAL state (no `advance` yet: nothing has been
             // emitted). `slot.logitBiasRow` stays the STATIC bias row; the mask row is added on
@@ -953,7 +1003,15 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 }
             }
             let token: MLXArray
-            if let sampler = slot.sampler {
+            if let penalizer = slot.penalizer {
+                // Penalties run on the RAW last-position logits FIRST (exactly the scalar route's
+                // order), then the bias and/or mask row, then the draw (sampled) or argmax.
+                let rawLogits = logits[0..., -1, 0...]
+                token = Self.penalizedToken(
+                    penalizer, sampler: slot.sampler, raw: rawLogits,
+                    rawFinite: isFinite(rawLogits).all(), bias: exactBiasRow,
+                    maskRow: initialMaskRow, masked: initialMaskRow != nil)
+            } else if let sampler = slot.sampler {
                 // The first token is drawn from the ADJUSTED logits (raw + bias + mask row), with
                 // the same raw-logit finite guard a greedy row has: a poisoned row yields the
                 // `-1` sentinel (which `validatedToken` rejects) instead of a sampled token.
@@ -996,6 +1054,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.prefillComplete = work.isFinal
         slot.stagedToken = staged
         slot.logitBiasRow = biasRow
+        slot.penalizedBiasRow = exactBiasRow
         slot.maskGeometry = maskGeometry
         if work.isFinal,
             let promptTokens = speculativePromptTokens[work.id],
@@ -1014,6 +1073,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             pendingLogitBias[work.id] = nil
             pendingTokenMasks[work.id] = nil
             pendingSamplers[work.id] = nil
+            pendingPenalizers[work.id] = nil
         }
     }
 
@@ -1068,6 +1128,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         pendingLogitBias[id] = nil
         pendingTokenMasks[id] = nil
         pendingSamplers[id] = nil
+        pendingPenalizers[id] = nil
         slots[id] = nil
 
         guard let batch else {
@@ -1171,7 +1232,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             let session = slot.pldSession,
             slot.logitBias.isEmpty,
             slot.tokenMask == nil,
-            slot.sampler == nil
+            slot.sampler == nil,
+            slot.penalizer == nil
         else {
             // A biased, masked or sampled row is never admitted with speculation, so it has no
             // session; the empty-bias, no-mask and no-sampler clauses keep the verify step
@@ -1282,7 +1344,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 counter: traceCounter,
                 biased: slot.usesBiasedStep,
                 masked: slot.tokenMask != nil,
-                sampled: slot.sampler != nil)
+                sampled: slot.sampler != nil,
+                penalized: slot.penalizer != nil)
         }
         var rollbackFallback = true
         defer {
@@ -1510,7 +1573,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 counter: traceCounter,
                 biased: slot.usesBiasedStep,
                 masked: slot.tokenMask != nil,
-                sampled: slot.sampler != nil)
+                sampled: slot.sampler != nil,
+                penalized: slot.penalizer != nil)
         }
         let following = launchScalarStep(slot, current)
         eval([following] + caches.flatMap { $0.innerState() })
@@ -1612,7 +1676,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 counter: traceCounter,
                 biased: slot.usesBiasedStep,
                 masked: slot.tokenMask != nil,
-                sampled: slot.sampler != nil)
+                sampled: slot.sampler != nil,
+                penalized: slot.penalizer != nil)
         }
         let emitted = try validatedToken(current, id: id)
         // Readback, advance, build, launch: the masked row for the FOLLOWING token reflects the
@@ -1680,7 +1745,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 biased: batch.logitBiasMatrix != nil
                     || ids.contains { slots[$0]?.tokenMask != nil },
                 masked: ids.contains { slots[$0]?.tokenMask != nil },
-                sampled: ids.contains { slots[$0]?.sampler != nil })
+                sampled: ids.contains { slots[$0]?.sampler != nil },
+                penalized: ids.contains { slots[$0]?.penalizer != nil })
         }
 
         let current = batch.stagedTokens
@@ -1701,7 +1767,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         let stepMatrix = try batchStepMatrix(ids, staticMatrix: batch.logitBiasMatrix)
         let following = launchBatchStep(
-            batch.step!(stepMatrix.map { [current, $0] } ?? [current]), ids: ids)
+            batch.step!(stepMatrix.map { [current, $0] } ?? [current]), ids: ids,
+            fed: current)
         asyncEval(following)
 
         for (id, token) in zip(ids, emitted) {
@@ -2102,6 +2169,17 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         return base + maskRow
     }
 
+    /// The mask-only `[1, width]` row (0 / -inf) for the slot's NEXT token, or `nil` for an
+    /// unmasked slot or a step whose mask is unconstrained (see `currentStepRow`). A penalized row
+    /// adds this AFTER its float32-exact bias (`penalizedBiasRow`), never the pre-combined row.
+    private func currentMaskRow(_ slot: Slot) -> MLXArray? {
+        guard let mask = slot.tokenMask, let geometry = slot.maskGeometry,
+            let bitset = mask.allowedTokenBitset()
+        else { return nil }
+        return ContinuousBatchRowTokenMaskRow.row(
+            bitset: bitset, width: geometry.width, dtype: geometry.dtype)
+    }
+
     /// The `[B, width]` additive matrix for one batch step. With no masked member this is the
     /// static bias matrix from `ensureBatch` (`nil` when no member is biased: the original step).
     /// With any masked member it is rebuilt from each member's current row: masked members use
@@ -2146,31 +2224,83 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// Launches the slot's scalar step and returns the next staged token. A greedy slot's step
     /// returns the token directly. A sampled slot's logits variant returns `[greedyTokens,
     /// adjustedLogits, rawFinite]`; the draw happens HERE, outside `compile`, with the slot's own
-    /// sampler: `which(rawFinite, sampler.sample(adjusted), -1)`. One draw per call.
+    /// sampler: `which(rawFinite, sampler.sample(adjusted), -1)`. One draw per call. A penalized
+    /// slot's logits variant also returns the RAW logits; `token` (the one just emitted and fed to
+    /// the step) is reported to the slot's processor, then the processor runs on the raw row, then
+    /// the additive row, then the draw or argmax (see `penalizedToken`).
     private func launchScalarStep(_ slot: Slot, _ token: MLXArray) -> MLXArray {
-        let outputs = slot.scalarStep!(scalarStepArguments(slot, token))
+        let arguments = scalarStepArguments(slot, token)
+        let outputs = slot.scalarStep!(arguments)
+        if let penalizer = slot.penalizer {
+            penalizer.processor.didSample(token: token)
+            return Self.penalizedToken(
+                penalizer, sampler: slot.sampler, raw: outputs[3], rawFinite: outputs[2],
+                bias: slot.penalizedBiasRow, maskRow: currentMaskRow(slot),
+                masked: slot.tokenMask != nil)
+        }
         guard let sampler = slot.sampler else { return outputs[0] }
         return Self.sampledToken(
             sampler: sampler, adjusted: outputs[1], rawFinite: outputs[2])
     }
 
-    /// Builds the batch's next staged-token vector. With no sampled member the step's single output
-    /// is the token vector. Otherwise each sampled row draws from its own sampler on its row of the
-    /// adjusted logits (guarded by its own raw-finite flag) and every greedy row keeps the greedy
-    /// token of the step, concatenated back to the same `[B]` int32 shape.
-    private func launchBatchStep(_ outputs: [MLXArray], ids: [BatchRequestID]) -> MLXArray {
-        guard ids.contains(where: { slots[$0]?.sampler != nil }) else { return outputs[0] }
+    /// Builds the batch's next staged-token vector. With no sampled or penalized member the step's
+    /// single output is the token vector. Otherwise each sampled row draws from its own sampler on
+    /// its row of the adjusted logits (guarded by its own raw-finite flag), each penalized row runs
+    /// its own processor on its row of the RAW logits first (`fed` is the vector of tokens just
+    /// emitted, one `didSample` per penalized row; its bias and mask rows come from the slot, not
+    /// from the step's `[B, width]` matrix, see `penalizedToken`),
+    /// and every other row keeps the greedy token of the step, concatenated back to the same `[B]`
+    /// int32 shape.
+    private func launchBatchStep(
+        _ outputs: [MLXArray], ids: [BatchRequestID], fed: MLXArray
+    ) -> MLXArray {
+        guard ids.contains(where: { slots[$0]?.sampler != nil || slots[$0]?.penalizer != nil })
+        else { return outputs[0] }
         let greedy = outputs[0]
         let adjusted = outputs[1]
         let rawFinite = outputs[2]
         let rows = ids.enumerated().map { row, id -> MLXArray in
-            guard let sampler = slots[id]?.sampler else { return greedy[row ..< row + 1] }
+            let slot = slots[id]
+            if let penalizer = slot?.penalizer {
+                penalizer.processor.didSample(token: fed[row ..< row + 1])
+                return Self.penalizedToken(
+                    penalizer, sampler: slot?.sampler, raw: outputs[3][row ..< row + 1],
+                    rawFinite: rawFinite[row ..< row + 1],
+                    bias: slot?.penalizedBiasRow, maskRow: slot.flatMap(currentMaskRow),
+                    masked: slot?.tokenMask != nil)
+            }
+            guard let sampler = slot?.sampler else { return greedy[row ..< row + 1] }
             return Self.sampledToken(
                 sampler: sampler,
                 adjusted: adjusted[row ..< row + 1],
                 rawFinite: rawFinite[row ..< row + 1])
         }
         return concatenated(rows, axis: 0)
+    }
+
+    /// The next token of a penalized row: `process(raw)` (the vendored processor, repetition then
+    /// presence then frequency), then `+ bias` (the float32 bias row cast to the PROCESSED dtype,
+    /// exactly the scalar route's construction) and `+ maskRow` (0 / -inf, exact in any dtype),
+    /// then the row's sampler draw or argmax. The result is the `[1]` int32 token, or the `-1` sentinel (rejected by
+    /// `validatedToken`) when the RAW logits held a non-finite value or, for a masked greedy row,
+    /// when no column survives the mask. `raw` is `[1, width]`; `rawFinite` holds one flag.
+    private static func penalizedToken(
+        _ penalizer: PenaltyProcessorBox, sampler: TopPSampler?, raw: MLXArray,
+        rawFinite: MLXArray, bias: MLXArray?, maskRow: MLXArray?, masked: Bool
+    ) -> MLXArray {
+        let penalized = penalizer.processor.process(logits: raw)
+        var adjusted = penalized
+        if let bias { adjusted = adjusted + bias.asType(penalized.dtype) }
+        if let maskRow { adjusted = adjusted + maskRow }
+        var valid = rawFinite.reshaped([1])
+        let token: MLXArray
+        if let sampler {
+            token = sampler.sample(logits: adjusted).asType(.int32).reshaped([1])
+        } else {
+            token = argMax(adjusted, axis: -1).asType(.int32).reshaped([1])
+            if masked { valid = valid & isFinite(adjusted.max(axis: -1)).reshaped([1]) }
+        }
+        return MLX.where(valid, token, MLXArray(Int32(-1)))
     }
 
     /// One draw of `sampler` on `adjusted` (`[1, width]`), or the `-1` sentinel (rejected by
@@ -2189,7 +2319,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// the slot's dense bias row as `arguments[1]` and adds it before the greedy reduction.
     private func makeScalarStep(
         caches: [any ContinuousScalarRowCache], counter: TraceCounter, biased: Bool = false,
-        masked: Bool = false, sampled: Bool = false
+        masked: Bool = false, sampled: Bool = false, penalized: Bool = false
     ) -> Step {
         let model = self.model
         // A scalar row IS the model cache: a dense row is the `CompiledCache` the model updates,
@@ -2237,10 +2367,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             return Self.logitsVariantOutputs(
                 raw: logits[0..., -1, 0...],
                 additive: biased || masked ? arguments[1] : nil,
-                masked: masked)
+                masked: masked,
+                includingRaw: penalized)
         }
         let step =
-            sampled ? sampledStep : (masked ? maskedStep : (biased ? biasedStep : plainStep))
+            sampled || penalized
+            ? sampledStep : (masked ? maskedStep : (biased ? biasedStep : plainStep))
         // Weights and fused projections enter as compile STATE (tracer inputs),
         // never captured constants -- see `compiledStepExtraState`.
         return compile(
@@ -2277,7 +2409,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         counter: TraceCounter,
         biased: Bool = false,
         masked: Bool = false,
-        sampled: Bool = false
+        sampled: Bool = false,
+        penalized: Bool = false
     ) -> Step {
         let model = self.model
         // A batched row WRAPS its model cache (dense → self, recurrent → the inner `MambaCache`),
@@ -2322,10 +2455,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             return Self.logitsVariantOutputs(
                 raw: logits[0..., -1, 0...],
                 additive: biased || masked ? arguments[1] : nil,
-                masked: masked)
+                masked: masked,
+                includingRaw: penalized)
         }
         let step =
-            sampled ? sampledStep : (masked ? maskedStep : (biased ? biasedStep : plainStep))
+            sampled || penalized
+            ? sampledStep : (masked ? maskedStep : (biased ? biasedStep : plainStep))
         // See `compiledStepExtraState`.
         return compile(
             inputs: state + compiledStepExtraState,
@@ -2339,8 +2474,12 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// is `raw + additive` (the bias and/or mask row) or `raw`; `rawFinite` is a per-row `[rows]`
     /// flag that the RAW logits hold no NaN/inf (a masked row's `-inf` columns are legitimate, so
     /// the adjusted logits are not what is checked).
+    ///
+    /// `includingRaw` (a step with a penalized member) appends the RAW last-position logits as a
+    /// fourth output, so each penalized row can run its processor on them outside `compile`; the
+    /// first three outputs are the same ops either way.
     private static func logitsVariantOutputs(
-        raw: MLXArray, additive: MLXArray?, masked: Bool
+        raw: MLXArray, additive: MLXArray?, masked: Bool, includingRaw: Bool = false
     ) -> [MLXArray] {
         let adjusted = additive.map { raw + $0 } ?? raw
         let greedy: MLXArray
@@ -2350,7 +2489,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         } else {
             greedy = CompiledMLXDecoder.greedyTokenOrInvalidSentinel(adjusted)
         }
-        return [greedy, adjusted, isFinite(raw).all(axis: -1)]
+        let base = [greedy, adjusted, isFinite(raw).all(axis: -1)]
+        return includingRaw ? base + [raw] : base
     }
 
     private func ensureScalarCapacity(
@@ -2471,6 +2611,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         if submission.requestsSpeculation, submission.sampling != nil {
             throw DenseContinuousBatchRuntimeError.samplingWithSpeculation(admission.id)
+        }
+        if submission.requestsSpeculation, submission.penalties != nil {
+            throw DenseContinuousBatchRuntimeError.penaltiesWithSpeculation(admission.id)
         }
         if let outOfRange = submission.logitBias.keys.sorted().first(where: {
             $0 < 0 || $0 >= vocabularySize

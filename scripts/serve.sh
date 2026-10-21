@@ -35,8 +35,9 @@
 # concurrency-aware verdict); the default sizes for a single stream.
 # Set FASTMLX_API_KEY to require Bearer auth (mandatory when binding a non-loopback --host).
 # Pass --single-stream (wrapper-only; never forwarded) to serve on the single-stream scalar route
-# instead of the default continuous-batch route: sampling (temperature>0), penalties, logprobs,
-# /v1/completions, response_format and --chat-template are served only there.
+# instead of the default continuous-batch route (which serves sampling (temperature>0) and the
+# presence/frequency/repetition penalties): logprobs, /v1/completions and --chat-template are
+# served only on the single-stream route.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -142,14 +143,14 @@ validate_host_use() {
 
 validate_host_use
 
-# --single-stream is a wrapper-only opt-out of the default continuous-batch route. That route is
-# greedy-only: it returns 400 for temperature>0, non-neutral penalties, logprobs, /v1/completions and
-# response_format, and the binary refuses --chat-template and --default-sampling alongside it. The
-# scalar (single-stream) route serves all of those, but the wrapper otherwise always selects the
-# continuous route (and its --max-reserved-kv-bytes default, which the binary rejects without
-# continuous mode), so this flag is how a user reaches the scalar route. Parsed, checked and stripped
-# here, before any build, binary resolution, download or quant work, so a conflicting launch exits 2
-# having touched nothing; the binary never sees the flag.
+# --single-stream is a wrapper-only opt-out of the default continuous-batch route. That route samples
+# (temperature>0) and applies presence/frequency/repetition penalties, but it returns 400 for
+# logprobs and /v1/completions, and the binary refuses --chat-template and --default-sampling
+# alongside it. The scalar (single-stream) route serves all of those, but the wrapper otherwise
+# always selects the continuous route (and its --max-reserved-kv-bytes default, which the binary
+# rejects without continuous mode), so this flag is how a user reaches the scalar route. Parsed,
+# checked and stripped here, before any build, binary resolution, download or quant work, so a
+# conflicting launch exits 2 having touched nothing; the binary never sees the flag.
 validate_and_strip_single_stream() {
   local count=0 a conflict
   for a in ${ARGS[@]+"${ARGS[@]}"}; do

@@ -112,9 +112,10 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
-    /// Penalties and invalid sampling values are still 400s on the continuous route, before any
-    /// admission.
-    func testContinuousBatchRouteStillRefusesPenaltiesAndInvalidSamplingValues()
+    /// Invalid sampling values are still 400s on the continuous route, before any admission. (The
+    /// penalty 400 that used to sit beside them is gone: penalties are served, see the penalty tests
+    /// below.)
+    func testContinuousBatchRouteStillRefusesInvalidSamplingValues()
         async throws
     {
         let recorder = ContinuousRuntimeRecorder()
@@ -133,27 +134,10 @@ final class ContinuousServingBackendTests: XCTestCase {
             pieces: [1: "s"],
             stopTokenIDs: [99])
 
-        // A penalized request (greedy, but presence_penalty != 0) is refused: the compiled path has
-        // no logit processor, so accepting it would be a silent no-op. Same for a sampled one.
-        for temperature in [0.0, 0.8] {
-            var penalized = request(text: "solo", maxTokens: 2)
-            penalized.temperature = temperature
-            penalized.presencePenalty = 1.5
-            do {
-                _ = try await backend.start(penalized)
-                XCTFail("continuous route must reject a penalized request (T=\(temperature))")
-            } catch let error as OpenAIServingError {
-                guard case .invalidRequest(_, let param) = error else {
-                    XCTFail("expected invalidRequest, got \(error)")
-                    await backend.shutdown()
-                    return
-                }
-                XCTAssertEqual(param, "presence_penalty")
-            }
-        }
-
+        // A penalized request with an invalid sampling value is still refused on the sampling param.
         var invalid = request(text: "solo", maxTokens: 2)
         invalid.temperature = 3.0
+        invalid.presencePenalty = 1.5
         do {
             _ = try await backend.start(invalid)
             XCTFail("temperature 3.0 is out of range and must be refused")
@@ -167,6 +151,184 @@ final class ContinuousServingBackendTests: XCTestCase {
         }
         XCTAssertEqual(recorder.submissions, [], "a refused request must never reach the coordinator")
         await backend.shutdown()
+    }
+
+    /// The request's penalty fields map through the scalar route's `DecoderPenalties` bridge: the
+    /// neutral set (`DecoderPenalties.isEmpty`) is `nil` (the unpenalized graph is untouched);
+    /// otherwise each field is a Float, with a neutral repetition value or a zero presence/frequency
+    /// as `nil`.
+    func testRowPenaltiesMappingMatchesTheDecoderPenaltiesBridge() {
+        func mapped(
+            presence: Double? = nil, frequency: Double? = nil, repetition: Double? = nil
+        ) -> ContinuousBatchRowPenalties? {
+            ContinuousServingBackend.rowPenalties(
+                for: DecoderPenalties(
+                    presencePenalty: presence, frequencyPenalty: frequency,
+                    repetitionPenalty: repetition))
+        }
+        XCTAssertNil(mapped())
+        XCTAssertNil(mapped(presence: 0, frequency: 0, repetition: 1))
+        XCTAssertNil(mapped(repetition: 0))
+        XCTAssertEqual(
+            mapped(presence: 1.5, frequency: 0.5, repetition: 1.1),
+            ContinuousBatchRowPenalties(
+                presence: Float(1.5), frequency: Float(0.5), repetition: Float(1.1)))
+        XCTAssertEqual(
+            mapped(presence: 1.5, repetition: 1.0),
+            ContinuousBatchRowPenalties(presence: Float(1.5), frequency: nil, repetition: nil))
+        XCTAssertEqual(
+            mapped(presence: 0, frequency: -0.5),
+            ContinuousBatchRowPenalties(presence: nil, frequency: Float(-0.5), repetition: nil))
+        XCTAssertEqual(
+            mapped(repetition: 1.1),
+            ContinuousBatchRowPenalties(presence: nil, frequency: nil, repetition: Float(1.1)))
+    }
+
+    /// P3: a neutral penalty set (`repetition_penalty: 1.0`, `presence_penalty: 0`,
+    /// `frequency_penalty: 0`) reaches the coordinator as NO penalties, exactly like a request that
+    /// never sent the fields.
+    func testContinuousBatchRouteSubmitsNoPenaltiesForTheNeutralSet() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        var neutral = request(text: "solo", maxTokens: 2)
+        neutral.repetitionPenalty = 1.0
+        neutral.presencePenalty = 0
+        neutral.frequencyPenalty = 0
+        let neutralHandle = try await backend.start(neutral)
+        XCTAssertEqual(recorder.submissions.count, 1)
+        XCTAssertNil(recorder.submissions.last?.penalties)
+        _ = await neutralHandle.lease.cancel(.clientDisconnected)
+
+        let absent = try await backend.start(request(text: "solo", maxTokens: 2))
+        XCTAssertEqual(recorder.submissions.count, 2)
+        XCTAssertNil(recorder.submissions.last?.penalties)
+        _ = await absent.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// A real penalty set is ADMITTED (greedy or sampled) and the coordinator receives exactly the
+    /// request's Float values; a neutral repetition beside a real presence penalty stays `nil`.
+    func testContinuousBatchRouteAdmitsPenaltiesAndCarriesThemIntoTheSubmission() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        for temperature in [0.0, 0.8] {
+            var full = request(text: "solo", maxTokens: 2)
+            full.temperature = temperature
+            full.presencePenalty = 1.5
+            full.repetitionPenalty = 1.1
+            full.frequencyPenalty = 0.5
+            let handle = try await backend.start(full)
+            XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+            XCTAssertEqual(
+                recorder.submissions.last?.penalties,
+                ContinuousBatchRowPenalties(
+                    presence: Float(1.5), frequency: Float(0.5), repetition: Float(1.1)),
+                "T=\(temperature)")
+            _ = await handle.lease.cancel(.clientDisconnected)
+        }
+
+        var presenceOnly = request(text: "solo", maxTokens: 2)
+        presenceOnly.presencePenalty = 1.5
+        presenceOnly.repetitionPenalty = 1.0
+        let presenceHandle = try await backend.start(presenceOnly)
+        XCTAssertEqual(
+            recorder.submissions.last?.penalties,
+            ContinuousBatchRowPenalties(presence: Float(1.5), frequency: nil, repetition: nil))
+        _ = await presenceHandle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// The HF Instruct preset (T 0.7, top_p 0.8, top_k 20, presence 1.5, repetition 1.0) is admitted
+    /// with BOTH its sampling and its penalties carried; the neutral repetition 1.0 adds nothing.
+    func testContinuousBatchRouteAdmitsTheHFInstructPreset() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99])
+
+        var preset = request(text: "solo", maxTokens: 2)
+        preset.temperature = 0.7
+        preset.topP = 0.8
+        preset.topK = 20
+        preset.presencePenalty = 1.5
+        preset.repetitionPenalty = 1.0
+        let handle = try await backend.start(preset)
+        XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        XCTAssertEqual(recorder.submissions.count, 1)
+        XCTAssertEqual(
+            recorder.submissions.first?.sampling,
+            ContinuousBatchRowSampling(
+                temperature: Float(0.7), topP: Float(0.8), topK: 20, minP: 0, seed: nil))
+        XCTAssertEqual(
+            recorder.submissions.first?.penalties,
+            ContinuousBatchRowPenalties(presence: Float(1.5), frequency: nil, repetition: nil))
+        _ = await handle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// Invalid penalty values keep their existing 400s, raised at request parse (ServingCore) with the
+    /// offending field as `param`; none of them can reach this route.
+    func testInvalidPenaltyValuesAreStillRefusedWithTheirOwnParam() throws {
+        let cases: [(String, String)] = [
+            (#""presence_penalty":3"#, "presence_penalty"),
+            (#""presence_penalty":-3"#, "presence_penalty"),
+            (#""frequency_penalty":2.1"#, "frequency_penalty"),
+            (#""repetition_penalty":-1"#, "repetition_penalty"),
+            (#""repetition_penalty":0"#, "repetition_penalty"),
+        ]
+        for (field, expectedParam) in cases {
+            let body =
+                #"{"model":"fixture","messages":[{"role":"user","content":"hi"}],"# + field + "}"
+            do {
+                _ = try OpenAIChatCompletionRequest.decodeStrict(from: Data(body.utf8))
+                XCTFail("\(field) must be refused")
+            } catch let error as OpenAIServingError {
+                guard case .invalidRequest(_, let param) = error else {
+                    XCTFail("expected invalidRequest for \(field), got \(error)")
+                    continue
+                }
+                XCTAssertEqual(param, expectedParam, field)
+            }
+        }
     }
 
     /// Each invalid sampling field is a 400 naming ITS OWN `param` (the scalar route's mapping, shared
@@ -277,6 +439,63 @@ final class ContinuousServingBackendTests: XCTestCase {
         XCTAssertEqual(greedy.1.first?.requestsSpeculation, true)
         XCTAssertEqual(
             greedy.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
+    }
+
+    /// On the solo-PLD route a PENALIZED greedy request is submitted WITHOUT speculation (the runtime
+    /// refuses penalties + speculation) while carrying its penalties; the control, an unpenalized
+    /// greedy request on the same route, still requests speculation.
+    func testDynamicAdmissionSoloPLDPenalizedRequestIsSubmittedWithoutSpeculation()
+        async throws
+    {
+        func runSolo(presencePenalty: Double?) async throws -> (
+            ServingExecutionRoute, [ContinuousBatchSubmission], [BatchDecodeAction]
+        ) {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 2, queued: 4),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]],
+                    recorder: recorder,
+                    allowsSpeculation: true),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeDynamicBackend(
+                coordinator: coordinator,
+                promptByText: ["solo": [10]],
+                pieces: [1: "s"],
+                stopTokenIDs: [99])
+            var solo = request(text: "solo", maxTokens: 2)
+            solo.presencePenalty = presencePenalty
+            let start = Task { try await backend.start(solo) }
+            await waitUntil {
+                await backend.diagnosticPendingAdmissionRequestCount() == 1
+            }
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+            let handle = try await start.value
+            try await runUntilDecode(coordinator, recorder: recorder)
+            let result = (handle.route, recorder.submissions, recorder.decodeActions)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+            return result
+        }
+
+        let penalized = try await runSolo(presencePenalty: 1.5)
+        XCTAssertEqual(penalized.0, .soloPLD)
+        XCTAssertEqual(penalized.1.count, 1)
+        XCTAssertEqual(
+            penalized.1.first?.penalties,
+            ContinuousBatchRowPenalties(presence: Float(1.5), frequency: nil, repetition: nil))
+        XCTAssertEqual(penalized.1.first?.requestsSpeculation, false)
+        XCTAssertEqual(
+            penalized.2.first, .solo(BatchRequestID(1), speculationAllowed: false))
+
+        let plain = try await runSolo(presencePenalty: nil)
+        XCTAssertEqual(plain.0, .soloPLD)
+        XCTAssertNil(plain.1.first?.penalties)
+        XCTAssertEqual(plain.1.first?.requestsSpeculation, true)
+        XCTAssertEqual(
+            plain.2.first, .solo(BatchRequestID(1), speculationAllowed: true))
     }
 
     /// `logit_bias` (A7): the capability is declared exactly when the backend knows the model's
@@ -1175,11 +1394,10 @@ final class ContinuousServingBackendTests: XCTestCase {
     /// `repetitionPenalty` is a MULTIPLICATIVE penalty (the vendored `RepetitionContext`:
     /// `x < 0 ? x * penalty : x / penalty`), so its neutral element is `1`, not `0`. Both
     /// HF-recommended presets for the deployed model send `repetition_penalty: 1.0` on every
-    /// request -- if this route treated that as "a penalty is active" it would reject every real
-    /// production request outright (an HTTP 400 a client actually observes). `1.1` is a REAL
-    /// penalty and must still be rejected, so this test discriminates rather than merely proving
-    /// "nothing here ever rejects."
-    func testContinuousBatchRouteAdmitsNeutralRepetitionPenaltyButRejectsReal() async throws {
+    /// request -- that must reach the coordinator as NO penalties (the unpenalized graph), while
+    /// `1.1` is a REAL penalty and must be carried, so this test discriminates rather than merely
+    /// proving "nothing here ever rejects."
+    func testContinuousBatchRouteTreatsNeutralRepetitionAsNoPenaltyAndCarriesRealOne() async throws {
         let recorder = ContinuousRuntimeRecorder()
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 2, queued: 4),
@@ -1200,21 +1418,17 @@ final class ContinuousServingBackendTests: XCTestCase {
         neutral.repetitionPenalty = 1.0
         let handle = try await backend.start(neutral)
         XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+        XCTAssertNil(recorder.submissions.last?.penalties)
         _ = await handle.lease.cancel(.clientDisconnected)
 
         var real = request(text: "solo", maxTokens: 2)
         real.repetitionPenalty = 1.1
-        do {
-            _ = try await backend.start(real)
-            XCTFail("continuous route must still reject a real (non-neutral) repetition penalty")
-        } catch let error as OpenAIServingError {
-            guard case .invalidRequest(_, let param) = error else {
-                XCTFail("expected invalidRequest, got \(error)")
-                await backend.shutdown()
-                return
-            }
-            XCTAssertEqual(param, "presence_penalty")
-        }
+        let realHandle = try await backend.start(real)
+        XCTAssertEqual(realHandle.route, .continuousBatchNoSpec)
+        XCTAssertEqual(
+            recorder.submissions.last?.penalties,
+            ContinuousBatchRowPenalties(presence: nil, frequency: nil, repetition: Float(1.1)))
+        _ = await realHandle.lease.cancel(.clientDisconnected)
         await backend.shutdown()
     }
 

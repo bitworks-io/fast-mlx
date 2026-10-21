@@ -238,6 +238,27 @@ public struct ContinuousBatchRowSampling: Sendable, Equatable {
     }
 }
 
+/// Per-row logit penalties for the continuous-batch route (the OpenAI `presence_penalty` /
+/// `frequency_penalty` and the `repetition_penalty` extension). The values are the ones the scalar
+/// route hands the vendored `GenerateParameters(...).processor()`; the dense runtime builds one
+/// processor per penalized row at admission and keeps it for the row's lifetime. `nil` fields mean
+/// "not set"; the submission's `penalties` itself is `nil` for a neutral request. Declared here
+/// (pure, MLX-free) because `ContinuousBatchSubmission` carries it.
+public struct ContinuousBatchRowPenalties: Sendable, Equatable {
+    /// Additive penalty applied once to each token present in the recent context.
+    public let presence: Float?
+    /// Additive penalty scaled by each token's count in the recent context.
+    public let frequency: Float?
+    /// Multiplicative (HF-style) penalty applied to tokens present in the recent context.
+    public let repetition: Float?
+
+    public init(presence: Float? = nil, frequency: Float? = nil, repetition: Float? = nil) {
+        self.presence = presence
+        self.frequency = frequency
+        self.repetition = repetition
+    }
+}
+
 public struct ContinuousBatchSubmission: Sendable, Equatable {
     public let promptTokens: [Int]
     public let maxOutputTokens: Int
@@ -262,6 +283,11 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
     /// row greedy. Sampling is incompatible with `requestsSpeculation`: a sampled row never
     /// speculates, and the runtime refuses the pair.
     public let sampling: ContinuousBatchRowSampling?
+    /// Per-row logit penalties. `nil` (the default, every prior submission, and every neutral
+    /// request) leaves the row on the original steps with no processor. Penalties are
+    /// incompatible with `requestsSpeculation`: a penalized row never speculates, and the
+    /// runtime refuses the pair.
+    public let penalties: ContinuousBatchRowPenalties?
 
     public static func == (lhs: ContinuousBatchSubmission, rhs: ContinuousBatchSubmission) -> Bool {
         lhs.promptTokens == rhs.promptTokens
@@ -273,6 +299,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             && lhs.logitBias == rhs.logitBias
             && lhs.tokenMask === rhs.tokenMask
             && lhs.sampling == rhs.sampling
+            && lhs.penalties == rhs.penalties
     }
 
     public init(
@@ -284,7 +311,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         ignoresStopTokens: Bool = false,
         logitBias: [Int: Float] = [:],
         tokenMask: (any ContinuousBatchRowTokenMask)? = nil,
-        sampling: ContinuousBatchRowSampling? = nil
+        sampling: ContinuousBatchRowSampling? = nil,
+        penalties: ContinuousBatchRowPenalties? = nil
     ) {
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
@@ -295,6 +323,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         self.logitBias = logitBias
         self.tokenMask = tokenMask
         self.sampling = sampling
+        self.penalties = penalties
     }
 
     public init(
@@ -306,7 +335,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         ignoresStopTokens: Bool = false,
         logitBias: [Int: Float] = [:],
         tokenMask: (any ContinuousBatchRowTokenMask)? = nil,
-        sampling: ContinuousBatchRowSampling? = nil
+        sampling: ContinuousBatchRowSampling? = nil,
+        penalties: ContinuousBatchRowPenalties? = nil
     ) {
         self.init(
             promptTokens: promptTokens,
@@ -317,7 +347,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             ignoresStopTokens: ignoresStopTokens,
             logitBias: logitBias,
             tokenMask: tokenMask,
-            sampling: sampling)
+            sampling: sampling,
+            penalties: penalties)
     }
 }
 
