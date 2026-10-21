@@ -395,23 +395,27 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-21",
-                "title": "Publish v0.1.21: fastmlx bench --combine accepts fastmlx-serve triples, and the continuous-batch route accepts logit_bias",
-                "publishedAt": "2026-10-20T02:19:26Z",
+                "id": "tagged-distribution-v0-1-22",
+                "title": "Publish v0.1.22: the continuous-batch route serves tool_choice, response_format, sampling, penalties and --default-sampling",
+                "publishedAt": "2026-10-21T10:23:05Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.21 arm64 macOS distribution: fastmlx bench "
-                    "--combine now accepts a triple of fastmlx-serve runs, where only "
-                    "the --model and --model-path values may differ between the arms "
-                    "and every other argument must match; and the continuous-batch "
-                    "route now accepts a per-request logit_bias, which it used to "
-                    "refuse when non-empty, with a token id at or above the model's "
-                    "vocab_size a 400 on logit_bias. A plain fastmlx serve launch "
-                    "uses the scalar route and is not affected. The bundled "
-                    "quality-card store is unchanged from v0.1.20. Greedy output is "
-                    "identical to the development build on the release check "
-                    "prompts. The engine still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.22 arm64 macOS distribution: the "
+                    "continuous-batch route now serves the request fields it used to "
+                    "refuse with a 400: a named or \"required\" tool_choice and "
+                    "response_format json_object or json_schema, enforced by a "
+                    "per-request token mask; sampling with temperature above zero, "
+                    "top_p, top_k and seed; and presence, frequency and repetition "
+                    "penalties. --default-sampling generation-config now "
+                    "works on continuous launches, refusing fast when the pack has no "
+                    "readable generation_config.json. A request without these fields "
+                    "keeps the original decode steps and output. On "
+                    "--continuous-dynamic-pld these requests decode without "
+                    "speculation, and logprobs is still served only by the scalar "
+                    "route. The bundled quality-card store is unchanged from v0.1.21. "
+                    "Greedy output is identical to the development build on the "
+                    "release check prompts. The engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -419,7 +423,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "18503a59cbf442b57f4c141bc6c7b969852fd749",
+                "publicCommit": "c24d156965343ad42ceb36d03b97ac8204135914",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -436,6 +440,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "c24d156965343ad42ceb36d03b97ac8204135914",
                 "18503a59cbf442b57f4c141bc6c7b969852fd749",
                 "96c7766077425f62b96ec779a008c86d8369e474",
                 "494f5b62cc78164f715c57ed6ea02089e0d73fb6",
