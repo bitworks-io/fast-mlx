@@ -259,6 +259,50 @@ public struct ContinuousBatchRowPenalties: Sendable, Equatable {
     }
 }
 
+/// One alternative in a `ContinuousBatchTokenLogprob`'s `top` list.
+public struct ContinuousBatchTokenLogprobCandidate: Sendable, Equatable {
+    public let tokenID: Int
+    public let logprob: Float
+
+    public init(tokenID: Int, logprob: Float) {
+        self.tokenID = tokenID
+        self.logprob = logprob
+    }
+}
+
+/// The logprob of one emitted token on the continuous-batch route, with the same meaning as the
+/// scalar route's `DecodedTokenLogprob`: the log-softmax (float32) of the row's RAW logits for the
+/// step that selected `tokenID` -- before penalties, `logit_bias`, the token mask, temperature and
+/// truncation -- plus up to `topLogprobs` alternatives by that same raw log-probability, sorted
+/// strictly descending, non-finite entries excluded, not deduplicated against `tokenID`. Declared
+/// here (pure, MLX-free) because `ContinuousBatchRowLogprobSink` carries it.
+public struct ContinuousBatchTokenLogprob: Sendable, Equatable {
+    public let tokenID: Int
+    public let logprob: Float
+    public let top: [ContinuousBatchTokenLogprobCandidate]
+
+    public init(tokenID: Int, logprob: Float, top: [ContinuousBatchTokenLogprobCandidate] = []) {
+        self.tokenID = tokenID
+        self.logprob = logprob
+        self.top = top
+    }
+}
+
+/// A per-row receiver for the OpenAI `logprobs` / `top_logprobs` request fields on the
+/// continuous-batch route. The runtime calls `record(_:)` exactly once per token it SELECTS for the
+/// row, in selection order (which is emission order: a row with a sink never speculates). The
+/// coordinator may trim a row's final tokens (a stop token, the output budget), so a sink can hold
+/// trailing entries for tokens that were never published; a consumer pairs entries with published
+/// tokens from the head, in order. `record(_:)` is non-throwing and must not block. Requesting
+/// logprobs never changes which token is selected. Declared here (pure, MLX-free) because
+/// `ContinuousBatchSubmission` carries it; the dense runtime in `SpikeCore` feeds it.
+public protocol ContinuousBatchRowLogprobSink: AnyObject, Sendable {
+    /// How many alternatives to report per token, `>= 0`. `0` reports only the selected token.
+    var topLogprobs: Int { get }
+    /// Called once per selected token, in selection order.
+    func record(_ logprob: ContinuousBatchTokenLogprob)
+}
+
 public struct ContinuousBatchSubmission: Sendable, Equatable {
     public let promptTokens: [Int]
     public let maxOutputTokens: Int
@@ -288,6 +332,11 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
     /// incompatible with `requestsSpeculation`: a penalized row never speculates, and the
     /// runtime refuses the pair.
     public let penalties: ContinuousBatchRowPenalties?
+    /// Per-row logprob reporting (`logprobs` / `top_logprobs`). `nil` (the default, every prior
+    /// submission) reports nothing and leaves the row on its existing steps. A sink is
+    /// incompatible with `requestsSpeculation`: a row with a sink never speculates, and the
+    /// runtime refuses the pair. Equality compares the sink by identity.
+    public let logprobs: (any ContinuousBatchRowLogprobSink)?
 
     public static func == (lhs: ContinuousBatchSubmission, rhs: ContinuousBatchSubmission) -> Bool {
         lhs.promptTokens == rhs.promptTokens
@@ -300,6 +349,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             && lhs.tokenMask === rhs.tokenMask
             && lhs.sampling == rhs.sampling
             && lhs.penalties == rhs.penalties
+            && lhs.logprobs === rhs.logprobs
     }
 
     public init(
@@ -312,7 +362,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         logitBias: [Int: Float] = [:],
         tokenMask: (any ContinuousBatchRowTokenMask)? = nil,
         sampling: ContinuousBatchRowSampling? = nil,
-        penalties: ContinuousBatchRowPenalties? = nil
+        penalties: ContinuousBatchRowPenalties? = nil,
+        logprobs: (any ContinuousBatchRowLogprobSink)? = nil
     ) {
         self.promptTokens = promptTokens
         self.maxOutputTokens = maxOutputTokens
@@ -324,6 +375,7 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         self.tokenMask = tokenMask
         self.sampling = sampling
         self.penalties = penalties
+        self.logprobs = logprobs
     }
 
     public init(
@@ -336,7 +388,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
         logitBias: [Int: Float] = [:],
         tokenMask: (any ContinuousBatchRowTokenMask)? = nil,
         sampling: ContinuousBatchRowSampling? = nil,
-        penalties: ContinuousBatchRowPenalties? = nil
+        penalties: ContinuousBatchRowPenalties? = nil,
+        logprobs: (any ContinuousBatchRowLogprobSink)? = nil
     ) {
         self.init(
             promptTokens: promptTokens,
@@ -348,7 +401,8 @@ public struct ContinuousBatchSubmission: Sendable, Equatable {
             logitBias: logitBias,
             tokenMask: tokenMask,
             sampling: sampling,
-            penalties: penalties)
+            penalties: penalties,
+            logprobs: logprobs)
     }
 }
 

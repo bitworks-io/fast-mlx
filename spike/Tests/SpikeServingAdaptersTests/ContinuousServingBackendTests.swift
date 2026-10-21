@@ -1501,13 +1501,55 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
-    /// The continuous-batch route has no seam to observe a step's raw logits — a request carrying
-    /// a validated `logprobsRequest` must be rejected with `logprobs_unsupported` BEFORE anything
-    /// is rendered or decoded, mirroring `completions_unsupported`'s mechanics exactly (never a
-    /// silently-wrong response omitting the logprobs the caller asked for).
-    func testContinuousBatchRouteRejectsLogprobsRequestBeforeRenderingOrDecoding()
-        async throws
-    {
+    // MARK: - `logprobs` / `top_logprobs` on the continuous route (cycle 280)
+
+    /// The expected wire-level entry for a fixture-selected token: what `fixtureLogprob` records,
+    /// mapped through the fixture codec exactly as the scalar route maps ids to text.
+    private func expectedServedLogprob(
+        _ token: Int, pieces: [Int: String], topLogprobs: Int
+    ) -> ServingTokenLogprob {
+        let raw = fixtureLogprob(for: token, topLogprobs: topLogprobs)
+        return ServingTokenLogprob(
+            tokenText: pieces[token] ?? "<\(token)>",
+            logprob: Double(raw.logprob),
+            topCandidates: raw.top.map {
+                ServingTokenLogprobCandidate(
+                    tokenText: pieces[$0.tokenID] ?? "<\($0.tokenID)>",
+                    logprob: Double($0.logprob))
+            })
+    }
+
+    private func logprobBackend(
+        script: [Int],
+        pieces: [Int: String],
+        logprobMode: FixtureLogprobMode = .faithful,
+        automaticDrive: Bool = true,
+        publicationCapacity: Int = 1,
+        mailboxCapacity: BoundedDeltaMailbox.Capacity = .init(maxDeltas: 64, maxBytes: 65_536)
+    ) throws -> (ContinuousServingBackend, ContinuousBatchCoordinator, ContinuousRuntimeRecorder) {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: script],
+                recorder: recorder,
+                allowsSpeculation: true,
+                logprobMode: logprobMode),
+            automaticDrive: automaticDrive,
+            publicationCapacity: publicationCapacity,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: pieces,
+            stopTokenIDs: [99],
+            mailboxCapacity: mailboxCapacity)
+        return (backend, coordinator, recorder)
+    }
+
+    /// The submission carries a sink ONLY when logprobs were requested, with the requested
+    /// `top_logprobs`; a request without logprobs builds exactly the submission it built before.
+    func testSubmissionCarriesLogprobSinkOnlyWhenLogprobsRequested() async throws {
         let recorder = ContinuousRuntimeRecorder()
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 2, queued: 4),
@@ -1524,22 +1566,296 @@ final class ContinuousServingBackendTests: XCTestCase {
             pieces: [1: "s"],
             stopTokenIDs: [99])
 
-        var logprobsRequest = request(text: "solo", maxTokens: 2)
-        logprobsRequest.logprobsRequest = .chat(topLogprobs: 0)
+        var five = request(text: "solo", maxTokens: 2)
+        five.logprobsRequest = .chat(topLogprobs: 5)
+        let fiveHandle = try await backend.start(five)
+        XCTAssertEqual(recorder.submissions.count, 1)
+        XCTAssertEqual(recorder.submissions.first?.logprobs?.topLogprobs, 5)
+        _ = await fiveHandle.lease.cancel(.clientDisconnected)
 
-        do {
-            _ = try await backend.start(logprobsRequest)
-            XCTFail("continuous route must reject a logprobs request")
-        } catch let error as OpenAIServingError {
-            guard case .invalidRequestWithCode(_, let param, let code) = error else {
-                XCTFail("expected invalidRequestWithCode, got \(error)")
-                return
+        var zero = request(text: "solo", maxTokens: 2)
+        zero.logprobsRequest = .chat(topLogprobs: 0)
+        let zeroHandle = try await backend.start(zero)
+        XCTAssertEqual(recorder.submissions.count, 2)
+        XCTAssertEqual(recorder.submissions.last?.logprobs?.topLogprobs, 0)
+        XCTAssertFalse(
+            recorder.submissions.first?.logprobs === recorder.submissions.last?.logprobs,
+            "each request owns its own sink")
+        _ = await zeroHandle.lease.cancel(.clientDisconnected)
+
+        let plainHandle = try await backend.start(request(text: "solo", maxTokens: 2))
+        XCTAssertEqual(recorder.submissions.count, 3)
+        let plain = try XCTUnwrap(recorder.submissions.last)
+        XCTAssertNil(plain.logprobs)
+        // Exactly the submission a request without logprobs has always built.
+        XCTAssertEqual(
+            plain,
+            ContinuousBatchSubmission(
+                promptTokens: [10], maxOutputTokens: 2, stopTokenIDs: [99],
+                architecture: .denseAttention))
+        _ = await plainHandle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// One logprob entry per VISIBLE token, delivered in generation order immediately before that
+    /// token's text delta (the scalar route's order); the stop token is trimmed by the coordinator,
+    /// so its recorded entry is never published. The same deltas feed the non-stream and stream HTTP
+    /// shapes; the encoded `OpenAIChatLogprobs` is checked here.
+    func testChatLogprobsArePairedInOrderWithTheVisibleTokensAndTrimStopToken() async throws {
+        let pieces = [1: "a", 2: "b", 3: "c"]
+        let (backend, _, _) = try logprobBackend(script: [1, 2, 3, 99], pieces: pieces)
+
+        var withLogprobs = request(text: "solo", maxTokens: 8)
+        withLogprobs.logprobsRequest = .chat(topLogprobs: 2)
+        let handle = try await backend.start(withLogprobs)
+        let events = try await collect(handle.mailbox)
+
+        func entry(_ token: Int) -> ServingResponseDelta {
+            .tokenLogprobs([expectedServedLogprob(token, pieces: pieces, topLogprobs: 2)])
+        }
+        XCTAssertEqual(
+            events,
+            [
+                entry(1), .text("a"),
+                entry(2), .text("b"),
+                entry(3), .text("c"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .stop,
+                        usage: OpenAIChatUsage(promptTokens: 1, completionTokens: 3))),
+            ])
+
+        // The scalar route's JSON shape, built from the delivered entries.
+        let served = events.compactMap { event -> [ServingTokenLogprob]? in
+            if case .tokenLogprobs(let tokens) = event { tokens } else { nil }
+        }.flatMap { $0 }
+        let encoded = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(OpenAIChatLogprobs(tokens: served))) as? [String: Any]
+        let content = try XCTUnwrap(encoded?["content"] as? [[String: Any]])
+        XCTAssertEqual(content.map { $0["token"] as? String }, ["a", "b", "c"])
+        XCTAssertEqual(content.map { $0["logprob"] as? Double }, [-0.125, -0.25, -0.375])
+        let firstTop = try XCTUnwrap(content.first?["top_logprobs"] as? [[String: Any]])
+        XCTAssertEqual(firstTop.count, 2)
+        XCTAssertEqual(firstTop.map { $0["logprob"] as? Double }, [-0.125, -1.125])
+        XCTAssertTrue(encoded?["refusal"] is NSNull)
+
+        // A request WITHOUT logprobs on the same backend delivers text only (unchanged shape).
+        let plain = try await backend.start(request(text: "solo", maxTokens: 8))
+        let plainEvents = try await collect(plain.mailbox)
+        XCTAssertEqual(
+            plainEvents.filter { if case .tokenLogprobs = $0 { true } else { false } }.count, 0)
+        XCTAssertEqual(
+            plainEvents.compactMap { event -> String? in
+                if case .text(let value) = event { value } else { nil }
+            },
+            ["a", "b", "c"])
+        await backend.shutdown()
+    }
+
+    /// `top_logprobs: 0` reports the selected token only.
+    func testChatLogprobsWithZeroTopCarryNoAlternatives() async throws {
+        let pieces = [1: "a"]
+        let (backend, _, _) = try logprobBackend(script: [1, 99], pieces: pieces)
+        var withLogprobs = request(text: "solo", maxTokens: 8)
+        withLogprobs.logprobsRequest = .chat(topLogprobs: 0)
+        let events = try await collect(try await backend.start(withLogprobs).mailbox)
+        XCTAssertEqual(
+            events.first,
+            .tokenLogprobs([expectedServedLogprob(1, pieces: pieces, topLogprobs: 0)]))
+        guard case .tokenLogprobs(let tokens)? = events.first else {
+            return XCTFail("expected a tokenLogprobs delta first")
+        }
+        XCTAssertTrue(tokens[0].topCandidates.isEmpty)
+        await backend.shutdown()
+    }
+
+    /// The output budget trims the row: exactly `max_tokens` entries are published, none for a
+    /// token the budget cut off, and the finish reason is `length`.
+    func testChatLogprobsAreTrimmedAtTheOutputBudget() async throws {
+        let pieces = [1: "a", 2: "b", 3: "c", 4: "d"]
+        let (backend, _, _) = try logprobBackend(script: [1, 2, 3, 4, 99], pieces: pieces)
+        var withLogprobs = request(text: "solo", maxTokens: 2)
+        withLogprobs.logprobsRequest = .chat(topLogprobs: 1)
+        let events = try await collect(try await backend.start(withLogprobs).mailbox)
+        XCTAssertEqual(
+            events,
+            [
+                .tokenLogprobs([expectedServedLogprob(1, pieces: pieces, topLogprobs: 1)]),
+                .text("a"),
+                .tokenLogprobs([expectedServedLogprob(2, pieces: pieces, topLogprobs: 1)]),
+                .text("b"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .length,
+                        usage: OpenAIChatUsage(promptTokens: 1, completionTokens: 2))),
+            ])
+        await backend.shutdown()
+    }
+
+    /// Scalar-route parity at a string `stop`: the scalar decoder reports a logprob for EVERY
+    /// generated token before consuming it, including tokens whose text the stop filter withholds
+    /// (token 2 here, held as a possible stop prefix) and the token that completes the stop (3).
+    /// The continuous route pairs one entry per PUBLISHED token the same way, so tokens 1, 2, 3 each
+    /// carry an entry and the never-published token 4 does not.
+    func testChatLogprobsCoverEveryPublishedTokenAroundAStopString() async throws {
+        let pieces = [1: "hello<", 2: "stop", 3: ">hidden", 4: "tail"]
+        let (backend, _, _) = try logprobBackend(script: [1, 2, 3, 4, 99], pieces: pieces)
+        var withLogprobs = request(text: "solo", maxTokens: 8, stop: ["<stop>"])
+        withLogprobs.logprobsRequest = .chat(topLogprobs: 0)
+        let events = try await collect(try await backend.start(withLogprobs).mailbox)
+
+        func entry(_ token: Int) -> ServingResponseDelta {
+            .tokenLogprobs([expectedServedLogprob(token, pieces: pieces, topLogprobs: 0)])
+        }
+        XCTAssertEqual(
+            events,
+            [
+                entry(1), .text("hello"),
+                entry(2),
+                entry(3),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .stop,
+                        usage: OpenAIChatUsage(promptTokens: 1, completionTokens: 3))),
+            ])
+        await backend.shutdown()
+    }
+
+    /// Deterministic head-pairing guard. The coordinator is driven by hand through EVERY decode
+    /// while the client reads nothing, and the client's mailbox holds one delta, so the backend
+    /// consumer is parked on its first text send: the sink holds all the remaining entries (tokens
+    /// 2...5 and the trimmed stop token 99) before the second pop, not by a race. Entries pair with
+    /// the published tokens from the HEAD, in order; a tail pop would hand token 2 the entry for 99
+    /// and fail the request closed on every run.
+    func testChatLogprobsPairFromTheHeadWhenSeveralEntriesAreQueuedBeforeThePop()
+        async throws
+    {
+        let pieces = [1: "a", 2: "b", 3: "c", 4: "d", 5: "e"]
+        let (backend, coordinator, recorder) = try logprobBackend(
+            script: [1, 2, 3, 4, 5, 99], pieces: pieces, automaticDrive: false,
+            publicationCapacity: 8, mailboxCapacity: .init(maxDeltas: 1, maxBytes: 65_536))
+        var withLogprobs = request(text: "solo", maxTokens: 8)
+        withLogprobs.logprobsRequest = .chat(topLogprobs: 2)
+        let handle = try await backend.start(withLogprobs)
+
+        var ticks = 0
+        while try await coordinator.runOneTick() {
+            ticks += 1
+            XCTAssertLessThan(ticks, 100, "the coordinator must finish")
+            if ticks >= 100 { break }
+        }
+        XCTAssertGreaterThanOrEqual(
+            recorder.decodeActions.count, 6,
+            "every decode ran before the client read anything")
+
+        let events = try await collect(handle.mailbox)
+        func entry(_ token: Int) -> ServingResponseDelta {
+            .tokenLogprobs([expectedServedLogprob(token, pieces: pieces, topLogprobs: 2)])
+        }
+        XCTAssertEqual(
+            events,
+            [
+                entry(1), .text("a"),
+                entry(2), .text("b"),
+                entry(3), .text("c"),
+                entry(4), .text("d"),
+                entry(5), .text("e"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .stop,
+                        usage: OpenAIChatUsage(promptTokens: 1, completionTokens: 5))),
+            ])
+        await backend.shutdown()
+    }
+
+    /// A logprobs request on `--continuous-dynamic-pld` decodes UNSPECULATED (like sampled,
+    /// penalized, biased and masked requests); the same request without logprobs still speculates.
+    func testDynamicPLDDecodesALogprobsRequestWithoutSpeculation() async throws {
+        for wantsLogprobs in [true, false] {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 2, queued: 4),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]],
+                    recorder: recorder,
+                    allowsSpeculation: true),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeDynamicBackend(
+                coordinator: coordinator,
+                promptByText: ["solo": [10]],
+                pieces: [1: "s"],
+                stopTokenIDs: [99])
+
+            var solo = request(text: "solo", maxTokens: 2)
+            if wantsLogprobs { solo.logprobsRequest = .chat(topLogprobs: 1) }
+            let start = Task { try await backend.start(solo) }
+            await waitUntil { await backend.diagnosticPendingAdmissionRequestCount() == 1 }
+            await backend.diagnosticExpireAdmissionCoalescingWindow()
+            let handle = try await start.value
+
+            XCTAssertEqual(handle.route, .soloPLD)
+            try await runUntilDecode(coordinator, recorder: recorder)
+            XCTAssertEqual(
+                recorder.submissions.first?.requestsSpeculation, !wantsLogprobs,
+                "logprobs=\(wantsLogprobs)")
+            XCTAssertEqual(
+                recorder.decodeActions.first,
+                .solo(BatchRequestID(1), speculationAllowed: !wantsLogprobs),
+                "logprobs=\(wantsLogprobs)")
+            XCTAssertEqual(recorder.submissions.first?.logprobs != nil, wantsLogprobs)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+        }
+    }
+
+    /// A published token with no queued entry, or whose entry belongs to another token, fails THAT
+    /// request closed with a backend error instead of emitting a wrong or misaligned logprob (no
+    /// delta of the failed request is delivered).
+    func testChatLogprobsFailClosedWhenTheQueueIsEmptyOrMismatched() async throws {
+        for mode in [FixtureLogprobMode.recordsNothing, .wrongTokenID] {
+            let (backend, coordinator, _) = try logprobBackend(
+                script: [1, 2, 99], pieces: [1: "a", 2: "b"], logprobMode: mode)
+            var withLogprobs = request(text: "solo", maxTokens: 8)
+            withLogprobs.logprobsRequest = .chat(topLogprobs: 1)
+            let handle = try await backend.start(withLogprobs)
+            do {
+                let events = try await collect(handle.mailbox)
+                XCTFail("\(mode): expected a failure, got \(events)")
+            } catch let error as ServingMailboxError {
+                guard case .backend(let message) = error else {
+                    XCTFail("\(mode): expected a backend failure, got \(error)")
+                    continue
+                }
+                XCTAssertTrue(message.contains("logprob"), "\(mode): \(message)")
             }
-            XCTAssertEqual(param, "logprobs")
-            XCTAssertEqual(code, "logprobs_unsupported")
+            await waitUntil { await coordinator.snapshots().isEmpty }
+            await backend.shutdown()
+        }
+    }
+
+    /// The legacy completions route stays refused on the continuous route (its earlier guard), with
+    /// `completions_unsupported`, even when the request carries `logprobs: N`.
+    func testCompletionsLogprobsStayRefusedOnTheContinuousRoute() async throws {
+        let (backend, coordinator, recorder) = try logprobBackend(
+            script: [1, 99], pieces: [1: "s"])
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(
+            from: Data(#"{"model":"fixture","prompt":"solo","max_tokens":2,"logprobs":2}"#.utf8))
+        let rawTextRequest = completionRequest.asChatCompletionRequest()
+        XCTAssertNotNil(rawTextRequest.logprobsRequest)
+        do {
+            _ = try await backend.start(rawTextRequest)
+            XCTFail("continuous route must still reject a completions request")
+        } catch let error as OpenAIServingError {
+            guard case .invalidRequestWithCode(_, _, let code) = error else {
+                return XCTFail("expected invalidRequestWithCode, got \(error)")
+            }
+            XCTAssertEqual(code, "completions_unsupported")
         }
         XCTAssertTrue(recorder.decodeActions.isEmpty)
-        XCTAssertTrue(recorder.admissionBatchSizes.isEmpty)
+        let slots = await coordinator.snapshots()
+        XCTAssertTrue(slots.isEmpty)
         await backend.shutdown()
     }
 
@@ -3586,6 +3902,29 @@ private final class BlockingRuntimeResourceSnapshotGate: Sendable {
     }
 }
 
+/// How the fixture runtime plays the real runtime's side of the `ContinuousBatchRowLogprobSink`
+/// contract (one `record` per selected token, in order). `faithful` is the contract; the others
+/// break it so the backend's fail-closed pairing can be exercised.
+private enum FixtureLogprobMode: Sendable {
+    case faithful
+    /// Never records (the consumer finds an empty queue).
+    case recordsNothing
+    /// Records an entry whose token id is not the selected token.
+    case wrongTokenID
+}
+
+/// The fixture's deterministic raw logprob for a selected token (exact in binary floating point).
+private func fixtureLogprob(
+    for token: Int, topLogprobs: Int
+) -> ContinuousBatchTokenLogprob {
+    let own = -Float(token) / 8
+    let top = (0 ..< topLogprobs).map { rank in
+        ContinuousBatchTokenLogprobCandidate(
+            tokenID: token + 100 * rank, logprob: own - Float(rank))
+    }
+    return ContinuousBatchTokenLogprob(tokenID: token, logprob: own, top: top)
+}
+
 private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     private struct Slot {
         var processedTokens = 0
@@ -3605,6 +3944,8 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
     /// bitset, BEFORE the backend's `publish` sees the token. The fixture never applies the bitset (its
     /// script is fixed), so a test chooses a script that either follows or violates the constraint.
     private let advancesTokenMasks: Bool
+    private let logprobMode: FixtureLogprobMode
+    private var logprobSinks: [BatchRequestID: any ContinuousBatchRowLogprobSink] = [:]
     private var admittedIDs: Set<BatchRequestID> = []
     private var promptHeadByID: [BatchRequestID: Int] = [:]
     private var slots: [BatchRequestID: Slot] = [:]
@@ -3616,8 +3957,10 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
         allowsSpeculation: Bool = false,
         speculativeSoloState: BatchSoloPipelineState = .speculative,
         resourceSnapshotGate: BlockingRuntimeResourceSnapshotGate? = nil,
-        advancesTokenMasks: Bool = false
+        advancesTokenMasks: Bool = false,
+        logprobMode: FixtureLogprobMode = .faithful
     ) {
+        self.logprobMode = logprobMode
         self.scriptsByPromptHead = scriptsByPromptHead
         self.recorder = recorder
         self.allowsSpeculation = allowsSpeculation
@@ -3630,6 +3973,7 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
         admittedIDs.formUnion(admissions.map(\.id))
         for admission in admissions {
             tokenMasks[admission.id] = admission.submission.tokenMask
+            logprobSinks[admission.id] = admission.submission.logprobs
         }
         recorder.admitted(admissions.count)
         recorder.admitted(admissions)
@@ -3724,6 +4068,18 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
                     mask.advance(token: tokens[0])
                     _ = mask.allowedTokenBitset()
                 }
+                if let sink = logprobSinks[id] {
+                    switch logprobMode {
+                    case .faithful:
+                        sink.record(
+                            fixtureLogprob(for: tokens[0], topLogprobs: sink.topLogprobs))
+                    case .recordsNothing:
+                        break
+                    case .wrongTokenID:
+                        sink.record(
+                            fixtureLogprob(for: tokens[0] + 1, topLogprobs: sink.topLogprobs))
+                    }
+                }
             } else {
                 tokens = []
                 finished = true
@@ -3745,6 +4101,7 @@ private final class FixtureContinuousRuntime: ContinuousBatchRuntime {
         }
         promptHeadByID[id] = nil
         tokenMasks[id] = nil
+        logprobSinks[id] = nil
     }
 }
 
@@ -3899,6 +4256,12 @@ private struct FixtureContinuousTextCodec: ScalarServingTextCodec {
 
     func makeDetokenizer() -> any ScalarServingDetokenizer {
         FixtureContinuousDetokenizer(pieces: pieces)
+    }
+
+    /// Each token's OWN text (a logprob entry), independent of the incremental detokenizer: the
+    /// piece when the fixture has one, else a visible `<id>` marker.
+    func decodeSingleToken(_ tokenID: Int) -> String {
+        pieces[tokenID] ?? "<\(tokenID)>"
     }
 }
 

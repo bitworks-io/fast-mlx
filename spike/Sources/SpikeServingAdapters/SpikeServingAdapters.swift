@@ -74,9 +74,10 @@ public protocol ScalarServingTextCodec: Sendable {
     /// per-token logprobs contract (`ServingCore.ServingTokenLogprob`) needs each token's OWN piece
     /// text, not text merged through the incremental multi-token `makeDetokenizer()` detokenizer,
     /// which deliberately coalesces UTF-8 continuation bytes and BPE space-prefix merges across
-    /// generation steps to produce clean display text. Only invoked once a decoder capability
-    /// check (`InferenceActor.supportsLogprobs()`) has already admitted a logprobs request, so the
-    /// default below never fires in production — see the extension's doc comment.
+    /// generation steps to produce clean display text. Invoked only for a logprobs request, on the
+    /// scalar route after `InferenceActor.supportsLogprobs()` and on the continuous-batch route
+    /// with no capability gate; the default below never fires in production because every
+    /// production load uses `MLXScalarTextCodec` — see the extension's doc comment.
     func decodeSingleToken(_ tokenID: Int) -> String
     /// The literal vocabulary string for a token ID (e.g. `"</s>"`), or `nil` when the codec cannot
     /// report one. Only consulted for the generated stop token of an `ignore_eos` request whose
@@ -101,12 +102,13 @@ extension ScalarServingTextCodec {
     }
 
     /// Default: empty text. Every codec that predates `decodeSingleToken` (test fixtures; any
-    /// future codec that has not opted in) keeps compiling unchanged, and this default is never
-    /// reached on a production route — `ScalarServingBackend.start` only ever calls it after
-    /// `InferenceActor.supportsLogprobs()` has already gated the request on a decoder that
-    /// genuinely computes logprobs, and only `MLXScalarTextCodec` (paired with a plain `MLXDecoder`)
-    /// is wired to that combination today. Only `MLXScalarTextCodec` overrides this with a real
-    /// tokenizer decode.
+    /// future codec that has not opted in) keeps compiling unchanged. Production routes never
+    /// reach this default: the scalar route (`ScalarServingBackend.start`, after
+    /// `InferenceActor.supportsLogprobs()`) and the continuous-batch route
+    /// (`ContinuousServingBackend`, which has no such capability gate) both serve logprobs through
+    /// `ServingLogprobMapping.served`, and both production loads use `MLXScalarTextCodec`, the only
+    /// codec that overrides this with a real tokenizer decode. A new production codec MUST
+    /// override it, or the continuous route would serve logprob entries with empty token text.
     public func decodeSingleToken(_ tokenID: Int) -> String {
         ""
     }
@@ -1177,26 +1179,15 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         guard let current = active, current.request.id == id else {
             throw CancellationError()
         }
-        let candidates = logprob.top.map { candidate in
-            ServingTokenLogprobCandidate(
-                tokenText: codec.decodeSingleToken(candidate.tokenID),
-                logprob: Double(candidate.logprob))
-        }
-        var generatedText = codec.decodeSingleToken(logprob.tokenID)
-        // Under `ignore_eos` a model stop token is a generated token. A stop token is usually a
-        // special token whose decode can come back empty, which would leave a client unable to tell
-        // that entry apart, so fall back to its literal vocabulary text (e.g. "</s>"). Scoped to
-        // the generated stop token only: every other entry keeps today's decode result.
-        if current.request.request.ignoreEOS, generatedText.isEmpty,
-            stopTokenIDs.contains(logprob.tokenID),
-            let vocabularyText = codec.vocabularyText(forTokenID: logprob.tokenID)
-        {
-            generatedText = vocabularyText
-        }
-        let served = ServingTokenLogprob(
-            tokenText: generatedText,
-            logprob: Double(logprob.logprob),
-            topCandidates: candidates)
+        // The id -> text mapping (including the `ignore_eos` stop-token vocabulary fallback) is
+        // shared with the continuous-batch route: see `ServingLogprobMapping`.
+        let served = ServingLogprobMapping.served(
+            tokenID: logprob.tokenID,
+            logprob: logprob.logprob,
+            top: logprob.top.map { (tokenID: $0.tokenID, logprob: $0.logprob) },
+            codec: codec,
+            ignoreEOS: current.request.request.ignoreEOS,
+            stopTokenIDs: stopTokenIDs)
         try await current.request.mailbox.send(.tokenLogprobs([served]))
     }
 

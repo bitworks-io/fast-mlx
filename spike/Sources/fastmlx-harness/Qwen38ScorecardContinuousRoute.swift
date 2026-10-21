@@ -664,10 +664,11 @@ enum Qwen38ScorecardProductionRouteRunner {
                                 .incompleteRequest(
                                     index: request.requestIndex)
                         case .tokenLogprobs:
-                            // This harness route never requests logprobs (the continuous-batch
-                            // backend refuses `logprobsRequest != nil` with `logprobs_unsupported`
-                            // before admission), so this delta is unreachable here — treated the
-                            // same as the equally-unreachable `.toolCalls` case above.
+                            // This harness route never requests logprobs (it builds no
+                            // `logprobsRequest`, and the continuous-batch backend publishes
+                            // `.tokenLogprobs` only for a request that carries one), so this delta
+                            // is unreachable here — treated the same as the equally-unreachable
+                            // `.toolCalls` case above.
                             throw Qwen38ScorecardContinuousRouteError
                                 .incompleteRequest(
                                     index: request.requestIndex)
@@ -1035,8 +1036,9 @@ public enum Qwen38ScorecardContinuousRouteRunner {
                 throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: index)
             case .tokenLogprobs:
                 // Unreachable: this harness route never requests logprobs (the continuous-batch
-                // backend refuses `logprobsRequest != nil` before admission) — same treatment as
-                // the equally-unreachable `.toolCalls` case above.
+                // backend publishes `.tokenLogprobs` only for a request carrying a
+                // `logprobsRequest`) — same treatment as the equally-unreachable `.toolCalls`
+                // case above.
                 throw Qwen38ScorecardContinuousRouteError.incompleteRequest(index: index)
             case .completion(let value):
                 completion = value

@@ -153,6 +153,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         /// Incremental call assembly for an ENFORCED `tool_choice` (`nil` for every other request,
         /// including `response_format`, whose output is plain content).
         let enforcedStream: EnforcedToolCallStream?
+        /// The request's logprob queue (`nil` unless the request carries `logprobs`): passed into the
+        /// coordinator submission, where the runtime records one entry per selected token.
+        let logprobSink: ContinuousServingLogprobSink?
     }
 
     private struct PendingAdmission {
@@ -186,6 +189,11 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         /// Incremental tool-call assembly for an enforced `tool_choice` (`nil` for every other
         /// request): turns the post-reasoning generated text into a call head plus argument fragments.
         var enforcedStream: EnforcedToolCallStream?
+        /// The request's logprob queue (`nil` = logprobs not requested; nothing is published).
+        let logprobSink: ContinuousServingLogprobSink?
+        /// Whether `ignore_eos` made a model stop token an ordinary generated token (the logprob
+        /// mapping's stop-token vocabulary fallback is scoped to exactly this case).
+        let ignoreEOS: Bool
     }
 
     private let launchedModel: String
@@ -412,16 +420,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
                 param: "prompt",
                 code: "completions_unsupported")
         }
-        // The continuous-batch route has no seam to observe a step's raw logits (its decode loop is
-        // driven entirely inside the batched scheduler, with no per-request hook comparable to the
-        // scalar route's detokenizer callback) — fail closed rather than silently omitting logprobs
-        // from a response that claims to carry them.
-        guard request.logprobsRequest == nil else {
-            throw OpenAIServingError.invalidRequestWithCode(
-                "This server does not support per-token logprobs on the loaded backend",
-                param: "logprobs",
-                code: "logprobs_unsupported")
-        }
+        // A chat `logprobs` / `top_logprobs` request is served: the row carries a
+        // `ContinuousServingLogprobSink` (see `PreparedRequest.logprobSink`) that the runtime fills
+        // once per selected token and `publish` pairs with the published tokens. (The legacy
+        // completions route is refused above, so only `.chat` requests reach this point.)
         // A named or `"required"` `tool_choice` is refused (400, `param: "tool_choice"`) unless this
         // route can enforce it (`enforcesForcingToolChoice`: the json_schema mask is loaded), before
         // any admission or decode, never answered in prose. Defense in depth behind the HTTP gate.
@@ -490,7 +492,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             outputTokenTraceLimit: outputTokenTraceLimit,
             completedTraceCapacity: completedTraceCapacity,
             tokenMask: constraint.mask,
-            enforcedStream: constraint.enforcedStream)
+            enforcedStream: constraint.enforcedStream,
+            logprobSink: request.logprobsRequest.map {
+                ContinuousServingLogprobSink(topLogprobs: $0.topLogprobs)
+            })
         switch configuration.admission {
         case .immediateBatchNoSpec:
             let handles = try await submitToCoordinator(
@@ -988,16 +993,18 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             architecture: .denseAttention,
             // A biased, masked, sampled or penalized row is never speculative (the runtime refuses each
             // pair, and the verify step must never see such a row): such a request on the solo-PLD
-            // route decodes without speculation. An unconstrained greedy request on that route still
+            // route decodes without speculation. A logprobs request is the same (a verify block would
+            // need per-position raw logits). An unconstrained greedy request on that route still
             // requests it.
             requestsSpeculation: route == .soloPLD && prepared.logitBias.isEmpty
                 && prepared.tokenMask == nil && prepared.sampling == nil
-                && prepared.penalties == nil,
+                && prepared.penalties == nil && prepared.logprobSink == nil,
             ignoresStopTokens: prepared.ignoreEOS,
             logitBias: prepared.logitBias,
             tokenMask: prepared.tokenMask,
             sampling: prepared.sampling,
-            penalties: prepared.penalties)
+            penalties: prepared.penalties,
+            logprobs: prepared.logprobSink)
     }
 
     private func submitToCoordinator(
@@ -1098,7 +1105,9 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             outputTokenTraceLimit: prepared.outputTokenTraceLimit,
             completedTraceCapacity: prepared.completedTraceCapacity,
             tokenMask: prepared.tokenMask,
-            enforcedStream: prepared.enforcedStream)
+            enforcedStream: prepared.enforcedStream,
+            logprobSink: prepared.logprobSink,
+            ignoreEOS: prepared.ignoreEOS)
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -1206,6 +1215,32 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
             throw failure
         }
 
+        // Logprob for EVERY published token, delivered BEFORE the token's text/tool deltas -- the
+        // scalar route's order (`generateBounded` reports a generated token's logprob right before
+        // `consume`). Like the scalar route this is independent of what the text pipeline does with
+        // the token afterwards: a token whose text the stop-string filter withholds (a possible stop
+        // prefix, or the token that completes the stop string), that the reasoning gate keeps out of
+        // the parser, or whose detokenizer chunk is empty still gets its entry, and a client sees
+        // exactly one entry per generated token that reached the publisher. Tokens the coordinator
+        // trimmed (stop token, output budget) are never published, hence never popped; their queued
+        // entries are simply dropped with the request. Pairing is from the head, and a missing or
+        // different-token entry fails THIS request closed rather than emitting a misaligned logprob.
+        var servedLogprob: ServingTokenLogprob?
+        if let sink = request.logprobSink {
+            let recorded = sink.popFirst()
+            guard let recorded, recorded.tokenID == token else {
+                throw ContinuousServingLogprobPairingError(
+                    publishedTokenID: token, recordedTokenID: recorded?.tokenID)
+            }
+            servedLogprob = ServingLogprobMapping.served(
+                tokenID: recorded.tokenID,
+                logprob: recorded.logprob,
+                top: recorded.top.map { (tokenID: $0.tokenID, logprob: $0.logprob) },
+                codec: codec,
+                ignoreEOS: request.ignoreEOS,
+                stopTokenIDs: stopTokenIDs)
+        }
+
         request.generatedTokenCount += 1
         if let limit = request.outputTokenTraceLimit {
             if request.outputTokenTrace.count < limit {
@@ -1218,6 +1253,10 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let chunk = request.detokenizer.next()
         let output = chunk.map { request.stopFilter.process($0) }
         requests[id] = request
+
+        if let servedLogprob {
+            try await request.mailbox.send(.tokenLogprobs([servedLogprob]))
+        }
 
         var stopped = output?.stopped == true
         if stopped {

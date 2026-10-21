@@ -330,9 +330,13 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 # (projected with spike/Tests), the structural pins that the continuous-batch load forwards and applies
 # --default-sampling. Conscious decision to publish: read in full; it holds only source-text scans of two projected
 # files, names no model family, host, credential or machine-local path, and the marker sweep passed on it.
+# 2026-10-21, 1059 -> 1061: adds spike/Sources/SpikeServingAdapters/ServingLogprobMapping.swift and
+#   spike/Tests/SpikeCoreTests/DenseContinuousBatchRuntimeLogprobTests.swift (continuous-route logprobs)
+#   Conscious decision to publish: read in full; runtime/backend logprob code and synthetic-fixture tests only, no
+#   model family, host, credential or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1059,
-    "pathModeSha256": "ea8ad9bff896393e6716471f33ccd92bbd6fcd6c7091fa9d2e94e0ede2b44975",
+    "pathCount": 1061,
+    "pathModeSha256": "936c484f982e7787be0475d54fb993d8ea32bd26429ea0b8e6b54fd410b68bb4",
 }
 
 

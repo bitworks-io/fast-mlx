@@ -255,14 +255,32 @@ public struct MLXDecoder: Decoder, LogprobDecoding {
     ///
     /// One `eval`, one small host transfer: only the sampled token's own logprob plus up to
     /// `topN` candidate (id, logprob) pairs ever leave the GPU — never the full vocabulary row.
-    private static func decodedTokenLogprob(
+    ///
+    /// Module-internal (not private) so the dense continuous-batch runtime shares this ONE
+    /// implementation; `rawLogits` may be `[vocab]` or `[1, vocab]`.
+    static func decodedTokenLogprob(
         rawLogits: MLXArray, sampledToken: Int, topN: Int
     ) -> DecodedTokenLogprob {
+        decodedTokenLogprob(
+            logProbabilities: logProbabilities(rawLogits: rawLogits),
+            sampledToken: sampledToken, topN: topN)
+    }
+
+    /// The float32 `[vocab]` log-softmax of one RAW logits row. Split out so the continuous-batch
+    /// runtime can capture it (a fresh buffer, independent of a prefill's `[1, prompt, vocab]`
+    /// logits) at selection time and report it once the token is emitted.
+    static func logProbabilities(rawLogits: MLXArray) -> MLXArray {
         // float32 before logSoftmax: models may emit float16/bfloat16 logits, and a half-precision
         // log-softmax would report visibly rounded logprobs.
         let flat = rawLogits.reshaped([rawLogits.size]).asType(.float32) // [vocab]
-        let vocab = flat.dim(0)
-        let logp = logSoftmax(flat, axis: -1) // [vocab], log-probabilities under the raw distribution
+        return logSoftmax(flat, axis: -1) // [vocab], log-probabilities under the raw distribution
+    }
+
+    /// The sampled token's logprob plus up to `topN` alternatives from a `logProbabilities` vector.
+    static func decodedTokenLogprob(
+        logProbabilities logp: MLXArray, sampledToken: Int, topN: Int
+    ) -> DecodedTokenLogprob {
+        let vocab = logp.dim(0)
         let n = max(0, min(topN, vocab))
 
         let sampledLogprob = logp[sampledToken]

@@ -348,6 +348,12 @@ public enum DenseContinuousBatchRuntimeError: Error, Equatable {
     /// A submission carried both `penalties` and `requestsSpeculation`. A penalized row never
     /// speculates, so the verify step can never see one.
     case penaltiesWithSpeculation(BatchRequestID)
+    /// A submission carried both a `logprobs` sink and `requestsSpeculation`. A row reporting
+    /// logprobs never speculates (a verify block has no per-position raw logits to report).
+    case logprobsWithSpeculation(BatchRequestID)
+    /// A row with a logprob sink reached a decode step with no captured log-probabilities for its
+    /// staged token. Unreachable by construction; fails closed instead of reporting nothing.
+    case logprobStateMissing(BatchRequestID)
 }
 
 struct DenseContinuousBatchRuntimeDiagnostics: Equatable {
@@ -427,6 +433,15 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         /// the slot's lifetime across scalar <-> batch moves. `nil` for an unpenalized row. Exactly
         /// one `didSample` per emitted token; penalized rows never speculate.
         let penalizer: PenaltyProcessorBox?
+        /// The request's logprob sink, or `nil` for a row that reports nothing. Fixed for the
+        /// slot's lifetime; a sink row never speculates (refused at admission).
+        let logprobs: (any ContinuousBatchRowLogprobSink)?
+        /// The float32 `[vocab]` log-softmax of the RAW logits row for the step that selected the
+        /// slot's staged token (`stagedToken`, or `batch.stagedTokens[row]` while batched). Kept
+        /// on the slot, never on the scalar/batch state, so it survives every scalar <-> batch
+        /// move untouched: it advances only together with the staged token (prefill-final, scalar
+        /// step, batch step). `nil` exactly when `logprobs` is, or before final prefill.
+        var stagedLogprobs: MLXArray?
 
         /// Whether this row needs the biased compiled step (a static bias row or a mask).
         var usesBiasedStep: Bool { logitBiasRow != nil || tokenMask != nil }
@@ -487,6 +502,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// Penalty processors built (and prompt-seeded) at admission awaiting their slot, cleared at
     /// final prefill and in `remove`, like `pendingSamplers`.
     private var pendingPenalizers: [BatchRequestID: PenaltyProcessorBox] = [:]
+    /// Logprob sinks awaiting their slot, cleared at final prefill and in `remove`, like
+    /// `pendingPenalizers`.
+    private var pendingLogprobSinks: [BatchRequestID: any ContinuousBatchRowLogprobSink] = [:]
     private var contextReservations: [BatchRequestID: Int] = [:]
     private var kvCapacityReservations: [BatchRequestID: Int] = [:]
     private var reservedKVBytes = 0
@@ -752,6 +770,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         var maskAdditions: [BatchRequestID: any ContinuousBatchRowTokenMask] = [:]
         var samplerAdditions: [BatchRequestID: TopPSampler] = [:]
         var penalizerAdditions: [BatchRequestID: PenaltyProcessorBox] = [:]
+        var sinkAdditions: [BatchRequestID: any ContinuousBatchRowLogprobSink] = [:]
         additions.reserveCapacity(admissions.count)
         for admission in admissions {
             let submission = admission.submission
@@ -772,6 +791,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     topK: sampling.topK,
                     minP: sampling.minP,
                     seed: sampling.seed)
+            }
+            if let sink = submission.logprobs {
+                sinkAdditions[admission.id] = sink
             }
             if let penalties = submission.penalties {
                 // Built exactly like `MLXDecoder.setPenalties` and seeded with the FULL prompt
@@ -846,6 +868,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         for (id, penalizer) in penalizerAdditions {
             pendingPenalizers[id] = penalizer
+        }
+        for (id, sink) in sinkAdditions {
+            pendingLogprobSinks[id] = sink
         }
         speculationRequestedRequests = nextSpeculationRequests
         reservedKVBytes = requestedKVBytes
@@ -937,7 +962,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 tokenMask: pendingTokenMasks[work.id],
                 maskGeometry: nil,
                 sampler: pendingSamplers[work.id],
-                penalizer: pendingPenalizers[work.id])
+                penalizer: pendingPenalizers[work.id],
+                logprobs: pendingLogprobSinks[work.id],
+                stagedLogprobs: nil)
         }
 
         guard work.startToken == slot.processedTokens else {
@@ -960,6 +987,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         // guard therefore runs on the final slice only; earlier slices' hidden states reach it
         // through the caches it attends over (the same trade the scalar route made in 41f7dbb0).
         let staged: MLXArray?
+        var stagedLogprobs: MLXArray?
         var biasRow: MLXArray?
         var exactBiasRow: MLXArray?
         var maskGeometry: (width: Int, dtype: DType)?
@@ -1025,7 +1053,15 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 token = maskedToken
                     ?? CompiledMLXDecoder.greedyTokenOrInvalidSentinel(finalLogits)
             }
-            eval([token] + caches.flatMap { $0.innerState() })
+            // A sink row also captures the float32 log-softmax of the RAW last-position row that
+            // selected this token (before the bias, mask, penalties and draw), evaluated here so
+            // it is a fresh `[vocab]` buffer independent of the prompt-wide logits. A poisoned
+            // row throws below, before anything is stored or reported.
+            if slot.logprobs != nil {
+                stagedLogprobs = MLXDecoder.logProbabilities(
+                    rawLogits: logits[0..., -1, 0...])
+            }
+            eval([token] + (stagedLogprobs.map { [$0] } ?? []) + caches.flatMap { $0.innerState() })
             _ = try validatedToken(token, id: work.id)
             staged = token
         } else {
@@ -1053,6 +1089,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         slot.cachedTokens = endToken
         slot.prefillComplete = work.isFinal
         slot.stagedToken = staged
+        slot.stagedLogprobs = stagedLogprobs
         slot.logitBiasRow = biasRow
         slot.penalizedBiasRow = exactBiasRow
         slot.maskGeometry = maskGeometry
@@ -1074,6 +1111,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             pendingTokenMasks[work.id] = nil
             pendingSamplers[work.id] = nil
             pendingPenalizers[work.id] = nil
+            pendingLogprobSinks[work.id] = nil
         }
     }
 
@@ -1129,6 +1167,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         pendingTokenMasks[id] = nil
         pendingSamplers[id] = nil
         pendingPenalizers[id] = nil
+        pendingLogprobSinks[id] = nil
         slots[id] = nil
 
         guard let batch else {
@@ -1233,7 +1272,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
             slot.logitBias.isEmpty,
             slot.tokenMask == nil,
             slot.sampler == nil,
-            slot.penalizer == nil
+            slot.penalizer == nil,
+            slot.logprobs == nil
         else {
             // A biased, masked or sampled row is never admitted with speculation, so it has no
             // session; the empty-bias, no-mask and no-sampler clauses keep the verify step
@@ -1345,7 +1385,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 biased: slot.usesBiasedStep,
                 masked: slot.tokenMask != nil,
                 sampled: slot.sampler != nil,
-                penalized: slot.penalizer != nil)
+                penalized: slot.penalizer != nil,
+                logprobs: slot.logprobs != nil)
         }
         var rollbackFallback = true
         defer {
@@ -1355,9 +1396,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 }
             }
         }
-        let next = launchScalarStep(slot, current)
+        let next = launchScalarStep(slot, current).token
         let emitted = try validatedToken(next, id: id)
-        let following = launchScalarStep(slot, next)
+        let following = launchScalarStep(slot, next).token
         asyncEval(following)
 
         do {
@@ -1574,9 +1615,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 biased: slot.usesBiasedStep,
                 masked: slot.tokenMask != nil,
                 sampled: slot.sampler != nil,
-                penalized: slot.penalizer != nil)
+                penalized: slot.penalizer != nil,
+                logprobs: slot.logprobs != nil)
         }
-        let following = launchScalarStep(slot, current)
+        let following = launchScalarStep(slot, current).token
         eval([following] + caches.flatMap { $0.innerState() })
 
         slot.cachedTokens += 1
@@ -1677,18 +1719,34 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 biased: slot.usesBiasedStep,
                 masked: slot.tokenMask != nil,
                 sampled: slot.sampler != nil,
-                penalized: slot.penalizer != nil)
+                penalized: slot.penalizer != nil,
+                logprobs: slot.logprobs != nil)
         }
         let emitted = try validatedToken(current, id: id)
+        // A sink row must hold the log-probabilities of the token it is about to emit.
+        let reportedLogprobs = slot.stagedLogprobs
+        if slot.logprobs != nil, reportedLogprobs == nil {
+            throw DenseContinuousBatchRuntimeError.logprobStateMissing(id)
+        }
+        // Report BEFORE the next step is launched. The entry's ops (index, argPartition, gather)
+        // and their `eval` run on the in-order GPU stream: queued after the following forward they
+        // would wait for it and serialize the pipeline. Here the stream is idle (the readback above
+        // synchronized it) and the staged log-probabilities are already evaluated. The entry
+        // belongs to `emitted` (the token the staged log-probabilities were captured for).
+        if let sink = slot.logprobs, let reportedLogprobs {
+            sink.record(Self.logprobEntry(reportedLogprobs, token: emitted, topN: sink.topLogprobs))
+        }
         // Readback, advance, build, launch: the masked row for the FOLLOWING token reflects the
         // token just emitted. Exactly one advance per emitted token.
         slot.tokenMask?.advance(token: emitted)
-        let following = launchScalarStep(slot, current)
+        let (following, followingLogprobs) = launchScalarStep(slot, current)
+        let followingOutputs = [following] + (followingLogprobs.map { [$0] } ?? [])
         if synchronously {
-            eval([following] + slot.scalarCaches!.flatMap { $0.innerState() })
+            eval(followingOutputs + slot.scalarCaches!.flatMap { $0.innerState() })
         } else {
-            asyncEval(following)
+            asyncEval(followingOutputs)
         }
+        slot.stagedLogprobs = followingLogprobs
 
         slot.cachedTokens += 1
         slot.emittedTokens += 1
@@ -1746,7 +1804,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                     || ids.contains { slots[$0]?.tokenMask != nil },
                 masked: ids.contains { slots[$0]?.tokenMask != nil },
                 sampled: ids.contains { slots[$0]?.sampler != nil },
-                penalized: ids.contains { slots[$0]?.penalizer != nil })
+                penalized: ids.contains { slots[$0]?.penalizer != nil },
+                logprobs: ids.contains { slots[$0]?.logprobs != nil })
         }
 
         let current = batch.stagedTokens
@@ -1759,21 +1818,38 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 throw DenseContinuousBatchRuntimeError.invalidTokenID(id, token)
             }
         }
+        for id in ids {
+            if let slot = slots[id], slot.logprobs != nil, slot.stagedLogprobs == nil {
+                throw DenseContinuousBatchRuntimeError.logprobStateMissing(id)
+            }
+        }
         // Readback, advance, build, launch. Every masked member advances on its emitted token (in
         // row order) BEFORE the step's additive matrix is built, so each masked row's mask reflects
         // every token it has emitted. A batch with a masked member rebuilds the matrix every step.
         for (id, token) in zip(ids, emitted) {
             slots[id]?.tokenMask?.advance(token: token)
         }
+        // Report BEFORE the next step is launched (see `decodeScalar`): queued after the following
+        // forward, the entry's `eval` would wait for it and serialize the pipeline. Only sink rows
+        // pay for it. Each entry pairs the emitted token with the log-probabilities captured when
+        // it was selected.
+        for (id, token) in zip(ids, emitted) {
+            if let slot = slots[id], let sink = slot.logprobs, let reported = slot.stagedLogprobs {
+                sink.record(Self.logprobEntry(reported, token: token, topN: sink.topLogprobs))
+            }
+        }
         let stepMatrix = try batchStepMatrix(ids, staticMatrix: batch.logitBiasMatrix)
-        let following = launchBatchStep(
+        let (following, followingLogprobs) = launchBatchStep(
             batch.step!(stepMatrix.map { [current, $0] } ?? [current]), ids: ids,
             fed: current)
-        asyncEval(following)
+        asyncEval([following] + followingLogprobs.compactMap { $0 })
 
-        for (id, token) in zip(ids, emitted) {
+        for (row, (id, token)) in zip(ids, emitted).enumerated() {
             guard var slot = slots[id] else {
                 throw DenseContinuousBatchRuntimeError.unknownRequest(id)
+            }
+            if slot.logprobs != nil {
+                slot.stagedLogprobs = followingLogprobs[row]
             }
             slot.cachedTokens += 1
             slot.emittedTokens += 1
@@ -2228,19 +2304,30 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// slot's logits variant also returns the RAW logits; `token` (the one just emitted and fed to
     /// the step) is reported to the slot's processor, then the processor runs on the raw row, then
     /// the additive row, then the draw or argmax (see `penalizedToken`).
-    private func launchScalarStep(_ slot: Slot, _ token: MLXArray) -> MLXArray {
+    private func launchScalarStep(
+        _ slot: Slot, _ token: MLXArray
+    ) -> (token: MLXArray, logProbabilities: MLXArray?) {
         let arguments = scalarStepArguments(slot, token)
         let outputs = slot.scalarStep!(arguments)
+        // A sink row's step also returns the RAW logits row (`outputs[3]`); its float32
+        // log-softmax is what the NEXT emission reports for the token chosen below.
+        let logProbabilities = slot.logprobs == nil
+            ? nil : MLXDecoder.logProbabilities(rawLogits: outputs[3])
         if let penalizer = slot.penalizer {
             penalizer.processor.didSample(token: token)
-            return Self.penalizedToken(
-                penalizer, sampler: slot.sampler, raw: outputs[3], rawFinite: outputs[2],
-                bias: slot.penalizedBiasRow, maskRow: currentMaskRow(slot),
-                masked: slot.tokenMask != nil)
+            return (
+                Self.penalizedToken(
+                    penalizer, sampler: slot.sampler, raw: outputs[3], rawFinite: outputs[2],
+                    bias: slot.penalizedBiasRow, maskRow: currentMaskRow(slot),
+                    masked: slot.tokenMask != nil),
+                logProbabilities
+            )
         }
-        guard let sampler = slot.sampler else { return outputs[0] }
-        return Self.sampledToken(
-            sampler: sampler, adjusted: outputs[1], rawFinite: outputs[2])
+        guard let sampler = slot.sampler else { return (outputs[0], logProbabilities) }
+        return (
+            Self.sampledToken(sampler: sampler, adjusted: outputs[1], rawFinite: outputs[2]),
+            logProbabilities
+        )
     }
 
     /// Builds the batch's next staged-token vector. With no sampled or penalized member the step's
@@ -2253,9 +2340,15 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// int32 shape.
     private func launchBatchStep(
         _ outputs: [MLXArray], ids: [BatchRequestID], fed: MLXArray
-    ) -> MLXArray {
+    ) -> (tokens: MLXArray, logProbabilities: [MLXArray?]) {
+        // One entry per row: a sink row's float32 log-softmax of ITS row of the RAW logits
+        // (`outputs[3]`), `nil` for every other row (they pay nothing).
+        let logProbabilities = ids.enumerated().map { row, id -> MLXArray? in
+            slots[id]?.logprobs == nil
+                ? nil : MLXDecoder.logProbabilities(rawLogits: outputs[3][row ..< row + 1])
+        }
         guard ids.contains(where: { slots[$0]?.sampler != nil || slots[$0]?.penalizer != nil })
-        else { return outputs[0] }
+        else { return (outputs[0], logProbabilities) }
         let greedy = outputs[0]
         let adjusted = outputs[1]
         let rawFinite = outputs[2]
@@ -2275,7 +2368,23 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 adjusted: adjusted[row ..< row + 1],
                 rawFinite: rawFinite[row ..< row + 1])
         }
-        return concatenated(rows, axis: 0)
+        return (concatenated(rows, axis: 0), logProbabilities)
+    }
+
+    /// The sink value of one emitted token: the shared scalar helper applied to the captured
+    /// `[vocab]` float32 log-probabilities (so the continuous route and the scalar route report
+    /// through ONE implementation).
+    private static func logprobEntry(
+        _ logProbabilities: MLXArray, token: Int, topN: Int
+    ) -> ContinuousBatchTokenLogprob {
+        let decoded = MLXDecoder.decodedTokenLogprob(
+            logProbabilities: logProbabilities, sampledToken: token, topN: topN)
+        return ContinuousBatchTokenLogprob(
+            tokenID: decoded.tokenID,
+            logprob: decoded.logprob,
+            top: decoded.top.map {
+                ContinuousBatchTokenLogprobCandidate(tokenID: $0.tokenID, logprob: $0.logprob)
+            })
     }
 
     /// The next token of a penalized row: `process(raw)` (the vendored processor, repetition then
@@ -2319,7 +2428,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// the slot's dense bias row as `arguments[1]` and adds it before the greedy reduction.
     private func makeScalarStep(
         caches: [any ContinuousScalarRowCache], counter: TraceCounter, biased: Bool = false,
-        masked: Bool = false, sampled: Bool = false, penalized: Bool = false
+        masked: Bool = false, sampled: Bool = false, penalized: Bool = false,
+        logprobs: Bool = false
     ) -> Step {
         let model = self.model
         // A scalar row IS the model cache: a dense row is the `CompiledCache` the model updates,
@@ -2368,10 +2478,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 raw: logits[0..., -1, 0...],
                 additive: biased || masked ? arguments[1] : nil,
                 masked: masked,
-                includingRaw: penalized)
+                includingRaw: penalized || logprobs)
         }
         let step =
-            sampled || penalized
+            sampled || penalized || logprobs
             ? sampledStep : (masked ? maskedStep : (biased ? biasedStep : plainStep))
         // Weights and fused projections enter as compile STATE (tracer inputs),
         // never captured constants -- see `compiledStepExtraState`.
@@ -2410,7 +2520,8 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         biased: Bool = false,
         masked: Bool = false,
         sampled: Bool = false,
-        penalized: Bool = false
+        penalized: Bool = false,
+        logprobs: Bool = false
     ) -> Step {
         let model = self.model
         // A batched row WRAPS its model cache (dense → self, recurrent → the inner `MambaCache`),
@@ -2456,10 +2567,10 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
                 raw: logits[0..., -1, 0...],
                 additive: biased || masked ? arguments[1] : nil,
                 masked: masked,
-                includingRaw: penalized)
+                includingRaw: penalized || logprobs)
         }
         let step =
-            sampled || penalized
+            sampled || penalized || logprobs
             ? sampledStep : (masked ? maskedStep : (biased ? biasedStep : plainStep))
         // See `compiledStepExtraState`.
         return compile(
@@ -2475,7 +2586,7 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
     /// flag that the RAW logits hold no NaN/inf (a masked row's `-inf` columns are legitimate, so
     /// the adjusted logits are not what is checked).
     ///
-    /// `includingRaw` (a step with a penalized member) appends the RAW last-position logits as a
+    /// `includingRaw` (a step with a penalized or logprob-reporting member) appends the RAW last-position logits as a
     /// fourth output, so each penalized row can run its processor on them outside `compile`; the
     /// first three outputs are the same ops either way.
     private static func logitsVariantOutputs(
@@ -2614,6 +2725,9 @@ public final class DenseContinuousBatchRuntime: ContinuousBatchRuntime {
         }
         if submission.requestsSpeculation, submission.penalties != nil {
             throw DenseContinuousBatchRuntimeError.penaltiesWithSpeculation(admission.id)
+        }
+        if submission.requestsSpeculation, submission.logprobs != nil {
+            throw DenseContinuousBatchRuntimeError.logprobsWithSpeculation(admission.id)
         }
         if let outOfRange = submission.logitBias.keys.sorted().first(where: {
             $0 < 0 || $0 >= vocabularySize
