@@ -287,4 +287,74 @@ final class DefaultSamplingServeArgumentTests: XCTestCase {
         XCTAssertEqual(arguments.inCheckpointMTPSelection, .converted4Bit)
         XCTAssertTrue(arguments.sampledMTPBlockDecisionsEnabled)
     }
+
+    // MARK: - Startup-line announcement (cycle 281)
+
+    /// Not applied -> exactly `default_sampling=off`.
+    func testDefaultSamplingAnnouncementRendersOffExactly() {
+        XCTAssertEqual(
+            ServingDefaultSamplingAnnouncement.machineReadableFields(source: .off, resolved: nil),
+            "default_sampling=off")
+    }
+
+    /// Fully-populated resolution renders every field with Swift's default number rendering.
+    func testDefaultSamplingAnnouncementRendersFullResolutionExactly() {
+        let resolved = ServingSamplingDefaults(temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0)
+        XCTAssertEqual(
+            ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: .generationConfig, resolved: resolved),
+            "default_sampling=generation-config default_sampling_temperature=0.6 "
+                + "default_sampling_top_p=0.95 default_sampling_top_k=20 default_sampling_min_p=0.0")
+    }
+
+    /// Optional fields the artifact did not constrain render `unset`, each independently.
+    func testDefaultSamplingAnnouncementRendersUnsetForAbsentOptionalFields() {
+        XCTAssertEqual(
+            ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: .generationConfig, resolved: ServingSamplingDefaults(temperature: 1.0)),
+            "default_sampling=generation-config default_sampling_temperature=1.0 "
+                + "default_sampling_top_p=unset default_sampling_top_k=unset "
+                + "default_sampling_min_p=unset")
+        XCTAssertEqual(
+            ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: .generationConfig,
+                resolved: ServingSamplingDefaults(temperature: 0.7, topP: 0.8, topK: nil, minP: 0.05)),
+            "default_sampling=generation-config default_sampling_temperature=0.7 "
+                + "default_sampling_top_p=0.8 default_sampling_top_k=unset "
+                + "default_sampling_min_p=0.05")
+    }
+
+    /// The line reports behaviour: a nil resolution announces `off` whatever the flag says.
+    func testDefaultSamplingAnnouncementNilResolutionIsOffEvenForGenerationConfigSource() {
+        XCTAssertEqual(
+            ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: .generationConfig, resolved: nil),
+            "default_sampling=off")
+    }
+
+    /// One line of space-separated `key=value` tokens, no spaces or `=` inside values.
+    func testDefaultSamplingAnnouncementIsSingleLineOfKeyValueTokens() throws {
+        let cases: [(FastMLXServeDefaultSampling, ServingSamplingDefaults?)] = [
+            (.off, nil),
+            (.generationConfig, nil),
+            (.generationConfig, ServingSamplingDefaults(temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0)),
+            (.generationConfig, ServingSamplingDefaults(temperature: 1.0)),
+        ]
+        let pattern = try NSRegularExpression(pattern: "^[a-z_]+=[^ =]+$")
+        for (source, resolved) in cases {
+            let fragment = ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: source, resolved: resolved)
+            XCTAssertFalse(fragment.contains("\n"), "\(fragment)")
+            XCTAssertFalse(fragment.contains("\r"), "\(fragment)")
+            let tokens = fragment.split(separator: " ", omittingEmptySubsequences: false)
+            XCTAssertFalse(tokens.isEmpty)
+            for token in tokens {
+                let text = String(token)
+                let range = NSRange(text.startIndex..<text.endIndex, in: text)
+                XCTAssertNotNil(
+                    pattern.firstMatch(in: text, range: range),
+                    "token `\(text)` in `\(fragment)` is not key=value")
+            }
+        }
+    }
 }

@@ -201,6 +201,10 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
     public let publicationCapacity: Int
     public let soloPLDPolicy: ContinuousServingSoloPLDPolicy?
     public let modelProofVerified: Bool
+    /// The RESOLVED `--default-sampling` values this load assigned to the backend configuration's
+    /// `samplingDefaults` (what omitted-parameter requests actually receive), or `nil` when none
+    /// are applied. The startup line announces it via `ServingDefaultSamplingAnnouncement`.
+    public let samplingDefaults: ServingSamplingDefaults?
 
     public init(
         launchedModel: String,
@@ -226,7 +230,8 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
         maxQueuedRequests: Int,
         publicationCapacity: Int,
         soloPLDPolicy: ContinuousServingSoloPLDPolicy?,
-        modelProofVerified: Bool
+        modelProofVerified: Bool,
+        samplingDefaults: ServingSamplingDefaults? = nil
     ) {
         self.launchedModel = launchedModel
         self.route = route
@@ -252,6 +257,7 @@ public struct ContinuousServingModelStartupReport: Equatable, Sendable {
         self.publicationCapacity = publicationCapacity
         self.soloPLDPolicy = soloPLDPolicy
         self.modelProofVerified = modelProofVerified
+        self.samplingDefaults = samplingDefaults
     }
 }
 
@@ -588,7 +594,8 @@ public func loadContinuousServingModel(
         maxQueuedRequests: scheduler.maxQueuedRequests,
         publicationCapacity: configuration.publicationCapacity,
         soloPLDPolicy: configuration.soloPLDPolicy,
-        modelProofVerified: true)
+        modelProofVerified: true,
+        samplingDefaults: defaultSamplingDefaults)
     return LoadedContinuousServingModel(
         backend: backend,
         startupReport: report,

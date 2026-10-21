@@ -228,4 +228,148 @@ final class DefaultSamplingContinuousWiringStructuralTests: XCTestCase {
             "resolveServingDefaultSampling( must run BEFORE the first `Memory.memoryLimit =` so a "
                 + "bad generation_config.json refuses before any process-global mutation or weight load.")
     }
+
+    // MARK: (c) cycle 281: the startup line announces the active default sampling preset
+
+    /// Body of `PreparedServingBackend.startupLine(localAddress:)` in FastMLXServe.swift.
+    private func startupLineBody() throws -> String {
+        let source = try strippedSource(
+            spikeRelativeComponents: ["Sources", "fastmlx-serve", "FastMLXServe.swift"])
+        let marker = "func startupLine(localAddress:"
+        let markerRange = try XCTUnwrap(
+            source.range(of: marker),
+            "found no `\(marker)` in FastMLXServe.swift (comments stripped)")
+        let bodyOpen = try XCTUnwrap(
+            source[markerRange.upperBound...].firstIndex(of: "{"),
+            "no function body after `\(marker)`")
+        let body = try XCTUnwrap(
+            balancedText(in: source, from: bodyOpen, open: "{", close: "}"),
+            "unbalanced braces in startupLine")
+        XCTAssertTrue(
+            body.contains("case .scalar(let report):") && body.contains("case .continuous(let report):")
+                && body.contains("listening=\\(localAddress)"),
+            "the extracted startupLine body is not the whole function; fix this pin rather than "
+                + "trusting its other assertions.")
+        return body
+    }
+
+    private func occurrences(of needle: String, in text: String) -> Int {
+        var count = 0
+        var range = text.startIndex..<text.endIndex
+        while let hit = text.range(of: needle, range: range) {
+            count += 1
+            range = hit.upperBound..<text.endIndex
+        }
+        return count
+    }
+
+    func testStartupLineEmitsDefaultSamplingAnnouncementInBothScalarAndContinuousBranches() throws {
+        let body = try startupLineBody()
+        let scalarMarker = "case .scalar(let report):"
+        let continuousMarker = "case .continuous(let report):"
+        let scalarRange = try XCTUnwrap(body.range(of: scalarMarker))
+        let continuousRange = try XCTUnwrap(body.range(of: continuousMarker))
+        XCTAssertLessThan(scalarRange.lowerBound, continuousRange.lowerBound)
+        let scalarBranch = String(body[scalarRange.upperBound..<continuousRange.lowerBound])
+        let continuousBranch = String(body[continuousRange.upperBound...])
+        let call = "ServingDefaultSamplingAnnouncement.machineReadableFields("
+        XCTAssertEqual(
+            occurrences(of: call, in: body), 2,
+            "startupLine must call `\(call)` exactly twice (scalar and continuous branches)")
+        for (name, branch) in [("scalar", scalarBranch), ("continuous", continuousBranch)] {
+            XCTAssertEqual(
+                occurrences(of: call, in: branch), 1,
+                "the \(name) startup-line branch does not emit the default-sampling announcement")
+            let compact = String(branch.filter { !$0.isWhitespace })
+            XCTAssertTrue(
+                compact.contains(
+                    "\(call)source:defaultSampling,resolved:report.samplingDefaults)"),
+                "the \(name) branch must announce `source: defaultSampling, resolved: "
+                    + "report.samplingDefaults` (the resolved defaults on the report).")
+            // Placement: the announcement token group sits before the fit fragment so
+            // `listening=` stays last.
+            let announcementInterpolation = "\\(defaultSamplingFields)"
+            let fitInterpolation = "\\(fit)"
+            let announcementAt = branch.range(of: announcementInterpolation)
+            let fitAt = branch.range(of: fitInterpolation)
+            XCTAssertNotNil(
+                announcementAt,
+                "the \(name) branch's returned line never interpolates the announcement")
+            XCTAssertNotNil(fitAt)
+            if let announcementAt, let fitAt {
+                XCTAssertLessThan(
+                    announcementAt.lowerBound, fitAt.lowerBound,
+                    "the \(name) announcement must precede the fit fragment")
+            }
+        }
+    }
+
+    /// Every real construction of `<typeName>(` in `fileComponents`' source forwards the SAME
+    /// value it assigns to `backendConfiguration.samplingDefaults` as `samplingDefaults:`.
+    private func assertReportForwardsResolvedDefaults(
+        file: String, typeName: String
+    ) throws {
+        let source = try strippedSource(
+            spikeRelativeComponents: ["Sources", "SpikeServingAdapters", file])
+        let assignment = "backendConfiguration.samplingDefaults ="
+        let assignmentRange = try XCTUnwrap(
+            source.range(of: assignment),
+            "\(file) has no `\(assignment)` to derive the resolved-defaults binding from")
+        let lineEnd = source[assignmentRange.upperBound...].firstIndex(of: "\n") ?? source.endIndex
+        let resolvedName = source[assignmentRange.upperBound..<lineEnd]
+            .trimmingCharacters(in: .whitespaces)
+        XCTAssertFalse(resolvedName.isEmpty)
+        XCTAssertNotEqual(resolvedName, "nil", "\(file) assigns nil defaults to the backend")
+        let marker = "\(typeName)("
+        var sites: [String] = []
+        var searchRange = source.startIndex..<source.endIndex
+        while let markerRange = source.range(of: marker, range: searchRange) {
+            searchRange = markerRange.upperBound..<source.endIndex
+            if markerRange.lowerBound > source.startIndex,
+                isIdentifierCharacter(source[source.index(before: markerRange.lowerBound)])
+            {
+                continue
+            }
+            let openParen = source.index(before: markerRange.upperBound)
+            sites.append(
+                try XCTUnwrap(
+                    balancedText(in: source, from: openParen, open: "(", close: ")"),
+                    "unbalanced parens in a \(marker) call"))
+        }
+        // The `public init(` declaration is not a `<typeName>(` call, so every hit is a real
+        // construction; zero hits means the pin went vacuous.
+        XCTAssertFalse(
+            sites.isEmpty,
+            "found zero \(marker) construction sites in \(file); fix this pin rather than "
+                + "letting it pass vacuously.")
+        for (offset, site) in sites.enumerated() {
+            let compact = String(site.filter { !$0.isWhitespace })
+            let needle = "samplingDefaults:\(resolvedName)"
+            var forwarded = false
+            var range = compact.startIndex..<compact.endIndex
+            while let hit = compact.range(of: needle, range: range) {
+                range = hit.upperBound..<compact.endIndex
+                let after = hit.upperBound < compact.endIndex ? compact[hit.upperBound] : Character(" ")
+                if after == "," || after == ")" {
+                    forwarded = true
+                    break
+                }
+            }
+            XCTAssertTrue(
+                forwarded,
+                "\(marker) site #\(offset) in \(file) does not pass `samplingDefaults: "
+                    + "\(resolvedName)` (the value assigned to the backend configuration); the "
+                    + "startup line would announce `default_sampling=off` while defaults are active.")
+        }
+    }
+
+    func testScalarStartupReportConstructionForwardsResolvedDefaults() throws {
+        try assertReportForwardsResolvedDefaults(
+            file: "MLXScalarServing.swift", typeName: "ScalarServingModelStartupReport")
+    }
+
+    func testContinuousStartupReportConstructionForwardsResolvedDefaults() throws {
+        try assertReportForwardsResolvedDefaults(
+            file: "MLXContinuousServing.swift", typeName: "ContinuousServingModelStartupReport")
+    }
 }

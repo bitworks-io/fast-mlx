@@ -177,3 +177,31 @@ public struct ServingSamplingDefaults: Equatable, Sendable {
         self.minP = minP
     }
 }
+
+/// Startup-line fragment announcing which default sampling preset a served route actually applies
+/// (cycle 281). Pure and MLX-free so the exact rendering is unit-pinned in `ServingCoreTests`.
+///
+/// The line reports BEHAVIOUR, not the flag: `resolved == nil` (no defaults reach requests, so an
+/// omitted `temperature` decodes greedily) always renders `default_sampling=off`, whatever `source`
+/// says. When defaults are applied the fragment carries the RESOLVED `ServingSamplingDefaults`
+/// values -- what requests actually receive -- never the raw `generation_config.json`; an optional
+/// field the artifact did not constrain renders `unset`. Every token is `key=value` with no spaces
+/// or `=` inside the value, and the fragment is a single line.
+public enum ServingDefaultSamplingAnnouncement {
+    public static func machineReadableFields(
+        source: FastMLXServeDefaultSampling,
+        resolved: ServingSamplingDefaults?
+    ) -> String {
+        guard let resolved else {
+            return "default_sampling=off"
+        }
+        let topP = resolved.topP.map { "\($0)" } ?? "unset"
+        let topK = resolved.topK.map { "\($0)" } ?? "unset"
+        let minP = resolved.minP.map { "\($0)" } ?? "unset"
+        return "default_sampling=\(source.rawValue) "
+            + "default_sampling_temperature=\(resolved.temperature) "
+            + "default_sampling_top_p=\(topP) "
+            + "default_sampling_top_k=\(topK) "
+            + "default_sampling_min_p=\(minP)"
+    }
+}

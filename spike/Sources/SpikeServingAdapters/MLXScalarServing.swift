@@ -796,6 +796,10 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
     public let chatTemplateSHA256: String?
     public let chatTemplateByteCount: Int?
     public let chatTemplateSource: ScalarServingChatTemplateSourceKind?
+    /// The RESOLVED `--default-sampling` values this load assigned to the backend configuration's
+    /// `samplingDefaults` (what omitted-parameter requests actually receive), or `nil` when none
+    /// are applied. The startup line announces it via `ServingDefaultSamplingAnnouncement`.
+    public let samplingDefaults: ServingSamplingDefaults?
 
     public init(
         launchedModel: String,
@@ -815,7 +819,8 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
         chatTemplateRefusesNonLeadingSystemMessage: Bool = true,
         chatTemplateSHA256: String? = nil,
         chatTemplateByteCount: Int? = nil,
-        chatTemplateSource: ScalarServingChatTemplateSourceKind? = nil
+        chatTemplateSource: ScalarServingChatTemplateSourceKind? = nil,
+        samplingDefaults: ServingSamplingDefaults? = nil
     ) {
         self.launchedModel = launchedModel
         self.route = route
@@ -835,6 +840,7 @@ public struct ScalarServingModelStartupReport: Equatable, Sendable {
         self.chatTemplateSHA256 = chatTemplateSHA256
         self.chatTemplateByteCount = chatTemplateByteCount
         self.chatTemplateSource = chatTemplateSource
+        self.samplingDefaults = samplingDefaults
     }
 
     /// Machine-readable startup-line fragment for the sampled MLX allocator bytes,
@@ -1507,7 +1513,8 @@ public func loadScalarServingModel(
         chatTemplateRefusesNonLeadingSystemMessage: chatTemplateRefusesNonLeadingSystemMessage,
         chatTemplateSHA256: chatTemplateSHA256,
         chatTemplateByteCount: chatTemplateByteCount,
-        chatTemplateSource: chatTemplateSource)
+        chatTemplateSource: chatTemplateSource,
+        samplingDefaults: defaultSamplingDefaults)
     return LoadedScalarServingModel(
         backend: backend,
         startupReport: report)

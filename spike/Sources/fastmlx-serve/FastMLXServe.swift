@@ -290,6 +290,10 @@ private struct PreparedServingBackend {
         ServingHTTPEvidenceConfiguration.SnapshotProvider?
     let mode: String
     let launchedModel: String
+    /// The `--default-sampling` flag value; the startup line announces what the load actually
+    /// resolved (`startupReport.samplingDefaults`), so `.generationConfig` with no resolved
+    /// defaults still announces `default_sampling=off`.
+    let defaultSampling: FastMLXServeDefaultSampling
     let startupReport: PreparedServingStartupReport?
     let fitDecision: ServingFitDecision?
     let exactMTPReport: ExactQwen35MTPServeStartupReport?
@@ -333,6 +337,8 @@ private struct PreparedServingBackend {
         let fit = fitDecision?.machineReadableFields() ?? "fit_check=skipped"
         switch startupReport {
         case .scalar(let report):
+            let defaultSamplingFields = ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: defaultSampling, resolved: report.samplingDefaults)
             let nativeCacheKinds = Set(
                 report.nativeCacheKinds.map(\.rawValue)
             ).sorted().joined(separator: ",")
@@ -372,10 +378,13 @@ private struct PreparedServingBackend {
                 \(scalarFallbackRoute) \
                 \(exactMTP) \
                 \(inCheckpointMTP) \
+                \(defaultSamplingFields) \
                 \(fit) \
                 listening=\(localAddress)
                 """
         case .continuous(let report):
+            let defaultSamplingFields = ServingDefaultSamplingAnnouncement.machineReadableFields(
+                source: defaultSampling, resolved: report.samplingDefaults)
             let nativeCacheKinds = Set(
                 report.nativeCacheKinds.map(\.rawValue)
             ).sorted().joined(separator: ",")
@@ -417,6 +426,7 @@ private struct PreparedServingBackend {
                 model_proof_verified=\(report.modelProofVerified) \
                 \(modelCapabilityFields) \
                 \(memory) \
+                \(defaultSamplingFields) \
                 \(fit) \
                 listening=\(localAddress)
                 """
@@ -1254,6 +1264,7 @@ private func loadScalarServingBackend(
         },
         mode: "scalar",
         launchedModel: arguments.model,
+        defaultSampling: arguments.defaultSampling,
         startupReport: .scalar(loaded.startupReport),
         fitDecision: fitDecision,
         exactMTPReport: nil,
@@ -1276,6 +1287,7 @@ private func prepareBackend(
             evidenceSnapshot: nil,
             mode: "scripted",
             launchedModel: arguments.model,
+            defaultSampling: .off,
             startupReport: nil,
             fitDecision: nil,
             exactMTPReport: nil,
@@ -1421,6 +1433,7 @@ private func prepareBackend(
                 },
                 mode: mode,
                 launchedModel: arguments.model,
+                defaultSampling: arguments.defaultSampling,
                 startupReport: .scalar(loaded.scalarStartupReport),
                 fitDecision: limits.fitDecision,
                 exactMTPReport: loaded.exactStartupReport,
@@ -1604,6 +1617,7 @@ private func prepareBackend(
                 ? "continuous-dynamic-pld"
                 : "continuous-batch-no-spec",
             launchedModel: arguments.model,
+            defaultSampling: arguments.defaultSampling,
             startupReport: .continuous(loaded.startupReport),
             fitDecision: limits.fitDecision,
             exactMTPReport: nil,

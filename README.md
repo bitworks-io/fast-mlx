@@ -100,6 +100,9 @@ different loads, because batched and solo logits are not bit-identical.
 omits from the checkpoint's own `generation_config.json` (explicit request fields win, and an explicit
 `temperature: 0` stays greedy), and refuses to start if that file is missing or unusable. With
 `--continuous-dynamic-pld` such a request is sampled and so decodes without speculation.
+The startup line on either route shows which defaults are in effect: `default_sampling=off`, or
+`default_sampling=generation-config` followed by the resolved `default_sampling_temperature`, `_top_p`,
+`_top_k` and `_min_p` (`unset` when the checkpoint leaves a field open).
 Pass `--single-stream` to serve on the single-stream scalar route instead, for
 `/v1/completions` and `--chat-template`; it cannot be
 combined with `--continuous-batch-no-spec`, `--continuous-dynamic-pld` or `--max-reserved-kv-bytes`.
