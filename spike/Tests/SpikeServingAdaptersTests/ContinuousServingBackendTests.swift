@@ -1457,13 +1457,75 @@ final class ContinuousServingBackendTests: XCTestCase {
         return run
     }
 
-    /// The continuous-batch route only knows how to render a CHAT-templated prompt — a legacy
-    /// `/v1/completions` request (`.rawText`) must be rejected with `completions_unsupported`
-    /// BEFORE anything is rendered or decoded, never silently mistreated as an already-templated
-    /// chat prompt.
-    func testContinuousBatchRouteRejectsRawTextCompletionsRequestBeforeRenderingOrDecoding()
-        async throws
-    {
+    // MARK: - legacy `/v1/completions` (raw-text prompts) on the continuous route (cycle 283)
+
+    private func rawTextCompletionRequest(
+        prompt: String = "solo", maxTokens: Int = 8, logprobs: Int? = nil
+    ) throws -> OpenAIChatCompletionRequest {
+        let logprobsField = logprobs.map { #","logprobs":\#($0)"# } ?? ""
+        let completionRequest = try OpenAICompletionRequest.decodeStrict(
+            from: Data(
+                #"{"model":"fixture","prompt":"\#(prompt)","max_tokens":\#(maxTokens)\#(logprobsField)}"#
+                    .utf8))
+        let rawTextRequest = completionRequest.asChatCompletionRequest()
+        XCTAssertEqual(rawTextRequest.promptInput, .rawText(prompt))
+        return rawTextRequest
+    }
+
+    /// C1: a raw-text request on the continuous route is admitted and decodes EXACTLY the codec's
+    /// `encode(rawText:)` tokens (never the chat render, which here is a different prompt that the
+    /// runtime has no script for), and ends with `stop` or `length`.
+    func testContinuousRouteServesRawTextCompletions() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 2, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: true,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            // The chat render of "solo" is [20]: a different prompt than the raw-text encode.
+            promptByText: ["solo": [20]],
+            pieces: [1: "a", 2: "b"],
+            stopTokenIDs: [99],
+            mailboxCapacity: .init(maxDeltas: 64, maxBytes: 65_536),
+            rawTextTokens: ["solo": [10]])
+
+        let stopped = try await backend.start(rawTextCompletionRequest(maxTokens: 8))
+        let stoppedEvents = try await collect(stopped.mailbox)
+        XCTAssertEqual(recorder.submissions.first?.promptTokens, [10])
+        XCTAssertEqual(
+            stoppedEvents,
+            [
+                .text("a"), .text("b"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .stop,
+                        usage: OpenAIChatUsage(promptTokens: 1, completionTokens: 2))),
+            ])
+
+        let truncated = try await backend.start(rawTextCompletionRequest(maxTokens: 1))
+        let truncatedEvents = try await collect(truncated.mailbox)
+        XCTAssertEqual(recorder.submissions.last?.promptTokens, [10])
+        XCTAssertEqual(
+            truncatedEvents,
+            [
+                .text("a"),
+                .completion(
+                    ServingGenerationCompletion(
+                        finishReason: .length,
+                        usage: OpenAIChatUsage(promptTokens: 1, completionTokens: 1))),
+            ])
+        await backend.shutdown()
+    }
+
+    /// C3: a raw-text handle never separates reasoning, even on a backend whose model thinks by
+    /// default (no chat template pre-fills a `<think>` block); the same backend's chat handle does.
+    func testRawTextOnThinkingBackendDoesNotSeparateReasoning() async throws {
         let recorder = ContinuousRuntimeRecorder()
         let coordinator = ContinuousBatchCoordinator(
             configuration: try configuration(active: 2, queued: 4),
@@ -1478,26 +1540,91 @@ final class ContinuousServingBackendTests: XCTestCase {
             coordinator: coordinator,
             promptByText: ["solo": [10]],
             pieces: [1: "s"],
-            stopTokenIDs: [99])
+            stopTokenIDs: [99],
+            thinksByDefault: true,
+            rawTextTokens: ["solo": [10]])
 
-        let completionRequest = try OpenAICompletionRequest.decodeStrict(
-            from: Data(#"{"model":"fixture","prompt":"solo","max_tokens":2}"#.utf8))
-        let rawTextRequest = completionRequest.asChatCompletionRequest()
-        XCTAssertEqual(rawTextRequest.promptInput, .rawText("solo"))
+        let rawHandle = try await backend.start(rawTextCompletionRequest(maxTokens: 2))
+        XCTAssertFalse(rawHandle.separatesReasoning)
+        _ = await rawHandle.lease.cancel(.clientDisconnected)
+
+        let chatHandle = try await backend.start(request(text: "solo", maxTokens: 2))
+        XCTAssertTrue(
+            chatHandle.separatesReasoning,
+            "control: the same thinking backend separates reasoning for a chat request")
+        _ = await chatHandle.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// C4 (failure path): a codec that has not opted in to `encode(rawText:)` still refuses with
+    /// `completions_unsupported` BEFORE any admission or decode.
+    func testCodecWithoutRawTextSupportStillRefuses() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            chatOnlyCodec: true)
 
         do {
-            _ = try await backend.start(rawTextRequest)
-            XCTFail("continuous route must reject a raw-text completions request")
+            _ = try await backend.start(rawTextCompletionRequest(maxTokens: 2, logprobs: 2))
+            XCTFail("a codec without raw-text support must refuse a completions request")
         } catch let error as OpenAIServingError {
             guard case .invalidRequestWithCode(_, let param, let code) = error else {
-                XCTFail("expected invalidRequestWithCode, got \(error)")
-                return
+                return XCTFail("expected invalidRequestWithCode, got \(error)")
             }
             XCTAssertEqual(param, "prompt")
             XCTAssertEqual(code, "completions_unsupported")
         }
         XCTAssertTrue(recorder.decodeActions.isEmpty)
         XCTAssertTrue(recorder.admissionBatchSizes.isEmpty)
+        XCTAssertTrue(recorder.submissions.isEmpty)
+        let slots = await coordinator.snapshots()
+        XCTAssertTrue(slots.isEmpty)
+        await backend.shutdown()
+    }
+
+    /// C4 (failure path): an empty `encode(rawText:)` result is `emptyRenderedPrompt`, before any
+    /// admission or decode.
+    func testRawTextEmptyEncodeRefusesEmptyRenderedPrompt() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]],
+                recorder: recorder,
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["solo": [10]],
+            pieces: [1: "s"],
+            stopTokenIDs: [99],
+            rawTextTokens: ["solo": []])
+
+        do {
+            _ = try await backend.start(rawTextCompletionRequest(maxTokens: 2))
+            XCTFail("an empty raw-text encode must be refused")
+        } catch let error as ContinuousServingBackendError {
+            XCTAssertEqual(error, .emptyRenderedPrompt)
+        }
+        XCTAssertTrue(recorder.decodeActions.isEmpty)
+        XCTAssertTrue(recorder.admissionBatchSizes.isEmpty)
+        XCTAssertTrue(recorder.submissions.isEmpty)
+        let slots = await coordinator.snapshots()
+        XCTAssertTrue(slots.isEmpty)
         await backend.shutdown()
     }
 
@@ -1543,7 +1670,8 @@ final class ContinuousServingBackendTests: XCTestCase {
             promptByText: ["solo": [10]],
             pieces: pieces,
             stopTokenIDs: [99],
-            mailboxCapacity: mailboxCapacity)
+            mailboxCapacity: mailboxCapacity,
+            rawTextTokens: ["solo": [10]])
         return (backend, coordinator, recorder)
     }
 
@@ -1835,28 +1963,36 @@ final class ContinuousServingBackendTests: XCTestCase {
         }
     }
 
-    /// The legacy completions route stays refused on the continuous route (its earlier guard), with
-    /// `completions_unsupported`, even when the request carries `logprobs: N`.
-    func testCompletionsLogprobsStayRefusedOnTheContinuousRoute() async throws {
-        let (backend, coordinator, recorder) = try logprobBackend(
-            script: [1, 99], pieces: [1: "s"])
-        let completionRequest = try OpenAICompletionRequest.decodeStrict(
-            from: Data(#"{"model":"fixture","prompt":"solo","max_tokens":2,"logprobs":2}"#.utf8))
-        let rawTextRequest = completionRequest.asChatCompletionRequest()
-        XCTAssertNotNil(rawTextRequest.logprobsRequest)
-        do {
-            _ = try await backend.start(rawTextRequest)
-            XCTFail("continuous route must still reject a completions request")
-        } catch let error as OpenAIServingError {
-            guard case .invalidRequestWithCode(_, _, let code) = error else {
-                return XCTFail("expected invalidRequestWithCode, got \(error)")
-            }
-            XCTAssertEqual(code, "completions_unsupported")
+    /// C2: a legacy completions request with integer `logprobs: N` on the continuous route gets
+    /// one entry per published token, each with N alternatives; `N = 0` gives empty top lists.
+    func testRawTextCompletionsLogprobsOnContinuousRoute() async throws {
+        let pieces = [1: "a", 2: "b", 3: "c"]
+        for topLogprobs in [5, 0] {
+            let (backend, _, recorder) = try logprobBackend(
+                script: [1, 2, 3, 99], pieces: pieces)
+            let handle = try await backend.start(
+                rawTextCompletionRequest(maxTokens: 8, logprobs: topLogprobs))
+            let events = try await collect(handle.mailbox)
+
+            XCTAssertEqual(recorder.submissions.first?.logprobs?.topLogprobs, topLogprobs)
+            let served = events.compactMap { event -> [ServingTokenLogprob]? in
+                if case .tokenLogprobs(let tokens) = event { tokens } else { nil }
+            }.flatMap { $0 }
+            XCTAssertEqual(
+                served,
+                [1, 2, 3].map {
+                    expectedServedLogprob($0, pieces: pieces, topLogprobs: topLogprobs)
+                },
+                "top_logprobs=\(topLogprobs)")
+            XCTAssertEqual(
+                served.map { $0.topCandidates.count }, [topLogprobs, topLogprobs, topLogprobs])
+            XCTAssertEqual(
+                events.compactMap { event -> String? in
+                    if case .text(let value) = event { value } else { nil }
+                },
+                ["a", "b", "c"])
+            await backend.shutdown()
         }
-        XCTAssertTrue(recorder.decodeActions.isEmpty)
-        let slots = await coordinator.snapshots()
-        XCTAssertTrue(slots.isEmpty)
-        await backend.shutdown()
     }
 
     /// `repetitionPenalty` is a MULTIPLICATIVE penalty (the vendored `RepetitionContext`:
@@ -4237,6 +4373,17 @@ private struct FixtureContinuousTextCodec: ScalarServingTextCodec {
     let promptByText: [String: [Int]]
     let pieces: [Int: String]
     let renderGate: BlockingRuntimeResourceSnapshotGate?
+    /// Raw-text (`/v1/completions`) tokenization: the codec's opt-in `encode(rawText:)`. A prompt
+    /// absent from the map is an `invalidPrefill` failure. (A codec that has NOT opted in is
+    /// `FixtureChatOnlyContinuousTextCodec`, which inherits the protocol's refusing default.)
+    var rawTextTokens: [String: [Int]] = [:]
+
+    func encode(rawText: String) throws -> [Int] {
+        guard let tokens = rawTextTokens[rawText] else {
+            throw FixtureContinuousRuntimeError.invalidPrefill
+        }
+        return tokens
+    }
 
     func render(
         messages: [OpenAIChatMessage],
@@ -4262,6 +4409,31 @@ private struct FixtureContinuousTextCodec: ScalarServingTextCodec {
     /// piece when the fixture has one, else a visible `<id>` marker.
     func decodeSingleToken(_ tokenID: Int) -> String {
         pieces[tokenID] ?? "<\(tokenID)>"
+    }
+}
+
+/// A chat-only codec: it deliberately does NOT implement `encode(rawText:)`, so it inherits the
+/// protocol's fail-closed `completions_unsupported` default exactly as a codec that has not opted
+/// in does in production.
+private struct FixtureChatOnlyContinuousTextCodec: ScalarServingTextCodec {
+    let promptByText: [String: [Int]]
+    let pieces: [Int: String]
+
+    func render(
+        messages: [OpenAIChatMessage],
+        tools: [OpenAIToolSpec],
+        enableThinking: Bool?,
+        reasoningEffort: String?,
+        addGenerationPrompt: Bool?
+    ) throws -> [Int] {
+        guard let text = messages.last?.text, let prompt = promptByText[text] else {
+            throw FixtureContinuousRuntimeError.invalidPrefill
+        }
+        return prompt
+    }
+
+    func makeDetokenizer() -> any ScalarServingDetokenizer {
+        FixtureContinuousDetokenizer(pieces: pieces)
     }
 }
 
@@ -4307,15 +4479,22 @@ private func makeBackend(
     logitBiasVocabularySize: Int? = nil,
     jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
     jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
-    samplingDefaults: ServingSamplingDefaults? = nil
+    samplingDefaults: ServingSamplingDefaults? = nil,
+    rawTextTokens: [String: [Int]] = [:],
+    chatOnlyCodec: Bool = false
 ) -> ContinuousServingBackend {
-    ContinuousServingBackend(
-        launchedModel: "fixture",
-        coordinator: coordinator,
-        codec: FixtureContinuousTextCodec(
+    let codec: any ScalarServingTextCodec =
+        chatOnlyCodec
+        ? FixtureChatOnlyContinuousTextCodec(promptByText: promptByText, pieces: pieces)
+        : FixtureContinuousTextCodec(
             promptByText: promptByText,
             pieces: pieces,
-            renderGate: nil),
+            renderGate: nil,
+            rawTextTokens: rawTextTokens)
+    return ContinuousServingBackend(
+        launchedModel: "fixture",
+        coordinator: coordinator,
+        codec: codec,
         stopTokenIDs: stopTokenIDs,
         modelStopStrings: [],
         configuration: ContinuousServingBackendConfiguration(

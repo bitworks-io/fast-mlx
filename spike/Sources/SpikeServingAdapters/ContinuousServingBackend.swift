@@ -411,19 +411,12 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard acceptingRequests else {
             throw ContinuousServingBackendError.shuttingDown
         }
-        // The continuous-batch route only knows how to render a CHAT-templated prompt (it has no
-        // tokenizer-only codepath); fail closed rather than silently mistreating raw completions text
-        // as an already-templated chat prompt.
-        guard request.promptInput == .chat else {
-            throw OpenAIServingError.invalidRequestWithCode(
-                "This server does not support the legacy text-completions route for the loaded backend",
-                param: "prompt",
-                code: "completions_unsupported")
-        }
-        // A chat `logprobs` / `top_logprobs` request is served: the row carries a
-        // `ContinuousServingLogprobSink` (see `PreparedRequest.logprobSink`) that the runtime fills
-        // once per selected token and `publish` pairs with the published tokens. (The legacy
-        // completions route is refused above, so only `.chat` requests reach this point.)
+        // A chat `logprobs` / `top_logprobs` request (and a legacy completions integer `logprobs`)
+        // is served: the row carries a `ContinuousServingLogprobSink` (see
+        // `PreparedRequest.logprobSink`) that the runtime fills once per selected token and
+        // `publish` pairs with the published tokens. Both request shapes (`.chat` and `.rawText`)
+        // reach this point; a codec that has not opted in to `encode(rawText:)` refuses a raw-text
+        // request below with `completions_unsupported`, before any admission.
         // A named or `"required"` `tool_choice` is refused (400, `param: "tool_choice"`) unless this
         // route can enforce it (`enforcesForcingToolChoice`: the json_schema mask is loaded), before
         // any admission or decode, never answered in prose. Defense in depth behind the HTTP gate.
@@ -447,21 +440,24 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         let activeTools = request.activeTools
         // Resolve thinking ONCE and use the SAME value for the prompt render and the reasoning gate —
         // a closed `<think></think>` in the prompt with a splitter still engaged would mislabel the
-        // answer. This route only accepts `.chat` prompts (raw-text is rejected above).
+        // answer. Raw-text completions never separate reasoning (no chat template pre-fills a
+        // `<think>` block), exactly as on the scalar route.
         let resolvedEnableThinking = request.resolvedEnableThinking(
             disableThinkingWhenToolsActive: configuration.disableThinkingWhenToolsActive)
-        let separatesReasoning = servingSeparatesReasoning(
-            thinksByDefault: configuration.thinksByDefault,
-            resolvedEnableThinking: resolvedEnableThinking)
+        let separatesReasoning =
+            request.promptInput == .chat
+            && servingSeparatesReasoning(
+                thinksByDefault: configuration.thinksByDefault,
+                resolvedEnableThinking: resolvedEnableThinking)
         // Named/`"required"` `tool_choice` and `response_format` masks: every refusal is raised here,
         // BEFORE the prompt render and any admission.
         let constraint = try await buildTokenMask(
             request, separatesReasoning: separatesReasoning)
-        let promptTokens = try codec.render(
-            messages: request.messages,
+        let promptTokens = try renderServingPrompt(
+            request,
+            codec: codec,
             tools: activeTools,
             enableThinking: resolvedEnableThinking,
-            reasoningEffort: request.reasoningEffort,
             addGenerationPrompt: request.addGenerationPrompt)
         guard !promptTokens.isEmpty else {
             throw ContinuousServingBackendError.emptyRenderedPrompt

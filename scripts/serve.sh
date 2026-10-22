@@ -35,8 +35,8 @@
 # concurrency-aware verdict); the default sizes for a single stream.
 # Set FASTMLX_API_KEY to require Bearer auth (mandatory when binding a non-loopback --host).
 # Pass --single-stream (wrapper-only; never forwarded) to serve on the single-stream scalar route
-# instead of the default continuous-batch route (which serves sampling (temperature>0) and the
-# presence/frequency/repetition penalties): logprobs, /v1/completions and --chat-template are
+# instead of the default continuous-batch route (which serves sampling (temperature>0), the
+# presence/frequency/repetition penalties, logprobs and /v1/completions): --chat-template is
 # served only on the single-stream route.
 set -euo pipefail
 
@@ -144,10 +144,10 @@ validate_host_use() {
 validate_host_use
 
 # --single-stream is a wrapper-only opt-out of the default continuous-batch route. That route samples
-# (temperature>0) and applies presence/frequency/repetition penalties, but it returns 400 for
-# logprobs and /v1/completions, and the binary refuses --chat-template alongside it
+# (temperature>0), applies presence/frequency/repetition penalties and serves logprobs and
+# /v1/completions, but the binary refuses --chat-template alongside it
 # (--default-sampling generation-config works on both routes). The scalar (single-stream) route
-# serves all of those, but the wrapper otherwise
+# serves --chat-template too, but the wrapper otherwise
 # always selects the continuous route (and its --max-reserved-kv-bytes default, which the binary
 # rejects without continuous mode), so this flag is how a user reaches the scalar route. Parsed,
 # checked and stripped here, before any build, binary resolution, download or quant work, so a

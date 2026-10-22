@@ -86,6 +86,31 @@ public protocol ScalarServingTextCodec: Sendable {
     func vocabularyText(forTokenID tokenID: Int) -> String?
 }
 
+/// Renders the prompt for either request shape, shared by the scalar and continuous-batch routes
+/// so the branch cannot drift between them: `.chat` goes through the codec's chat-template
+/// `render`, unchanged; `.rawText` goes through `encode(rawText:)` (no template, no tools, no
+/// thinking control — the codec's default implementation fails closed with
+/// `completions_unsupported` for a codec that has not opted in).
+func renderServingPrompt(
+    _ request: OpenAIChatCompletionRequest,
+    codec: any ScalarServingTextCodec,
+    tools: [OpenAIToolSpec],
+    enableThinking: Bool?,
+    addGenerationPrompt: Bool?
+) throws -> [Int] {
+    switch request.promptInput {
+    case .chat:
+        return try codec.render(
+            messages: request.messages,
+            tools: tools,
+            enableThinking: enableThinking,
+            reasoningEffort: request.reasoningEffort,
+            addGenerationPrompt: addGenerationPrompt)
+    case .rawText(let prompt):
+        return try codec.encode(rawText: prompt)
+    }
+}
+
 extension ScalarServingTextCodec {
     public func vocabularyText(forTokenID tokenID: Int) -> String? {
         nil
@@ -652,7 +677,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         var promptTokens: [Int]?
         var completionBudgetResolution: ServingCompletionBudgetResolution?
         if let capabilities = configuration.modelCapabilities {
-            let rendered = try Self.renderPrompt(
+            let rendered = try renderServingPrompt(
                 request,
                 codec: codec,
                 tools: activeTools,
@@ -689,7 +714,7 @@ public actor ScalarServingBackend: ServingGenerationBackend {
                 retryAfterSeconds: configuration.queueRetryAfterSeconds)
         }
         if promptTokens == nil {
-            promptTokens = try Self.renderPrompt(
+            promptTokens = try renderServingPrompt(
                 request,
                 codec: codec,
                 tools: activeTools,
@@ -758,31 +783,6 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             lease: lease,
             completionBudgetResolution: completionBudgetResolution,
             separatesReasoning: separatesReasoning)
-    }
-
-    /// Renders the prompt for either request shape: `.chat` goes through the codec's chat-template
-    /// `render`, unchanged; `.rawText` goes through `encode(rawText:)` (no template, no tools, no
-    /// thinking control — the codec's default implementation fails closed with
-    /// `completions_unsupported` for a codec that has not opted in). Both call sites in `start(...)`
-    /// above share this so the branch cannot drift between them.
-    private static func renderPrompt(
-        _ request: OpenAIChatCompletionRequest,
-        codec: any ScalarServingTextCodec,
-        tools: [OpenAIToolSpec],
-        enableThinking: Bool?,
-        addGenerationPrompt: Bool?
-    ) throws -> [Int] {
-        switch request.promptInput {
-        case .chat:
-            return try codec.render(
-                messages: request.messages,
-                tools: tools,
-                enableThinking: enableThinking,
-                reasoningEffort: request.reasoningEffort,
-                addGenerationPrompt: addGenerationPrompt)
-        case .rawText(let prompt):
-            return try codec.encode(rawText: prompt)
-        }
     }
 
     public func snapshot() -> ScalarServingBackendSnapshot {

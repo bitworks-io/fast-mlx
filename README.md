@@ -218,10 +218,11 @@ and `suffix` (insertion mode) is not supported. Integer `logprobs` (0…5) is a 
 "logprobs off" — returning `choices[0].logprobs` with `tokens`/`token_logprobs`/`top_logprobs`
 (`null` per-token when `logprobs:0`)/`text_offset` (the code-point offset of each token into the
 full completion text), same raw-logits semantics as the chat route above; a value outside 0…5 is
-rejected. Only the single-stream scalar serving route serves this route today (including
-in-checkpoint MTP on that route); the continuous-batch route (which serves chat logprobs, but not this
-legacy completions route, with or without `logprobs`), the separate draft-model speculative
-route, and evidence-recording mode all fail closed with `completions_unsupported` (or
+rejected. Both the single-stream scalar serving route (including in-checkpoint MTP on that route) and
+the continuous-batch route (the default) serve this route, with or without `logprobs`; a raw-text
+request never separates reasoning on either, and on the continuous route a `logprobs` completion decodes
+without speculation. The separate draft-model speculative route, the exact-MTP route, evidence-recording
+mode, and any loaded codec without raw-text support all fail closed with `completions_unsupported` (or
 `logprobs_unsupported` for a logprobs request on a route that cannot serve it) rather than silently
 mistreating raw text as an already-templated chat prompt or omitting values a caller asked for. As with the chat route, a
 `logprobs` request against the scalar route ITSELF still refuses with `logprobs_unsupported` when
