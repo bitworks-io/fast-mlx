@@ -217,7 +217,11 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         pendingHead = nil
         pendingBody = nil
 
-        if head.method == .GET, head.uri == "/v1/models" {
+        // Route on the path only: a query string never changes which route serves the request (see
+        // `servingRoutePath`).
+        let routePath = servingRoutePath(head.uri)
+
+        if head.method == .GET, routePath == "/v1/models" {
             guard body.readableBytes == 0 else {
                 writeError(
                     .invalidRequest("GET /v1/models does not accept a request body", param: nil),
@@ -229,7 +233,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeModelList(keepAlive: head.isKeepAlive, context: context)
             return
         }
-        if head.method == .GET, let rawModelId = Self.modelDetailPathSuffix(head.uri) {
+        if head.method == .GET, let rawModelId = Self.modelDetailPathSuffix(routePath) {
             guard body.readableBytes == 0 else {
                 writeError(
                     .invalidRequest("GET /v1/models/{id} does not accept a request body", param: nil),
@@ -245,7 +249,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeModelObject(id: requestedModelId, keepAlive: head.isKeepAlive, context: context)
             return
         }
-        if head.method == .GET, head.uri == "/metrics" {
+        if head.method == .GET, routePath == "/metrics" {
             guard body.readableBytes == 0 else {
                 writeError(
                     .invalidRequest("GET /metrics does not accept a request body", param: nil),
@@ -257,7 +261,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeMetrics(keepAlive: head.isKeepAlive, context: context)
             return
         }
-        if head.method == .GET, head.uri == "/healthz" {
+        if head.method == .GET, routePath == "/healthz" {
             guard body.readableBytes == 0 else {
                 writeError(
                     .invalidRequest("GET /healthz does not accept a request body", param: nil),
@@ -273,7 +277,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 context: context)
             return
         }
-        if head.method == .GET, head.uri == "/readyz" {
+        if head.method == .GET, routePath == "/readyz" {
             guard body.readableBytes == 0 else {
                 writeError(
                     .invalidRequest("GET /readyz does not accept a request body", param: nil),
@@ -293,12 +297,12 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
 
         let bodyData = Data(body.readBytes(length: body.readableBytes) ?? [])
 
-        if head.uri == "/v1/embeddings" {
+        if routePath == "/v1/embeddings" {
             handleEmbeddings(head: head, bodyData: bodyData, context: context)
             return
         }
 
-        let isLegacyCompletions = head.uri == "/v1/completions"
+        let isLegacyCompletions = routePath == "/v1/completions"
         let responseKind: ServingResponseKind = isLegacyCompletions ? .completions : .chat
 
         // `ServingEvidence.validateCanonicalHTTPRequest` only recognizes `/v1/chat/completions` as a
@@ -479,7 +483,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             requestEvidence = try configuration.evidence.map { _ in
                 try ServingEvidence.Request(
                     method: head.method.rawValue,
-                    path: head.uri,
+                    path: servingRoutePath(head.uri),
                     headers: head.headers.map {
                         ServingEvidence.Header(
                             name: $0.name,
@@ -593,7 +597,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     private static func modelDetailPathSuffix(_ uri: String) -> String? {
         let prefix = "/v1/models/"
         // A query string is not part of the model id (`/v1/models/org%2Fname?x=1`).
-        let path = uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        let path = servingRoutePath(uri)
         guard path.hasPrefix(prefix) else { return nil }
         let suffix = String(path.dropFirst(prefix.count))
         return suffix.isEmpty ? nil : suffix
@@ -602,14 +606,17 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     private func validateHead(
         _ head: HTTPRequestHead
     ) -> (status: HTTPResponseStatus, error: OpenAIServingError)? {
-        let isChat = head.uri == "/v1/chat/completions"
-        let isCompletions = head.uri == "/v1/completions"
-        let isEmbeddings = head.uri == "/v1/embeddings"
-        let isModels = head.uri == "/v1/models"
-        let isModelDetail = Self.modelDetailPathSuffix(head.uri) != nil
-        let isMetrics = head.uri == "/metrics"
-        let isHealthz = head.uri == "/healthz"
-        let isReadyz = head.uri == "/readyz"
+        // Match on the path only, so `?api-version=...` and the like never turn a known route into a
+        // 404; a query string is never consulted for authentication either (see `servingRoutePath`).
+        let routePath = servingRoutePath(head.uri)
+        let isChat = routePath == "/v1/chat/completions"
+        let isCompletions = routePath == "/v1/completions"
+        let isEmbeddings = routePath == "/v1/embeddings"
+        let isModels = routePath == "/v1/models"
+        let isModelDetail = Self.modelDetailPathSuffix(routePath) != nil
+        let isMetrics = routePath == "/metrics"
+        let isHealthz = routePath == "/healthz"
+        let isReadyz = routePath == "/readyz"
         guard
             isChat || isCompletions || isEmbeddings || isModels || isModelDetail || isMetrics
                 || isHealthz || isReadyz

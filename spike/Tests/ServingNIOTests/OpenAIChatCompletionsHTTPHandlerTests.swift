@@ -3771,6 +3771,234 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertNil(object["ignored_fields"])
         _ = try await channel.finish()
     }
+
+    // MARK: - Routing ignores the query string (cycle 286)
+
+    // T1: an SDK `extra_query`/gateway-appended query string must not turn a valid chat request
+    // into a 404 "Unknown route".
+    func testChatCompletionsWithQueryStringRoutesToChatAndStartsBackendOnce() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeRequest(
+            channel,
+            body: requestBody(stream: false),
+            uri: "/v1/chat/completions?api-version=2024-06-01")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        _ = try await channel.finish()
+    }
+
+    // T2: the legacy completions route ignores a query string too.
+    func testLegacyCompletionsWithQueryStringRoutesToCompletions() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend)
+
+        try await writeCompletionsRequest(
+            channel,
+            body: completionsRequestBody(stream: false),
+            uri: "/v1/completions?x=1")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        XCTAssertEqual(backend.snapshot().startCount, 1)
+        _ = try await channel.finish()
+    }
+
+    // T3: every GET route ignores a query string (a Prometheus `params:` scrape, a probe with a
+    // cache-buster), and `/healthz?...` still bypasses the bearer token.
+    func testGETRoutesIgnoreQueryString() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+        for uri in ["/v1/models?limit=5", "/metrics?x=1", "/readyz?x", "/healthz?probe=1"] {
+            let channel = try await makeChannel(
+                backend: ScriptedBackend(scripts: []), configuration: configuration)
+            try await writeHeadOnlyRequest(channel, method: .GET, uri: uri)
+            let response = try await collectResponse(from: channel)
+            XCTAssertEqual(response.head.status, .ok, "GET \(uri)")
+            _ = try await channel.finish()
+        }
+
+        let tokenConfiguration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let healthzChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: tokenConfiguration)
+        try await writeHeadOnlyRequest(healthzChannel, method: .GET, uri: "/healthz?probe=1")
+        let healthz = try await collectResponse(from: healthzChannel)
+        XCTAssertEqual(healthz.head.status, .ok, "healthz must still bypass the bearer token")
+        _ = try await healthzChannel.finish()
+    }
+
+    // T4: with evidence on, a query string is routed past AND never reaches the stored evidence
+    // path (`ServingEvidence.Request` rejects any query on purpose, so a secret in a query is never
+    // stored). Bounded: a regression that throws in the evidence constructor closes the
+    // connection with no response, so this waits on the recorder (bounded) before reading output.
+    func testEvidenceRecordsQueryFreePathAndNeverStoresQuerySecret() async throws {
+        let querySentinel = "QUERY-SECRET-SENTINEL-286"
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { message in
+                    Task { await recorder.recordFailure(message) }
+                }))
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(
+            channel,
+            body: requestBody(stream: false),
+            uri: "/v1/chat/completions?api_key=\(querySentinel)")
+        await waitUntil(attempts: 2_000) {
+            let recorded = await recorder.snapshot()
+            return recorded.evidence.count == 1 || !recorded.failures.isEmpty
+        }
+        let recorded = await recorder.snapshot()
+        guard recorded.evidence.count == 1, recorded.failures.isEmpty else {
+            XCTFail(
+                "expected one evidence record and no failure; got \(recorded.evidence.count) "
+                    + "record(s), failures \(recorded.failures)")
+            return
+        }
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .ok)
+        let evidence = try XCTUnwrap(recorded.evidence.first)
+        XCTAssertEqual(evidence.request.path, "/v1/chat/completions")
+        let json = try XCTUnwrap(String(data: try evidence.canonicalJSONData(), encoding: .utf8))
+        XCTAssertFalse(json.contains(querySentinel))
+        _ = try await channel.finish()
+    }
+
+    // T5: with evidence on, `/v1/completions?x=1` takes the same fail-closed 400 as the bare path,
+    // not a 404 and not a silently closed connection.
+    func testLegacyCompletionsWithQueryStringAndEvidenceIsStill400CompletionsUnsupported()
+        async throws
+    {
+        let backend = ScriptedBackend(scripts: [])
+        let recorder = ServingEvidenceRecorder()
+        let configuration = defaultConfiguration(
+            evidence: ServingHTTPEvidenceConfiguration(
+                snapshot: nil,
+                record: { evidence in try await recorder.record(evidence) },
+                reportFailure: { _ in }))
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeCompletionsRequest(
+            channel,
+            body: completionsRequestBody(stream: false),
+            uri: "/v1/completions?x=1")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .badRequest)
+        XCTAssertTrue(response.body.contains("completions_unsupported"))
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
+
+    // T6: telemetry and the router agree: the log line and the `/metrics` series for a
+    // query-carrying chat request report the query-free route with a 2xx status.
+    func testQueryStringRequestIsLoggedAndCountedUnderTheQueryFreeRouteWith2xx() async throws {
+        let recorder = RequestLogRecorder()
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() },
+            requestLog: recorder.sink())
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["ok"], promptTokens: 1, completionTokens: 1)
+        ])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(
+            channel,
+            body: requestBody(stream: false),
+            uri: "/v1/chat/completions?api-version=2024-06-01")
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .ok)
+        await waitUntil { recorder.lines().count == 1 }
+        _ = try await channel.finish()
+
+        let object = try requestLogJSONObject(try XCTUnwrap(recorder.lines().first))
+        XCTAssertEqual(object["route"] as? String, "/v1/chat/completions")
+        XCTAssertEqual(object["status"] as? Int, 200)
+
+        let scrapeChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+        try await writeHeadOnlyRequest(scrapeChannel, method: .GET, uri: "/metrics")
+        let scrape = try await collectResponse(from: scrapeChannel)
+        XCTAssertTrue(
+            scrape.body.contains(
+                #"fastmlx_http_requests_total{route="/v1/chat/completions",status_class="2xx",outcome="completed"} 1"#))
+        _ = try await scrapeChannel.finish()
+    }
+
+    // T7 (edge, stays green): only a literal `?` splits the path. A trailing slash, a different
+    // path, and a percent-encoded `?` are still unknown routes; the method check still applies.
+    func testQueryStringStrippingDoesNotWidenRouting() async throws {
+        for uri in [
+            "/v1/chat/completions/?a=1", "/v1/chat/completionsX?a", "/v1/chat/completions%3Fa=1",
+        ] {
+            let backend = ScriptedBackend(scripts: [])
+            let channel = try await makeChannel(backend: backend)
+            try await writeRequest(channel, body: requestBody(stream: false), uri: uri)
+            let response = try await collectResponse(from: channel)
+            XCTAssertEqual(response.head.status, .notFound, "POST \(uri)")
+            XCTAssertEqual(backend.snapshot().startCount, 0)
+            _ = try await channel.finish()
+        }
+
+        let channel = try await makeChannel(backend: ScriptedBackend(scripts: []))
+        try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/chat/completions?x")
+        let response = try await collectResponse(from: channel)
+        XCTAssertEqual(response.head.status, .methodNotAllowed)
+        _ = try await channel.finish()
+    }
+
+    // T8 (failure path): a query string never authenticates. The bearer token must come from the
+    // Authorization header, even when it is echoed in `?api_key=`.
+    func testQueryStringApiKeyDoesNotAuthenticate() async throws {
+        let token = "sk-QUERY-AUTH-SENTINEL-286"
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: token,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+        let backend = ScriptedBackend(scripts: [])
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+
+        try await writeRequest(
+            channel,
+            body: requestBody(stream: false),
+            uri: "/v1/chat/completions?api_key=\(token)")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .unauthorized)
+        XCTAssertEqual(backend.snapshot().startCount, 0)
+        _ = try await channel.finish()
+    }
 }
 
 private struct CollectedResponse {
@@ -3898,11 +4126,14 @@ private func budgetResolution(
         limitingFactor: limitingFactor)
 }
 
-private func validHead(contentLength: Int) -> HTTPRequestHead {
+private func validHead(
+    contentLength: Int,
+    uri: String = "/v1/chat/completions"
+) -> HTTPRequestHead {
     HTTPRequestHead(
         version: .http1_1,
         method: .POST,
-        uri: "/v1/chat/completions",
+        uri: uri,
         headers: [
             "host": "localhost",
             "content-type": "application/json",
@@ -3931,9 +4162,10 @@ private func validHead(
 private func writeRequest(
     _ channel: NIOAsyncTestingChannel,
     body: String,
-    authorization: String? = nil
+    authorization: String? = nil,
+    uri: String = "/v1/chat/completions"
 ) async throws {
-    var head = validHead(contentLength: body.utf8.count)
+    var head = validHead(contentLength: body.utf8.count, uri: uri)
     if let authorization {
         head.headers.add(name: "authorization", value: authorization)
     }
@@ -3949,11 +4181,14 @@ private func completionsRequestBody(prompt: String = "Hello", stream: Bool) -> S
     """
 }
 
-private func completionsHead(contentLength: Int) -> HTTPRequestHead {
+private func completionsHead(
+    contentLength: Int,
+    uri: String = "/v1/completions"
+) -> HTTPRequestHead {
     HTTPRequestHead(
         version: .http1_1,
         method: .POST,
-        uri: "/v1/completions",
+        uri: uri,
         headers: [
             "host": "localhost",
             "content-type": "application/json",
@@ -3964,9 +4199,10 @@ private func completionsHead(contentLength: Int) -> HTTPRequestHead {
 private func writeCompletionsRequest(
     _ channel: NIOAsyncTestingChannel,
     body: String,
-    authorization: String? = nil
+    authorization: String? = nil,
+    uri: String = "/v1/completions"
 ) async throws {
-    var head = completionsHead(contentLength: body.utf8.count)
+    var head = completionsHead(contentLength: body.utf8.count, uri: uri)
     if let authorization {
         head.headers.add(name: "authorization", value: authorization)
     }

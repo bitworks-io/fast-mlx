@@ -69,6 +69,18 @@ struct ServingRequestLogPreamble: Sendable {
     let startedAt: ContinuousClock.Instant
 }
 
+/// The route-matching part of a request URI: everything before the first `?`. The router, the
+/// bearer-auth/method validation, the request-log/metrics templater, and the serving-evidence
+/// request path all key on this ONE helper so a query string (an OpenAI SDK `extra_query`, a
+/// query-forwarding gateway, a Prometheus `params:` scrape) can never make them disagree: a route
+/// that matches here is served, logged, and counted under the same query-free path, and the query
+/// itself is never stored (`ServingEvidence.Request` rejects a query on purpose). Only a literal
+/// `?` splits -- a trailing `/`, a percent-encoded `?` (`%3F`), and case differences are NOT
+/// normalized, so they remain unknown routes.
+func servingRoutePath(_ uri: String) -> String {
+    String(uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0])
+}
+
 /// Maps a request URI to the PUBLIC route shape the request-log's `route` field reports, stripping
 /// any query string (raw query strings are never logged -- see `ServingRequestLogRecord`'s doc
 /// comment) and templating the variable `/v1/models/{id}` segment instead of echoing the requested
@@ -76,7 +88,7 @@ struct ServingRequestLogPreamble: Sendable {
 /// fixed `<unmatched>` template: an unmatched path is arbitrary, unbounded client input (it can
 /// carry tokens or identifiers), so it is never echoed into the log.
 func servingRequestLogTemplatedRoute(_ uri: String) -> String {
-    let path = String(uri.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)[0])
+    let path = servingRoutePath(uri)
     let modelsPrefix = "/v1/models/"
     if path.hasPrefix(modelsPrefix), path.count > modelsPrefix.count {
         return "/v1/models/{id}"
