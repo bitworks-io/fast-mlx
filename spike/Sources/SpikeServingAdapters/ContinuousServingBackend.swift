@@ -45,6 +45,12 @@ public struct ContinuousServingBackendConfiguration: Sendable {
     /// FAIL CLOSED) means the width is unknown, which keeps `ContinuousServingBackend.supportsLogitBias`
     /// `false` so a non-empty bias is refused rather than applied unchecked.
     public var logitBiasVocabularySize: Int?
+    /// Prompt token IDs the loaded model's own input validation rejects (`servingRejectedPromptTokenIDs`;
+    /// empty for every family without such a validation, which keeps the screen inert). `start` answers
+    /// a request whose rendered prompt contains one with a terminal 400 `unsupported_prompt_token`,
+    /// before budget resolution and any coordinator or dynamic admission -- the same screen the scalar
+    /// route runs (`screenServingRejectedPromptTokens`).
+    public var rejectedPromptTokenIDs: Set<Int>
     /// Load-time `response_format: json_object` support (the byte-classification table of this
     /// checkpoint's tokenizer; see `loadScalarServingJSONObjectConstraintSupport`). `nil` (the default,
     /// FAIL CLOSED) keeps `ContinuousServingBackend.supportsJSONObjectResponseFormat` `false`.
@@ -80,7 +86,8 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         logitBiasVocabularySize: Int? = nil,
         jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
         jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
-        samplingDefaults: ServingSamplingDefaults? = nil
+        samplingDefaults: ServingSamplingDefaults? = nil,
+        rejectedPromptTokenIDs: Set<Int> = []
     ) {
         precondition(
             defaultMaximumCompletionTokens > 0,
@@ -105,6 +112,7 @@ public struct ContinuousServingBackendConfiguration: Sendable {
         self.jsonObjectConstraintSupport = jsonObjectConstraintSupport
         self.jsonSchemaConstraintSupport = jsonSchemaConstraintSupport
         self.samplingDefaults = samplingDefaults
+        self.rejectedPromptTokenIDs = rejectedPromptTokenIDs
     }
 }
 
@@ -462,6 +470,13 @@ public actor ContinuousServingBackend: ServingGenerationBackend {
         guard !promptTokens.isEmpty else {
             throw ContinuousServingBackendError.emptyRenderedPrompt
         }
+        // Terminal 400 for a prompt the model's own input validation would abort the process on. Runs
+        // before budget resolution and before ANY coordinator or dynamic admission, so a permanently
+        // invalid request is never queued and is never answered with the retryable `queueFull`.
+        try screenServingRejectedPromptTokens(
+            promptTokens,
+            rejectedIDs: configuration.rejectedPromptTokenIDs,
+            promptInput: request.promptInput)
         let completionBudgetResolution = try configuration.modelCapabilities?
             .resolveCompletionBudget(
                 requestedCompletionTokens: request.maxCompletionTokens,

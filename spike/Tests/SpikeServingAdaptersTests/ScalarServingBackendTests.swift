@@ -562,6 +562,34 @@ final class ScalarServingBackendTests: XCTestCase {
         }
     }
 
+    // S1: the offending field of a raw-text (`/v1/completions`) request is `prompt`, not `messages`;
+    // a chat request keeps `messages`.
+    func testRawTextRejectedPromptTokenNamesPromptAndChatNamesMessages() async throws {
+        let codec = RawTextFixtureScalarTextCodec(
+            chatPromptTokens: [10, 7],
+            rawTextTokens: [7],
+            pieces: [:],
+            renderCounter: RenderCounter(),
+            encodeRawTextCounter: RenderCounter())
+        let backend = makeBackendWithCodec(
+            script: [99], codec: codec, rejectedPromptTokenIDs: [7])
+
+        do {
+            _ = try await backend.start(rawTextRequest(prompt: "hi", maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "unsupported_prompt_token")
+            XCTAssertEqual(error.openAIError.param, "prompt")
+        }
+        do {
+            _ = try await backend.start(request(maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token rejection")
+        } catch let error as OpenAIServingError {
+            XCTAssertEqual(error.openAIError.code, "unsupported_prompt_token")
+            XCTAssertEqual(error.openAIError.param, "messages")
+        }
+    }
+
     func testScalarRoutePublishesExactTextUsageAndLength() async throws {
         let backend = makeBackend(
             script: [1, 2, 99],

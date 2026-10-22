@@ -471,6 +471,12 @@ public func loadContinuousServingModel(
         using: #huggingFaceTokenizerLoader())
     try validateContinuousServingMemoryLimits(configuration)
 
+    // Prompt token IDs the model's own input validation rejects (empty for every family without such a
+    // validation). Captured BEFORE `context.model` is handed to the runtime below, the same way the
+    // scalar load captures it before sending the model into the decoder actor, and assigned to the
+    // backend configuration so `ContinuousServingBackend.start` can answer 400 instead of letting the
+    // prompt reach a `preconditionFailure`.
+    let rejectedPromptTokenIDs = servingRejectedPromptTokenIDs(model: context.model)
     let nativeCacheKinds = classifyScalarServingNativeCaches(
         context.model.newCache(parameters: nil))
     // Continuous-route cache-layout admission. `.recurrentState` (the hybrid GatedDeltaNet-linear
@@ -541,6 +547,7 @@ public func loadContinuousServingModel(
         modelDirectory: configuration.modelDirectory,
         hybridAdmitted: proof.verifiedHybridGeometry != nil)
     backendConfiguration.scorecardTraceCapacity = configuration.traceLimit
+    backendConfiguration.rejectedPromptTokenIDs = rejectedPromptTokenIDs
     // `logit_bias`: the dense runtime applies it per row; the model's own `vocab_size` (the same
     // `config.json` value the runtime's verified proof carries) bounds every bias id at admission. An
     // unreadable config leaves it `nil`, which keeps `ContinuousServingBackend.supportsLogitBias`

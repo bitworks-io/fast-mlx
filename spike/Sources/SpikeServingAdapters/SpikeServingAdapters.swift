@@ -111,6 +111,41 @@ func renderServingPrompt(
     }
 }
 
+/// Reject a rendered prompt that contains a token ID the loaded model's OWN input validation
+/// rejects. Some model families `preconditionFailure` on specific input token IDs inside their
+/// forward path; on the scalar route that kills the server process. Generated tokens are already
+/// masked away from these IDs, but prompt tokens are not, so an admitted chat request that merely
+/// tokenizes to one of them would otherwise be an HTTP-reachable way to kill the server. Shared by
+/// the scalar route (called from two sites in `ScalarServingBackend.start(...)` — see the comments
+/// there for why) and the continuous-batch route (`ContinuousServingBackend.start(...)`), kept as one
+/// function so the rule cannot drift between them. The offending `param` follows the request shape
+/// (`prompt` for a raw-text `/v1/completions` request, `messages` for chat), the same
+/// `promptInput` distinction `renderServingPrompt` makes. Deliberately does not include the offending
+/// token ID or any decoded text in the message: echoing user-controlled content back in the response
+/// is avoided.
+func screenServingRejectedPromptTokens(
+    _ tokens: [Int],
+    rejectedIDs: Set<Int>,
+    promptInput: ServingPromptInput
+) throws {
+    guard !rejectedIDs.isEmpty,
+        tokens.contains(where: { rejectedIDs.contains($0) })
+    else {
+        return
+    }
+    let param: String
+    switch promptInput {
+    case .chat:
+        param = "messages"
+    case .rawText:
+        param = "prompt"
+    }
+    throw OpenAIServingError.invalidRequestWithCode(
+        "The request contains a token this model cannot accept",
+        param: param,
+        code: "unsupported_prompt_token")
+}
+
 extension ScalarServingTextCodec {
     public func vocabularyText(forTokenID tokenID: Int) -> String? {
         nil
@@ -689,9 +724,12 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             // Screen here too (in addition to the shared screen below) so that a rejected token is a
             // terminal 400 EVEN WHEN the queue is saturated. The queue-full check below throws a
             // retryable error; if a permanently-invalid request reached it first, a client would retry
-            // a request that can never succeed. See `screenRejectedPromptTokens` for the rule itself —
-            // it lives in one place so the two call sites cannot drift apart.
-            try Self.screenRejectedPromptTokens(rendered, configuration: configuration)
+            // a request that can never succeed. See `screenServingRejectedPromptTokens` for the rule
+            // itself — it lives in one place so the call sites cannot drift apart.
+            try screenServingRejectedPromptTokens(
+                rendered,
+                rejectedIDs: configuration.rejectedPromptTokenIDs,
+                promptInput: request.promptInput)
             let resolved = try capabilities.resolveCompletionBudget(
                 requestedCompletionTokens: request.maxCompletionTokens,
                 renderedPromptTokens: rendered.count,
@@ -734,7 +772,10 @@ public actor ScalarServingBackend: ServingGenerationBackend {
         // branch, and it is the ONLY screen for the fallback branch, whose render is deliberately
         // deferred past the queue-full check to avoid paying render cost for requests that queue-full
         // will reject anyway.
-        try Self.screenRejectedPromptTokens(renderedPromptTokens, configuration: configuration)
+        try screenServingRejectedPromptTokens(
+            renderedPromptTokens,
+            rejectedIDs: configuration.rejectedPromptTokenIDs,
+            promptInput: request.promptInput)
         // Resolve + validate sampling at admission so an out-of-range temperature/top_p rejects
         // with a clean 400 here rather than failing mid-generation in the detached task.
         let sampling = try resolveDecoderSampling(request)
@@ -829,29 +870,6 @@ public actor ScalarServingBackend: ServingGenerationBackend {
             return
         }
         await current.task?.value
-    }
-
-    /// Reject a rendered prompt that contains a token ID the loaded model's OWN input validation
-    /// rejects. Some model families `preconditionFailure` on specific input token IDs inside their
-    /// forward path; on the scalar route that kills the server process. Generated tokens are already
-    /// masked away from these IDs, but prompt tokens are not, so an admitted chat request that merely
-    /// tokenizes to one of them would otherwise be an HTTP-reachable way to kill the server. Called
-    /// from two sites in `start(...)` — see the comments there for why — kept as one function so the
-    /// rule cannot drift between them. Deliberately does not include the offending token ID or any
-    /// decoded text in the message: echoing user-controlled content back in the response is avoided.
-    private static func screenRejectedPromptTokens(
-        _ tokens: [Int],
-        configuration: ScalarServingBackendConfiguration
-    ) throws {
-        guard !configuration.rejectedPromptTokenIDs.isEmpty,
-            tokens.contains(where: { configuration.rejectedPromptTokenIDs.contains($0) })
-        else {
-            return
-        }
-        throw OpenAIServingError.invalidRequestWithCode(
-            "The request contains a token this model cannot accept",
-            param: "messages",
-            code: "unsupported_prompt_token")
     }
 
     /// Bridge the request's OpenAI penalty fields to the decoder-runtime penalties (SpikeCore).

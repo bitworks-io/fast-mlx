@@ -3023,6 +3023,277 @@ final class ContinuousServingBackendTests: XCTestCase {
         await backend.shutdown()
     }
 
+    // MARK: - prompt-token screen on the continuous route (cycle 284)
+
+    private static let rejectedPromptTokenMessage =
+        "The request contains a token this model cannot accept"
+
+    private func assertRejectedPromptToken(
+        _ error: any Error, param: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        guard let serving = error as? OpenAIServingError else {
+            XCTFail("expected OpenAIServingError, got \(error)", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(serving.openAIError.type, .invalidRequest, file: file, line: line)
+        XCTAssertEqual(
+            serving.openAIError.code, "unsupported_prompt_token", file: file, line: line)
+        XCTAssertEqual(serving.openAIError.param, param, file: file, line: line)
+        // Neither the token ID nor any user content is echoed back.
+        XCTAssertEqual(
+            serving.openAIError.message, Self.rejectedPromptTokenMessage, file: file, line: line)
+    }
+
+    /// C1: a chat request whose rendered prompt contains a rejected ID is a 400 naming `messages`, and
+    /// nothing reaches the coordinator.
+    func testContinuousChatWithARejectedPromptTokenIsRefusedAndAdmitsNothing() async throws {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["bad": [10, 7, 11]],
+            pieces: [1: "a"],
+            stopTokenIDs: [99],
+            rejectedPromptTokenIDs: [7])
+
+        do {
+            _ = try await backend.start(request(text: "bad", maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token rejection")
+        } catch {
+            assertRejectedPromptToken(error, param: "messages")
+        }
+        let snapshots = await coordinator.snapshots()
+        XCTAssertTrue(snapshots.isEmpty)
+        XCTAssertTrue(recorder.submissions.isEmpty)
+        let coordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertTrue(coordinatorIDs.isEmpty)
+        await backend.shutdown()
+    }
+
+    /// C2: the same for a raw-text completion, naming `prompt`. The CHAT render of the same text is
+    /// clean, so only the raw-text tokens can trip the screen.
+    func testContinuousRawTextWithARejectedPromptTokenIsRefusedNamingPromptAndAdmitsNothing()
+        async throws
+    {
+        let recorder = ContinuousRuntimeRecorder()
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 2, queued: 4),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: ["bad": [10]],
+            pieces: [1: "a"],
+            stopTokenIDs: [99],
+            rawTextTokens: ["bad": [10, 7]],
+            rejectedPromptTokenIDs: [7])
+
+        do {
+            _ = try await backend.start(rawTextCompletionRequest(prompt: "bad", maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token rejection")
+        } catch {
+            assertRejectedPromptToken(error, param: "prompt")
+        }
+        let snapshots = await coordinator.snapshots()
+        XCTAssertTrue(snapshots.isEmpty)
+        XCTAssertTrue(recorder.submissions.isEmpty)
+        let coordinatorIDs = await backend.diagnosticCoordinatorRequestIDs()
+        XCTAssertTrue(coordinatorIDs.isEmpty)
+        await backend.shutdown()
+    }
+
+    /// C3 (edge, immediateBatchNoSpec): with the coordinator queue full, a clean request is the
+    /// retryable `queueFull` (the control proving the queue really is full), but a rejected-token
+    /// request still gets the terminal 400 -- a client must never be told to retry a request that can
+    /// never succeed.
+    func testRejectedPromptTokenBeatsQueueFullOnImmediateBatchNoSpec() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99], 20: [2, 99], 30: [3, 99]],
+                recorder: ContinuousRuntimeRecorder()),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeBackend(
+            coordinator: coordinator,
+            promptByText: [
+                "active": [10], "queued": [20], "clean": [30], "bad": [30, 7],
+            ],
+            pieces: [1: "a", 2: "b", 3: "c"],
+            stopTokenIDs: [99],
+            rejectedPromptTokenIDs: [7])
+        let active = try await backend.start(request(text: "active", maxTokens: 2))
+        _ = try await coordinator.runOneTick()
+        let queued = try await backend.start(request(text: "queued", maxTokens: 2))
+
+        do {
+            _ = try await backend.start(request(text: "clean", maxTokens: 2))
+            XCTFail("Control: a clean request must hit queueFull")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(error, .queueFull(retryAfterSeconds: 2))
+        }
+        do {
+            _ = try await backend.start(request(text: "bad", maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token, not queueFull")
+        } catch is ServingBackendAdmissionError {
+            XCTFail("The rejected-token request must not be answered with queueFull")
+        } catch {
+            assertRejectedPromptToken(error, param: "messages")
+        }
+
+        _ = await queued.lease.cancel(.clientDisconnected)
+        _ = await active.lease.cancel(.clientDisconnected)
+        await backend.shutdown()
+    }
+
+    /// C3 (edge, `.dynamic`): same precedence when the dynamic admission queue is full.
+    func testRejectedPromptTokenBeatsQueueFullOnDynamicAdmission() async throws {
+        let coordinator = ContinuousBatchCoordinator(
+            configuration: try configuration(active: 1, queued: 1),
+            runtime: FixtureContinuousRuntime(
+                scriptsByPromptHead: [10: [1, 99], 20: [2, 99]],
+                recorder: ContinuousRuntimeRecorder(),
+                allowsSpeculation: true),
+            automaticDrive: false,
+            publicationCapacity: 1,
+            traceLimit: 32)
+        let backend = makeDynamicBackend(
+            coordinator: coordinator,
+            promptByText: ["held": [10], "clean": [20], "bad": [20, 7]],
+            pieces: [1: "h", 2: "o"],
+            stopTokenIDs: [99],
+            maximumBatchRequests: 1,
+            maximumQueuedRequests: 0,
+            rejectedPromptTokenIDs: [7])
+        let held = Task {
+            try await backend.start(request(text: "held", maxTokens: 2))
+        }
+        await waitUntil {
+            await backend.diagnosticPendingAdmissionRequestCount() == 1
+        }
+
+        do {
+            _ = try await backend.start(request(text: "clean", maxTokens: 2))
+            XCTFail("Control: a clean request must hit queueFull")
+        } catch let error as ServingBackendAdmissionError {
+            XCTAssertEqual(error, .queueFull(retryAfterSeconds: 2))
+        }
+        do {
+            _ = try await backend.start(request(text: "bad", maxTokens: 2))
+            XCTFail("Expected unsupported_prompt_token, not queueFull")
+        } catch is ServingBackendAdmissionError {
+            XCTFail("The rejected-token request must not be answered with queueFull")
+        } catch {
+            assertRejectedPromptToken(error, param: "messages")
+        }
+        let snapshots = await coordinator.snapshots()
+        XCTAssertTrue(snapshots.isEmpty)
+
+        held.cancel()
+        _ = try? await held.value
+        await backend.shutdown()
+    }
+
+    /// C4 (control): a non-empty rejected set does not refuse a clean prompt, and the empty default
+    /// set is inert even for a prompt that contains the ID another configuration would reject.
+    func testRejectedPromptTokenSetAdmitsCleanPromptsAndEmptyDefaultIsInert() async throws {
+        for (rejected, promptTokens) in [
+            (Set<Int>([7]), [10, 11]),
+            (Set<Int>(), [10, 7]),
+        ] {
+            let recorder = ContinuousRuntimeRecorder()
+            let coordinator = ContinuousBatchCoordinator(
+                configuration: try configuration(active: 1, queued: 2),
+                runtime: FixtureContinuousRuntime(
+                    scriptsByPromptHead: [10: [1, 99]], recorder: recorder),
+                automaticDrive: false,
+                publicationCapacity: 1,
+                traceLimit: 32)
+            let backend = makeBackend(
+                coordinator: coordinator,
+                promptByText: ["p": promptTokens],
+                pieces: [1: "a"],
+                stopTokenIDs: [99],
+                rejectedPromptTokenIDs: rejected)
+
+            let handle = try await backend.start(request(text: "p", maxTokens: 2))
+
+            XCTAssertEqual(handle.route, .continuousBatchNoSpec)
+            XCTAssertEqual(recorder.submissions.first?.promptTokens, promptTokens)
+            _ = await handle.lease.cancel(.clientDisconnected)
+            await backend.shutdown()
+        }
+    }
+
+    /// Structural pin: the continuous LOADER assigns `servingRejectedPromptTokenIDs(model:)` (captured
+    /// before the model is handed to the runtime) to the backend configuration. The assignment needs
+    /// real weights of a conforming family, which the continuous route does not admit, so no unit test
+    /// can reach it. Source text with block and line comments stripped, so a comment cannot satisfy it.
+    func testContinuousLoaderAssignsTheModelRejectedPromptTokenIDsToTheBackendConfiguration()
+        throws
+    {
+        let components = ["Sources", "SpikeServingAdapters", "MLXContinuousServing.swift"]
+        var directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        var located: URL?
+        for _ in 0..<8 where located == nil {
+            for suffix in [["spike"] + components, components] {
+                let candidate = suffix.reduce(directory) { $0.appendingPathComponent($1) }
+                if FileManager.default.fileExists(atPath: candidate.path) {
+                    located = candidate
+                    break
+                }
+            }
+            directory.deleteLastPathComponent()
+        }
+        let url = try XCTUnwrap(
+            located, "could not locate MLXContinuousServing.swift walking up from \(#filePath)")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertFalse(source.isEmpty)
+        let blocks = try NSRegularExpression(
+            pattern: "/\\*.*?\\*/", options: [.dotMatchesLineSeparators])
+        let withoutBlocks = blocks.stringByReplacingMatches(
+            in: source, options: [], range: NSRange(source.startIndex..., in: source),
+            withTemplate: "")
+        let stripped = withoutBlocks
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                line.range(of: "//").map { line[line.startIndex..<$0.lowerBound] } ?? line
+            }
+            .joined(separator: "\n")
+
+        let capture = try NSRegularExpression(
+            pattern:
+                #"let\s+(\w+)\s*=\s*servingRejectedPromptTokenIDs\(\s*model:\s*context\.model\s*\)"#)
+        let captureMatch = try XCTUnwrap(
+            capture.firstMatch(
+                in: stripped, options: [], range: NSRange(stripped.startIndex..., in: stripped)),
+            "found no `let <name> = servingRejectedPromptTokenIDs(model: context.model)` capture "
+                + "(comments stripped)")
+        let name = String(stripped[Range(captureMatch.range(at: 1), in: stripped)!])
+        let assignment = try NSRegularExpression(
+            pattern:
+                #"backendConfiguration\.rejectedPromptTokenIDs\s*=\s*"# + name + #"\b"#)
+        XCTAssertNotNil(
+            assignment.firstMatch(
+                in: stripped, options: [], range: NSRange(stripped.startIndex..., in: stripped)),
+            "the loader does not assign the captured `\(name)` to "
+                + "`backendConfiguration.rejectedPromptTokenIDs`")
+        // The capture precedes the point where the model is handed to the runtime.
+        let captureEnd = Range(captureMatch.range, in: stripped)!.lowerBound
+        let runtime = try XCTUnwrap(stripped.range(of: "DenseContinuousBatchRuntime("))
+        XCTAssertLessThan(captureEnd, runtime.lowerBound)
+    }
+
     func testDefaultConfigurationStillStartsImmediateBatchNoSpec()
         async throws
     {
@@ -4481,7 +4752,8 @@ private func makeBackend(
     jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
     samplingDefaults: ServingSamplingDefaults? = nil,
     rawTextTokens: [String: [Int]] = [:],
-    chatOnlyCodec: Bool = false
+    chatOnlyCodec: Bool = false,
+    rejectedPromptTokenIDs: Set<Int> = []
 ) -> ContinuousServingBackend {
     let codec: any ScalarServingTextCodec =
         chatOnlyCodec
@@ -4506,7 +4778,8 @@ private func makeBackend(
             logitBiasVocabularySize: logitBiasVocabularySize,
             jsonObjectConstraintSupport: jsonObjectConstraintSupport,
             jsonSchemaConstraintSupport: jsonSchemaConstraintSupport,
-            samplingDefaults: samplingDefaults))
+            samplingDefaults: samplingDefaults,
+            rejectedPromptTokenIDs: rejectedPromptTokenIDs))
 }
 
 private func makeDynamicBackend(
@@ -4525,7 +4798,8 @@ private func makeDynamicBackend(
     logitBiasVocabularySize: Int? = nil,
     jsonObjectConstraintSupport: ScalarServingJSONObjectConstraintSupport? = nil,
     jsonSchemaConstraintSupport: ScalarServingJSONSchemaConstraintSupport? = nil,
-    samplingDefaults: ServingSamplingDefaults? = nil
+    samplingDefaults: ServingSamplingDefaults? = nil,
+    rejectedPromptTokenIDs: Set<Int> = []
 ) -> ContinuousServingBackend {
     ContinuousServingBackend(
         launchedModel: "fixture",
@@ -4550,7 +4824,8 @@ private func makeDynamicBackend(
             logitBiasVocabularySize: logitBiasVocabularySize,
             jsonObjectConstraintSupport: jsonObjectConstraintSupport,
             jsonSchemaConstraintSupport: jsonSchemaConstraintSupport,
-            samplingDefaults: samplingDefaults))
+            samplingDefaults: samplingDefaults,
+            rejectedPromptTokenIDs: rejectedPromptTokenIDs))
 }
 
 private let continuousWeatherTool = OpenAIToolSpec(
