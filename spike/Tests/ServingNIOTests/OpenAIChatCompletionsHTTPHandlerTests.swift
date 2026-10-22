@@ -3203,6 +3203,207 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         _ = try await channel.finish()
     }
 
+    // MARK: - HEAD and Allow (RFC 9110 sections 9.1, 9.3.2, 15.5.6)
+
+    // T1: HEAD is answered wherever GET is, with the GET status and headers (including the
+    // would-be content-length) and no body bytes.
+    func testHeadRoutesMatchGetStatusAndHeadersWithEmptyBody() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+        for uri in ["/healthz", "/readyz", "/v1/models", "/v1/models/qwen3-32b", "/metrics"] {
+            let getChannel = try await makeChannel(
+                backend: ScriptedBackend(scripts: []), configuration: configuration)
+            try await writeHeadOnlyRequest(getChannel, method: .GET, uri: uri)
+            let get = try await collectResponse(from: getChannel)
+            _ = try await getChannel.finish()
+
+            let headChannel = try await makeChannel(
+                backend: ScriptedBackend(scripts: []), configuration: configuration)
+            try await writeHeadOnlyRequest(headChannel, method: .HEAD, uri: uri)
+            let head = try await collectResponse(from: headChannel)
+            _ = try await headChannel.finish()
+
+            XCTAssertEqual(get.head.status, .ok, "GET \(uri)")
+            XCTAssertFalse(get.body.isEmpty, "GET \(uri) must carry a body")
+            XCTAssertEqual(head.head.status, get.head.status, "HEAD \(uri)")
+            XCTAssertEqual(
+                head.head.headers.first(name: "content-type"),
+                get.head.headers.first(name: "content-type"),
+                "HEAD \(uri)")
+            if uri == "/metrics" {
+                // The scrape text counts the requests served so far, so its length differs
+                // between two scrapes; HEAD still advertises a non-empty length.
+                XCTAssertGreaterThan(
+                    Int(head.head.headers.first(name: "content-length") ?? "") ?? 0, 0,
+                    "HEAD \(uri) keeps a would-be content-length")
+            } else {
+                XCTAssertEqual(
+                    head.head.headers.first(name: "content-length"),
+                    "\(get.body.utf8.count)",
+                    "HEAD \(uri) keeps the would-be content-length")
+            }
+            XCTAssertEqual(head.body, "", "HEAD \(uri) must carry no body")
+        }
+    }
+
+    func testHeadReadyzReturns503WithNoBodyWhenNotReady() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            readiness: { false })
+        let channel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: configuration)
+
+        try await writeHeadOnlyRequest(channel, method: .HEAD, uri: "/readyz")
+        let response = try await collectResponse(from: channel)
+
+        XCTAssertEqual(response.head.status, .serviceUnavailable)
+        XCTAssertEqual(response.head.headers.first(name: "content-type"), "application/json")
+        XCTAssertEqual(response.body, "")
+        _ = try await channel.finish()
+    }
+
+    // T1 (auth): HEAD follows GET's auth rules -- probes stay open, models and metrics need the
+    // bearer token, and a supplied token is honored.
+    func testHeadFollowsGetAuthenticationRules() async throws {
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+        let cases: [(uri: String, authorization: String?, status: HTTPResponseStatus)] = [
+            ("/healthz", nil, .ok),
+            ("/readyz", nil, .ok),
+            ("/v1/models", "Bearer secret", .ok),
+            ("/metrics", "Bearer secret", .ok),
+        ]
+        for testCase in cases {
+            let channel = try await makeChannel(
+                backend: ScriptedBackend(scripts: []), configuration: configuration)
+            try await writeHeadOnlyRequest(
+                channel, method: .HEAD, uri: testCase.uri, authorization: testCase.authorization)
+            let response = try await collectResponse(from: channel)
+            XCTAssertEqual(response.head.status, testCase.status, "HEAD \(testCase.uri)")
+            XCTAssertEqual(response.body, "", "HEAD \(testCase.uri)")
+            _ = try await channel.finish()
+        }
+    }
+
+    // T2: a 405 names the methods the route allows (RFC 9110 section 15.5.6), and its HEAD form
+    // carries no body.
+    func testMethodNotAllowedCarriesAllowHeader() async throws {
+        let cases: [(method: HTTPMethod, uri: String, allow: String)] = [
+            (.HEAD, "/v1/chat/completions", "POST"),
+            (.GET, "/v1/completions", "POST"),
+            (.GET, "/v1/embeddings", "POST"),
+            (.POST, "/healthz", "GET, HEAD"),
+            (.PUT, "/v1/models", "GET, HEAD"),
+            (.POST, "/v1/models/qwen3-32b", "GET, HEAD"),
+            (.DELETE, "/metrics", "GET, HEAD"),
+            (.POST, "/readyz", "GET, HEAD"),
+        ]
+        for testCase in cases {
+            let channel = try await makeChannel(
+                backend: ScriptedBackend(scripts: []), configuration: defaultConfiguration())
+            try await writeHeadOnlyRequest(channel, method: testCase.method, uri: testCase.uri)
+            let response = try await collectResponse(from: channel)
+            let label = "\(testCase.method) \(testCase.uri)"
+            XCTAssertEqual(response.head.status, .methodNotAllowed, label)
+            XCTAssertEqual(response.head.headers.first(name: "allow"), testCase.allow, label)
+            if testCase.method == .HEAD {
+                XCTAssertEqual(response.body, "", "\(label) must carry no body")
+                XCTAssertNotNil(response.head.headers.first(name: "content-length"), label)
+            } else {
+                XCTAssertFalse(response.body.isEmpty, "\(label) keeps its error body")
+            }
+            _ = try await channel.finish()
+        }
+    }
+
+    // T3: every error answer to a HEAD request keeps the status and content-length but sends no body.
+    func testHeadFailurePathsAnswerWithoutBody() async throws {
+        let tokenConfiguration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+
+        let unauthorizedChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: tokenConfiguration)
+        try await writeHeadOnlyRequest(unauthorizedChannel, method: .HEAD, uri: "/v1/models")
+        let unauthorized = try await collectResponse(from: unauthorizedChannel)
+        XCTAssertEqual(unauthorized.head.status, .unauthorized)
+        XCTAssertEqual(unauthorized.body, "")
+        XCTAssertNotEqual(unauthorized.head.headers.first(name: "content-length"), "0")
+        _ = try await unauthorizedChannel.finish()
+
+        let unknownChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: defaultConfiguration())
+        try await writeHeadOnlyRequest(unknownChannel, method: .HEAD, uri: "/nope")
+        let unknown = try await collectResponse(from: unknownChannel)
+        XCTAssertEqual(unknown.head.status, .notFound)
+        XCTAssertEqual(unknown.body, "")
+        _ = try await unknownChannel.finish()
+
+        let unknownModelChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: defaultConfiguration())
+        try await writeHeadOnlyRequest(
+            unknownModelChannel, method: .HEAD, uri: "/v1/models/other-model")
+        let unknownModel = try await collectResponse(from: unknownModelChannel)
+        XCTAssertEqual(unknownModel.head.status, .notFound)
+        XCTAssertEqual(unknownModel.body, "")
+        _ = try await unknownModelChannel.finish()
+
+        let bodyChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: defaultConfiguration())
+        try await writeHeadWithBodyRequest(
+            bodyChannel, method: .HEAD, uri: "/healthz", body: "hello")
+        let withBody = try await collectResponse(from: bodyChannel)
+        XCTAssertEqual(withBody.head.status, .badRequest)
+        XCTAssertEqual(withBody.body, "")
+        _ = try await bodyChannel.finish()
+
+        // Control: the same 400 for GET keeps its body, so the suppression is HEAD-only.
+        let getBodyChannel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []), configuration: defaultConfiguration())
+        try await writeHeadWithBodyRequest(
+            getBodyChannel, method: .GET, uri: "/healthz", body: "hello")
+        let getWithBody = try await collectResponse(from: getBodyChannel)
+        XCTAssertEqual(getWithBody.head.status, .badRequest)
+        XCTAssertFalse(getWithBody.body.isEmpty)
+        _ = try await getBodyChannel.finish()
+    }
+
+    // The request log (and `/metrics`, which keys on the same templated route) records method HEAD.
+    func testRequestLogRecordsHeadMethodUnderTheSameTemplatedRoute() async throws {
+        let recorder = RequestLogRecorder()
+        let channel = try await makeChannel(
+            backend: ScriptedBackend(scripts: []),
+            configuration: requestLogConfiguration(sink: recorder.sink()))
+
+        try await writeHeadOnlyRequest(channel, method: .HEAD, uri: "/healthz?probe=1")
+        let response = try await collectResponse(from: channel)
+        await waitUntil { recorder.lines().count == 1 }
+
+        XCTAssertEqual(response.head.status, .ok)
+        let object = try requestLogJSONObject(try XCTUnwrap(recorder.lines().first))
+        XCTAssertEqual(object["method"] as? String, "HEAD")
+        XCTAssertEqual(object["route"] as? String, "/healthz")
+        XCTAssertEqual(object["status"] as? Int, 200)
+        _ = try await channel.finish()
+    }
+
     // MARK: - Logprobs
 
     func testChatNonStreamingResponseIncludesLogprobsForEveryGeneratedTokenInOrder() async throws {

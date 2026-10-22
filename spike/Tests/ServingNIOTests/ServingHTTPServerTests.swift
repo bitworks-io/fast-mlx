@@ -259,6 +259,108 @@ final class ServingHTTPServerTests: XCTestCase {
         try? await client.close().get()
         try await clientGroup.shutdownGracefully()
     }
+
+    // T4 (RFC 9110 section 9.3.2): a HEAD answer must not leave body bytes on a keep-alive
+    // connection, or they corrupt the next response. HEAD then GET on ONE connection must parse as
+    // exactly two well-formed responses, the second carrying the GET body.
+    func testRawSocketHeadThenGetOnKeepAliveConnectionParsesAsTwoResponses() async throws {
+        let stream = try await rawHeadThenGetExchange(headTarget: "/healthz")
+
+        XCTAssertTrue(stream.hasPrefix("HTTP/1.1 200 OK\r\n"), stream)
+        let (headResponse, afterHead) = try splitAtHeaderEnd(stream)
+        XCTAssertTrue(headResponse.lowercased().contains("content-length: 15"), headResponse)
+        XCTAssertTrue(
+            afterHead.hasPrefix("HTTP/1.1 200 OK\r\n"),
+            "HEAD must leave no body bytes before the next response: \(afterHead)")
+        let (_, getBody) = try splitAtHeaderEnd(afterHead)
+        XCTAssertEqual(getBody, #"{"status":"ok"}"#)
+    }
+
+    // Same framing guarantee on the ERROR path (`writeError`), which has its own body write.
+    func testRawSocketHeadErrorThenGetOnKeepAliveConnectionParsesAsTwoResponses() async throws {
+        let stream = try await rawHeadThenGetExchange(headTarget: "/nope")
+
+        XCTAssertTrue(stream.hasPrefix("HTTP/1.1 404 Not Found\r\n"), stream)
+        let (_, afterHead) = try splitAtHeaderEnd(stream)
+        XCTAssertTrue(
+            afterHead.hasPrefix("HTTP/1.1 200 OK\r\n"),
+            "HEAD 404 must leave no body bytes before the next response: \(afterHead)")
+        let (_, getBody) = try splitAtHeaderEnd(afterHead)
+        XCTAssertEqual(getBody, #"{"status":"ok"}"#)
+    }
+}
+
+/// Sends `HEAD <headTarget>` and, once its header block has arrived, `GET /healthz` with
+/// `Connection: close` on the SAME connection, then returns every byte the server wrote until it
+/// closed the connection.
+private func rawHeadThenGetExchange(headTarget: String) async throws -> String {
+    let server = try await ServingHTTPServer.start(
+        configuration: socketConfiguration(requiredBearerToken: nil),
+        backend: SocketBackend(script: .completed))
+    let clientGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+    let collector = RawByteCollector()
+    do {
+        let client = try await ClientBootstrap(group: clientGroup)
+            .channelInitializer { channel in
+                channel.pipeline.addHandler(collector)
+            }
+            .connect(to: server.localAddress)
+            .get()
+        try await client.writeAndFlush(
+            ByteBuffer(
+                string: "HEAD \(headTarget) HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+        ).get()
+        try await waitUntilSocketTest { collector.text().contains("\r\n\r\n") }
+        try await client.writeAndFlush(
+            ByteBuffer(
+                string: "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            )
+        ).get()
+        try await waitUntilSocketTest { collector.isClosed() }
+    } catch {
+        try? await server.shutdown(gracePeriod: .seconds(1))
+        try? await clientGroup.shutdownGracefully()
+        throw error
+    }
+    try await server.shutdown(gracePeriod: .seconds(1))
+    try await clientGroup.shutdownGracefully()
+    return collector.text()
+}
+
+private func splitAtHeaderEnd(_ text: String) throws -> (header: String, rest: String) {
+    let range = try XCTUnwrap(text.range(of: "\r\n\r\n"), "no header terminator in: \(text)")
+    return (String(text[..<range.lowerBound]), String(text[range.upperBound...]))
+}
+
+private final class RawByteCollector: ChannelInboundHandler, @unchecked Sendable {
+    typealias InboundIn = ByteBuffer
+
+    private struct State {
+        var bytes: [UInt8] = []
+        var closed = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        var buffer = unwrapInboundIn(data)
+        let incoming = buffer.readBytes(length: buffer.readableBytes) ?? []
+        state.withLock { $0.bytes.append(contentsOf: incoming) }
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        state.withLock { $0.closed = true }
+        context.fireChannelInactive()
+    }
+
+    func text() -> String {
+        state.withLock { String(decoding: $0.bytes, as: UTF8.self) }
+    }
+
+    func isClosed() -> Bool {
+        state.withLock { $0.closed }
+    }
 }
 
 private func socketConfiguration(

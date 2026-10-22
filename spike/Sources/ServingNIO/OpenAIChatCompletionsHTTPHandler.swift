@@ -38,6 +38,13 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     /// request head while a previous one is still in flight (`activeControl == nil, pendingHead ==
     /// nil`), so there is never more than one request's preamble live at once on this handler.
     private var pendingRequestLogPreamble: ServingRequestLogPreamble?
+    /// Whether the request currently being answered is a `HEAD`. Set in `receiveHead` for every
+    /// request (so it never carries over from a previous one on a keep-alive connection) and read by
+    /// every synchronous response writer: a HEAD answer has the status and headers (including the
+    /// would-be `content-length`) of the GET answer but NO body bytes (RFC 9110 section 9.3.2), or
+    /// the leftover bytes would be parsed as the start of the next response. The async `/metrics`
+    /// writers take the same fact as a parameter captured when the task is created.
+    private var isHeadRequest = false
     /// TEST-ONLY seam: awaited once per generation, immediately after the final response bytes for
     /// a keep-alive-preserving request have been flushed and `control` has been marked terminal --
     /// see `runGeneration`'s call site. `nil` for every production and non-`@testable` caller (the
@@ -162,6 +169,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             method: head.method.rawValue,
             route: servingRequestLogTemplatedRoute(head.uri),
             startedAt: ContinuousClock().now)
+        isHeadRequest = head.method == .HEAD
 
         if let rejection = validateHead(head) {
             discardingRequestBody = true
@@ -169,7 +177,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 rejection.error,
                 status: rejection.status,
                 keepAlive: head.isKeepAlive,
-                context: context)
+                context: context,
+                allow: rejection.allow)
             return
         }
 
@@ -220,11 +229,13 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         // Route on the path only: a query string never changes which route serves the request (see
         // `servingRoutePath`).
         let routePath = servingRoutePath(head.uri)
+        // HEAD is served wherever GET is, by the same writers (which omit the body for HEAD).
+        let isGETOrHEAD = head.method == .GET || head.method == .HEAD
 
-        if head.method == .GET, routePath == "/v1/models" {
+        if isGETOrHEAD, routePath == "/v1/models" {
             guard body.readableBytes == 0 else {
                 writeError(
-                    .invalidRequest("GET /v1/models does not accept a request body", param: nil),
+                    .invalidRequest("\(head.method.rawValue) /v1/models does not accept a request body", param: nil),
                     status: .badRequest,
                     keepAlive: head.isKeepAlive,
                     context: context)
@@ -233,10 +244,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeModelList(keepAlive: head.isKeepAlive, context: context)
             return
         }
-        if head.method == .GET, let rawModelId = Self.modelDetailPathSuffix(routePath) {
+        if isGETOrHEAD, let rawModelId = Self.modelDetailPathSuffix(routePath) {
             guard body.readableBytes == 0 else {
                 writeError(
-                    .invalidRequest("GET /v1/models/{id} does not accept a request body", param: nil),
+                    .invalidRequest("\(head.method.rawValue) /v1/models/{id} does not accept a request body", param: nil),
                     status: .badRequest,
                     keepAlive: head.isKeepAlive,
                     context: context)
@@ -249,10 +260,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeModelObject(id: requestedModelId, keepAlive: head.isKeepAlive, context: context)
             return
         }
-        if head.method == .GET, routePath == "/metrics" {
+        if isGETOrHEAD, routePath == "/metrics" {
             guard body.readableBytes == 0 else {
                 writeError(
-                    .invalidRequest("GET /metrics does not accept a request body", param: nil),
+                    .invalidRequest("\(head.method.rawValue) /metrics does not accept a request body", param: nil),
                     status: .badRequest,
                     keepAlive: head.isKeepAlive,
                     context: context)
@@ -261,10 +272,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeMetrics(keepAlive: head.isKeepAlive, context: context)
             return
         }
-        if head.method == .GET, routePath == "/healthz" {
+        if isGETOrHEAD, routePath == "/healthz" {
             guard body.readableBytes == 0 else {
                 writeError(
-                    .invalidRequest("GET /healthz does not accept a request body", param: nil),
+                    .invalidRequest("\(head.method.rawValue) /healthz does not accept a request body", param: nil),
                     status: .badRequest,
                     keepAlive: head.isKeepAlive,
                     context: context)
@@ -277,10 +288,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 context: context)
             return
         }
-        if head.method == .GET, routePath == "/readyz" {
+        if isGETOrHEAD, routePath == "/readyz" {
             guard body.readableBytes == 0 else {
                 writeError(
-                    .invalidRequest("GET /readyz does not accept a request body", param: nil),
+                    .invalidRequest("\(head.method.rawValue) /readyz does not accept a request body", param: nil),
                     status: .badRequest,
                     keepAlive: head.isKeepAlive,
                     context: context)
@@ -605,7 +616,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
 
     private func validateHead(
         _ head: HTTPRequestHead
-    ) -> (status: HTTPResponseStatus, error: OpenAIServingError)? {
+    ) -> (status: HTTPResponseStatus, error: OpenAIServingError, allow: String?)? {
         // Match on the path only, so `?api-version=...` and the like never turn a known route into a
         // 404; a query string is never consulted for authentication either (see `servingRoutePath`).
         let routePath = servingRoutePath(head.uri)
@@ -623,20 +634,26 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         else {
             return (
                 .notFound,
-                .invalidRequest("Unknown route", param: nil))
+                .invalidRequest("Unknown route", param: nil),
+                nil)
         }
+        // HEAD is accepted wherever GET is (RFC 9110 section 9.1), under the same auth and
+        // Content-Length rules below.
+        let isGETOrHEAD = head.method == .GET || head.method == .HEAD
         guard (isChat && head.method == .POST)
             || (isCompletions && head.method == .POST)
             || (isEmbeddings && head.method == .POST)
-            || (isModels && head.method == .GET)
-            || (isModelDetail && head.method == .GET)
-            || (isMetrics && head.method == .GET)
-            || (isHealthz && head.method == .GET)
-            || (isReadyz && head.method == .GET)
+            || (isModels && isGETOrHEAD)
+            || (isModelDetail && isGETOrHEAD)
+            || (isMetrics && isGETOrHEAD)
+            || (isHealthz && isGETOrHEAD)
+            || (isReadyz && isGETOrHEAD)
         else {
+            // RFC 9110 section 15.5.6: a 405 must name the methods the route does allow.
             return (
                 .methodNotAllowed,
-                .invalidRequest("Method is not supported for this route", param: nil))
+                .invalidRequest("Method is not supported for this route", param: nil),
+                (isChat || isCompletions || isEmbeddings) ? "POST" : "GET, HEAD")
         }
 
         // Liveness/readiness probes bypass the bearer-token check entirely: an orchestrator health
@@ -648,7 +665,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             guard lengthHeaders.count <= 1 else {
                 return (
                     .badRequest,
-                    .invalidRequest("Content-Length must be unique", param: nil))
+                    .invalidRequest("Content-Length must be unique", param: nil),
+                    nil)
             }
             if let rawLength = lengthHeaders.first,
                 (Int(rawLength) ?? -1) != 0
@@ -656,7 +674,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 let route = isHealthz ? "/healthz" : "/readyz"
                 return (
                     .badRequest,
-                    .invalidRequest("GET \(route) does not accept a request body", param: nil))
+                    .invalidRequest(
+                        "\(head.method.rawValue) \(route) does not accept a request body", param: nil),
+                    nil)
             }
             return nil
         }
@@ -669,7 +689,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             else {
                 return (
                     .unauthorized,
-                    .invalidRequest("Missing or invalid API key", param: nil))
+                    .invalidRequest("Missing or invalid API key", param: nil),
+                    nil)
             }
         }
 
@@ -678,7 +699,8 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             guard lengthHeaders.count <= 1 else {
                 return (
                     .badRequest,
-                    .invalidRequest("Content-Length must be unique", param: nil))
+                    .invalidRequest("Content-Length must be unique", param: nil),
+                    nil)
             }
             if let rawLength = lengthHeaders.first,
                 (Int(rawLength) ?? -1) != 0
@@ -686,7 +708,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                 let route = isMetrics ? "/metrics" : (isModelDetail ? "/v1/models/{id}" : "/v1/models")
                 return (
                     .badRequest,
-                    .invalidRequest("GET \(route) does not accept a request body", param: nil))
+                    .invalidRequest(
+                        "\(head.method.rawValue) \(route) does not accept a request body", param: nil),
+                    nil)
             }
             return nil
         }
@@ -701,25 +725,29 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         else {
             return (
                 .unsupportedMediaType,
-                .invalidRequest("Content-Type must be application/json", param: nil))
+                .invalidRequest("Content-Type must be application/json", param: nil),
+                nil)
         }
 
         let lengthHeaders = head.headers["content-length"]
         if lengthHeaders.count > 1 {
             return (
                 .badRequest,
-                .invalidRequest("Content-Length must be unique", param: nil))
+                .invalidRequest("Content-Length must be unique", param: nil),
+                nil)
         }
         if let rawLength = lengthHeaders.first {
             guard let length = Int(rawLength), length >= 0 else {
                 return (
                     .badRequest,
-                    .invalidRequest("Content-Length must be a non-negative integer", param: nil))
+                    .invalidRequest("Content-Length must be a non-negative integer", param: nil),
+                    nil)
             }
             if length > configuration.requestLimits.maximumBodyBytes {
                 return (
                     .payloadTooLarge,
-                    .invalidRequest("Request body exceeds the configured byte limit", param: nil))
+                    .invalidRequest("Request body exceeds the configured byte limit", param: nil),
+                    nil)
             }
         }
 
@@ -755,7 +783,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             var body = context.channel.allocator.buffer(capacity: data.count)
             body.writeBytes(data)
             context.write(wrapOutboundOut(.head(head)), promise: nil)
-            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            if !isHeadRequest {
+                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            }
             let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
             if !keepAlive {
                 let channel = context.channel
@@ -817,7 +847,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             var body = context.channel.allocator.buffer(capacity: data.count)
             body.writeBytes(data)
             context.write(wrapOutboundOut(.head(head)), promise: nil)
-            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            if !isHeadRequest {
+                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            }
             let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
             if !keepAlive {
                 let channel = context.channel
@@ -867,7 +899,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             var body = context.channel.allocator.buffer(capacity: data.count)
             body.writeBytes(data)
             context.write(wrapOutboundOut(.head(head)), promise: nil)
-            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            if !isHeadRequest {
+                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            }
             let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
             if !keepAlive {
                 let channel = context.channel
@@ -890,6 +924,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         activeControl = control
         activeTask = Self.makeMetricsTask(
             keepAlive: keepAlive,
+            isHead: isHeadRequest,
             configuration: configuration,
             channel: channel,
             control: control,
@@ -910,7 +945,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         // match via `requireLaunchedModel`, mirroring the same rule `runGeneration` follows.
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
-        requestLogIgnoredFields: [String] = []
+        requestLogIgnoredFields: [String] = [],
+        // The `Allow` value of a 405 (see `validateHead`); `nil` for every other status.
+        allow: String? = nil
     ) {
         if let preamble = pendingRequestLogPreamble {
             let payload = error.openAIError
@@ -930,6 +967,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             var headers = HTTPHeaders()
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
+            if let allow {
+                headers.add(name: "allow", value: allow)
+            }
             if !keepAlive {
                 headers.add(name: "connection", value: "close")
             }
@@ -940,7 +980,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             var body = context.channel.allocator.buffer(capacity: data.count)
             body.writeBytes(data)
             context.write(wrapOutboundOut(.head(head)), promise: nil)
-            context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            if !isHeadRequest {
+                context.write(wrapOutboundOut(.body(.byteBuffer(body))), promise: nil)
+            }
             let completion = context.writeAndFlush(wrapOutboundOut(.end(nil)))
             if !keepAlive {
                 let channel = context.channel
@@ -1247,6 +1289,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
     static func makeMetricsTask(
         keepAlive: Bool,
+        isHead: Bool = false,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
@@ -1256,6 +1299,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         Task.detached {
             await runMetrics(
                 keepAlive: keepAlive,
+                isHead: isHead,
                 configuration: configuration,
                 channel: channel,
                 control: control,
@@ -1266,6 +1310,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
     static func runMetrics(
         keepAlive: Bool,
+        isHead: Bool = false,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
@@ -1287,6 +1332,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 message: "Metrics snapshot is not configured",
                 code: "metrics_unavailable",
                 keepAlive: keepAlive,
+                isHead: isHead,
                 configuration: configuration,
                 channel: channel,
                 control: control,
@@ -1314,6 +1360,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 message: "Metrics snapshot failed",
                 code: "metrics_snapshot_failed",
                 keepAlive: keepAlive,
+                isHead: isHead,
                 configuration: configuration,
                 channel: channel,
                 control: control,
@@ -1327,6 +1374,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 bodyText,
                 contentType: "text/plain; version=0.0.4; charset=utf-8",
                 keepAlive: keepAlive,
+                isHead: isHead,
                 channel: channel,
                 control: control,
                 timeout: configuration.backpressureStallTimeout,
@@ -2451,6 +2499,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         _ text: String,
         contentType: String,
         keepAlive: Bool,
+        isHead: Bool = false,
         channel: any Channel,
         control: ServingTransportRequestControl,
         timeout: Duration,
@@ -2468,9 +2517,11 @@ private extension OpenAIChatCompletionsHTTPHandler {
             status: .ok,
             headers: headers)
         try await writePart(.head(head), channel: channel, timeout: timeout)
-        var buffer = channel.allocator.buffer(capacity: data.count)
-        buffer.writeBytes(data)
-        try await writePart(.body(.byteBuffer(buffer)), channel: channel, timeout: timeout)
+        if !isHead {
+            var buffer = channel.allocator.buffer(capacity: data.count)
+            buffer.writeBytes(data)
+            try await writePart(.body(.byteBuffer(buffer)), channel: channel, timeout: timeout)
+        }
         try await writeFinalPart(
             control: control,
             channel: channel,
@@ -2752,6 +2803,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         _ error: OpenAIServingError,
         responseStarted: Bool,
         keepAlive: Bool,
+        isHead: Bool = false,
         channel: any Channel,
         control: ServingTransportRequestControl,
         timeout: Duration,
@@ -2809,12 +2861,14 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     status: status,
                     headers: headers)
                 try await writePart(.head(head), channel: channel, timeout: timeout)
-                var body = channel.allocator.buffer(capacity: data.count)
-                body.writeBytes(data)
-                try await writePart(
-                    .body(.byteBuffer(body)),
-                    channel: channel,
-                    timeout: timeout)
+                if !isHead {
+                    var body = channel.allocator.buffer(capacity: data.count)
+                    body.writeBytes(data)
+                    try await writePart(
+                        .body(.byteBuffer(body)),
+                        channel: channel,
+                        timeout: timeout)
+                }
                 // Not yet started -- see the matching comment in `writeFailureIfPossible`: route the
                 // final part through `writeFinalPart` so `control` is marked terminal before this
                 // write is initiated instead of only in `runGeneration`'s top-level `defer`.
@@ -2848,6 +2902,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         message: String,
         code: String,
         keepAlive: Bool,
+        isHead: Bool = false,
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
@@ -2858,6 +2913,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             .server(message, code: code),
             responseStarted: false,
             keepAlive: keepAlive,
+            isHead: isHead,
             channel: channel,
             control: control,
             timeout: configuration.backpressureStallTimeout,
