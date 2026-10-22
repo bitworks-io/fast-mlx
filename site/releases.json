@@ -16,6 +16,26 @@
   },
   "releases": [
     {
+      "id": "tagged-distribution-v0-1-24",
+      "title": "Publish v0.1.24: the continuous-batch route serves legacy /v1/completions, with logprobs",
+      "publishedAt": "2026-10-22T11:38:48Z",
+      "category": "operations",
+      "state": "released",
+      "summary": "Publishes the v0.1.24 arm64 macOS distribution: the continuous-batch route now serves legacy /v1/completions (a raw prompt, streamed or not), which it used to refuse with a 400, and on the release check prompts its greedy text equals the scalar route's. Integer logprobs return the legacy tokens, token_logprobs and top_logprobs object, each value the log-probability from the model's raw output, before sampling transforms, penalties, logit_bias and the token mask, the same meaning as on the scalar route. Both routes now apply one prompt-token screen before admission, and the scalar route's raw-text refusal names the prompt parameter. The bundled quality-card store is unchanged from v0.1.23. Greedy output is identical to the development build on the release check prompts. The engine still links mlx-swift 0.31.6.",
+      "scope": "Tagged public distribution and the arm64 macOS archive published with its SHA-256 checksum only; the binaries are unsigned and not notarized, and no performance, quality, model-support, host-qualification, deployment, or production-promotion claim follows.",
+      "publicCommit": "ccce6096054f922cd5f9d2dc0e053c3896306bc4",
+      "publicLinks": [
+        {
+          "label": "Start with the operator quickstart",
+          "path": "quickstart/"
+        },
+        {
+          "label": "Read the release ledger",
+          "path": "releases/index.json"
+        }
+      ]
+    },
+    {
       "id": "tagged-distribution-v0-1-23",
       "title": "Publish v0.1.23: chat logprobs on the continuous-batch route, and the startup line names the default sampling preset",
       "publishedAt": "2026-10-21T22:41:53Z",

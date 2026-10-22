@@ -395,25 +395,26 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             catalog["releases"][0],
             {
-                "id": "tagged-distribution-v0-1-23",
-                "title": "Publish v0.1.23: chat logprobs on the continuous-batch route, and the startup line names the default sampling preset",
-                "publishedAt": "2026-10-21T22:41:53Z",
+                "id": "tagged-distribution-v0-1-24",
+                "title": "Publish v0.1.24: the continuous-batch route serves legacy /v1/completions, with logprobs",
+                "publishedAt": "2026-10-22T11:38:48Z",
                 "category": "operations",
                 "state": "released",
                 "summary": (
-                    "Publishes the v0.1.23 arm64 macOS distribution: the "
-                    "continuous-batch route now serves chat logprobs and "
-                    "top_logprobs, which it used to refuse with a 400. Each value is "
-                    "the log-probability from the model's raw output, before "
-                    "sampling transforms, penalties, logit_bias and the token mask, "
-                    "the same meaning as on the scalar route; a logprobs request "
-                    "decodes without speculation. Both serve routes now name the "
-                    "active default sampling preset on the startup line: "
-                    "default_sampling=off, or default_sampling=generation-config "
-                    "with the resolved temperature, top_p, top_k and min_p. The "
-                    "bundled quality-card store is unchanged from v0.1.22. Greedy "
-                    "output is identical to the development build on the release "
-                    "check prompts. The engine still links mlx-swift 0.31.6."
+                    "Publishes the v0.1.24 arm64 macOS distribution: the "
+                    "continuous-batch route now serves legacy /v1/completions (a raw "
+                    "prompt, streamed or not), which it used to refuse with a 400, and "
+                    "on the release check prompts its greedy text equals the scalar "
+                    "route's. Integer logprobs return the legacy tokens, "
+                    "token_logprobs and top_logprobs object, each value the "
+                    "log-probability from the model's raw output, before sampling "
+                    "transforms, penalties, logit_bias and the token mask, the same "
+                    "meaning as on the scalar route. Both routes now apply one "
+                    "prompt-token screen before admission, and the scalar route's "
+                    "raw-text refusal names the prompt parameter. The bundled "
+                    "quality-card store is unchanged from v0.1.23. Greedy output is "
+                    "identical to the development build on the release check prompts. "
+                    "The engine still links mlx-swift 0.31.6."
                 ),
                 "scope": (
                     "Tagged public distribution and the arm64 macOS archive published "
@@ -421,7 +422,7 @@ class PublicSiteTests(unittest.TestCase):
                     "notarized, and no performance, quality, model-support, host-"
                     "qualification, deployment, or production-promotion claim follows."
                 ),
-                "publicCommit": "e505002a38bf7aad32f0392be486b1ae9b7c38d2",
+                "publicCommit": "ccce6096054f922cd5f9d2dc0e053c3896306bc4",
                 "publicLinks": [
                     {
                         "label": "Start with the operator quickstart",
@@ -438,6 +439,7 @@ class PublicSiteTests(unittest.TestCase):
         self.assertEqual(
             commits,
             [
+                "ccce6096054f922cd5f9d2dc0e053c3896306bc4",
                 "e505002a38bf7aad32f0392be486b1ae9b7c38d2",
                 "c24d156965343ad42ceb36d03b97ac8204135914",
                 "18503a59cbf442b57f4c141bc6c7b969852fd749",
