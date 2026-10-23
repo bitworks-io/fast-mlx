@@ -51,7 +51,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     /// generation handle exists (then `handle.responseID` takes over). Whatever value a response
     /// carries in its `x-request-id` header is the same value the `--request-log` `request_id` and
     /// the request-failure diagnostic line report for it.
-    private var requestID = UUID().uuidString
+    private var requestID = servingMintRequestID()
     /// TEST-ONLY seam: awaited once per generation, immediately after the final response bytes for
     /// a keep-alive-preserving request have been flushed and `control` has been marked terminal --
     /// see `runGeneration`'s call site. `nil` for every production and non-`@testable` caller (the
@@ -177,7 +177,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             route: servingRequestLogTemplatedRoute(head.uri),
             startedAt: ContinuousClock().now)
         isHeadRequest = head.method == .HEAD
-        requestID = UUID().uuidString
+        requestID = servingMintRequestID()
 
         if let rejection = validateHead(head) {
             discardingRequestBody = true

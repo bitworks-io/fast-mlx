@@ -150,7 +150,9 @@ public actor ServingHTTPServer {
                     let pipeline = channel.pipeline.syncOperations
                     try pipeline.configureHTTPServerPipeline(
                         withPipeliningAssistance: false,
-                        withErrorHandling: true)
+                        withErrorHandling: false)
+                    try pipeline.addHandler(
+                        ServingHTTPProtocolErrorHandler(configuration: configuration))
                     try pipeline.addHandler(
                         OpenAIChatCompletionsHTTPHandler(
                             configuration: configuration,

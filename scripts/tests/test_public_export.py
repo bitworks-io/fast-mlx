@@ -334,9 +334,13 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 #   spike/Tests/SpikeCoreTests/DenseContinuousBatchRuntimeLogprobTests.swift (continuous-route logprobs)
 #   Conscious decision to publish: read in full; runtime/backend logprob code and synthetic-fixture tests only, no
 #   model family, host, credential or machine-local path.
+# 2026-10-23, 1061 -> 1063: adds spike/Sources/ServingNIO/ServingHTTPProtocolErrorHandler.swift and
+#   spike/Tests/ServingNIOTests/ProtocolErrorRequestIDTests.swift (the malformed-HTTP 400 carries an x-request-id and
+#   one request-log line). Conscious decision to publish: read in full; the handler and raw-socket tests with synthetic
+#   request bytes and the suite's existing synthetic model string only, no host, credential or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1061,
-    "pathModeSha256": "936c484f982e7787be0475d54fb993d8ea32bd26429ea0b8e6b54fd410b68bb4",
+    "pathCount": 1063,
+    "pathModeSha256": "3964f3e1bb047c7d00e2c38e4008c321c5631b1da766ad1b997be65087d4a98e",
 }
 
 
