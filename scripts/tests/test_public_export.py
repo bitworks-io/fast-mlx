@@ -343,9 +343,13 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 #   (the DNS-rebinding Host guard on a tokenless server and its `--allow-host` flag). Conscious decision to publish: read
 #   in full; a pure Host parser, raw-socket tests with synthetic hostnames (`*.example`, `*.evil.com`, TEST-NET-3
 #   addresses) and the suite's existing synthetic model string; no host, credential or machine-local path.
+# 2026-10-23, 1066 -> 1067: adds spike/Tests/ServingNIOTests/DeliveredReplyIsNotADisconnectTests.swift (a reply the
+#   client received in full is never logged or counted as a client disconnect). Conscious decision to publish: read
+#   in full; in-memory fake backends, synthetic request bodies and the suite's existing synthetic model string only;
+#   no host, credential or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1066,
-    "pathModeSha256": "a1663c83af504c3fdad01d549b8b7de138b7af1bcdf9467fe2940d56a9270715",
+    "pathCount": 1067,
+    "pathModeSha256": "813d191b881afb96b317a01cb138099697c48cb8cdceaa54967cd9fff88898e5",
 }
 
 

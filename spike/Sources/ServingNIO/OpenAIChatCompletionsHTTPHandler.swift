@@ -82,6 +82,17 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     /// `OpenAIChatCompletionsHTTPHandler.writeFinalPart`'s doc comment for the fix this hook
     /// verifies. `nil` for every production and non-`@testable` caller.
     private let finalWriteRaceTestHook: (@Sendable () async -> Void)?
+    /// TEST-ONLY seam (cycle 291d), awaited from inside the write-completion callback of the LAST
+    /// body write of a successful generation reply (the single JSON body, or the SSE `data: [DONE]`
+    /// event), before the writer's continuation resumes. It parks exactly where a client that has
+    /// read the complete body can close the connection while the writer has not yet moved on --
+    /// see `docs/task-inbox/2026-10-23-PREDECLARATION-a-delivered-reply-is-never-logged-as-a-disconnect.md`.
+    /// `nil` for every production and non-`@testable` caller.
+    private let lastBodyWriteRaceTestHook: (@Sendable () async -> Void)?
+    /// TEST-ONLY seam (cycle 291d), awaited immediately BEFORE the last body write of a successful
+    /// generation reply is issued (and before the request is marked terminal for it): lets a test
+    /// deliver a close that arrives before any body byte is written. `nil` in production.
+    private let beforeLastBodyWriteTestHook: (@Sendable () async -> Void)?
 
     public convenience init(
         configuration: ServingHTTPConfiguration,
@@ -93,7 +104,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             backend: backend,
             embeddingsBackend: embeddingsBackend,
             responseCompletionTestHook: nil,
-            finalWriteRaceTestHook: nil)
+            finalWriteRaceTestHook: nil,
+            lastBodyWriteRaceTestHook: nil,
+            beforeLastBodyWriteTestHook: nil)
     }
 
     /// Test-only widening of the public initializer above -- `internal` so it is reachable from
@@ -105,13 +118,17 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
         backend: any ServingGenerationBackend,
         embeddingsBackend: (any ServingEmbeddingsBackend)? = nil,
         responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
-        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        lastBodyWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        beforeLastBodyWriteTestHook: (@Sendable () async -> Void)? = nil
     ) {
         self.configuration = configuration
         self.backend = backend
         self.embeddingsBackend = embeddingsBackend
         self.responseCompletionTestHook = responseCompletionTestHook
         self.finalWriteRaceTestHook = finalWriteRaceTestHook
+        self.lastBodyWriteRaceTestHook = lastBodyWriteRaceTestHook
+        self.beforeLastBodyWriteTestHook = beforeLastBodyWriteTestHook
     }
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -552,7 +569,9 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             requestID: requestID,
             requestLogPreamble: pendingRequestLogPreamble,
             responseCompletionTestHook: responseCompletionTestHook,
-            finalWriteRaceTestHook: finalWriteRaceTestHook)
+            finalWriteRaceTestHook: finalWriteRaceTestHook,
+            lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+            beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
     }
 
     /// `POST /v1/embeddings`. Method is already confirmed `POST` by `validateHead` before
@@ -1143,7 +1162,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
-        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        lastBodyWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        beforeLastBodyWriteTestHook: (@Sendable () async -> Void)? = nil
     ) -> Task<Void, Never> {
         let responseAccumulator = requestEvidence.map { _ in
             ServingResponseEvidenceAccumulator()
@@ -1165,7 +1186,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         requestID: requestID,
                         requestLogPreamble: requestLogPreamble,
                         responseCompletionTestHook: responseCompletionTestHook,
-                        finalWriteRaceTestHook: finalWriteRaceTestHook)
+                        finalWriteRaceTestHook: finalWriteRaceTestHook,
+                        lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+                        beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
                 }
         }
     }
@@ -1276,10 +1299,8 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 .head(head), channel: channel, timeout: configuration.backpressureStallTimeout)
             var buffer = channel.allocator.buffer(capacity: data.count)
             buffer.writeBytes(data)
-            try await writePart(
-                .body(.byteBuffer(buffer)), channel: channel,
-                timeout: configuration.backpressureStallTimeout)
-            try await writeFinalPart(
+            try await writeLastBodyAndFinalPart(
+                buffer,
                 control: control,
                 channel: channel,
                 timeout: configuration.backpressureStallTimeout,
@@ -1497,7 +1518,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
-        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        lastBodyWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        beforeLastBodyWriteTestHook: (@Sendable () async -> Void)? = nil
     ) async {
         var handle: ServingGenerationHandle?
         var responseStarted = false
@@ -1620,7 +1643,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     logprobsRequest: request.logprobsRequest,
                     remainderLogprobs: streamResult.remainderLogprobs,
                     completionsTextOffset: streamResult.completionsTextOffset,
-                    finalWriteRaceTestHook: finalWriteRaceTestHook)
+                    finalWriteRaceTestHook: finalWriteRaceTestHook,
+                    lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+                    beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
             } else {
                 let result = try await collectNonStreaming(
                     handle: started,
@@ -1665,7 +1690,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         control: control,
                         writabilityGate: writabilityGate,
                         timeout: configuration.backpressureStallTimeout,
-                        finalWriteRaceTestHook: finalWriteRaceTestHook)
+                        finalWriteRaceTestHook: finalWriteRaceTestHook,
+                        lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+                        beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
                 case .completions:
                     // Raw-text completions never separate reasoning and never parse tool calls (no
                     // tools are ever active on this route). A backend that emits tool calls anyway is
@@ -1697,7 +1724,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         control: control,
                         writabilityGate: writabilityGate,
                         timeout: configuration.backpressureStallTimeout,
-                        finalWriteRaceTestHook: finalWriteRaceTestHook)
+                        finalWriteRaceTestHook: finalWriteRaceTestHook,
+                        lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+                        beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
                 }
                 responseStarted = true
             }
@@ -2470,7 +2499,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         logprobsRequest: ServingLogprobsRequest? = nil,
         remainderLogprobs: [ServingTokenLogprob] = [],
         completionsTextOffset: Int = 0,
-        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        lastBodyWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        beforeLastBodyWriteTestHook: (@Sendable () async -> Void)? = nil
     ) async throws {
         try await waitUntilWritable(writabilityGate, timeout: timeout)
         switch responseKind {
@@ -2527,15 +2558,18 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 try await writeBody(usageChunk.sseEvent(), channel: channel, timeout: timeout)
             }
         }
-        try await writeBody(
-            OpenAIChatCompletionChunk.doneSSEEvent,
-            channel: channel,
-            timeout: timeout)
-        try await writeFinalPart(
+        // `[DONE]` and the final `.end` leave together, with `control` already terminal.
+        var done = channel.allocator.buffer(
+            capacity: OpenAIChatCompletionChunk.doneSSEEvent.utf8.count)
+        done.writeString(OpenAIChatCompletionChunk.doneSSEEvent)
+        try await writeLastBodyAndFinalPart(
+            done,
             control: control,
             channel: channel,
             timeout: timeout,
-            finalWriteRaceTestHook: finalWriteRaceTestHook)
+            finalWriteRaceTestHook: finalWriteRaceTestHook,
+            lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+            beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
     }
 
     static func writeJSONResponse<Response: Encodable>(
@@ -2547,7 +2581,9 @@ private extension OpenAIChatCompletionsHTTPHandler {
         control: ServingTransportRequestControl,
         writabilityGate: ServingChannelWritabilityGate,
         timeout: Duration,
-        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        lastBodyWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        beforeLastBodyWriteTestHook: (@Sendable () async -> Void)? = nil
     ) async throws {
         try await waitUntilWritable(writabilityGate, timeout: timeout)
         let data = try JSONEncoder.openAI.encode(response)
@@ -2569,12 +2605,14 @@ private extension OpenAIChatCompletionsHTTPHandler {
         try await writePart(.head(head), channel: channel, timeout: timeout)
         var buffer = channel.allocator.buffer(capacity: data.count)
         buffer.writeBytes(data)
-        try await writePart(.body(.byteBuffer(buffer)), channel: channel, timeout: timeout)
-        try await writeFinalPart(
+        try await writeLastBodyAndFinalPart(
+            buffer,
             control: control,
             channel: channel,
             timeout: timeout,
-            finalWriteRaceTestHook: finalWriteRaceTestHook)
+            finalWriteRaceTestHook: finalWriteRaceTestHook,
+            lastBodyWriteRaceTestHook: lastBodyWriteRaceTestHook,
+            beforeLastBodyWriteTestHook: beforeLastBodyWriteTestHook)
     }
 
     static func writeTextResponse(
@@ -2604,13 +2642,19 @@ private extension OpenAIChatCompletionsHTTPHandler {
         if !isHead {
             var buffer = channel.allocator.buffer(capacity: data.count)
             buffer.writeBytes(data)
-            try await writePart(.body(.byteBuffer(buffer)), channel: channel, timeout: timeout)
+            try await writeLastBodyAndFinalPart(
+                buffer,
+                control: control,
+                channel: channel,
+                timeout: timeout,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
+        } else {
+            try await writeFinalPart(
+                control: control,
+                channel: channel,
+                timeout: timeout,
+                finalWriteRaceTestHook: finalWriteRaceTestHook)
         }
-        try await writeFinalPart(
-            control: control,
-            channel: channel,
-            timeout: timeout,
-            finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
 
     static func waitUntilWritable(
@@ -2685,6 +2729,60 @@ private extension OpenAIChatCompletionsHTTPHandler {
         timeout: Duration,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async throws {
+        let pending = try issuePart(
+            part,
+            channel: channel,
+            timeout: timeout,
+            flush: true,
+            completionHook: finalWriteRaceTestHook)
+        try await pending.wait()
+    }
+
+    /// A response part that has been handed to the channel and whose completion has not been
+    /// awaited yet (see `issuePart`).
+    struct PendingPartWrite {
+        fileprivate let result: EventLoopFuture<Void>
+        fileprivate let deadline: Scheduled<Void>
+        fileprivate let evidencePart: ServingWrittenResponsePart?
+        fileprivate let responseAccumulator: ServingResponseEvidenceAccumulator?
+
+        /// Awaits the write; throws `RunError.writeFailure` (or `.backpressureTimeout`) exactly like
+        /// `writePart` always has.
+        func wait() async throws {
+            defer {
+                deadline.cancel()
+            }
+            do {
+                try await result.get()
+                if let evidencePart {
+                    try await responseAccumulator?.record(evidencePart)
+                }
+            } catch let error as RunError {
+                throw error
+            } catch {
+                throw RunError.writeFailure
+            }
+        }
+
+        /// Gives up on awaiting this write (its own deadline is cancelled); the write itself stays
+        /// in flight.
+        func abandon() {
+            deadline.cancel()
+        }
+    }
+
+    /// Hands one response part to the channel without awaiting it. `flush: false` only queues the
+    /// part: it goes out with the next flushing write on the same channel, so two parts can be
+    /// issued back to back and leave in one flush (see `writeLastBodyAndFinalPart`).
+    /// `completionHook` is the TEST-ONLY seam described on `finalWriteRaceTestHook`: `nil` in
+    /// production.
+    static func issuePart(
+        _ part: HTTPServerResponsePart,
+        channel: any Channel,
+        timeout: Duration,
+        flush: Bool,
+        completionHook: (@Sendable () async -> Void)? = nil
+    ) throws -> PendingPartWrite {
         let responseAccumulator =
             ServingTransportEvidenceTaskContext.responseAccumulator
         let evidencePart: ServingWrittenResponsePart?
@@ -2711,11 +2809,12 @@ private extension OpenAIChatCompletionsHTTPHandler {
 
         let race = ServingWriteCompletionRace()
         let result = channel.eventLoop.makePromise(of: Void.self)
-        channel.writeAndFlush(part).whenComplete { writeResult in
+        let written = flush ? channel.writeAndFlush(part) : channel.write(part)
+        written.whenComplete { writeResult in
             guard race.claim() else {
                 return
             }
-            guard let finalWriteRaceTestHook else {
+            guard let completionHook else {
                 result.completeWith(writeResult)
                 return
             }
@@ -2724,14 +2823,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
             // write-completion notification -- for `NIOAsyncTestingChannel`, that is
             // `EmbeddedChannelCore.flush0`, which notifies any outbound-buffer reader (unblocking a
             // test's `collectResponse`) BEFORE it succeeds this write's own promise. Detaching a
-            // `Task` here, instead of completing `result` inline, means this call's own `await
-            // result.futureResult.get()` below cannot resume until the hook releases it, so a test
-            // can deterministically land a second request's head in the window between "the
-            // response is fully visible" and "this task resumes far enough to reach
-            // `writeFinalPart`'s `control.markTerminal()`" -- the same scheduling gap that makes
-            // this race possible in production, without depending on incidental executor ordering.
+            // `Task` here, instead of completing `result` inline, means the awaiting caller cannot
+            // resume until the hook releases it, so a test can deterministically land a second
+            // request's head (or a client close) in the window between "the response is fully
+            // visible" and "the writer resumes" -- the same scheduling gap that makes these races
+            // possible in production, without depending on incidental executor ordering.
             Task {
-                await finalWriteRaceTestHook()
+                await completionHook()
                 result.completeWith(writeResult)
             }
         }
@@ -2742,18 +2840,79 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 result.fail(RunError.backpressureTimeout)
             }
         }
-        defer {
-            deadline.cancel()
+        return PendingPartWrite(
+            result: result.futureResult,
+            deadline: deadline,
+            evidencePart: evidencePart,
+            responseAccumulator: responseAccumulator)
+    }
+
+    /// Writes the LAST body write of a Content-Length (or chunked) reply together with its final
+    /// `HTTPServerResponsePart.end`: `control` is marked terminal BEFORE the body write is issued,
+    /// and the body and `.end` are handed to the channel back to back and leave in ONE flush; both
+    /// completions are awaited. Cycle 291d: with a separate awaited body write followed by
+    /// `writeFinalPart` (which marked terminal only afterwards), a client that read exactly the
+    /// body bytes and closed in the gap made `channelInactive` -> `cancelActive` find the request
+    /// not terminal and record `.clientDisconnected`; the `.end` write then failed and a reply the
+    /// client had received in full was logged `client_disconnected` (status 500 for a
+    /// not-yet-started reply), counted as a disconnect, and its lease cancelled instead of
+    /// completed. Once the request is terminal, a close that arrives afterwards can no longer
+    /// turn it into a disconnect.
+    ///
+    /// A close seen BEFORE this point stays a disconnect: `cancelActive` cancels the task, so the
+    /// cancellation check below reports a write failure (the same outcome a closed channel's failed
+    /// body write has always produced) before anything is written.
+    ///
+    /// Safety net: if the body write succeeded and only the `.end` write failed with a plain write
+    /// failure, the complete reply is on the wire (a Content-Length body is complete at its last
+    /// byte; the chunked terminator carries no payload), so it is treated as delivered and this
+    /// returns normally -- the caller then logs the real outcome and status and completes the lease.
+    /// The un-written `.end` is NOT recorded as written response evidence. A body-write failure, or
+    /// a timeout, still throws.
+    static func writeLastBodyAndFinalPart(
+        _ body: ByteBuffer,
+        control: ServingTransportRequestControl,
+        channel: any Channel,
+        timeout: Duration,
+        finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        lastBodyWriteRaceTestHook: (@Sendable () async -> Void)? = nil,
+        beforeLastBodyWriteTestHook: (@Sendable () async -> Void)? = nil
+    ) async throws {
+        // TEST-ONLY (`nil` in production): see `beforeLastBodyWriteTestHook`'s doc comment.
+        await beforeLastBodyWriteTestHook?()
+        guard !Task.isCancelled else {
+            throw RunError.writeFailure
+        }
+        control.markTerminal()
+        let pendingBody = try issuePart(
+            .body(.byteBuffer(body)),
+            channel: channel,
+            timeout: timeout,
+            flush: false,
+            completionHook: lastBodyWriteRaceTestHook)
+        let pendingEnd: PendingPartWrite
+        do {
+            pendingEnd = try issuePart(
+                .end(nil),
+                channel: channel,
+                timeout: timeout,
+                flush: true,
+                completionHook: finalWriteRaceTestHook)
+        } catch {
+            pendingBody.abandon()
+            channel.flush()
+            throw error
         }
         do {
-            try await result.futureResult.get()
-            if let evidencePart {
-                try await responseAccumulator?.record(evidencePart)
-            }
-        } catch let error as RunError {
-            throw error
+            try await pendingBody.wait()
         } catch {
-            throw RunError.writeFailure
+            pendingEnd.abandon()
+            throw error
+        }
+        do {
+            try await pendingEnd.wait()
+        } catch RunError.writeFailure {
+            return
         }
     }
 
@@ -2833,17 +2992,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 try await writePart(.head(head), channel: channel, timeout: timeout)
                 var body = channel.allocator.buffer(capacity: data.count)
                 body.writeBytes(data)
-                try await writePart(
-                    .body(.byteBuffer(body)),
-                    channel: channel,
-                    timeout: timeout)
                 // Not yet started (no response bytes sent): this is the keep-alive-preserving case
                 // the race in `docs/task-inbox/2026-09-16-keepalive-next-request-race-closes-connection.md`
-                // covers. Route the final part through `writeFinalPart`, exactly like a successful
-                // response's `writeJSONResponse`/`writeSSETerminal`, so `control` is marked terminal
-                // before this write is even initiated instead of only much later in `runGeneration`'s
+                // covers. Route the last body write and the final part through
+                // `writeLastBodyAndFinalPart`, exactly like a successful response's
+                // `writeJSONResponse`/`writeSSETerminal`, so `control` is marked terminal before
+                // either write is initiated instead of only much later in `runGeneration`'s
                 // top-level `defer`.
-                try await writeFinalPart(
+                try await writeLastBodyAndFinalPart(
+                    body,
                     control: control,
                     channel: channel,
                     timeout: timeout,
@@ -2947,22 +3104,26 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     status: status,
                     headers: headers)
                 try await writePart(.head(head), channel: channel, timeout: timeout)
+                // Not yet started -- see the matching comment in `writeFailureIfPossible`: route the
+                // last body write and the final part through `writeLastBodyAndFinalPart` so
+                // `control` is marked terminal before either write is initiated instead of only in
+                // `runGeneration`'s top-level `defer`.
                 if !isHead {
                     var body = channel.allocator.buffer(capacity: data.count)
                     body.writeBytes(data)
-                    try await writePart(
-                        .body(.byteBuffer(body)),
+                    try await writeLastBodyAndFinalPart(
+                        body,
+                        control: control,
                         channel: channel,
-                        timeout: timeout)
+                        timeout: timeout,
+                        finalWriteRaceTestHook: finalWriteRaceTestHook)
+                } else {
+                    try await writeFinalPart(
+                        control: control,
+                        channel: channel,
+                        timeout: timeout,
+                        finalWriteRaceTestHook: finalWriteRaceTestHook)
                 }
-                // Not yet started -- see the matching comment in `writeFailureIfPossible`: route the
-                // final part through `writeFinalPart` so `control` is marked terminal before this
-                // write is initiated instead of only in `runGeneration`'s top-level `defer`.
-                try await writeFinalPart(
-                    control: control,
-                    channel: channel,
-                    timeout: timeout,
-                    finalWriteRaceTestHook: finalWriteRaceTestHook)
                 if !keepAlive {
                     await close(channel)
                 }
@@ -3119,15 +3280,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
             try await writePart(.head(head), channel: channel, timeout: timeout)
             var body = channel.allocator.buffer(capacity: data.count)
             body.writeBytes(data)
-            try await writePart(
-                .body(.byteBuffer(body)),
-                channel: channel,
-                timeout: timeout)
             // Admission failures never have a response already in flight -- always the
             // keep-alive-preserving case (see `writeFailureIfPossible`'s matching comment). Route
-            // the final part through `writeFinalPart` so `control` is marked terminal before this
-            // write is initiated instead of only in `runGeneration`'s top-level `defer`.
-            try await writeFinalPart(
+            // the last body write and the final part through `writeLastBodyAndFinalPart` so
+            // `control` is marked terminal before either write is initiated instead of only in
+            // `runGeneration`'s top-level `defer`.
+            try await writeLastBodyAndFinalPart(
+                body,
                 control: control,
                 channel: channel,
                 timeout: timeout,
