@@ -45,6 +45,13 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     /// the leftover bytes would be parsed as the start of the next response. The async `/metrics`
     /// writers take the same fact as a parameter captured when the task is created.
     private var isHeadRequest = false
+    /// The id of the request currently being answered: a fresh UUID minted in `receiveHead` for
+    /// EVERY request head (so it never carries over from a previous request on a keep-alive
+    /// connection), never taken from anything the client sent. It is the response id until a
+    /// generation handle exists (then `handle.responseID` takes over). Whatever value a response
+    /// carries in its `x-request-id` header is the same value the `--request-log` `request_id` and
+    /// the request-failure diagnostic line report for it.
+    private var requestID = UUID().uuidString
     /// TEST-ONLY seam: awaited once per generation, immediately after the final response bytes for
     /// a keep-alive-preserving request have been flushed and `control` has been marked terminal --
     /// see `runGeneration`'s call site. `nil` for every production and non-`@testable` caller (the
@@ -170,6 +177,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             route: servingRequestLogTemplatedRoute(head.uri),
             startedAt: ContinuousClock().now)
         isHeadRequest = head.method == .HEAD
+        requestID = UUID().uuidString
 
         if let rejection = validateHead(head) {
             discardingRequestBody = true
@@ -538,6 +546,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             control: control,
             writabilityGate: writabilityGate,
             requestEvidence: requestEvidence,
+            requestID: requestID,
             requestLogPreamble: pendingRequestLogPreamble,
             responseCompletionTestHook: responseCompletionTestHook,
             finalWriteRaceTestHook: finalWriteRaceTestHook)
@@ -596,6 +605,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             embeddingsBackend: embeddingsBackend,
             channel: channel,
             control: control,
+            requestID: requestID,
             requestLogPreamble: pendingRequestLogPreamble,
             finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
@@ -762,6 +772,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             Self.emitRequestLog(
                 configuration: configuration,
                 preamble: preamble,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.ok.code),
                 outcome: .completed)
         }
@@ -771,6 +782,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                     model: configuration.launchedModel,
                     capabilities: configuration.modelCapabilities))
             var headers = HTTPHeaders()
+            Self.addRequestID(requestID, to: &headers)
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
             if !keepAlive {
@@ -826,6 +838,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             Self.emitRequestLog(
                 configuration: configuration,
                 preamble: preamble,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.ok.code),
                 outcome: .completed)
         }
@@ -835,6 +848,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
                     model: configuration.launchedModel,
                     capabilities: configuration.modelCapabilities))
             var headers = HTTPHeaders()
+            Self.addRequestID(requestID, to: &headers)
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
             if !keepAlive {
@@ -881,12 +895,14 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             Self.emitRequestLog(
                 configuration: configuration,
                 preamble: preamble,
+                requestID: requestID,
                 status: Int(httpStatus.code),
                 outcome: .completed)
         }
         do {
             let data = try JSONEncoder.openAI.encode(HealthProbeStatus(status: status))
             var headers = HTTPHeaders()
+            Self.addRequestID(requestID, to: &headers)
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
             if !keepAlive {
@@ -928,6 +944,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             configuration: configuration,
             channel: channel,
             control: control,
+            requestID: requestID,
             requestLogPreamble: requestLogPreamble,
             finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
@@ -954,6 +971,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             Self.emitRequestLog(
                 configuration: configuration,
                 preamble: preamble,
+                requestID: requestID,
                 status: Int(status.code),
                 outcome: .error,
                 stream: requestLogStream,
@@ -965,6 +983,7 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             let data = try JSONEncoder.openAI.encode(
                 OpenAIErrorEnvelope(error: error.openAIError))
             var headers = HTTPHeaders()
+            Self.addRequestID(requestID, to: &headers)
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
             if let allow {
@@ -1037,14 +1056,15 @@ private extension OpenAIChatCompletionsHTTPHandler {
     /// `runGeneration`'s many outcomes and `runMetrics`'s success/failure branches -- mirroring the
     /// instance-side emission `writeError` does internally. `preamble: nil` (request logging off, or
     /// a route this handler does not track a preamble for) is a no-op, so every call site here can
-    /// call this unconditionally. `requestID` defaults to a freshly generated id, matching the
-    /// serve flag's "the existing response id if one exists, else a generated one" contract --
-    /// callers that already minted a real response id (a started generation handle) pass it
-    /// explicitly instead.
+    /// call this unconditionally. `requestID` is required (it has no default): it is the "existing
+    /// response id if one exists, else the per-request id" that the same response also carries in
+    /// its `x-request-id` header, so a log-time `UUID()` here would silently log an id the client
+    /// never saw. Callers pass the handler's per-request id, or a started generation handle's
+    /// `responseID`.
     static func emitRequestLog(
         configuration: ServingHTTPConfiguration,
         preamble: ServingRequestLogPreamble?,
-        requestID: String = UUID().uuidString,
+        requestID: String,
         status: Int,
         outcome: ServingRequestLogRecord.Outcome,
         stream: Bool? = nil,
@@ -1075,6 +1095,13 @@ private extension OpenAIChatCompletionsHTTPHandler {
             ignoredFields: ignoredFields)
     }
 
+    /// Adds the response's single `x-request-id` header. Every response head this handler writes goes
+    /// through here with the same id its request-log line reports; a client-sent `x-request-id` is
+    /// never consulted, so there is nothing client-controlled to echo or to inject into a header.
+    static func addRequestID(_ requestID: String, to headers: inout HTTPHeaders) {
+        headers.replaceOrAdd(name: "x-request-id", value: requestID)
+    }
+
     static func makeGenerationTask(
         request: OpenAIChatCompletionRequest,
         responseKind: ServingResponseKind,
@@ -1085,6 +1112,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         control: ServingTransportRequestControl,
         writabilityGate: ServingChannelWritabilityGate,
         requestEvidence: ServingEvidence.Request?,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
@@ -1106,6 +1134,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                         writabilityGate: writabilityGate,
                         requestEvidence: requestEvidence,
                         responseAccumulator: responseAccumulator,
+                        requestID: requestID,
                         requestLogPreamble: requestLogPreamble,
                         responseCompletionTestHook: responseCompletionTestHook,
                         finalWriteRaceTestHook: finalWriteRaceTestHook)
@@ -1120,6 +1149,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         embeddingsBackend: any ServingEmbeddingsBackend,
         channel: any Channel,
         control: ServingTransportRequestControl,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) -> Task<Void, Never> {
@@ -1131,6 +1161,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 embeddingsBackend: embeddingsBackend,
                 channel: channel,
                 control: control,
+                requestID: requestID,
                 requestLogPreamble: requestLogPreamble,
                 finalWriteRaceTestHook: finalWriteRaceTestHook)
         }
@@ -1157,6 +1188,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         embeddingsBackend: any ServingEmbeddingsBackend,
         channel: any Channel,
         control: ServingTransportRequestControl,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async {
@@ -1167,8 +1199,6 @@ private extension OpenAIChatCompletionsHTTPHandler {
         defer {
             control.markTerminal()
         }
-        let requestLogID = UUID().uuidString
-
         do {
             try Task.checkCancellation()
             let result = try await embeddingsBackend.embed(request)
@@ -1207,6 +1237,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             }
 
             var headers = HTTPHeaders()
+            addRequestID(requestID, to: &headers)
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
             if !keepAlive {
@@ -1229,7 +1260,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: requestLogID,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.ok.code),
                 outcome: .completed,
                 stream: false,
@@ -1250,7 +1281,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
-                requestLogRequestID: requestLogID,
+                requestID: requestID,
                 requestLogStream: false,
                 requestLogModel: request.model,
                 requestLogIgnoredFields: request.ignoredFields,
@@ -1259,7 +1290,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: requestLogID,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.internalServerError.code),
                 outcome: .clientDisconnected,
                 stream: false,
@@ -1279,7 +1310,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
-                requestLogRequestID: requestLogID,
+                requestID: requestID,
                 requestLogStream: false,
                 requestLogModel: request.model,
                 requestLogIgnoredFields: request.ignoredFields,
@@ -1293,6 +1324,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) -> Task<Void, Never> {
@@ -1303,6 +1335,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 configuration: configuration,
                 channel: channel,
                 control: control,
+                requestID: requestID,
                 requestLogPreamble: requestLogPreamble,
                 finalWriteRaceTestHook: finalWriteRaceTestHook)
         }
@@ -1314,6 +1347,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async {
@@ -1336,6 +1370,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 configuration: configuration,
                 channel: channel,
                 control: control,
+                requestID: requestID,
                 requestLogPreamble: requestLogPreamble,
                 finalWriteRaceTestHook: finalWriteRaceTestHook)
             return
@@ -1349,6 +1384,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.internalServerError.code),
                 outcome: .clientDisconnected)
             await close(channel)
@@ -1364,6 +1400,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 configuration: configuration,
                 channel: channel,
                 control: control,
+                requestID: requestID,
                 requestLogPreamble: requestLogPreamble,
                 finalWriteRaceTestHook: finalWriteRaceTestHook)
             return
@@ -1375,6 +1412,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 contentType: "text/plain; version=0.0.4; charset=utf-8",
                 keepAlive: keepAlive,
                 isHead: isHead,
+                requestID: requestID,
                 channel: channel,
                 control: control,
                 timeout: configuration.backpressureStallTimeout,
@@ -1382,6 +1420,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.ok.code),
                 outcome: .completed)
             if !keepAlive {
@@ -1391,6 +1430,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.ok.code),
                 outcome: .clientDisconnected)
             await close(channel)
@@ -1398,6 +1438,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
+                requestID: requestID,
                 status: Int(HTTPResponseStatus.ok.code),
                 outcome: .error)
             await close(channel)
@@ -1425,6 +1466,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         writabilityGate: ServingChannelWritabilityGate,
         requestEvidence: ServingEvidence.Request?,
         responseAccumulator: ServingResponseEvidenceAccumulator?,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         responseCompletionTestHook: (@Sendable () async -> Void)? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
@@ -1439,18 +1481,28 @@ private extension OpenAIChatCompletionsHTTPHandler {
         // Request-finishing state, fed to `emitRequestLog`/`servingEmitRequestLog` below on every
         // request regardless of `--request-log` -- that call always feeds `configuration
         // .httpMetrics` and only conditionally also emits a JSON access-log line (see
-        // `pendingRequestLogPreamble`'s own doc comment). `requestLogID` is the "existing response
-        // id if one exists, else a generated one" contract -- generated up front so every catch
-        // branch, including ones reached before a
-        // backend handle exists, has an id to report. `requestLogTTFTAt` is set once, the first time
+        // `pendingRequestLogPreamble`'s own doc comment). `requestID` (minted per request head by
+        // `receiveHead`) is the "existing response id if one exists, else a generated one"
+        // contract -- known up front so every catch branch, including ones reached before a
+        // backend handle exists, has an id to report. `currentResponseID()` below is the one
+        // value the response's `x-request-id` header, the request-log `request_id` and the
+        // request-failure diagnostic line all use. `requestLogTTFTAt` is set once, the first time
         // a generated token becomes available on the STREAMING path (see below); left `nil` for a
         // non-streaming response and for a request that fails before any token is produced.
         // `requestLogCompletion` is set from whichever branch (streaming/non-streaming) actually
         // finishes, so the single success-path emission below does not need to duplicate either
         // branch's own completion-handling logic.
-        let requestLogID = UUID().uuidString
         var requestLogTTFTAt: ContinuousClock.Instant?
         var requestLogCompletion: ServingGenerationCompletion?
+        // The response id: the per-request id until a generation handle exists, `handle.responseID`
+        // from then on (an empty handle id -- itself an invalid-handle defect -- falls back to the
+        // per-request id so the header is never empty).
+        func currentResponseID() -> String {
+            if let id = handle?.responseID, !id.isEmpty {
+                return id
+            }
+            return requestID
+        }
         defer {
             control.markTerminal()
             configuration.evidence?.tracker.end()
@@ -1677,7 +1729,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
-                requestLogRequestID: handle?.responseID ?? requestLogID,
+                requestID: currentResponseID(),
                 requestLogStream: request.stream,
                 requestLogModel: configuration.launchedModel,
                 requestLogIgnoredFields: request.ignoredFields,
@@ -1695,7 +1747,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
-                requestLogRequestID: handle?.responseID ?? requestLogID,
+                requestID: currentResponseID(),
                 requestLogStream: request.stream,
                 requestLogModel: configuration.launchedModel,
                 requestLogIgnoredFields: request.ignoredFields,
@@ -1708,7 +1760,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: handle?.responseID ?? requestLogID,
+                requestID: currentResponseID(),
                 status: Int(
                     (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
                 outcome: .clientDisconnected,
@@ -1723,7 +1775,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: handle?.responseID ?? requestLogID,
+                requestID: currentResponseID(),
                 status: Int(
                     (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
                 outcome: .error,
@@ -1738,7 +1790,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 emitRequestLog(
                     configuration: configuration,
                     preamble: requestLogPreamble,
-                    requestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     status: Int(
                         (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
                     outcome: reason == .clientDisconnected ? .clientDisconnected : .error,
@@ -1756,7 +1808,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
-                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
                     requestLogIgnoredFields: request.ignoredFields,
@@ -1772,7 +1824,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 emitRequestLog(
                     configuration: configuration,
                     preamble: requestLogPreamble,
-                    requestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     status: Int(
                         (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
                     outcome: .error,
@@ -1793,7 +1845,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
-                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
                     requestLogIgnoredFields: request.ignoredFields,
@@ -1805,7 +1857,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 emitRequestLog(
                     configuration: configuration,
                     preamble: requestLogPreamble,
-                    requestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     status: Int(
                         (responseStarted ? HTTPResponseStatus.ok : .internalServerError).code),
                     outcome: .clientDisconnected,
@@ -1824,7 +1876,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
-                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
                     requestLogIgnoredFields: request.ignoredFields,
@@ -1842,7 +1894,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                     timeout: configuration.backpressureStallTimeout,
                     configuration: configuration,
                     requestLogPreamble: requestLogPreamble,
-                    requestLogRequestID: handle?.responseID ?? requestLogID,
+                    requestID: currentResponseID(),
                     requestLogStream: request.stream,
                     requestLogModel: configuration.launchedModel,
                     requestLogIgnoredFields: request.ignoredFields,
@@ -1857,7 +1909,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             }
             configuration.requestFailureReporter?(
                 requestFailureDiagnosticLine(
-                    requestID: handle?.responseID ?? configuration.launchedModel,
+                    requestID: currentResponseID(),
                     error: error))
             _ = await handle?.lease.fail("generation failed")
             if let writeCancellation = await writeFailureIfPossible(
@@ -1868,7 +1920,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 timeout: configuration.backpressureStallTimeout,
                 configuration: configuration,
                 requestLogPreamble: requestLogPreamble,
-                requestLogRequestID: handle?.responseID ?? requestLogID,
+                requestID: currentResponseID(),
                 requestLogStream: request.stream,
                 requestLogModel: configuration.launchedModel,
                 requestLogIgnoredFields: request.ignoredFields,
@@ -2348,6 +2400,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         timeout: Duration
     ) async throws {
         var headers = HTTPHeaders()
+        addRequestID(handle.responseID, to: &headers)
         headers.add(name: "content-type", value: "text/event-stream")
         headers.add(name: "cache-control", value: "no-cache")
         headers.add(name: "x-accel-buffering", value: "no")
@@ -2474,6 +2527,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             throw RunError.responseLimitExceeded
         }
         var headers = HTTPHeaders()
+        addRequestID(handle.responseID, to: &headers)
         headers.add(name: "content-type", value: "application/json")
         headers.add(name: "content-length", value: "\(data.count)")
         addCompletionBudgetHeaders(from: handle, to: &headers)
@@ -2500,6 +2554,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         contentType: String,
         keepAlive: Bool,
         isHead: Bool = false,
+        requestID: String,
         channel: any Channel,
         control: ServingTransportRequestControl,
         timeout: Duration,
@@ -2507,6 +2562,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
     ) async throws {
         let data = Data(text.utf8)
         var headers = HTTPHeaders()
+        addRequestID(requestID, to: &headers)
         headers.add(name: "content-type", value: contentType)
         headers.add(name: "content-length", value: "\(data.count)")
         if !keepAlive {
@@ -2696,7 +2752,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         timeout: Duration,
         configuration: ServingHTTPConfiguration? = nil,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
-        requestLogRequestID: String? = nil,
+        requestID: String,
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
         requestLogIgnoredFields: [String] = [],
@@ -2715,7 +2771,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: requestLogRequestID ?? UUID().uuidString,
+                requestID: requestID,
                 status: reportedStatus,
                 outcome: outcome,
                 stream: requestLogStream,
@@ -2736,6 +2792,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await close(channel)
             } else {
                 var headers = HTTPHeaders()
+                addRequestID(requestID, to: &headers)
                 headers.add(name: "content-type", value: "application/json")
                 headers.add(name: "content-length", value: "\(data.count)")
                 if !keepAlive {
@@ -2809,7 +2866,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         timeout: Duration,
         configuration: ServingHTTPConfiguration? = nil,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
-        requestLogRequestID: String? = nil,
+        requestID: String,
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
         requestLogIgnoredFields: [String] = [],
@@ -2831,7 +2888,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: requestLogRequestID ?? UUID().uuidString,
+                requestID: requestID,
                 status: reportedStatus,
                 outcome: outcome,
                 stream: requestLogStream,
@@ -2851,6 +2908,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
                 await close(channel)
             } else {
                 var headers = HTTPHeaders()
+                addRequestID(requestID, to: &headers)
                 headers.add(name: "content-type", value: "application/json")
                 headers.add(name: "content-length", value: "\(data.count)")
                 if !keepAlive {
@@ -2906,6 +2964,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         configuration: ServingHTTPConfiguration,
         channel: any Channel,
         control: ServingTransportRequestControl,
+        requestID: String,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
         finalWriteRaceTestHook: (@Sendable () async -> Void)? = nil
     ) async {
@@ -2919,6 +2978,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             timeout: configuration.backpressureStallTimeout,
             configuration: configuration,
             requestLogPreamble: requestLogPreamble,
+            requestID: requestID,
             finalWriteRaceTestHook: finalWriteRaceTestHook)
     }
 
@@ -2968,7 +3028,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
         timeout: Duration,
         configuration: ServingHTTPConfiguration? = nil,
         requestLogPreamble: ServingRequestLogPreamble? = nil,
-        requestLogRequestID: String? = nil,
+        requestID: String,
         requestLogStream: Bool? = nil,
         requestLogModel: String? = nil,
         requestLogIgnoredFields: [String] = [],
@@ -3000,7 +3060,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             emitRequestLog(
                 configuration: configuration,
                 preamble: requestLogPreamble,
-                requestID: requestLogRequestID ?? UUID().uuidString,
+                requestID: requestID,
                 status: Int(status.code),
                 outcome: outcome,
                 stream: requestLogStream,
@@ -3013,6 +3073,7 @@ private extension OpenAIChatCompletionsHTTPHandler {
             let data = try JSONEncoder.openAI.encode(
                 OpenAIErrorEnvelope(error: payload))
             var headers = HTTPHeaders()
+            addRequestID(requestID, to: &headers)
             headers.add(name: "content-type", value: "application/json")
             headers.add(name: "content-length", value: "\(data.count)")
             if let retryAfterSeconds = admissionError.retryAfterSeconds {

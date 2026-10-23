@@ -4200,6 +4200,499 @@ final class OpenAIChatCompletionsHTTPHandlerTests: XCTestCase {
         XCTAssertEqual(backend.snapshot().startCount, 0)
         _ = try await channel.finish()
     }
+
+    // MARK: - x-request-id response header (cycle 288)
+
+    /// Runs one request against a fresh channel and returns the response plus its single
+    /// `x-request-id` (failing if the response carries zero or several, or an empty one).
+    private func requestIDExchange(
+        _ label: String,
+        backend: any ServingGenerationBackend = ScriptedBackend(scripts: []),
+        configuration: ServingHTTPConfiguration = defaultConfiguration(),
+        send: (NIOAsyncTestingChannel) async throws -> Void
+    ) async throws -> (response: CollectedResponse, id: String) {
+        let channel = try await makeChannel(backend: backend, configuration: configuration)
+        try await send(channel)
+        let response = try await collectResponse(from: channel)
+        let id = singleRequestID(of: response, label)
+        _ = try await channel.finish(acceptAlreadyClosed: true)
+        return (response, id)
+    }
+
+    private func singleRequestID(of response: CollectedResponse, _ label: String) -> String {
+        let values = response.head.headers["x-request-id"]
+        XCTAssertEqual(values.count, 1, "\(label): exactly one x-request-id header")
+        let id = values.first ?? ""
+        XCTAssertFalse(id.isEmpty, "\(label): x-request-id must be non-empty")
+        return id
+    }
+
+    private func loggedRequestID(
+        _ recorder: RequestLogRecorder,
+        _ label: String
+    ) async throws -> String? {
+        await waitUntil { recorder.lines().count >= 1 }
+        XCTAssertEqual(recorder.lines().count, 1, "\(label): exactly one request-log line")
+        let object = try requestLogJSONObject(try XCTUnwrap(recorder.lines().first))
+        return object["request_id"] as? String
+    }
+
+    // T1: every response class carries exactly one non-empty x-request-id, HEAD included.
+    func testEveryResponseClassCarriesExactlyOneRequestID() async throws {
+        let metricsConfiguration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            metricsSnapshot: { try emptyResourceSnapshot() })
+        let tokenConfiguration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: "secret",
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1))
+
+        // GET and HEAD on every read-only route, plus unknown route / unknown model (404).
+        for method in [HTTPMethod.GET, .HEAD] {
+            for uri in [
+                "/healthz", "/readyz", "/v1/models", "/v1/models/qwen3-32b", "/metrics",
+                "/v1/models/other-model", "/nope",
+            ] {
+                _ = try await requestIDExchange(
+                    "\(method) \(uri)", configuration: metricsConfiguration
+                ) { channel in
+                    try await writeHeadOnlyRequest(channel, method: method, uri: uri)
+                }
+            }
+        }
+        // 405 (GET/HEAD/POST forms), 401, and a 400 for a body on a bodyless route.
+        for (method, uri) in [
+            (HTTPMethod.POST, "/healthz"), (.DELETE, "/metrics"), (.GET, "/v1/chat/completions"),
+            (.HEAD, "/v1/chat/completions"),
+        ] {
+            _ = try await requestIDExchange("405 \(method) \(uri)") { channel in
+                try await writeHeadOnlyRequest(channel, method: method, uri: uri)
+            }
+        }
+        _ = try await requestIDExchange("401", configuration: tokenConfiguration) { channel in
+            try await writeHeadOnlyRequest(channel, method: .GET, uri: "/v1/models")
+        }
+        _ = try await requestIDExchange("400 body on GET") { channel in
+            try await writeHeadWithBodyRequest(
+                channel, method: .GET, uri: "/healthz", body: "hello")
+        }
+        // 400 invalid JSON, 413 oversize declared body, 415 wrong content type.
+        _ = try await requestIDExchange("400 invalid json") { channel in
+            try await writeRequest(channel, body: "not json")
+        }
+        _ = try await requestIDExchange("413") { channel in
+            _ = try await channel.writeInbound(
+                HTTPServerRequestPart.head(
+                    validHead(contentLength: 1_000_000_000_000)))
+            _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+        }
+        _ = try await requestIDExchange("415") { channel in
+            var head = validHead(contentLength: 2)
+            head.headers.replaceOrAdd(name: "content-type", value: "text/plain")
+            _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+            _ = try await channel.writeInbound(HTTPServerRequestPart.body(ByteBuffer(string: "{}")))
+            _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+        }
+        // Embeddings with no embedding model loaded: 404.
+        _ = try await requestIDExchange("404 embeddings") { channel in
+            let body = #"{"model":"qwen3-32b","input":"hi"}"#
+            try await writeRequest(channel, body: body, uri: "/v1/embeddings")
+        }
+        // /metrics with no snapshot provider: 500 through writeMetricsFailure.
+        _ = try await requestIDExchange("500 metrics") { channel in
+            try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+        }
+        // Generation responses: chat and legacy completions, streaming and not.
+        for stream in [false, true] {
+            _ = try await requestIDExchange(
+                "200 chat stream=\(stream)",
+                backend: ScriptedBackend(scripts: [
+                    .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+                ])
+            ) { channel in
+                try await writeRequest(channel, body: requestBody(stream: stream))
+            }
+            _ = try await requestIDExchange(
+                "200 completions stream=\(stream)",
+                backend: ScriptedBackend(scripts: [
+                    .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+                ])
+            ) { channel in
+                try await writeCompletionsRequest(
+                    channel, body: completionsRequestBody(stream: stream))
+            }
+        }
+        // Admission refusal (429), typed serving failure (500), untyped failure (500).
+        _ = try await requestIDExchange(
+            "429 admission",
+            backend: ScriptedBackend(scripts: [.admissionRejected(.queueFull(retryAfterSeconds: 2))])
+        ) { channel in
+            try await writeRequest(channel, body: requestBody(stream: false))
+        }
+        _ = try await requestIDExchange(
+            "500 serving error",
+            backend: ScriptedBackend(scripts: [.servingError(.server("boom", code: "boom_code"))])
+        ) { channel in
+            try await writeRequest(channel, body: requestBody(stream: false))
+        }
+        _ = try await requestIDExchange(
+            "500 untyped failure", backend: ScriptedBackend(scripts: [.untypedFailure])
+        ) { channel in
+            try await writeRequest(channel, body: requestBody(stream: false))
+        }
+        // Embeddings success.
+        let embeddingsChannel = try await NIOAsyncTestingChannel { channel in
+            try channel.pipeline.syncOperations.addHandler(
+                OpenAIChatCompletionsHTTPHandler(
+                    configuration: defaultConfiguration(),
+                    backend: ScriptedBackend(scripts: []),
+                    embeddingsBackend: RequestIDEmbeddingsBackend()))
+        }
+        try await writeRequest(
+            embeddingsChannel, body: #"{"model":"qwen3-32b","input":"hi"}"#,
+            uri: "/v1/embeddings")
+        let embeddings = try await collectResponse(from: embeddingsChannel)
+        XCTAssertEqual(embeddings.head.status, .ok)
+        _ = singleRequestID(of: embeddings, "200 embeddings")
+        _ = try await embeddingsChannel.finish(acceptAlreadyClosed: true)
+    }
+
+    // T2: with request logging on, the header equals the logged request_id; for generation
+    // responses it also equals the response body id.
+    func testRequestIDHeaderEqualsLoggedRequestIDAcrossOutcomes() async throws {
+        // Success, non-streaming chat: header == log == body id.
+        do {
+            let recorder = RequestLogRecorder()
+            let (response, id) = try await requestIDExchange(
+                "chat success",
+                backend: ScriptedBackend(scripts: [
+                    .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+                ]),
+                configuration: requestLogConfiguration(sink: recorder.sink())
+            ) { channel in
+                try await writeRequest(channel, body: requestBody(stream: false))
+            }
+            XCTAssertEqual(response.head.status, .ok)
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+            XCTAssertEqual(object["id"] as? String, id, "chat body id equals header")
+            let logged = try await loggedRequestID(recorder, "chat success")
+            XCTAssertEqual(logged, id, "chat success: logged request_id equals header")
+        }
+        // Streaming chat: header == log == every chunk id.
+        do {
+            let recorder = RequestLogRecorder()
+            let (response, id) = try await requestIDExchange(
+                "chat stream",
+                backend: ScriptedBackend(scripts: [
+                    .completed(text: ["hel", "lo"], promptTokens: 1, completionTokens: 2)
+                ]),
+                configuration: requestLogConfiguration(sink: recorder.sink())
+            ) { channel in
+                try await writeRequest(channel, body: requestBody(stream: true))
+            }
+            // The SSE head is the whole `collectResponse` read; the chunk stream follows it.
+            let events = try sseJSONEvents(from: response.body)
+            XCTAssertFalse(events.isEmpty)
+            for event in events {
+                XCTAssertEqual(event["id"] as? String, id, "every chunk id equals header")
+            }
+            let logged = try await loggedRequestID(recorder, "chat stream")
+            XCTAssertEqual(logged, id, "chat stream: logged request_id equals header")
+        }
+        // Legacy completions: header == log; body id is the cmpl- spelling of the same id.
+        do {
+            let recorder = RequestLogRecorder()
+            let (response, id) = try await requestIDExchange(
+                "completions success",
+                backend: ScriptedBackend(scripts: [
+                    .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+                ]),
+                configuration: requestLogConfiguration(sink: recorder.sink())
+            ) { channel in
+                try await writeCompletionsRequest(
+                    channel, body: completionsRequestBody(stream: false))
+            }
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(response.body.utf8)) as? [String: Any])
+            XCTAssertTrue(id.hasPrefix("chatcmpl-"), "scripted handle id: \(id)")
+            XCTAssertEqual(
+                object["id"] as? String, "cmpl-" + id.dropFirst("chatcmpl-".count))
+            let logged = try await loggedRequestID(recorder, "completions success")
+            XCTAssertEqual(logged, id)
+        }
+        // Validation error (400), unknown route (404), probe (200): header == log.
+        let staticCases: [(label: String, send: (NIOAsyncTestingChannel) async throws -> Void)] = [
+            ("400 validation", { channel in try await writeRequest(channel, body: "not json") }),
+            (
+                "404 unknown route",
+                { channel in try await writeHeadOnlyRequest(channel, method: .GET, uri: "/nope") }
+            ),
+            (
+                "200 healthz",
+                { channel in
+                    try await writeHeadOnlyRequest(channel, method: .GET, uri: "/healthz")
+                }
+            ),
+            (
+                "405",
+                { channel in
+                    try await writeHeadOnlyRequest(channel, method: .POST, uri: "/healthz")
+                }
+            ),
+        ]
+        for testCase in staticCases {
+            let recorder = RequestLogRecorder()
+            let (_, id) = try await requestIDExchange(
+                testCase.label, configuration: requestLogConfiguration(sink: recorder.sink()),
+                send: testCase.send)
+            let logged = try await loggedRequestID(recorder, testCase.label)
+            XCTAssertEqual(logged, id, "\(testCase.label): logged request_id equals header")
+        }
+        // Auth error (401).
+        do {
+            let recorder = RequestLogRecorder()
+            let configuration = ServingHTTPConfiguration(
+                launchedModel: "qwen3-32b",
+                requestLimits: .productionDefault,
+                requiredBearerToken: "secret",
+                maximumNonStreamingResponseBytes: 1_048_576,
+                backpressureStallTimeout: .seconds(1),
+                requestLog: recorder.sink())
+            let (response, id) = try await requestIDExchange(
+                "401", configuration: configuration
+            ) { channel in
+                try await writeRequest(channel, body: requestBody(stream: false))
+            }
+            XCTAssertEqual(response.head.status, .unauthorized)
+            let logged = try await loggedRequestID(recorder, "401")
+            XCTAssertEqual(logged, id, "401: logged request_id equals header")
+        }
+        // Admission refusal (429) and generation failures (500): header == log.
+        let failureCases: [(label: String, script: ScriptedBackend.Script)] = [
+            ("429 admission", .admissionRejected(.queueFull(retryAfterSeconds: 2))),
+            ("500 serving error", .servingError(.server("boom", code: "boom_code"))),
+            ("500 untyped failure", .untypedFailure),
+        ]
+        for testCase in failureCases {
+            let recorder = RequestLogRecorder()
+            let (_, id) = try await requestIDExchange(
+                testCase.label,
+                backend: ScriptedBackend(scripts: [testCase.script]),
+                configuration: requestLogConfiguration(sink: recorder.sink())
+            ) { channel in
+                try await writeRequest(channel, body: requestBody(stream: false))
+            }
+            let logged = try await loggedRequestID(recorder, testCase.label)
+            XCTAssertEqual(logged, id, "\(testCase.label): logged request_id equals header")
+        }
+        // Embeddings (success 200 and a backend failure 500) and /metrics (200): these routes
+        // mint no backend handle, so header == log == the per-request id.
+        let embeddingsCases: [(label: String, backend: any ServingEmbeddingsBackend, status: HTTPResponseStatus)] = [
+            ("embeddings success", RequestIDEmbeddingsBackend(), .ok),
+            ("embeddings backend failure", RequestIDFailingEmbeddingsBackend(), .internalServerError),
+        ]
+        for testCase in embeddingsCases {
+            let recorder = RequestLogRecorder()
+            let channel = try await NIOAsyncTestingChannel { channel in
+                try channel.pipeline.syncOperations.addHandler(
+                    OpenAIChatCompletionsHTTPHandler(
+                        configuration: requestLogConfiguration(sink: recorder.sink()),
+                        backend: ScriptedBackend(scripts: []),
+                        embeddingsBackend: testCase.backend))
+            }
+            try await writeRequest(
+                channel, body: #"{"model":"qwen3-32b","input":"hi"}"#, uri: "/v1/embeddings")
+            let response = try await collectResponse(from: channel)
+            XCTAssertEqual(response.head.status, testCase.status, testCase.label)
+            let id = singleRequestID(of: response, testCase.label)
+            _ = try await channel.finish(acceptAlreadyClosed: true)
+            let logged = try await loggedRequestID(recorder, testCase.label)
+            XCTAssertEqual(logged, id, "\(testCase.label): logged request_id equals header")
+        }
+        do {
+            let recorder = RequestLogRecorder()
+            let configuration = ServingHTTPConfiguration(
+                launchedModel: "qwen3-32b",
+                requestLimits: .productionDefault,
+                requiredBearerToken: nil,
+                maximumNonStreamingResponseBytes: 1_048_576,
+                backpressureStallTimeout: .seconds(1),
+                metricsSnapshot: { try emptyResourceSnapshot() },
+                requestLog: recorder.sink())
+            let (response, id) = try await requestIDExchange(
+                "200 metrics", configuration: configuration
+            ) { channel in
+                try await writeHeadOnlyRequest(channel, method: .GET, uri: "/metrics")
+            }
+            XCTAssertEqual(response.head.status, .ok)
+            let logged = try await loggedRequestID(recorder, "200 metrics")
+            XCTAssertEqual(logged, id, "200 metrics: logged request_id equals header")
+        }
+    }
+
+    // T3: two requests on one keep-alive connection get different ids.
+    func testKeepAliveRequestsOnOneConnectionGetDistinctRequestIDs() async throws {
+        let backend = ScriptedBackend(scripts: [
+            .completed(text: ["a"], promptTokens: 1, completionTokens: 1),
+            .completed(text: ["b"], promptTokens: 1, completionTokens: 1),
+        ])
+        let channel = try await makeChannel(backend: backend)
+        var ids: [String] = []
+
+        for step in 0..<6 {
+            switch step {
+            case 0, 1:
+                try await writeHeadOnlyRequest(channel, method: .GET, uri: "/healthz")
+            case 2:
+                try await writeHeadOnlyRequest(channel, method: .GET, uri: "/nope")
+            case 3, 4:
+                try await writeRequest(channel, body: requestBody(stream: false))
+            default:
+                try await writeHeadOnlyRequest(channel, method: .HEAD, uri: "/readyz")
+            }
+            let response = try await collectResponse(from: channel)
+            ids.append(singleRequestID(of: response, "keep-alive step \(step)"))
+        }
+
+        XCTAssertEqual(Set(ids).count, ids.count, "every request gets its own id: \(ids)")
+        _ = try await channel.finish()
+    }
+
+    // T4 (edge): a client-sent x-request-id is never echoed, used as the id, or logged, and an
+    // encoded CR/LF in it cannot reach the response head.
+    func testClientSentRequestIDIsIgnored() async throws {
+        let clientValues = [
+            "attacker",
+            "abc\r\nx-injected: 1",
+            "abc%0d%0ax-injected:%201",
+        ]
+        for clientValue in clientValues {
+            let routes: [(label: String, post: Bool)] = [
+                ("GET /healthz", false), ("GET /nope", false), ("POST chat", true),
+            ]
+            for route in routes {
+                let recorder = RequestLogRecorder()
+                let label = "\(route.label) with client id \(clientValue.debugDescription)"
+                let (response, id) = try await requestIDExchange(
+                    label,
+                    backend: ScriptedBackend(scripts: [
+                        .completed(text: ["hi"], promptTokens: 1, completionTokens: 1)
+                    ]),
+                    configuration: requestLogConfiguration(sink: recorder.sink())
+                ) { channel in
+                    if route.post {
+                        let body = requestBody(stream: false)
+                        var head = validHead(contentLength: body.utf8.count)
+                        head.headers.add(name: "x-request-id", value: clientValue)
+                        _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+                        _ = try await channel.writeInbound(
+                            HTTPServerRequestPart.body(ByteBuffer(string: body)))
+                        _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+                    } else {
+                        let uri = route.label.hasSuffix("/nope") ? "/nope" : "/healthz"
+                        var head = validHead(method: .GET, uri: uri)
+                        head.headers.add(name: "x-request-id", value: clientValue)
+                        _ = try await channel.writeInbound(HTTPServerRequestPart.head(head))
+                        _ = try await channel.writeInbound(HTTPServerRequestPart.end(nil))
+                    }
+                }
+                XCTAssertNotEqual(id, clientValue, label)
+                XCTAssertFalse(id.contains("attacker"), label)
+                XCTAssertFalse(id.contains("abc"), label)
+                XCTAssertFalse(id.contains("\r") || id.contains("\n"), label)
+                XCTAssertNil(response.head.headers.first(name: "x-injected"), label)
+                let logged = try await loggedRequestID(recorder, label)
+                XCTAssertEqual(logged, id, label)
+            }
+        }
+    }
+
+    // T5: a generation failure before any backend handle exists reports the per-request id (the
+    // one the response header carries) as the diagnostic `request_id`, not the model name.
+    func testGenerationFailureBeforeHandleReportsPerRequestIDNotModelName() async throws {
+        let diagnostics = RequestLogRecorder()
+        let recorder = RequestLogRecorder()
+        let configuration = ServingHTTPConfiguration(
+            launchedModel: "qwen3-32b",
+            requestLimits: .productionDefault,
+            requiredBearerToken: nil,
+            maximumNonStreamingResponseBytes: 1_048_576,
+            backpressureStallTimeout: .seconds(1),
+            requestFailureReporter: diagnostics.sink(),
+            requestLog: recorder.sink())
+        let (response, id) = try await requestIDExchange(
+            "untyped failure",
+            backend: ScriptedBackend(scripts: [.untypedFailure]),
+            configuration: configuration
+        ) { channel in
+            try await writeRequest(channel, body: requestBody(stream: false))
+        }
+        XCTAssertEqual(response.head.status, .internalServerError)
+        await waitUntil { diagnostics.lines().count == 1 }
+
+        let line = try XCTUnwrap(diagnostics.lines().first)
+        XCTAssertTrue(
+            line.contains("request_id=\(id) "),
+            "diagnostic request_id must be the header id \(id); got: \(line)")
+        XCTAssertFalse(line.contains("request_id=qwen3-32b"), "got: \(line)")
+        let logged = try await loggedRequestID(recorder, "untyped failure")
+        XCTAssertEqual(logged, id)
+    }
+
+    // T6: once a backend handle exists, a failure answers with the handle's responseID (not a
+    // per-request UUID) in both the x-request-id header and the request-log request_id. The
+    // scripted backend returns a valid handle ("chatcmpl-1") and then emits tool calls on the
+    // legacy /v1/completions route, which the handler rejects as an invalid backend handle after
+    // the handle is attached and before any response head is written (a 500).
+    func testFailureAfterHandleUsesHandleResponseIDInHeaderAndLog() async throws {
+        let recorder = RequestLogRecorder()
+        let backend = ScriptedBackend(scripts: [
+            .completedWithToolCalls(
+                text: ["hi"],
+                toolCalls: [
+                    OpenAIToolCall(id: "call_1", function: .init(name: "get_weather", arguments: "{}"))
+                ],
+                finishReason: .toolCalls,
+                promptTokens: 1,
+                completionTokens: 1)
+        ])
+        let (response, id) = try await requestIDExchange(
+            "failure after handle",
+            backend: backend,
+            configuration: requestLogConfiguration(sink: recorder.sink())
+        ) { channel in
+            try await writeCompletionsRequest(
+                channel, body: completionsRequestBody(stream: false))
+        }
+
+        XCTAssertEqual(response.head.status, .internalServerError)
+        XCTAssertEqual(backend.snapshot().startCount, 1, "the handle must have been minted")
+        XCTAssertEqual(id, "chatcmpl-1", "header carries the handle's responseID")
+        XCTAssertNil(UUID(uuidString: id), "header must not be a per-request UUID: \(id)")
+        let logged = try await loggedRequestID(recorder, "failure after handle")
+        XCTAssertEqual(logged, "chatcmpl-1", "logged request_id is the handle's responseID")
+        XCTAssertEqual(logged, id)
+    }
+}
+
+private final class RequestIDFailingEmbeddingsBackend: ServingEmbeddingsBackend, Sendable {
+    func embed(_ request: OpenAIEmbeddingsRequest) async throws -> ServingEmbeddingsResult {
+        throw DistinctiveUntypedGenerationFailure()
+    }
+}
+
+private final class RequestIDEmbeddingsBackend: ServingEmbeddingsBackend, Sendable {
+    func embed(_ request: OpenAIEmbeddingsRequest) async throws -> ServingEmbeddingsResult {
+        ServingEmbeddingsResult(
+            vectors: request.inputs.map { _ in [0.25, 0.5, 0.75] }, promptTokens: 1)
+    }
 }
 
 private struct CollectedResponse {
