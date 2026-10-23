@@ -4566,5 +4566,251 @@ class ProxySaturationSnapshotTests(unittest.TestCase):
         holder.join(timeout=5)
 
 
+class ProxyAdoptsEngineRequestIdTests(unittest.TestCase):
+    """Cycle 290: the proxy's request id is the upstream engine's
+    ``x-request-id`` when exactly one valid, non-echoed one is relayed;
+    otherwise a minted 32-hex id. Every proxy-originated response carries
+    exactly one ``x-request-id`` equal to ``X-FastMLX-Request-Id``.
+    """
+
+    ENGINE_ID = "0b0f6a52-3c1d-4e0a-9d51-7f2f6f1e8a10"
+
+    def setUp(self):
+        self._servers = []
+        self._listeners = []
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for server in self._servers:
+            server.shutdown()
+            server.server_close()
+            server._test_thread.join(timeout=5)
+        for listener in self._listeners:
+            listener.close()
+
+    # -- helpers ---------------------------------------------------------
+    def _start_proxy(self, upstream_port, log_hook=None, **kwargs):
+        server = FASTMLX_PROXY.create_server(
+            "127.0.0.1", 0, "127.0.0.1", upstream_port, FIXTURE_PLAN, log_hook=log_hook, **kwargs
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        server._test_thread = thread
+        self._servers.append(server)
+        return server
+
+    def _collector(self):
+        entries = []
+        arrived = threading.Event()
+
+        def hook(entry):
+            if entry.get("event") == "saturation_snapshot":
+                return
+            entries.append(entry)
+            arrived.set()
+
+        return entries, arrived, hook
+
+    def _raw_upstream(self, status_and_headers: bytes, body: bytes = b""):
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            conn.sendall(status_and_headers + b"\r\n" + body)
+
+        listener, _ = _start_raw_socket_upstream(handle)
+        self._listeners.append(listener)
+        return listener.getsockname()[1]
+
+    @staticmethod
+    def _ids(resp):
+        return [v for n, v in resp.getheaders() if n.lower() == "x-request-id"]
+
+    def _get(self, proxy, path="/v1/models", headers=None, method="GET"):
+        conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=10)
+        conn.request(method, path, headers=headers or {})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp
+
+    def _assert_minted(self, value):
+        self.assertEqual(len(value), 32)
+        int(value, 16)
+
+    def _relay(self, extra_headers: bytes, streamed: bool, client_headers=None):
+        body = b"hello"
+        if streamed:
+            upstream = self._raw_upstream(b"HTTP/1.1 200 OK\r\n" + extra_headers, body)
+        else:
+            upstream = self._raw_upstream(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n" + extra_headers, body
+            )
+        entries, arrived, hook = self._collector()
+        proxy = self._start_proxy(upstream, log_hook=hook)
+        resp = self._get(proxy, headers=client_headers)
+        self.assertTrue(arrived.wait(timeout=5), "request was never logged")
+        self.assertEqual(resp.status, 200)
+        return resp, entries[0]
+
+    # -- T1 --------------------------------------------------------------
+    def test_t1_relayed_200_adopts_engine_id_buffered_and_streamed(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                resp, entry = self._relay(
+                    b"x-request-id: " + self.ENGINE_ID.encode() + b"\r\n", streamed
+                )
+                self.assertEqual(resp.getheader("X-FastMLX-Request-Id"), self.ENGINE_ID)
+                self.assertEqual(self._ids(resp), [self.ENGINE_ID])
+                self.assertEqual(entry["request_id"], self.ENGINE_ID)
+
+    # -- T2 --------------------------------------------------------------
+    def _assert_proxy_originated(self, resp, entries=None, arrived=None):
+        ids = self._ids(resp)
+        self.assertEqual(len(ids), 1, resp.getheaders())
+        self.assertEqual(ids[0], resp.getheader("X-FastMLX-Request-Id"))
+        self._assert_minted(ids[0])
+        if entries is not None:
+            self.assertTrue(arrived.wait(timeout=5), "request was never logged")
+            self.assertEqual(entries[0]["request_id"], ids[0])
+
+    def test_t2_proxy_originated_responses_carry_one_matching_request_id(self):
+        # 502 upstream unavailable: a port that was bound then closed.
+        dead = socket.socket()
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()
+        entries, arrived, hook = self._collector()
+        proxy = self._start_proxy(dead_port, log_hook=hook, )
+        resp = self._get(proxy)
+        self.assertEqual(resp.status, 502)
+        self._assert_proxy_originated(resp, entries, arrived)
+
+        # provenance 200
+        entries, arrived, hook = self._collector()
+        proxy = self._start_proxy(dead_port, log_hook=hook)
+        resp = self._get(proxy, "/fastmlx/provenance")
+        self.assertEqual(resp.status, 200)
+        self._assert_proxy_originated(resp, entries, arrived)
+
+        # 411 / 400 / 413 via raw requests
+        for raw, status, kwargs in (
+            (b"POST /v1/x HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", 411, {}),
+            (b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n", 400, {}),
+            (
+                b"POST /v1/x HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n",
+                413,
+                {"max_request_body_bytes": 10},
+            ),
+        ):
+            with self.subTest(status=status):
+                entries, arrived, hook = self._collector()
+                proxy = self._start_proxy(dead_port, log_hook=hook, **kwargs)
+                sock = socket.create_connection(("127.0.0.1", proxy.server_address[1]), timeout=5)
+                sock.sendall(raw)
+                resp = http.client.HTTPResponse(sock)
+                resp.begin()
+                resp.read()
+                sock.close()
+                self.assertEqual(resp.status, status)
+                self._assert_proxy_originated(resp, entries, arrived)
+
+    def test_t2_capacity_refusal_503_carries_one_matching_request_id(self):
+        gate = threading.Event()
+        held = threading.Event()
+
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            held.set()
+            gate.wait(timeout=10)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+        listener, _ = _start_raw_socket_upstream(handle)
+        self._listeners.append(listener)
+        self.addCleanup(gate.set)
+        entries, arrived, hook = self._collector()
+        proxy = self._start_proxy(listener.getsockname()[1], log_hook=hook, max_concurrent_requests=1)
+
+        def hold():
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=15)
+            conn.request("GET", "/v1/models")
+            conn.getresponse().read()
+            conn.close()
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        self.assertTrue(held.wait(timeout=5))
+        resp = self._get(proxy)
+        self.assertEqual(resp.status, 503)
+        self.assertTrue(arrived.wait(timeout=5))
+        self._assert_proxy_originated(resp, entries, arrived)
+        gate.set()
+        holder.join(timeout=5)
+
+    # -- T3 --------------------------------------------------------------
+    def test_t3_truncated_body_502_carries_the_engine_id(self):
+        upstream = self._raw_upstream(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nx-request-id: "
+            + self.ENGINE_ID.encode()
+            + b"\r\n",
+            b"short",
+        )
+        entries, arrived, hook = self._collector()
+        proxy = self._start_proxy(upstream, log_hook=hook)
+        resp = self._get(proxy)
+        self.assertEqual(resp.status, 502)
+        self.assertTrue(arrived.wait(timeout=5))
+        self.assertEqual(resp.getheader("X-FastMLX-Request-Id"), self.ENGINE_ID)
+        self.assertEqual(self._ids(resp), [self.ENGINE_ID])
+        self.assertEqual(entries[0]["request_id"], self.ENGINE_ID)
+
+    # -- T4 --------------------------------------------------------------
+    def test_t4_invalid_upstream_ids_fall_back_to_minted_and_relay_verbatim(self):
+        cases = {
+            "two headers": (b"x-request-id: aaa\r\nx-request-id: bbb\r\n", ["aaa", "bbb"]),
+            "129 chars": (b"x-request-id: " + b"a" * 129 + b"\r\n", ["a" * 129]),
+            "bad charset": (b"x-request-id: abc def/ghi\r\n", ["abc def/ghi"]),
+        }
+        for label, (headers, relayed) in cases.items():
+            for streamed in (False, True):
+                with self.subTest(case=label, streamed=streamed):
+                    resp, entry = self._relay(headers, streamed)
+                    minted = resp.getheader("X-FastMLX-Request-Id")
+                    self._assert_minted(minted)
+                    self.assertEqual(entry["request_id"], minted)
+                    self.assertEqual(self._ids(resp), relayed)
+
+    # -- T5 --------------------------------------------------------------
+    def test_t5_no_upstream_id_means_minted_and_no_x_request_id_added(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                resp, entry = self._relay(b"", streamed)
+                minted = resp.getheader("X-FastMLX-Request-Id")
+                self._assert_minted(minted)
+                self.assertEqual(entry["request_id"], minted)
+                self.assertEqual(self._ids(resp), [])
+
+    # -- T6 --------------------------------------------------------------
+    def test_t6_upstream_echo_of_client_id_is_not_adopted(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                resp, entry = self._relay(
+                    b"x-request-id: client-0123\r\n",
+                    streamed,
+                    client_headers={"x-request-id": "client-0123"},
+                )
+                minted = resp.getheader("X-FastMLX-Request-Id")
+                self._assert_minted(minted)
+                self.assertEqual(entry["request_id"], minted)
+                self.assertEqual(self._ids(resp), ["client-0123"])
+
+    def test_client_id_does_not_block_a_different_engine_id(self):
+        resp, entry = self._relay(
+            b"x-request-id: " + self.ENGINE_ID.encode() + b"\r\n",
+            False,
+            client_headers={"x-request-id": "client-0123"},
+        )
+        self.assertEqual(resp.getheader("X-FastMLX-Request-Id"), self.ENGINE_ID)
+        self.assertEqual(entry["request_id"], self.ENGINE_ID)
+
+
 if __name__ == "__main__":
     unittest.main()

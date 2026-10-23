@@ -29,7 +29,7 @@ import time
 import uuid
 from http import client as http_client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Collection, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 
@@ -276,6 +276,33 @@ def _saturation_threshold(max_concurrent_requests: int) -> int:
 
 def _sanitize_header_value(value: object) -> str:
     return _NON_PRINTABLE_ASCII.sub("", str(value))
+
+
+_ADOPTABLE_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+
+def _adopt_upstream_request_id(
+    upstream_headers: List[Tuple[str, str]], client_request_ids: Collection[str]
+) -> Optional[str]:
+    """The engine's ``x-request-id`` if this proxy may adopt it as its own
+    request id, else ``None`` (the caller keeps its minted id).
+
+    Adopted only when the upstream sent EXACTLY ONE ``x-request-id`` header
+    (counted over the full header list, never a joined ``getheader``),
+    its value is 1-128 characters of ``[A-Za-z0-9._:-]``, and it does not
+    equal any ``x-request-id`` the CLIENT sent -- a third-party engine that
+    echoes the client's header must not let a client choose the id written
+    to the operator's log.
+    """
+    values = [value for name, value in upstream_headers if name.lower() == "x-request-id"]
+    if len(values) != 1:
+        return None
+    value = values[0]
+    if _ADOPTABLE_REQUEST_ID.fullmatch(value) is None:
+        return None
+    if value in client_request_ids:
+        return None
+    return value
 
 
 def _response_write_budget_exceeded_message() -> str:
@@ -976,9 +1003,15 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
             return
 
         status = response.status
+        upstream_header_list = response.getheaders()
+        adopted_request_id = _adopt_upstream_request_id(
+            upstream_header_list, self.headers.get_all("x-request-id") or []
+        )
+        if adopted_request_id is not None:
+            request_id = adopted_request_id
         response_headers = [
             (name, value)
-            for name, value in _strip_hop_by_hop(response.getheaders())
+            for name, value in _strip_hop_by_hop(upstream_header_list)
             if not name.lower().startswith(_PROVENANCE_HEADER_PREFIX)
         ]
         response_content_length_header = response.getheader("Content-Length")
@@ -1024,12 +1057,20 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
             headers.append((_GENERATION_SCOPE_HEADER, scope))
         return headers
 
+    def _proxy_originated_headers(self, request_id: str) -> List[Tuple[str, str]]:
+        # Responses this proxy writes itself (never relayed ones, which keep
+        # the upstream's own ``x-request-id`` verbatim) also carry exactly one
+        # ``x-request-id`` equal to ``X-FastMLX-Request-Id``.
+        return self._provenance_headers_with_request_id(request_id) + [
+            ("x-request-id", _sanitize_header_value(request_id))
+        ]
+
     def _serve_provenance(self, request_id: str) -> int:
         body = json.dumps(self.server.provenance_body).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        for name, value in self._provenance_headers_with_request_id(request_id):
+        for name, value in self._proxy_originated_headers(request_id):
             self.send_header(name, value)
         self.close_connection = True
         self.end_headers()
@@ -1044,7 +1085,7 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        for name, value in self._provenance_headers_with_request_id(request_id):
+        for name, value in self._proxy_originated_headers(request_id):
             self.send_header(name, value)
         self.close_connection = True
         self.end_headers()
@@ -1778,6 +1819,7 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         ]
         headers.extend(self.provenance_headers)
         headers.append(("X-FastMLX-Request-Id", _sanitize_header_value(request_id)))
+        headers.append(("x-request-id", _sanitize_header_value(request_id)))
         header_bytes = b"".join(f"{name}: {value}\r\n".encode("utf-8") for name, value in headers)
         response = b"HTTP/1.0 503 Service Unavailable\r\n" + header_bytes + b"\r\n" + body
         try:

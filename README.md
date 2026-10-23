@@ -709,7 +709,9 @@ every response gains a fixed set of `X-FastMLX-*` headers computed once from the
 prints: `X-FastMLX-Admission`, `X-FastMLX-Card`, `X-FastMLX-Fit`, `X-FastMLX-Residency`,
 `X-FastMLX-Engine-Build`, `X-FastMLX-MTP`, `X-FastMLX-Quality-Verdict`,
 `X-FastMLX-Quality-Measured-Tokens`, and a per-request `X-FastMLX-Request-Id` (plus
-`X-FastMLX-Quality-Generation-Scope` on completion requests; see below). `GET /fastmlx/provenance` is answered by the proxy itself with the same
+`X-FastMLX-Quality-Generation-Scope` on completion requests; see below). `X-FastMLX-Request-Id` equals the engine's
+`x-request-id` when the engine sends exactly one valid id, else it is a minted 32-hex id; responses the proxy writes
+itself also carry `x-request-id` with that value. `GET /fastmlx/provenance` is answered by the proxy itself with the same
 plan summary as JSON, never the raw argv or a model path.
 
 ```sh
