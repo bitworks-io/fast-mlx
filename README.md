@@ -90,7 +90,12 @@ limits from that, so you don't have to supply them. Passing `--memory-limit-byte
 headroom. It can only lower the ceiling, never raise it, and startup tells you which ceiling
 actually bound, including when your budget turned out to be the loose one. Use `--host` / `--port`
 to change where it listens, and set `FASTMLX_API_KEY` to require Bearer auth (mandatory for a
-non-loopback `--host`).
+non-loopback `--host`). Without a key the server also refuses, with `421 host_not_allowed`, any request
+whose `Host` header is not `localhost`, a `127.x.x.x` address or `[::1]` (the port is ignored, so an
+`ssh -L` tunnel still works), and answers a missing or duplicated `Host` with `400 invalid_host_header`.
+This stops a web page you visit from reaching the server through DNS rebinding. If a local reverse
+proxy or container forwards another name, add it with `--allow-host NAME` (repeatable; refused when a
+key is set, because the check is off then). The startup line reports `host_guard=on|off`.
 
 The default launch serves on the continuous-batch route, which samples (`temperature`, `top_p`, `top_k`,
 `min_p`, `seed`) and applies `presence_penalty`, `frequency_penalty` and `repetition_penalty`. A `seed`
@@ -720,6 +725,12 @@ python3 scripts/fastmlx.py serve --model-path ./models/qwen3-8b --port 8081 --fr
 
 In front mode the engine binds `127.0.0.1` whatever `--front-host` says, so other machines reach
 only the proxy. Processes on the same Mac can still reach the engine's loopback port directly.
+Without `FASTMLX_API_KEY`, `fastmlx serve` refuses (exit 2) a `--front-host` that is not loopback, the same
+rule the engine applies to `--host`; with a key, a wider `--front-host` is allowed. A launch without a
+key also turns on the proxy's own `Host` check (the proxy rewrites `Host`, so the engine's check cannot
+cover the front port): the same `421`/`400` refusals as the engine, before any body is read or the engine
+is contacted, carrying only `x-request-id` and `X-FastMLX-Request-Id`. `--front-allow-host NAME` adds a
+name (repeatable; refused with a key). The launcher prints `fastmlx_launch=front_host_guard on|off`.
 `fastmlx serve` refuses (exit 2) if `--front-port` equals `--port`, if a passthrough argument
 (after `--`) sets the engine's host or port (`--host`, `--port`, `--hostname`, `--bind`, `-H`, or
 their `=` forms), or if the resolved engine profile itself could bypass the loopback guarantee: its

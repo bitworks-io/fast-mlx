@@ -557,6 +557,124 @@ def build_provenance_body(plan: dict) -> dict:
     }
 
 
+# -- DNS-rebinding Host guard (tokenless front proxy only) ------------------
+# A web page the operator's browser visits can rebind its own hostname to
+# 127.0.0.1 and then reach a loopback server same-origin. A Host header that
+# is not a loopback name is the tell, so on a tokenless front proxy (no
+# ``FASTMLX_API_KEY``) every request must carry exactly one well-formed Host
+# naming ``localhost``, a canonical 127.x.x.x address, ``::1`` or an operator
+# ``--front-allow-host`` name. The proxy strips Host before relaying, so the
+# engine's own guard cannot protect this port. The Host value is never echoed.
+_HOST_NAME_CHARS = re.compile(r"[a-z0-9._-]+")
+_HOST_PORT = re.compile(r"[0-9]{0,5}")
+_CANONICAL_IPV4 = re.compile(
+    r"(?:0|[1-9][0-9]{0,2})\.(?:0|[1-9][0-9]{0,2})\.(?:0|[1-9][0-9]{0,2})\.(?:0|[1-9][0-9]{0,2})"
+)
+_LDH_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+_HOST_NOT_ALLOWED = "host_not_allowed"
+_INVALID_HOST_HEADER = "invalid_host_header"
+
+
+def _canonical_ipv4_octets(name: str) -> Optional[List[int]]:
+    if not _CANONICAL_IPV4.fullmatch(name):
+        return None
+    octets = [int(part) for part in name.split(".")]
+    if any(octet > 255 for octet in octets):
+        return None
+    return octets
+
+
+def parse_host_header(value: str) -> Tuple[str, Optional[str]]:
+    """Parse one Host header value (H2). Returns ``("ok", name)`` with the
+    lowercased host (port ignored, one trailing dot stripped, IPv6 keeps its
+    brackets removed), ``("lookalike", None)`` for a value that opens a
+    bracket but is not a bracketed IPv6 literal followed by an optional port
+    (e.g. ``[::1].evil``: a syntactically odd name, never allowed), or
+    ``("malformed", None)``.
+    """
+    # Trim only SP and HT (what the engine trims); any other control or
+    # whitespace-like character left in the value is malformed, never stripped.
+    text = value.strip(" \t").lower()
+    if not text or any(ord(ch) <= 0x20 or ord(ch) == 0x7F for ch in text):
+        return "malformed", None
+    if text.startswith("["):
+        close = text.find("]")
+        if close < 0:
+            return "malformed", None
+        inner, rest = text[1:close], text[close + 1:]
+        if not inner or ":" not in inner or not re.fullmatch(r"[0-9a-f:.]+", inner):
+            return "malformed", None
+        if rest == "" or (rest.startswith(":") and _HOST_PORT.fullmatch(rest[1:])):
+            return "ok", inner
+        return "lookalike", None
+    if text.count(":") > 1:
+        return "malformed", None
+    name, _, port = text.partition(":")
+    if ":" in text and not _HOST_PORT.fullmatch(port):
+        return "malformed", None
+    if name.endswith("."):
+        name = name[:-1]
+    if not name or not _HOST_NAME_CHARS.fullmatch(name):
+        return "malformed", None
+    return "ok", name
+
+
+def is_loopback_host_name(name: str) -> bool:
+    """H3 strict loopback rule on an already-parsed lowercase host name:
+    exactly ``localhost``, a canonical dotted-quad 127.x.x.x (no leading
+    zeros), or ``::1``. Never ``*.localhost``, never a prefix/substring.
+    """
+    if name == "localhost" or name == "::1":
+        return True
+    octets = _canonical_ipv4_octets(name)
+    return octets is not None and octets[0] == 127
+
+
+def front_host_is_loopback(value: str) -> bool:
+    """F1: is a ``--front-host`` bind address strictly loopback? Case-
+    insensitive, one trailing dot stripped; a bracketed ``[::1]`` is accepted
+    too. ``0.0.0.0``, ``::``, ``127.1``, ``127.000.000.001`` and LAN names are
+    not.
+    """
+    text = value.strip().lower()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    if text.endswith("."):
+        text = text[:-1]
+    return is_loopback_host_name(text)
+
+
+def normalize_allow_host(value: str) -> str:
+    """H5 validation of one ``--front-allow-host`` name: an LDH name (labels
+    1-63, total <= 253) or a canonical IPv4. Returns the lowercase form;
+    raises ``ValueError`` (with a reason that never needs the value) for an
+    empty name, a wildcard, a port, brackets, a slash or any other character.
+    """
+    text = value.strip().lower()
+    if not text:
+        raise ValueError("is empty")
+    if "*" in text:
+        raise ValueError("must not contain a wildcard")
+    if ":" in text or "[" in text or "]" in text:
+        raise ValueError("must be a bare name: no port and no brackets")
+    if "/" in text:
+        raise ValueError("must not contain '/'")
+    if text.endswith("."):
+        text = text[:-1]
+    if not text or len(text) > 253:
+        raise ValueError("must be 1-253 characters")
+    labels = text.split(".")
+    if not all(_LDH_LABEL.fullmatch(label) for label in labels):
+        raise ValueError("must be an LDH host name (letters, digits, hyphen; labels 1-63)")
+    # Same rule as the engine's validatedAllowHost: a name whose LAST label is
+    # all digits is only accepted as a canonical dotted-quad IPv4 ("127.1",
+    # "2130706433", "1.2.3" and "10.0.0.0300" are refused, never normalized).
+    if labels[-1].isdigit() and labels[-1].isascii() and _canonical_ipv4_octets(text) is None:
+        raise ValueError("a name ending in a numeric label must be a canonical dotted-quad IPv4")
+    return text
+
+
 class _DeadlineBoundRfile:
     """Wraps the real ``self.rfile`` (an ``io.BufferedReader`` over the
     client socket) so every underlying read is bounded by the time
@@ -890,6 +1008,11 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
         # can never carry a previous request's value.
         self._generation_scope = None
 
+        # FIRST: the DNS-rebinding Host guard (tokenless only), before
+        # provenance, the body read and the upstream connect.
+        if self._refuse_disallowed_host(request_id, path_only):
+            return
+
         if self.command == "GET" and path_only == "/fastmlx/provenance":
             bytes_out = self._serve_provenance(request_id)
             self._log(request_id, self.command, path_only, 200, 0.0, bytes_out, False)
@@ -1074,6 +1197,59 @@ class ProvenanceProxyHandler(BaseHTTPRequestHandler):
             self.send_header(name, value)
         self.close_connection = True
         self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        return len(body)
+
+    def _refuse_disallowed_host(self, request_id: str, path_only: str) -> bool:
+        """The Host guard. Returns True when a refusal was written (the caller
+        returns), False when the request may proceed (guard off, or allowed).
+        """
+        enabled, extra_names = getattr(self.server, "host_guard", (False, ()))
+        if not enabled:
+            return False
+        host_values = self.headers.get_all("Host") or []
+        if len(host_values) != 1:
+            status, code, message = 400, _INVALID_HOST_HEADER, "exactly one Host header is required"
+        else:
+            verdict, name = parse_host_header(host_values[0])
+            if verdict == "malformed":
+                status, code, message = 400, _INVALID_HOST_HEADER, "the Host header is malformed"
+            elif not self.path.startswith("/"):
+                status, code, message = 421, _HOST_NOT_ALLOWED, "the request target is not allowed"
+            elif verdict == "lookalike" or not (
+                is_loopback_host_name(name) or name in extra_names
+            ):
+                status, code, message = 421, _HOST_NOT_ALLOWED, "the Host header is not allowed"
+            else:
+                return False
+        body_length = self._send_host_refusal(status, code, message, request_id)
+        self._log(request_id, self.command, path_only, status, 0.0, body_length, False, code)
+        return True
+
+    def _send_host_refusal(self, status: int, code: str, message: str, request_id: str) -> int:
+        """Writes a Host-guard refusal: deliberately NOT ``_send_json_error``,
+        which stamps the launch plan's ``X-FastMLX-*`` headers on the reply
+        (a rebinding page could read the plan) and writes a body on HEAD.
+        Only Content-Type, Content-Length, the two request-id headers and
+        ``Connection: close`` are sent. Returns the body bytes written.
+        """
+        body = json.dumps(
+            {"error": {"message": message, "type": code, "code": code}}
+        ).encode("utf-8")
+        safe_id = _sanitize_header_value(request_id)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("x-request-id", safe_id)
+        self.send_header("X-FastMLX-Request-Id", safe_id)
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        if self.command == "HEAD":
+            return 0
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError, OSError):
@@ -1409,8 +1585,12 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
         max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
         max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
         log_hook: Optional[Callable[[dict], None]] = None,
+        host_guard: Tuple[bool, Collection[str]] = (False, ()),
     ):
         super().__init__(server_address, handler_cls)
+        # (enabled, extra allowed names): the DNS-rebinding Host guard, on
+        # only for a tokenless launch (see ``_refuse_disallowed_host``).
+        self.host_guard = (bool(host_guard[0]), frozenset(host_guard[1]))
         self.upstream_host = upstream_host
         self.upstream_port = upstream_port
         self.plan = plan
@@ -1817,7 +1997,11 @@ class ProvenanceProxyServer(ThreadingHTTPServer):
             ("Retry-After", "1"),
             ("Connection", "close"),
         ]
-        headers.extend(self.provenance_headers)
+        # The accept-time 503 is written before any Host header is read, so
+        # with the Host guard on it must not hand the launch plan's X-FastMLX-*
+        # headers to a (possibly DNS-rebound) page.
+        if not self.host_guard[0]:
+            headers.extend(self.provenance_headers)
         headers.append(("X-FastMLX-Request-Id", _sanitize_header_value(request_id)))
         headers.append(("x-request-id", _sanitize_header_value(request_id)))
         header_bytes = b"".join(f"{name}: {value}\r\n".encode("utf-8") for name, value in headers)
@@ -2025,6 +2209,7 @@ def create_server(
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES,
     max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
     log_hook: Optional[Callable[[dict], None]] = None,
+    host_guard: Tuple[bool, Collection[str]] = (False, ()),
 ) -> ProvenanceProxyServer:
     """Construct (bind + listen, not yet serving) the proxy server. Raises
     ``OSError`` if ``front_host``:``front_port`` cannot be bound -- the
@@ -2042,4 +2227,5 @@ def create_server(
         max_request_body_bytes,
         max_concurrent_requests,
         log_hook,
+        host_guard,
     )

@@ -125,6 +125,10 @@ public struct ServingHTTPConfiguration: Sendable {
     /// (reference type) so every copy of this configuration value shares one recorder instance --
     /// the same sharing `ServingHTTPEvidenceConfiguration.tracker` already relies on.
     let httpMetrics: ServingHTTPMetricsRecorder
+    /// DNS-rebinding `Host` guard (cycle 291). Non-`nil` exactly when no bearer token is configured
+    /// (a missing token already implies a loopback bind); `nil` when a token is set, so tokened
+    /// servers are byte-for-byte unchanged. Built from `allowedHosts` (`--allow-host`).
+    let hostGuard: ServingHostGuard?
 
     public init(
         launchedModel: String,
@@ -137,7 +141,8 @@ public struct ServingHTTPConfiguration: Sendable {
         metricsSnapshot: ServingHTTPEvidenceConfiguration.SnapshotProvider? = nil,
         requestFailureReporter: ServingHTTPEvidenceConfiguration.FailureReporter? = nil,
         readiness: @escaping @Sendable () -> Bool = { true },
-        requestLog: (@Sendable (String) -> Void)? = nil
+        requestLog: (@Sendable (String) -> Void)? = nil,
+        allowedHosts: [String] = []
     ) {
         precondition(
             !launchedModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
@@ -151,6 +156,9 @@ public struct ServingHTTPConfiguration: Sendable {
         if let requiredBearerToken {
             precondition(!requiredBearerToken.isEmpty, "requiredBearerToken must be non-empty")
         }
+        precondition(
+            requiredBearerToken == nil || allowedHosts.isEmpty,
+            "allowedHosts is only meaningful on a server without a bearer token")
 
         self.launchedModel = launchedModel
         self.requestLimits = requestLimits
@@ -164,6 +172,8 @@ public struct ServingHTTPConfiguration: Sendable {
         self.readiness = readiness
         self.requestLog = requestLog
         self.httpMetrics = ServingHTTPMetricsRecorder()
+        self.hostGuard =
+            requiredBearerToken == nil ? ServingHostGuard(allowedHosts: allowedHosts) : nil
         precondition(
             modelCapabilities == nil || modelCapabilities?.model == launchedModel,
             "modelCapabilities must describe the launched model")

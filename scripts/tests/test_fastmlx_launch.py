@@ -1867,7 +1867,11 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
                 "--front-host": "0.0.0.0",
             }
         ) + ["--dry-run"]
-        code, stdout, _ = self.run_main(argv)
+        # Contract change (cycle 291, F1): a non-loopback --front-host needs
+        # FASTMLX_API_KEY; with one it is still a supported topology and the
+        # Host guard is off (hostGuard.enabled False).
+        with patch.dict(os.environ, {"FASTMLX_API_KEY": "test-key"}):
+            code, stdout, _ = self.run_main(argv)
         self.assertEqual(code, 0)
         plan = json.loads(stdout)
         self.assertEqual(
@@ -1878,8 +1882,210 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
         self.assertEqual(plan["argv"][plan["argv"].index("--port") + 1], "8080")
         self.assertEqual(
             plan["front"],
-            {"host": "0.0.0.0", "port": 9090, "upstream": "http://127.0.0.1:8080"},
+            {
+                "host": "0.0.0.0",
+                "port": 9090,
+                "upstream": "http://127.0.0.1:8080",
+                "hostGuard": {"enabled": False, "allow": []},
+            },
         )
+
+    # ------------------------------------------------------------------
+    # Cycle 291 (F1/F2/F4, L1-L5): a tokenless launch refuses a non-loopback
+    # --front-host (the engine refuses the same bind without a key, the
+    # launcher never did), turns the proxy's DNS-rebinding Host guard on, and
+    # announces it. A key leaves the wide bind supported and the guard off.
+    # ------------------------------------------------------------------
+    NON_LOOPBACK_FRONT_HOSTS = (
+        "0.0.0.0", "::", "203.0.113.5", "127.1", "127.000.000.001", "127.0.0.1.evil.com",
+        "localhost.evil.com", "a.localhost", "0x7f.0.0.1", "2130706433", "example.com",
+    )
+    LOOPBACK_FRONT_HOSTS = ("localhost", "LOCALHOST.", "127.0.0.1", "127.8.9.10", "::1")
+
+    def _front_args(self, **overrides):
+        values = {"--model-repo": PASS_REPO, "--context": "2048", "--front-port": "9090"}
+        values.update(overrides)
+        return self.base_args(**values)
+
+    def _run_front_launch(self, argv, env):
+        """Run ``main`` with ``create_server`` stubbed to fail the bind (exit 3
+        AFTER the front-mode validation and the announcement lines), so no
+        socket is opened and no engine is ever started. Returns
+        (code, stdout, stderr, create_server call records)."""
+        calls = []
+
+        def recording_create_server(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise OSError("address already in use")
+
+        with patch.dict(os.environ, env), patch.object(
+            FASTMLX_LAUNCH.fastmlx_proxy, "create_server", side_effect=recording_create_server
+        ):
+            code, stdout, stderr = self.run_main(argv)
+        return code, stdout, stderr, calls
+
+    @staticmethod
+    def _env_without_key():
+        env = {k: v for k, v in os.environ.items() if k != "FASTMLX_API_KEY"}
+        return env
+
+    def _tokenless(self):
+        patcher = patch.dict(os.environ, self._env_without_key(), clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_l1_tokenless_non_loopback_front_host_is_refused_before_any_engine_start(self):
+        self._tokenless()
+        for front_host in self.NON_LOOPBACK_FRONT_HOSTS:
+            for dry_run in (True, False):
+                with self.subTest(front_host=front_host, dry_run=dry_run):
+                    argv = self._front_args(**{"--front-host": front_host})
+                    if dry_run:
+                        argv += ["--dry-run"]
+                    calls = []
+                    with patch.object(
+                        FASTMLX_LAUNCH.fastmlx_proxy,
+                        "create_server",
+                        side_effect=lambda *a, **k: calls.append((a, k)),
+                    ), patch.object(FASTMLX_LAUNCH, "_run_front_mode") as run_front_mode:
+                        code, stdout, stderr = self.run_main(argv)
+                    self.assertEqual(code, 2, stderr)
+                    self.assertIn("FASTMLX_API_KEY", stderr)
+                    self.assertIn("--front-host", stderr)
+                    self.assertEqual(stdout, "", "a refused launch prints no plan")
+                    self.assertEqual(calls, [], "the proxy must not even be constructed")
+                    run_front_mode.assert_not_called()
+
+    def test_l1_tokenless_empty_key_counts_as_tokenless(self):
+        argv = self._front_args(**{"--front-host": "0.0.0.0"}) + ["--dry-run"]
+        with patch.dict(os.environ, {"FASTMLX_API_KEY": ""}):
+            code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("FASTMLX_API_KEY", stderr)
+
+    def test_l1_tokenless_loopback_front_hosts_are_admitted(self):
+        self._tokenless()
+        for front_host in self.LOOPBACK_FRONT_HOSTS:
+            with self.subTest(front_host=front_host):
+                argv = self._front_args(**{"--front-host": front_host}) + ["--dry-run"]
+                code, stdout, stderr = self.run_main(argv)
+                self.assertEqual(code, 0, stderr)
+                plan = json.loads(stdout)
+                self.assertEqual(plan["front"]["host"], front_host)
+                self.assertEqual(plan["front"]["hostGuard"], {"enabled": True, "allow": []})
+
+    def test_l2_with_a_key_a_wide_front_host_is_admitted_and_the_guard_is_off(self):
+        for front_host in ("0.0.0.0", "203.0.113.5", "::"):
+            with self.subTest(front_host=front_host):
+                argv = self._front_args(**{"--front-host": front_host})
+                code, _, stderr, calls = self._run_front_launch(
+                    argv, {"FASTMLX_API_KEY": "test-key"}
+                )
+                self.assertEqual(code, 3, stderr)  # the stubbed bind failure
+                self.assertEqual(len(calls), 1)
+                self.assertEqual(calls[0][0][0], front_host)
+                self.assertEqual(calls[0][1]["host_guard"], (False, ()))
+
+    def test_l3_guard_state_follows_the_environment_and_is_announced(self):
+        cases = (
+            ({"FASTMLX_API_KEY": "test-key"}, "off", (False, ())),
+            ({"FASTMLX_API_KEY": ""}, "on", (True, ())),
+            ({}, "on", (True, ())),
+        )
+        for env_patch, word, expected_guard in cases:
+            with self.subTest(env=env_patch):
+                env = self._env_without_key()
+                env.update(env_patch)
+                argv = self._front_args()
+                with patch.dict(os.environ, env, clear=True):
+                    code, _, stderr, calls = self._run_front_launch(argv, {})
+                self.assertEqual(code, 3, stderr)
+                lines = [line for line in stderr.splitlines() if line.startswith("fastmlx_launch=")]
+                self.assertIn(f"fastmlx_launch=front_host_guard {word}", lines)
+                self.assertEqual(
+                    sum(1 for line in lines if "front_host_guard" in line), 1, lines
+                )
+                admitted = [line for line in lines if line.startswith("fastmlx_launch=admitted")]
+                self.assertEqual(len(admitted), 1)
+                self.assertNotIn("host_guard", admitted[0], "the admitted line keeps its arity")
+                self.assertEqual(calls[0][1]["host_guard"], expected_guard)
+
+    def test_l3_front_allow_host_names_reach_the_proxy_and_the_plan(self):
+        self._tokenless()
+        argv = self._front_args(**{"--front-allow-host": "Dash.Example"}) + [
+            "--front-allow-host", "203.0.113.5", "--dry-run",
+        ]
+        code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            json.loads(stdout)["front"]["hostGuard"],
+            {"enabled": True, "allow": ["dash.example", "203.0.113.5"]},
+        )
+        code, _, stderr, calls = self._run_front_launch(
+            self._front_args() + ["--front-allow-host", "dash.example"], self._env_without_key()
+        )
+        self.assertEqual(code, 3, stderr)
+        self.assertEqual(calls[0][1]["host_guard"], (True, ("dash.example",)))
+
+    def test_l4_front_allow_host_validation_and_refusal_with_a_key(self):
+        bad_values = (
+            "", "*", "*.example.com", "host:80", "[::1]", "a/b", "-a.com", "a b", "a" * 64,
+            "evil.com@x", "ex_ample.com",
+        )
+        self._tokenless()
+        for value in bad_values:
+            with self.subTest(value=value):
+                argv = self._front_args() + ["--front-allow-host", value, "--dry-run"]
+                code, stdout, stderr = self.run_main(argv)
+                self.assertEqual(code, 2, stderr)
+                self.assertIn("--front-allow-host", stderr)
+                self.assertEqual(stdout, "")
+        # Given together with a key: refused, never silently ignored.
+        argv = self._front_args() + ["--front-allow-host", "dash.example", "--dry-run"]
+        with patch.dict(os.environ, {"FASTMLX_API_KEY": "test-key"}):
+            code, stdout, stderr = self.run_main(argv)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("FASTMLX_API_KEY", stderr)
+        self.assertIn("--front-allow-host", stderr)
+        self.assertEqual(stdout, "")
+        # Without --front-port there is no proxy to configure: refused too.
+        argv = self.base_args(**{"--model-repo": PASS_REPO, "--context": "2048"}) + [
+            "--front-allow-host", "dash.example", "--dry-run",
+        ]
+        code, _, stderr = self.run_main(argv)
+        self.assertEqual(code, 2, stderr)
+        self.assertIn("--front-port", stderr)
+
+    def test_l5_non_front_plan_and_announcements_are_byte_identical(self):
+        argv = self.base_args(**{"--model-repo": PASS_REPO, "--context": "2048"}) + ["--dry-run"]
+        outputs = []
+        for env_patch in ({}, {"FASTMLX_API_KEY": "test-key"}, {"FASTMLX_API_KEY": ""}):
+            env = self._env_without_key()
+            env.update(env_patch)
+            with patch.dict(os.environ, env, clear=True):
+                code, stdout, stderr = self.run_main(argv)
+            self.assertEqual(code, 0, stderr)
+            outputs.append(stdout)
+            self.assertNotIn("front", json.loads(stdout))
+            self.assertNotIn("hostGuard", stdout)
+            self.assertNotIn("host_guard", stderr)
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(outputs[0], outputs[2])
+
+    def test_l5_non_front_real_launch_prints_no_host_guard_line(self):
+        self._tokenless()
+        argv = self.base_args(**{"--model-repo": PASS_REPO, "--context": "2048"})
+        stderr = io.StringIO()
+        with patch.object(FASTMLX_LAUNCH.os, "execv", side_effect=SystemExit(0)), patch.object(
+            FASTMLX_LAUNCH.fastmlx_proxy, "create_server"
+        ) as create_server, contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            with self.assertRaises(SystemExit):
+                FASTMLX_LAUNCH.main(argv)
+        self.assertNotIn("host_guard", stderr.getvalue())
+        self.assertIn("fastmlx_launch=admitted", stderr.getvalue())
+        create_server.assert_not_called()
 
     # ------------------------------------------------------------------
     # Refusal: --front-port must not equal --port.
@@ -2483,6 +2689,9 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
         stub_bin = write_script(self.root / "stub-engine.py", STUB_ENGINE_BODY)
         pid_path = self.root / "stub-engine.pid"
         env = dict(os.environ)
+        # Tokenless: the launcher turns the proxy's Host guard on (checked
+        # below against the real front port).
+        env.pop("FASTMLX_API_KEY", None)
         env["STUB_ENGINE_PID_PATH"] = str(pid_path)
         if graceful_engine:
             env["STUB_ENGINE_GRACEFUL"] = "1"
@@ -2536,6 +2745,18 @@ class FrontProxyModeTests(FastmlxLaunchTestCase):
             self.assertEqual(json.loads(body), {"stub": True})
             self.assertIsNotNone(resp.getheader("X-FastMLX-Admission"))
             self.assertIsNotNone(resp.getheader("X-FastMLX-Request-Id"))
+
+            # The real tokenless launch wired the Host guard into the real
+            # front proxy: a rebinding-style Host is refused with 421.
+            evil = http.client.HTTPConnection("127.0.0.1", front_port, timeout=5)
+            evil.putrequest("GET", "/v1/models", skip_host=True)
+            evil.putheader("Host", "rebind.evil.example")
+            evil.endheaders()
+            evil_resp = evil.getresponse()
+            evil_body = evil_resp.read()
+            evil.close()
+            self.assertEqual(evil_resp.status, 421)
+            self.assertEqual(json.loads(evil_body)["error"]["code"], "host_not_allowed")
 
             deadline = time.time() + 5
             while not pid_path.exists() and time.time() < deadline:

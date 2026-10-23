@@ -195,6 +195,14 @@ struct FastMLXServe {
         let apiKey = ProcessInfo.processInfo.environment["FASTMLX_API_KEY"].flatMap {
             $0.isEmpty ? nil : $0
         }
+        // `--allow-host` only means something on a tokenless server (the Host guard is off with a
+        // key), so the combination is refused before any model load rather than ignored.
+        if let refusal = FastMLXServeHostGuardStartup.refusalLine(
+            apiKeyConfigured: apiKey != nil, allowHosts: arguments.allowHosts)
+        {
+            FileHandle.standardError.write(Data((refusal + "\n").utf8))
+            exit(2)
+        }
         let prepared = try await prepareBackend(arguments, hostReport: hostReport)
         let evidenceSink: ServingEvidenceJSONLSink?
         do {
@@ -249,7 +257,10 @@ struct FastMLXServe {
             // or writes a request-log line -- byte-identical to today. `json` wires in the
             // production stderr sink; every route (including `--scripted`) shares this one
             // `ServingHTTPConfiguration` construction site.
-            requestLog: arguments.requestLog == .json ? servingRequestLogStandardErrorSink() : nil)
+            requestLog: arguments.requestLog == .json ? servingRequestLogStandardErrorSink() : nil,
+            // The DNS-rebinding Host guard is active exactly when `apiKey` is nil; `--allow-host`
+            // names were refused above when a key is set.
+            allowedHosts: arguments.allowHosts)
         let server: ServingHTTPServer
         do {
             server = try await ServingHTTPServer.start(
@@ -264,7 +275,8 @@ struct FastMLXServe {
 
         print(
             prepared.startupLine(localAddress: server.localAddress.description)
-                + " \(qualityCardsAnnounce)")
+                + " \(qualityCardsAnnounce)"
+                + " \(FastMLXServeHostGuardStartup.announceFields(apiKeyConfigured: apiKey != nil, allowHosts: arguments.allowHosts))")
         print("fastmlx-serve ready=true; press Control-C to stop.")
 
         await waitForShutdownSignal()

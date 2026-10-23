@@ -4745,6 +4745,64 @@ class ProxyAdoptsEngineRequestIdTests(unittest.TestCase):
         gate.set()
         holder.join(timeout=5)
 
+    def _saturated_503(self, **proxy_kwargs):
+        gate = threading.Event()
+        held = threading.Event()
+
+        def handle(conn):
+            _read_raw_request_headers(conn)
+            held.set()
+            gate.wait(timeout=10)
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+        listener, _ = _start_raw_socket_upstream(handle)
+        self._listeners.append(listener)
+        self.addCleanup(gate.set)
+        proxy = self._start_proxy(
+            listener.getsockname()[1], max_concurrent_requests=1, **proxy_kwargs
+        )
+
+        def hold():
+            conn = http.client.HTTPConnection("127.0.0.1", proxy.server_address[1], timeout=15)
+            conn.request("GET", "/v1/models")
+            conn.getresponse().read()
+            conn.close()
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        self.assertTrue(held.wait(timeout=5))
+        resp = self._get(proxy)
+        gate.set()
+        holder.join(timeout=5)
+        return resp
+
+    def test_c291r_guarded_capacity_503_omits_the_launch_plan_headers(self):
+        # The accept-time 503 is written before any Host is read, so with the
+        # Host guard on it must not carry the launch plan's X-FastMLX-* headers.
+        resp = self._saturated_503(host_guard=(True, ()))
+        self.assertEqual(resp.status, 503)
+        names = {n.lower() for n, _ in resp.getheaders()}
+        plan_prefixes = (
+            "x-fastmlx-admission", "x-fastmlx-card", "x-fastmlx-fit", "x-fastmlx-engine-build",
+            "x-fastmlx-mtp", "x-fastmlx-quality", "x-fastmlx-residency",
+        )
+        leaked = sorted(n for n in names if n.startswith(plan_prefixes))
+        self.assertEqual(leaked, [])
+        self.assertEqual(
+            sorted(n for n in names if n.startswith("x-fastmlx-")), ["x-fastmlx-request-id"]
+        )
+        self.assertEqual(resp.getheader("Retry-After"), "1")
+        self.assertEqual(resp.getheader("Connection"), "close")
+        self._assert_proxy_originated(resp)
+
+    def test_c291r_unguarded_capacity_503_still_carries_the_launch_plan_headers(self):
+        resp = self._saturated_503()
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(resp.getheader("X-FastMLX-Admission"), FIXTURE_PLAN["admission"])
+        self.assertEqual(resp.getheader("X-FastMLX-Card"), FIXTURE_PLAN["card"]["id"])
+        self.assertIsNotNone(resp.getheader("X-FastMLX-Engine-Build"))
+        self._assert_proxy_originated(resp)
+
     # -- T3 --------------------------------------------------------------
     def test_t3_truncated_body_502_carries_the_engine_id(self):
         upstream = self._raw_upstream(
@@ -4810,6 +4868,348 @@ class ProxyAdoptsEngineRequestIdTests(unittest.TestCase):
         )
         self.assertEqual(resp.getheader("X-FastMLX-Request-Id"), self.ENGINE_ID)
         self.assertEqual(entry["request_id"], self.ENGINE_ID)
+
+
+class _ConnectionCountingUpstream(ThreadingHTTPServer):
+    """A fake upstream that counts every ACCEPTED TCP connection, so a Host
+    guard test can prove the refused request never even reached a connect."""
+
+    connections = 0
+
+    def get_request(self):
+        accepted = super().get_request()
+        self.connections += 1
+        return accepted
+
+
+class ProxyHostGuardTests(unittest.TestCase):
+    """DNS-rebinding Host guard on a TOKENLESS front proxy (cycle 291, F2/F3,
+    P1-P7): exactly one well-formed Host that is loopback or operator-allowed,
+    checked FIRST in dispatch, answered by a dedicated refusal writer.
+    """
+
+    LOOKALIKES = (
+        "127.0.0.1.evil.com",
+        "localhost.evil.com",
+        "[::1].evil",
+        "0x7f.1",
+        "2130706433",
+        "127.1",
+        "127.000.000.001",
+        "a.localhost",
+    )
+    ALLOWED = ("localhost:9999", "LOCALHOST.", "127.8.9.10", "[::1]:1", "127.0.0.1")
+
+    def setUp(self):
+        self._servers = []
+        self.addCleanup(self._cleanup)
+        self.hits = []
+        hits = self.hits
+
+        def responder(handler):
+            hits.append(handler.path)
+            payload = b'{"ok":true}'
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/json")
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            if handler.command != "HEAD":
+                handler.wfile.write(payload)
+
+        self.upstream = _ConnectionCountingUpstream(("127.0.0.1", 0), _FakeUpstreamHandler)
+        self.upstream.responder = responder
+        thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
+        thread.start()
+        self.upstream._test_thread = thread
+        self._servers.append(self.upstream)
+
+    def _cleanup(self):
+        for server in self._servers:
+            stop_server(server)
+
+    def _start_proxy(self, guard=(True, ()), **kwargs):
+        self.log_entries = []
+        server = start_proxy(
+            FIXTURE_PLAN,
+            "127.0.0.1",
+            self.upstream.server_address[1],
+            host_guard=guard,
+            log_hook=self.log_entries.append,
+            **kwargs,
+        )
+        self._servers.append(server)
+        return server.server_address[1]
+
+    @staticmethod
+    def _raw(port, request: bytes):
+        """Send ``request`` verbatim, read to EOF; returns (status, header
+        list of (name, value) preserving duplicates, body bytes)."""
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+            sock.sendall(request)
+            data = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+        head, _, body = data.partition(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        status = int(lines[0].split(" ")[1])
+        headers = [tuple(line.split(": ", 1)) for line in lines[1:]]
+        return status, headers, body
+
+    def _request(self, port, host_lines, target="/v1/models", method="GET", version="HTTP/1.1", extra=b""):
+        raw = f"{method} {target} {version}\r\n".encode()
+        for line in host_lines:
+            raw += line.encode() + b"\r\n"
+        raw += extra + b"\r\n"
+        return self._raw(port, raw)
+
+    def _host(self, port, value, **kwargs):
+        return self._request(port, [f"Host: {value}"], **kwargs)
+
+    def _assert_upstream_untouched(self):
+        time.sleep(0.05)
+        self.assertEqual(self.upstream.connections, 0, "the upstream saw a connection")
+        self.assertEqual(self.hits, [])
+
+    # P1 ---------------------------------------------------------------
+    def test_lookalike_hosts_are_421_and_the_upstream_sees_zero_connections(self):
+        port = self._start_proxy()
+        for host in self.LOOKALIKES + ("evil.com", "0.0.0.0", "203.0.113.5"):
+            with self.subTest(host=host):
+                status, _, body = self._host(port, host)
+                self.assertEqual(status, 421)
+                self.assertEqual(json.loads(body)["error"]["code"], "host_not_allowed")
+        self._assert_upstream_untouched()
+
+    def test_loopback_hosts_pass_with_any_case_port_and_trailing_dot(self):
+        port = self._start_proxy()
+        for index, host in enumerate(self.ALLOWED, start=1):
+            with self.subTest(host=host):
+                status, _, body = self._host(port, host)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"ok": True})
+                self.assertEqual(len(self.hits), index)
+
+    def test_front_allow_host_name_passes_and_others_stay_refused(self):
+        port = self._start_proxy(guard=(True, ("dash.example",)))
+        self.assertEqual(self._host(port, "Dash.Example:8080")[0], 200)
+        self.assertEqual(self._host(port, "dash.example.evil.com")[0], 421)
+        self.assertEqual(self._host(port, "evil.com")[0], 421)
+        self.assertEqual(self._host(port, "localhost")[0], 200)
+
+    # Missing / duplicate / malformed -> 400 ---------------------------
+    def test_missing_duplicate_and_malformed_host_are_400(self):
+        port = self._start_proxy()
+        cases = {
+            "missing http/1.1": ([], "HTTP/1.1"),
+            "missing http/1.0": ([], "HTTP/1.0"),
+            "duplicate loopback+evil": (["Host: localhost", "Host: evil.com"], "HTTP/1.1"),
+            "duplicate evil+loopback": (["Host: evil.com", "Host: localhost"], "HTTP/1.1"),
+            "duplicate identical loopback": (["Host: localhost", "Host: localhost"], "HTTP/1.1"),
+            "empty": (["Host: "], "HTTP/1.1"),
+            "bare ipv6": (["Host: ::1"], "HTTP/1.1"),
+            "port not digits": (["Host: localhost:abc"], "HTTP/1.1"),
+            "port too long": (["Host: localhost:123456"], "HTTP/1.1"),
+            "two colons": (["Host: localhost:1:2"], "HTTP/1.1"),
+            "unclosed bracket": (["Host: [::1"], "HTTP/1.1"),
+            "slash": (["Host: localhost/x"], "HTTP/1.1"),
+            "userinfo": (["Host: evil.com@localhost"], "HTTP/1.1"),
+            "space inside": (["Host: local host"], "HTTP/1.1"),
+            "only a dot": (["Host: ."], "HTTP/1.1"),
+        }
+        for label, (host_lines, version) in cases.items():
+            with self.subTest(case=label):
+                status, _, body = self._request(port, host_lines, version=version)
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(body)["error"]["code"], "invalid_host_header")
+        self._assert_upstream_untouched()
+
+    def test_c291r_host_with_non_space_tab_control_or_unicode_space_is_400(self):
+        # The engine trims only SP and HT; \v \f \x1c-\x1f \x85 \xa0 must not be
+        # silently stripped into a loopback name.
+        port = self._start_proxy()
+        for suffix in ("\x0b", "\x0c", "\x1c", "\x1f", "\x85", "\xa0", "\x7f"):
+            for prefix in ("", "\x0b"):
+                value = "Host: " + prefix + "localhost" + suffix
+                with self.subTest(value=repr(value)):
+                    raw = b"GET /v1/models HTTP/1.1\r\n" + value.encode("latin-1") + b"\r\n\r\n"
+                    status, _, body = self._raw(port, raw)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(json.loads(body)["error"]["code"], "invalid_host_header")
+        status, _, _ = self._request(port, ["Host: \t localhost \t"])
+        self.assertEqual(status, 200)
+
+    # P2 ---------------------------------------------------------------
+    def test_provenance_endpoint_is_refused_for_an_evil_host(self):
+        port = self._start_proxy()
+        status, _, body = self._host(port, "evil.com", target="/fastmlx/provenance")
+        self.assertEqual(status, 421)
+        for leaked in (b"admission", b"fixture-card", b"qualityVerdict", b"engineBuild"):
+            self.assertNotIn(leaked, body)
+        status, _, body = self._host(port, "localhost:1", target="/fastmlx/provenance")
+        self.assertEqual(status, 200)
+        self.assertIn(b"admission", body)
+
+    # P3 + F3 ----------------------------------------------------------
+    def test_refusal_carries_only_the_request_id_headers_and_a_json_error(self):
+        port = self._start_proxy()
+        # Control: an allowed request DOES carry the launch-plan headers, so
+        # the absence below is not a vacuous property of the fixture.
+        _, allowed_headers, _ = self._host(port, "localhost")
+        self.assertIn("x-fastmlx-admission", {name.lower() for name, _ in allowed_headers})
+
+        for host, expected_status in (("evil.example", 421), ("", 400)):
+            with self.subTest(host=host):
+                status, headers, body = self._host(port, host)
+                self.assertEqual(status, expected_status)
+                names = [name.lower() for name, _ in headers]
+                self.assertEqual(len(names), len(set(names)), names)
+                fastmlx_names = {name for name in names if name.startswith("x-fastmlx-")}
+                self.assertEqual(fastmlx_names, {"x-fastmlx-request-id"}, names)
+                self.assertTrue(
+                    set(names) <= {
+                        "server", "date", "content-type", "content-length", "connection",
+                        "x-request-id", "x-fastmlx-request-id",
+                    },
+                    names,
+                )
+                header_map = {name.lower(): value for name, value in headers}
+                self.assertEqual(header_map["connection"], "close")
+                self.assertEqual(header_map["content-type"], "application/json")
+                self.assertEqual(header_map["content-length"], str(len(body)))
+                self.assertEqual(header_map["x-request-id"], header_map["x-fastmlx-request-id"])
+                self.assertRegex(header_map["x-request-id"], r"^[0-9a-f]{32}$")
+                error = json.loads(body)["error"]
+                self.assertEqual(set(error), {"message", "type", "code"})
+                self.assertIn(error["code"], ("host_not_allowed", "invalid_host_header"))
+                if host:
+                    self.assertNotIn(host.encode(), body)
+
+    # P4 ---------------------------------------------------------------
+    def test_evil_host_with_a_huge_declared_body_is_421_not_413(self):
+        port = self._start_proxy()
+        status, _, body = self._request(
+            port,
+            ["Host: evil.com"],
+            target="/v1/chat/completions",
+            method="POST",
+            extra=b"Content-Length: 1000000000\r\n",
+        )
+        self.assertEqual(status, 421)
+        self.assertEqual(json.loads(body)["error"]["code"], "host_not_allowed")
+        # Control: the same declared size with a loopback Host IS the 413.
+        status, _, _ = self._request(
+            port,
+            ["Host: localhost"],
+            target="/v1/chat/completions",
+            method="POST",
+            extra=b"Content-Length: 1000000000\r\n",
+        )
+        self.assertEqual(status, 413)
+        self._assert_upstream_untouched()
+
+    # P5 ---------------------------------------------------------------
+    def test_absolute_form_and_asterisk_targets_are_421_even_with_a_loopback_host(self):
+        port = self._start_proxy()
+        for method, target in (
+            ("GET", "http://evil/fastmlx/provenance"),
+            ("GET", "http://localhost/v1/models"),
+            ("OPTIONS", "*"),
+        ):
+            with self.subTest(target=target):
+                status, _, body = self._request(port, ["Host: 127.0.0.1"], target=target, method=method)
+                self.assertEqual(status, 421)
+                self.assertEqual(json.loads(body)["error"]["code"], "host_not_allowed")
+        self._assert_upstream_untouched()
+
+    # P6 ---------------------------------------------------------------
+    def test_head_refusal_has_no_body(self):
+        port = self._start_proxy()
+        for host_lines, expected in ((["Host: evil.com"], 421), ([], 400)):
+            with self.subTest(expected=expected):
+                status, headers, body = self._request(port, host_lines, method="HEAD")
+                self.assertEqual(status, expected)
+                self.assertEqual(body, b"")
+                self.assertGreater(int({n.lower(): v for n, v in headers}["content-length"]), 0)
+        self._assert_upstream_untouched()
+
+    # P7 ---------------------------------------------------------------
+    def test_a_proxy_without_the_guard_passes_an_evil_host_unchanged(self):
+        port = self._start_proxy(guard=(False, ()))
+        for host_lines in (["Host: evil.com"], ["Host: a", "Host: b"], []):
+            with self.subTest(host_lines=host_lines):
+                status, _, body = self._request(port, host_lines)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"ok": True})
+        self.assertEqual(self.upstream.connections, 3)
+
+    def test_a_proxy_built_without_host_guard_argument_defaults_to_off(self):
+        server = FASTMLX_PROXY.create_server(
+            "127.0.0.1", 0, "127.0.0.1", self.upstream.server_address[1], FIXTURE_PLAN
+        )
+        self.addCleanup(server.server_close)
+        self.assertEqual(server.host_guard, (False, frozenset()))
+
+    # Log line (F3) ----------------------------------------------------
+    def test_each_refusal_writes_one_log_entry_with_status_and_code_and_no_host(self):
+        port = self._start_proxy()
+        status, headers, _ = self._host(port, "secret-marker.evil.com")
+        self.assertEqual(status, 421)
+        time.sleep(0.05)
+        self.assertEqual(len(self.log_entries), 1, self.log_entries)
+        entry = self.log_entries[0]
+        header_map = {name.lower(): value for name, value in headers}
+        self.assertEqual(entry["status"], 421)
+        self.assertEqual(entry["error"], "host_not_allowed")
+        self.assertEqual(entry["request_id"], header_map["x-request-id"])
+        self.assertNotIn("secret-marker", json.dumps(entry))
+        status, _, _ = self._request(port, [])
+        self.assertEqual(status, 400)
+        time.sleep(0.05)
+        self.assertEqual([e["error"] for e in self.log_entries], ["host_not_allowed", "invalid_host_header"])
+
+
+class ProxyHostGuardHelperTests(unittest.TestCase):
+    def test_front_host_is_loopback_is_strict(self):
+        loopback = ["localhost", "LOCALHOST.", "127.0.0.1", "127.8.9.10", "::1", "[::1]", "Localhost"]
+        wide = [
+            "0.0.0.0", "::", "203.0.113.5", "127.1", "127.000.000.001", "127.0.0.1.evil.com",
+            "localhost.evil.com", "a.localhost", "0x7f.0.0.1", "2130706433", "", "128.0.0.1",
+            "127.0.0.256", "localhost:80",
+        ]
+        for value in loopback:
+            with self.subTest(value=value):
+                self.assertTrue(FASTMLX_PROXY.front_host_is_loopback(value))
+        for value in wide:
+            with self.subTest(value=value):
+                self.assertFalse(FASTMLX_PROXY.front_host_is_loopback(value))
+
+    def test_normalize_allow_host_accepts_ldh_and_ipv4_and_refuses_the_rest(self):
+        self.assertEqual(FASTMLX_PROXY.normalize_allow_host("Dash.Example"), "dash.example")
+        self.assertEqual(FASTMLX_PROXY.normalize_allow_host("203.0.113.5"), "203.0.113.5")
+        self.assertEqual(FASTMLX_PROXY.normalize_allow_host("a" * 63 + ".example"), "a" * 63 + ".example")
+        bad = [
+            "", "  ", "*", "*.example.com", "a.*", "host:80", "[::1]", "::1", "a/b", "-a.com",
+            "a-.com", "a..b", "a b", "a" * 64 + ".example", ".".join(["a" * 60] * 5), "ex_ample.com",
+            "evil.com@x",
+        ]
+        for value in bad:
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FASTMLX_PROXY.normalize_allow_host(value)
+
+    def test_normalize_allow_host_refuses_a_numeric_last_label_unless_canonical_ipv4(self):
+        # Mirrors the engine's validatedAllowHost: a name whose LAST label is
+        # all digits must be a canonical dotted-quad, else it is refused.
+        for value in ("127.1", "2130706433", "1.2.3", "10.0.0.0300", "a.1", "1.2.3.4.5", "1.2.3.256"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    FASTMLX_PROXY.normalize_allow_host(value)
+        for value in ("203.0.113.5", "a1.example", "host-2.example", "1.example"):
+            with self.subTest(value=value):
+                self.assertEqual(FASTMLX_PROXY.normalize_allow_host(value), value)
 
 
 if __name__ == "__main__":

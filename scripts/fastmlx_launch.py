@@ -57,7 +57,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import List, NamedTuple, Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -2944,6 +2944,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "with --front-port; never changes where the engine binds)"
         ),
     )
+    serve.add_argument(
+        "--front-allow-host",
+        action="append",
+        default=None,
+        metavar="NAME",
+        help=(
+            "in front mode WITHOUT FASTMLX_API_KEY, the proxy refuses (421) any "
+            "request whose Host header is not localhost, a 127.x.x.x address or "
+            "::1 (DNS-rebinding guard); this additionally allows the Host name "
+            "NAME (an LDH host name or a canonical IPv4, no port, no wildcard); "
+            "repeatable; refused when FASTMLX_API_KEY is set"
+        ),
+    )
     # Deliberately NOT ``type=int``: argparse's own conversion would refuse
     # a non-numeric value with its own "invalid int value" usage error, a
     # different shape than the ``LaunchRefusal`` fail-closed style every
@@ -4123,6 +4136,33 @@ def _run_serve(args, passthrough_args: list) -> int:
             f"--front-port {args.front_port} cannot equal --port {args.port}: the "
             "front proxy and the engine it fronts must bind different ports",
         )
+    # The DNS-rebinding Host guard follows the SAME rule as the engine: on
+    # exactly when no bearer token is configured (FASTMLX_API_KEY unset or
+    # empty). Outside front mode there is no proxy, so nothing to configure.
+    front_tokenless = not os.environ.get("FASTMLX_API_KEY")
+    front_allow_hosts: List[str] = []
+    if args.front_allow_host and not front_mode:
+        raise LaunchRefusal(2, "--front-allow-host requires --front-port (front mode)")
+    if front_mode:
+        if front_tokenless and not fastmlx_proxy.front_host_is_loopback(args.front_host):
+            raise LaunchRefusal(
+                2,
+                f"--front-host {args.front_host!r} is not a loopback address while "
+                "FASTMLX_API_KEY is unset or empty: a tokenless engine must not be "
+                "reachable beyond loopback; set FASTMLX_API_KEY to bind a wider "
+                "front host, or use --front-host 127.0.0.1",
+            )
+        for allow_host in args.front_allow_host or []:
+            try:
+                front_allow_hosts.append(fastmlx_proxy.normalize_allow_host(allow_host))
+            except ValueError as exc:
+                raise LaunchRefusal(2, f"--front-allow-host {allow_host!r} {exc}")
+        if front_allow_hosts and not front_tokenless:
+            raise LaunchRefusal(
+                2,
+                "--front-allow-host has no effect while FASTMLX_API_KEY is set (the "
+                "Host guard is only on for a tokenless launch); remove it",
+            )
     if front_mode:
         # The loopback guarantee depends on the PROFILE, not only on the
         # passthrough-args refusal below: a custom --engine-profile whose
@@ -4316,6 +4356,7 @@ def _run_serve(args, passthrough_args: list) -> int:
             "host": args.front_host,
             "port": args.front_port,
             "upstream": f"http://127.0.0.1:{args.port}",
+            "hostGuard": {"enabled": front_tokenless, "allow": front_allow_hosts},
         }
 
     if args.dry_run:
@@ -4332,6 +4373,12 @@ def _run_serve(args, passthrough_args: list) -> int:
     if front_mode:
         admitted_line += f" front={args.front_host}:{args.front_port}"
     print(admitted_line, file=sys.stderr)
+    if front_mode:
+        # A SEPARATE line (the `admitted` line keeps its fixed arity).
+        print(
+            f"fastmlx_launch=front_host_guard {'on' if front_tokenless else 'off'}",
+            file=sys.stderr,
+        )
     # A SEPARATE line (the `admitted` line keeps its fixed arity): which card
     # store this launch admitted against, so an operator can tell a bundled
     # store from a newer one and pin it with --quality-cards-sha256.
@@ -4699,6 +4746,8 @@ def _run_front_mode(
     # through every caller of this function.
     upstream_host = "127.0.0.1"
     upstream_port = int(front["upstream"].rsplit(":", 1)[1])
+    host_guard_plan = front.get("hostGuard") or {}
+    host_guard = (bool(host_guard_plan.get("enabled")), tuple(host_guard_plan.get("allow") or ()))
 
     try:
         server = fastmlx_proxy.create_server(
@@ -4709,6 +4758,7 @@ def _run_front_mode(
             plan,
             max_request_body_bytes=max_request_body_bytes,
             max_concurrent_requests=max_concurrent_requests,
+            host_guard=host_guard,
         )
     except OSError as exc:
         print(

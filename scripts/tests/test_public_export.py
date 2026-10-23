@@ -338,9 +338,14 @@ PUBLIC_VENDOR_SOURCE_OVERRIDES = {
 #   spike/Tests/ServingNIOTests/ProtocolErrorRequestIDTests.swift (the malformed-HTTP 400 carries an x-request-id and
 #   one request-log line). Conscious decision to publish: read in full; the handler and raw-socket tests with synthetic
 #   request bytes and the suite's existing synthetic model string only, no host, credential or machine-local path.
+# 2026-10-23, 1063 -> 1066: adds spike/Sources/ServingNIO/ServingHostGuard.swift,
+#   spike/Tests/ServingNIOTests/HostGuardTests.swift and spike/Tests/ServingCoreTests/AllowHostServeArgumentTests.swift
+#   (the DNS-rebinding Host guard on a tokenless server and its `--allow-host` flag). Conscious decision to publish: read
+#   in full; a pure Host parser, raw-socket tests with synthetic hostnames (`*.example`, `*.evil.com`, TEST-NET-3
+#   addresses) and the suite's existing synthetic model string; no host, credential or machine-local path.
 SEALED_PUBLIC_INDEX = {
-    "pathCount": 1063,
-    "pathModeSha256": "3964f3e1bb047c7d00e2c38e4008c321c5631b1da766ad1b997be65087d4a98e",
+    "pathCount": 1066,
+    "pathModeSha256": "a1663c83af504c3fdad01d549b8b7de138b7af1bcdf9467fe2940d56a9270715",
 }
 
 

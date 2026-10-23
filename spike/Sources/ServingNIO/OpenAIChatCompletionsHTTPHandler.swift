@@ -184,7 +184,10 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
             writeError(
                 rejection.error,
                 status: rejection.status,
-                keepAlive: head.isKeepAlive,
+                // A Host-guard refusal always closes the connection (a rebinding page must not
+                // keep a connection to probe with); every other rejection keeps the client's
+                // keep-alive choice.
+                keepAlive: head.isKeepAlive && !ServingHostGuard.isGuardRejection(rejection.error),
                 context: context,
                 allow: rejection.allow)
             return
@@ -627,6 +630,31 @@ public final class OpenAIChatCompletionsHTTPHandler: ChannelInboundHandler {
     private func validateHead(
         _ head: HTTPRequestHead
     ) -> (status: HTTPResponseStatus, error: OpenAIServingError, allow: String?)? {
+        // DNS-rebinding Host guard (tokenless servers only): FIRST, before the route match, the
+        // method check, the /healthz and /readyz probe bypass, authentication and any body read, so
+        // no route -- not even a probe -- answers a request whose Host is not allowed.
+        if let hostGuard = configuration.hostGuard {
+            switch hostGuard.evaluate(
+                hostHeaders: head.headers["host"], requestTarget: head.uri)
+            {
+            case .allow:
+                break
+            case .rejectInvalidHost:
+                return (
+                    .badRequest,
+                    .invalidRequestWithCode(
+                        ServingHostGuard.invalidHostMessage, param: nil,
+                        code: ServingHostGuard.invalidHostCode),
+                    nil)
+            case .rejectNotAllowed:
+                return (
+                    .misdirectedRequest,
+                    .invalidRequestWithCode(
+                        ServingHostGuard.notAllowedMessage, param: nil,
+                        code: ServingHostGuard.notAllowedCode),
+                    nil)
+            }
+        }
         // Match on the path only, so `?api-version=...` and the like never turn a known route into a
         // 404; a query string is never consulted for authentication either (see `servingRoutePath`).
         let routePath = servingRoutePath(head.uri)

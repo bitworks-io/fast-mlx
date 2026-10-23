@@ -16,6 +16,10 @@ the maintainers to establish a private channel; do not disclose technical detail
 
 - The default server bind is loopback.
 - A non-loopback bind requires a non-empty `FASTMLX_API_KEY`.
+- This includes the `fastmlx serve --front-port` proxy's `--front-host`.
+- Without a key, the server and the front-port proxy refuse a request whose `Host` is not a loopback
+  name (or an operator `--allow-host` / `--front-allow-host` name), so a DNS-rebound web page cannot use
+  them.
 - Loaded-model serving requires explicit memory and cache limits.
 - Evidence and source-admission controls are not substitutes for operating-system containment.
 - Diagnostic and comparison evidence never grants runtime or publication authority by itself.

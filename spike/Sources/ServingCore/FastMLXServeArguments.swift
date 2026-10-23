@@ -267,6 +267,9 @@ public enum FastMLXServeArgumentError:
     /// `--qwen4exp-sampled-mtp` is also present.
     case defaultSamplingWithInCheckpointMTPRequiresSampledMTP
     case invalidRequestLogMode
+    /// `--allow-host` must be a bare DNS host name (LDH labels) or a canonical dotted-quad IPv4
+    /// address: no wildcard, port, brackets, path or empty value.
+    case invalidAllowHost
 
     public var description: String {
         switch self {
@@ -410,6 +413,9 @@ public enum FastMLXServeArgumentError:
                 + "accelerated greedy MTP to unaccelerated scalar decode"
         case .invalidRequestLogMode:
             "--request-log must be off or json"
+        case .invalidAllowHost:
+            "--allow-host must be a bare DNS host name or a canonical IPv4 address "
+                + "(no wildcard, port, brackets, path or empty value)"
         }
     }
 }
@@ -438,6 +444,33 @@ public enum FastMLXServeArgumentError:
 /// ~28 cases the same way rather than inventing structure the description doesn't need.
 public func fastMLXServeArgumentRefusalAnnounceLine(_ error: FastMLXServeArgumentError) -> String {
     "fastmlx-serve configuration=refused reason=invalid_arguments detail=\(error.description)"
+}
+
+/// Startup-line and startup-refusal text for the tokenless-server `Host` guard (cycle 291). Pure so
+/// `fastmlx-serve` (which reads `FASTMLX_API_KEY` from the environment) and the tests share one
+/// definition of the strings.
+public enum FastMLXServeHostGuardStartup {
+    /// H6: `host_guard=on|off host_guard_allow=<csv>|none`. The guard is on exactly when no API key
+    /// is configured.
+    public static func announceFields(apiKeyConfigured: Bool, allowHosts: [String]) -> String {
+        guard !apiKeyConfigured else {
+            return "host_guard=off host_guard_allow=none"
+        }
+        let allow = allowHosts.isEmpty ? "none" : allowHosts.joined(separator: ",")
+        return "host_guard=on host_guard_allow=\(allow)"
+    }
+
+    /// H5: `--allow-host` given while an API key is set is refused (the guard is off with a key, so
+    /// the flag would be silently inert). Returns the refusal line, or `nil` when there is no
+    /// conflict.
+    public static func refusalLine(apiKeyConfigured: Bool, allowHosts: [String]) -> String? {
+        guard apiKeyConfigured, !allowHosts.isEmpty else {
+            return nil
+        }
+        return "fastmlx-serve configuration=refused reason=allow_host_with_api_key "
+            + "detail=--allow-host cannot be combined with FASTMLX_API_KEY: the Host guard is "
+            + "only active on a server without an API key"
+    }
 }
 
 public struct FastMLXServeArguments: Equatable, Sendable {
@@ -639,6 +672,14 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                                       strings, or client IP. Applies to every route,
                                       including --scripted.
           --host HOST                 Bind host (default: 127.0.0.1).
+          --allow-host NAME           Repeatable. Without FASTMLX_API_KEY the server
+                                      refuses any request whose Host header is not
+                                      localhost, a canonical 127.x.y.z address, or [::1]
+                                      (DNS-rebinding guard: 421 host_not_allowed, or 400
+                                      invalid_host_header). NAME adds one accepted Host
+                                      (a DNS name or canonical IPv4; no wildcard, port or
+                                      brackets). Refused at startup when FASTMLX_API_KEY
+                                      is set, since the guard is off with a key.
           --host-use VALUE            Operator host-use intent (shared|dedicated-serving).
                                       Omit to keep default policy provenance distinct
                                       from an explicit shared assertion.
@@ -880,6 +921,12 @@ public struct FastMLXServeArguments: Equatable, Sendable {
     /// silently dropped on (every route -- including `--scripted` -- reaches the same handler
     /// finishing points), so it carries no companion "requires"/"conflicts with" refusals.
     public let requestLog: FastMLXServeRequestLogMode
+    /// `--allow-host NAME` (repeatable): extra `Host` header names a TOKENLESS server accepts on top
+    /// of the loopback names (cycle 291 DNS-rebinding guard). Validated and lowercased at parse
+    /// time (see `validatedAllowHost`); empty by default. Combining it with a configured
+    /// `FASTMLX_API_KEY` is refused at startup by `fastmlx-serve` (the key is read from the
+    /// environment there, not here), never silently ignored.
+    public let allowHosts: [String]
 
     private init(
         backend: FastMLXServeBackend?,
@@ -922,7 +969,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         fitCheckOnly: Bool = false,
         offloadPlanCheckOnly: Bool = false,
         defaultSampling: FastMLXServeDefaultSampling = .off,
-        requestLog: FastMLXServeRequestLogMode = .off
+        requestLog: FastMLXServeRequestLogMode = .off,
+        allowHosts: [String] = []
     ) {
         self.backend = backend
         self.host = host
@@ -964,6 +1012,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         self.offloadPlanCheckOnly = offloadPlanCheckOnly
         self.defaultSampling = defaultSampling
         self.requestLog = requestLog
+        self.allowHosts = allowHosts
     }
 
     public static func parse<S: Sequence>(
@@ -1018,6 +1067,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         var offloadPlanCheckOnly = false
         var defaultSampling = FastMLXServeDefaultSampling.off
         var requestLog = FastMLXServeRequestLogMode.off
+        var allowHosts: [String] = []
 
         var index = 0
         while index < arguments.count {
@@ -1250,6 +1300,15 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     throw FastMLXServeArgumentError.invalidRequestLogMode
                 }
                 requestLog = parsedRequestLog
+            case "--allow-host":
+                index += 1
+                let rawAllowHost = try value(at: index, in: arguments, for: argument)
+                guard let allowHost = Self.validatedAllowHost(rawAllowHost) else {
+                    throw FastMLXServeArgumentError.invalidAllowHost
+                }
+                if !allowHosts.contains(allowHost) {
+                    allowHosts.append(allowHost)
+                }
             case "--quality-cards", "--quality-cards-sha256", "--accept-quality", "--model-revision":
                 // Quality-guidance moat admission flags, plus --model-revision (the pinned HF commit
                 // sha used for hfPin-prefix card resolution). Accepted + value-consumed here so the
@@ -1291,7 +1350,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumRequestBodyBytes: maximumRequestBodyBytes,
                 maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
                 completionLimitPolicy: completionLimitPolicy,
-                requestLog: requestLog)
+                requestLog: requestLog,
+                allowHosts: allowHosts)
         }
 
         if requestedHostUse == .dedicatedServing {
@@ -1537,7 +1597,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                     preferMode: preferMode,
                     autoQuantBase: base,
                     memoryLimitBytes: memoryLimitBytes,
-                    requestLog: requestLog)
+                    requestLog: requestLog,
+                    allowHosts: allowHosts)
             }
             guard !quantCandidateDirs.isEmpty else {
                 throw FastMLXServeArgumentError.missingRequiredOption("--quant-candidates")
@@ -1568,7 +1629,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 planConcurrency: planConcurrency,
                 preferMode: preferMode,
                 memoryLimitBytes: memoryLimitBytes,
-                requestLog: requestLog)
+                requestLog: requestLog,
+                allowHosts: allowHosts)
         }
 
         let hasQuantCandidates = !quantCandidateDirs.isEmpty
@@ -1641,7 +1703,8 @@ public struct FastMLXServeArguments: Equatable, Sendable {
                 maximumRequestBodyBytes: maximumRequestBodyBytes,
                 maximumNonStreamingResponseBytes: maximumNonStreamingResponseBytes,
                 completionLimitPolicy: completionLimitPolicy,
-                requestLog: requestLog)
+                requestLog: requestLog,
+                allowHosts: allowHosts)
         }
 
         guard continuousModeSelected || hasLoadedModelOptions else {
@@ -1749,10 +1812,48 @@ public struct FastMLXServeArguments: Equatable, Sendable {
             fitCheckOnly: fitCheckOnly,
             offloadPlanCheckOnly: offloadPlanCheckOnly,
             defaultSampling: defaultSampling,
-            requestLog: requestLog)
+            requestLog: requestLog,
+            allowHosts: allowHosts)
     }
 
-    private static let repeatableOptions: Set<String> = ["--accept-quality"]
+    private static let repeatableOptions: Set<String> = ["--accept-quality", "--allow-host"]
+
+    /// H5: validates one `--allow-host` value and returns its normalized (lowercased) form, or
+    /// `nil` when it is not a bare DNS host name (LDH labels of 1-63 characters, total at most 253,
+    /// no leading/trailing hyphen, no empty label, no trailing dot) or a canonical dotted-quad IPv4
+    /// address. Wildcards, ports, brackets (IPv6), paths, whitespace and non-ASCII are refused. A
+    /// name whose last label is all digits must be a canonical IPv4 (so `127.1` and `2130706433`
+    /// are not smuggled in as "names").
+    public static func validatedAllowHost(_ raw: String) -> String? {
+        let name = raw.lowercased()
+        guard !name.isEmpty, name.utf8.count <= 253 else {
+            return nil
+        }
+        let labels = name.split(separator: ".", omittingEmptySubsequences: false)
+        for label in labels {
+            guard (1...63).contains(label.utf8.count),
+                !label.hasPrefix("-"), !label.hasSuffix("-"),
+                label.utf8.allSatisfy({
+                    ($0 >= 0x61 && $0 <= 0x7A) || ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x2D
+                })
+            else {
+                return nil
+            }
+        }
+        if let last = labels.last, last.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) {
+            guard labels.count == 4 else {
+                return nil
+            }
+            for label in labels {
+                guard label.count <= 3, label == "0" || !label.hasPrefix("0"),
+                    let octet = Int(label), octet <= 255
+                else {
+                    return nil
+                }
+            }
+        }
+        return name
+    }
 
     private static let supportedOptions: Set<String> = [
         "--scripted",
@@ -1799,6 +1900,7 @@ public struct FastMLXServeArguments: Equatable, Sendable {
         "--offload-plan-check-only",
         "--default-sampling",
         "--request-log",
+        "--allow-host",
         "--quality-cards",
         "--quality-cards-sha256",
         "--accept-quality",
